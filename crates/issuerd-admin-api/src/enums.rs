@@ -127,9 +127,21 @@ fn algorithms() -> Vec<EnumValueRepresentation> {
         ("ES256", "ES256", "ECDSA with SHA-256"),
         ("ES384", "ES384", "ECDSA with SHA-384"),
         ("ES512", "ES512", "ECDSA with SHA-512"),
-        ("HS256", "HS256", "HMAC with SHA-256"),
-        ("HS384", "HS384", "HMAC with SHA-384"),
-        ("HS512", "HS512", "HMAC with SHA-512"),
+        (
+            "HS256",
+            "HS256",
+            "HMAC with SHA-256 (symmetric; not applicable to realm token signing)",
+        ),
+        (
+            "HS384",
+            "HS384",
+            "HMAC with SHA-384 (symmetric; not applicable to realm token signing)",
+        ),
+        (
+            "HS512",
+            "HS512",
+            "HMAC with SHA-512 (symmetric; not applicable to realm token signing)",
+        ),
         ("EdDSA", "EdDSA", "Edwards-curve Digital Signature Algorithm"),
     ]
     .into_iter()
@@ -1124,6 +1136,29 @@ mod tests {
         assert_eq!(algs.len(), expected.len());
         for (alg, exp) in algs.iter().zip(expected.iter()) {
             assert_eq!(alg.id, *exp);
+        }
+    }
+
+    #[test]
+    fn hmac_algorithms_are_marked_not_applicable_to_realm_signing() {
+        // The SPA renders these descriptions next to the realm signing
+        // algorithm and rotation dropdowns: symmetric HS* values parse as
+        // valid `Algorithm`s but are ignored for realm token signing (and
+        // rejected by rotation), and that contract must be visible to the
+        // admin instead of silently ignored.
+        for alg in algorithms() {
+            let desc = alg.description.as_deref().unwrap_or_default();
+            if alg.id.starts_with("HS") {
+                assert!(
+                    desc.contains("not applicable to realm token signing"),
+                    "HS* description must disclose the realm-signing exclusion: {alg:?}"
+                );
+            } else {
+                assert!(
+                    !desc.contains("not applicable to realm token signing"),
+                    "asymmetric algorithms stay applicable: {alg:?}"
+                );
+            }
         }
     }
 

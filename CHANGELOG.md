@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The default token-signing algorithm is now **EdDSA (Ed25519)** instead of
+  RS256 (asymmetric-first policy). New deployments generate an EdDSA signing
+  key on first boot, and realms without a `default_signature_algorithm`
+  attribute resolve to the EdDSA server default (`CryptoConfig::default_alg`,
+  `TokenManager::new`, admin key rotation with no existing keys); RS256
+  remains fully supported as an explicit compatibility choice. **Existing
+  deployments are unaffected**: stored keys are untouched, and an RS256-only
+  key set keeps signing un-configured realms via the newest-active-key
+  fallback. Note that deliberately rotating an EdDSA key into an existing
+  deployment now switches un-configured realms to EdDSA (previously issued
+  RS256 tokens keep validating — both keys stay published), so pin
+  `default_signature_algorithm=RS256` on realms that must stay on RSA before
+  rotating. The admin enum/serverinfo descriptions for the `HS*` algorithms
+  now state they are not applicable to realm token signing (they were always
+  ignored there — the contract is now visible to the SPA), and the
+  `RUSTSEC-2023-0071` (rsa crate, Marvin) ignores in `.cargo/audit.toml` /
+  `deny.toml` carry the verified justification plus the residual plan (RSA key
+  generation only, retained for compatibility; switch to a maintained crate
+  if a fix/fork lands). See `docs/configuration.md` — "Token signing
+  algorithm".
 - Token issuer (`iss`) validation is now **exact-match**: access, refresh,
   and ID token issuers are parsed as URLs and must equal the configured
   issuer base URL in scheme, host, and port, with a path of exactly

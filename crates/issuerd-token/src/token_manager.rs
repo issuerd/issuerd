@@ -50,7 +50,8 @@ const JARM_RESPONSE_LIFETIME_SECS: i64 = 60;
 impl<C: CryptoProvider> TokenManager<C> {
     /// Create a new token manager.
     ///
-    /// The default token-signing algorithm is RS256; use
+    /// The default token-signing algorithm matches
+    /// [`CryptoConfig::default`][crate::CryptoConfig] (EdDSA); use
     /// [`TokenManager::with_default_alg`] to override it.
     ///
     /// # Examples
@@ -78,7 +79,7 @@ impl<C: CryptoProvider> TokenManager<C> {
         clock_skew: std::time::Duration,
         jwks: JwkSet,
     ) -> Self {
-        Self::with_default_alg(crypto, issuer_base_url, clock_skew, jwks, Algorithm::Rs256)
+        Self::with_default_alg(crypto, issuer_base_url, clock_skew, jwks, Algorithm::EdDsa)
     }
 
     /// Create a token manager with an explicit default token-signing
@@ -4143,21 +4144,25 @@ mod tests {
         serde_json::from_slice(&bytes).expect("header segment is JSON")
     }
 
-    /// Token manager backed by a real provider with three ACTIVE keys of
-    /// different algorithms: RS256 (oldest), ES256, ES512 (newest). The JWKS
-    /// snapshot therefore orders them `[ES512, ES256, RS256]`.
+    /// Token manager backed by a real provider with four ACTIVE keys of
+    /// different algorithms: EdDSA (oldest), RS256, ES256, ES512 (newest).
+    /// The JWKS snapshot therefore orders them `[ES512, ES256, RS256, EdDSA]`.
     async fn multi_alg_tm() -> (TokenManager<RingCryptoProvider>, Vec<(String, Algorithm)>) {
-        let rsa = KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
+        let eddsa = KeyStore::generate_key(Algorithm::EdDsa, 2048).unwrap();
+        let mut rsa = KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
+        rsa.created_at = eddsa.created_at + chrono::Duration::seconds(1);
         let mut es256 = KeyStore::generate_key(Algorithm::Es256, 2048).unwrap();
-        es256.created_at = rsa.created_at + chrono::Duration::seconds(1);
+        es256.created_at = eddsa.created_at + chrono::Duration::seconds(2);
         let mut es512 = KeyStore::generate_key(Algorithm::Es512, 2048).unwrap();
-        es512.created_at = rsa.created_at + chrono::Duration::seconds(2);
+        es512.created_at = eddsa.created_at + chrono::Duration::seconds(3);
         let kids = vec![
+            (eddsa.kid.to_string(), Algorithm::EdDsa),
             (rsa.kid.to_string(), Algorithm::Rs256),
             (es256.kid.to_string(), Algorithm::Es256),
             (es512.kid.to_string(), Algorithm::Es512),
         ];
         let stored = vec![
+            eddsa.to_stored(true),
             rsa.to_stored(true),
             es256.to_stored(true),
             es512.to_stored(true),
@@ -4182,7 +4187,7 @@ mod tests {
     #[tokio::test]
     async fn realm_algorithm_selects_matching_active_key() {
         let (tm, kids) = multi_alg_tm().await;
-        let es256_kid = &kids[1].0;
+        let es256_kid = &kids[2].0;
         let session = SessionId::new("s1").unwrap();
 
         // Realm pinned to ES256 signs with the active ES256 key.
@@ -4201,8 +4206,8 @@ mod tests {
         assert_eq!(header["kid"], es256_kid.as_str());
         assert!(tm.validate_access_token(&token.token).is_ok());
 
-        // A realm without the attribute keeps the server default (RS256) even
-        // though newer ES* keys are active.
+        // A realm without the attribute keeps the server default (EdDSA) even
+        // though newer RS*/ES* keys are active.
         let token = tm
             .issue_access_token(
                 &test_user(),
@@ -4214,8 +4219,25 @@ mod tests {
             .await
             .unwrap();
         let header = decode_header(&token.token);
-        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["alg"], "EdDSA");
         assert_eq!(header["kid"], kids[0].0.as_str());
+        assert!(tm.validate_access_token(&token.token).is_ok());
+
+        // A realm explicitly pinned to RS256 (compatibility choice) signs with
+        // the active RS256 key.
+        let token = tm
+            .issue_access_token(
+                &test_user(),
+                &test_client(),
+                &realm_with_alg("RS256"),
+                &["openid".to_string()],
+                &session,
+            )
+            .await
+            .unwrap();
+        let header = decode_header(&token.token);
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["kid"], kids[1].0.as_str());
         assert!(tm.validate_access_token(&token.token).is_ok());
     }
 
@@ -4236,7 +4258,7 @@ mod tests {
             .unwrap();
         let header = decode_header(&token.token);
         assert_eq!(header["alg"], "ES512", "keys[0] is the newest active key");
-        assert_eq!(header["kid"], kids[2].0.as_str());
+        assert_eq!(header["kid"], kids[3].0.as_str());
         assert!(tm.validate_access_token(&token.token).is_ok());
     }
 
@@ -4344,7 +4366,7 @@ mod tests {
             .unwrap();
         let header = decode_header(&token.token);
         assert_eq!(header["alg"], "ES512");
-        assert_eq!(header["kid"], kids[2].0.as_str());
+        assert_eq!(header["kid"], kids[3].0.as_str());
 
         let validated = tm.validate_access_token(&token.token).unwrap();
         assert_eq!(validated.header.alg, Algorithm::Es512);

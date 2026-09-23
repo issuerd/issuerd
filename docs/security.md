@@ -140,7 +140,11 @@ cluster node signs with the same active key and validates tokens issued by its p
 ### Per-realm signing algorithm
 
 Supported signing algorithms: **RS256/RS384/RS512** (RSA), **ES256/ES384/ES512** (ECDSA, ES512 via
-P-521), and **EdDSA** (`crates/issuerd-core/src/traits.rs`). A realm selects its algorithm with the
+P-521), and **EdDSA** (`crates/issuerd-core/src/traits.rs`). The server default is **EdDSA**: the
+first-boot signing key is Ed25519 and realms without an explicit setting sign with the newest
+active key of the default algorithm, so fresh deployments issue EdDSA tokens and never generate an
+RSA key unless an operator opts in (RS256 remains fully supported as an explicit compatibility
+choice). A realm selects its algorithm with the
 realm attribute `default_signature_algorithm` (e.g. `"ES256"`); issuance then picks the newest
 active key of that algorithm. Symmetric `HS*` values are ignored (an HMAC "public" JWK exposes no
 verification material), and absent/invalid values fall back to the newest active key overall.
@@ -166,7 +170,8 @@ Content-Type: application/json
 {"algorithm": "ES256", "key_size": 2048}
 ```
 
-The body is optional and defaults to the newest active key's parameters (RS256/2048 when no key
+The body is optional and defaults to the newest active key's parameters (the server-default
+algorithm EdDSA when no key
 exists). Rotation generates a new active key and demotes the other active keys **of the same
 algorithm** — exactly one active key per algorithm is kept, so realms pinned to other algorithms
 are unaffected. RSA `key_size` must be 2048–8192 bits; `HS*` algorithms are rejected with 400.

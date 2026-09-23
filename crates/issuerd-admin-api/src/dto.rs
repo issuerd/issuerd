@@ -864,7 +864,7 @@ pub struct KeysMetadataRepresentation {
 
 /// Optional request body for `POST /admin/realms/{realm}/keys/rotate`.
 /// Both fields default to the newest active key's parameters
-/// (RS256/2048 when no key exists).
+/// (the server-default algorithm EdDSA when no key exists).
 #[derive(ToSchema, Serialize, Deserialize, Debug, Clone, Default)]
 pub struct RotateKeyRequest {
     /// JWS algorithm of the new key (e.g. `"RS256"`, `"ES256"`, `"ES512"`,

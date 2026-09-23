@@ -207,12 +207,12 @@ async fn bench_userinfo_stage_attribution() {
     }
     timed("revoked-key alloc + GET", N, start);
 
-    // 2. RS256 access-token verification (sync crypto + claims parse).
+    // 2. EdDSA access-token verification (sync crypto + claims parse).
     let start = Instant::now();
     for _ in 0..N {
         std::hint::black_box(state.token_service.validate_access_token(&token).unwrap());
     }
-    timed("validate_access_token (RS256)", N, start);
+    timed("validate_access_token (EdDSA)", N, start);
 
     // 3. Issuer realm resolution (realm-by-name cache hit).
     let start = Instant::now();

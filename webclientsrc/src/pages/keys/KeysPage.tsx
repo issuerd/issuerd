@@ -34,8 +34,8 @@ export default function KeysPage() {
   const updateRealm = useUpdateRealm()
   const { data: serverInfo, isLoading: infoLoading } = useServerInfo()
 
-  // The realm's configured signing algorithm (server default RS256 when unset).
-  const realmAlg = realmData?.attributes?.[DEFAULT_SIGNATURE_ALGORITHM_ATTRIBUTE] ?? 'RS256'
+  // The realm's configured signing algorithm (server default EdDSA when unset).
+  const realmAlg = realmData?.attributes?.[DEFAULT_SIGNATURE_ALGORITHM_ATTRIBUTE] ?? 'EdDSA'
   // Algorithm the next rotation generates a key for; follows the realm algorithm.
   const [rotateAlgOverride, setRotateAlgOverride] = useState<string | null>(null)
   const rotateAlg = rotateAlgOverride ?? realmAlg

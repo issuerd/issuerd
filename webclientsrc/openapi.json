@@ -12647,7 +12647,7 @@
           "Keys"
         ],
         "summary": "Rotate the active signing key",
-        "description": "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (RS256/2048 when no key exists). The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
+        "description": "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists). The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
         "operationId": "rotate_keys",
         "parameters": [
           {
@@ -21167,7 +21167,7 @@
       },
       "RotateKeyRequest": {
         "type": "object",
-        "description": "Optional request body for `POST /admin/realms/{realm}/keys/rotate`.\nBoth fields default to the newest active key's parameters\n(RS256/2048 when no key exists).",
+        "description": "Optional request body for `POST /admin/realms/{realm}/keys/rotate`.\nBoth fields default to the newest active key's parameters\n(the server-default algorithm EdDSA when no key exists).",
         "properties": {
           "algorithm": {
             "type": [

@@ -108,6 +108,52 @@ async fn set_realm_algorithm(harness: &TestHarness, realm_name: &str, alg: &str)
         .unwrap();
 }
 
+/// Fresh deployments start on EdDSA: the first-boot signing key is Ed25519
+/// and realms without a `default_signature_algorithm` attribute get EdDSA
+/// tokens that validate end-to-end. RS256 stays available as an explicit
+/// opt-in (covered by the other tests in this file).
+#[tokio::test]
+async fn fresh_deployment_defaults_to_eddsa_signing() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("default-realm").await;
+    let client = harness.create_client("default-realm", false).await;
+    harness.create_user("default-realm", "dave", "password123").await;
+
+    // The boot key set holds exactly one active key, and it is EdDSA.
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
+    let meta = body_json(resp).await;
+    let boot_kid = meta["active"]["EdDSA"].as_str().expect("EdDSA boot key").to_string();
+    assert_eq!(meta["active"].as_object().unwrap().len(), 1, "fresh boot keeps one active key");
+
+    // An un-configured realm gets EdDSA tokens signed by the boot key.
+    let tokens = password_grant_ok(&harness, "default-realm", &client, "dave", "password123").await;
+    let access = tokens["access_token"].as_str().unwrap();
+    let header = jwt_header(access);
+    assert_eq!(header["alg"], "EdDSA");
+    assert_eq!(header["kid"], boot_kid);
+    assert_eq!(jwt_header(tokens["id_token"].as_str().unwrap())["alg"], "EdDSA");
+
+    // The EdDSA token validates at userinfo (stateless OKP verification).
+    let resp = harness
+        .get_auth("/realms/default-realm/protocol/openid-connect/userinfo", access)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // JWKS publishes the OKP key with the Ed25519 curve and no private material.
+    let resp = harness.get("/realms/default-realm/protocol/openid-connect/certs").await;
+    let jwks = body_json(resp).await;
+    let key = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"].as_str() == Some(boot_kid.as_str()))
+        .expect("boot key published");
+    assert_eq!(key["kty"], "OKP");
+    assert_eq!(key["crv"], "Ed25519");
+    assert!(key.get("k").is_none() || key["k"].is_null(), "no symmetric material exposed");
+}
+
 #[tokio::test]
 async fn realm_es256_signs_tokens_old_rs256_tokens_still_validate() {
     let harness = TestHarness::new().await;
@@ -116,10 +162,15 @@ async fn realm_es256_signs_tokens_old_rs256_tokens_still_validate() {
     harness.create_user("es256-realm", "alice", "password123").await;
     let admin = harness.get_admin_token("master", "admin", "admin").await;
 
-    // Before the switch: tokens are RS256 (server default).
+    // RS256 as the explicit compatibility choice: pin the realm to an RS256
+    // key (rotated in deliberately) even though the server default is EdDSA.
+    let rs256_kid = rotate_and_wait(&harness, &admin, "RS256").await;
+    set_realm_algorithm(&harness, "es256-realm", "RS256").await;
     let rs256_tokens =
         password_grant_ok(&harness, "es256-realm", &client, "alice", "password123").await;
-    assert_eq!(jwt_header(rs256_tokens["access_token"].as_str().unwrap())["alg"], "RS256");
+    let rs256_header = jwt_header(rs256_tokens["access_token"].as_str().unwrap());
+    assert_eq!(rs256_header["alg"], "RS256");
+    assert_eq!(rs256_header["kid"], rs256_kid);
 
     // Generate an ES256 active key (server-global) and pin the realm to it.
     let es256_kid = rotate_and_wait(&harness, &admin, "ES256").await;
@@ -162,12 +213,13 @@ async fn realm_es256_signs_tokens_old_rs256_tokens_still_validate() {
         .collect();
     assert!(algs.contains(&"ES256") && algs.contains(&"RS256"));
 
-    // Discovery lists exactly the active algorithms (newest first).
+    // Discovery lists exactly the active algorithms (newest first; the EdDSA
+    // boot key is the oldest active key).
     let resp = harness.get("/realms/es256-realm/.well-known/openid-configuration").await;
     let discovery = body_json(resp).await;
     assert_eq!(
         discovery["id_token_signing_alg_values_supported"],
-        serde_json::json!(["ES256", "RS256"])
+        serde_json::json!(["ES256", "RS256", "EdDSA"])
     );
 }
 
@@ -235,24 +287,24 @@ async fn realm_algorithm_without_active_key_falls_back_to_default() {
     let client = harness.create_client("fallback-realm", false).await;
     harness.create_user("fallback-realm", "carol", "password123").await;
 
-    // No ES384 key exists: issuance falls back to the default (RS256) key.
+    // No ES384 key exists: issuance falls back to the default (EdDSA boot) key.
     set_realm_algorithm(&harness, "fallback-realm", "ES384").await;
     let tokens =
         password_grant_ok(&harness, "fallback-realm", &client, "carol", "password123").await;
-    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "RS256");
+    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "EdDSA");
 
     // An invalid algorithm value is ignored the same way.
     set_realm_algorithm(&harness, "fallback-realm", "FOOBAR").await;
     let tokens =
         password_grant_ok(&harness, "fallback-realm", &client, "carol", "password123").await;
-    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "RS256");
+    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "EdDSA");
 
     // Symmetric algorithms are never selected for realm token signing (HS*
     // keys publish no usable public material), so this falls back too.
     set_realm_algorithm(&harness, "fallback-realm", "HS256").await;
     let tokens =
         password_grant_ok(&harness, "fallback-realm", &client, "carol", "password123").await;
-    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "RS256");
+    assert_eq!(jwt_header(tokens["access_token"].as_str().unwrap())["alg"], "EdDSA");
 }
 
 #[tokio::test]
@@ -260,26 +312,26 @@ async fn rotate_keeps_one_active_key_per_algorithm() {
     let harness = TestHarness::new().await;
     let admin = harness.get_admin_token("master", "admin", "admin").await;
 
-    // Boot state: one active RS256 key.
+    // Boot state: one active EdDSA key.
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     let meta = body_json(resp).await;
-    let rsa_kid = meta["active"]["RS256"].as_str().unwrap().to_string();
+    let eddsa_kid = meta["active"]["EdDSA"].as_str().unwrap().to_string();
 
-    // ES256 rotation: the RS256 key stays active alongside.
+    // ES256 rotation: the EdDSA key stays active alongside.
     rotate_and_wait(&harness, &admin, "ES256").await;
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     let meta = body_json(resp).await;
-    assert_eq!(meta["active"]["RS256"], rsa_kid);
+    assert_eq!(meta["active"]["EdDSA"], eddsa_kid);
     let es_kid = meta["active"]["ES256"].as_str().unwrap().to_string();
 
-    // A bare rotate refreshes the newest algorithm's key only; the RS256
+    // A bare rotate refreshes the newest algorithm's key only; the EdDSA
     // active key is untouched.
     let resp = harness
         .post_json_auth("/admin/realms/master/keys/rotate", &admin, serde_json::json!({}))
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let meta = body_json(resp).await;
-    assert_eq!(meta["active"]["RS256"], rsa_kid);
+    assert_eq!(meta["active"]["EdDSA"], eddsa_kid);
     assert_ne!(meta["active"]["ES256"].as_str().unwrap(), es_kid);
 }
 
@@ -299,11 +351,11 @@ async fn rotate_with_unknown_algorithm_rejected() {
 }
 
 #[tokio::test]
-async fn discovery_default_realm_lists_rs256_only() {
+async fn discovery_default_realm_lists_eddsa_only() {
     let harness = TestHarness::new().await;
     let resp = harness.get("/realms/master/.well-known/openid-configuration").await;
     let discovery = body_json(resp).await;
-    assert_eq!(discovery["id_token_signing_alg_values_supported"], serde_json::json!(["RS256"]));
+    assert_eq!(discovery["id_token_signing_alg_values_supported"], serde_json::json!(["EdDSA"]));
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +394,7 @@ async fn disabled_key_never_signs_for_pinned_realm() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // New tokens for the pinned realm must NOT carry the disabled kid — the
-    // fallback signs with the newest active key (RS256 default). The reload
+    // fallback signs with the newest active key (EdDSA boot key). The reload
     // hook is fire-and-forget, so poll briefly.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -350,7 +402,7 @@ async fn disabled_key_never_signs_for_pinned_realm() {
             password_grant_ok(&harness, "disable-realm", &client, "alice", "password123").await;
         let header = jwt_header(tokens["access_token"].as_str().unwrap());
         if header["kid"] != es256_kid {
-            assert_eq!(header["alg"], "RS256", "fallback must sign with the default active key");
+            assert_eq!(header["alg"], "EdDSA", "fallback must sign with the default active key");
             break;
         }
         assert!(

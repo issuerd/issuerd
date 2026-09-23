@@ -17,7 +17,12 @@ ignore = [
     # and rustls-native-certs. We migrated our direct usage to rustls-pki-types.
     { id = "RUSTSEC-2025-0134", reason = "transitive dep via redis/rustls-native-certs; direct usage migrated to rustls-pki-types" },
     # rsa crate has a timing side-channel in RSA decryption / signature verification (Marvin Attack).
-    # We only use rsa::RsaPrivateKey::new for key generation; signing and verification are done via ring.
+    # We only use rsa::RsaPrivateKey::new for key generation; signing and verification are done via
+    # ring, and issuerd performs no RSA decryption at all, so the padding oracle the advisory
+    # targets is unreachable.
+    # Residual plan: RSA stays only as an explicit compatibility choice — new deployments default
+    # to EdDSA signing keys, so fresh installs never generate RSA keys unless an operator opts in;
+    # switch key generation to a maintained crate if a fix/fork of the rsa crate lands.
     { id = "RUSTSEC-2023-0071", reason = "only used for RSA key generation, not decryption or verification" },
 ]
 

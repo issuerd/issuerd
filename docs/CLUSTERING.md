@@ -37,7 +37,7 @@ The critical cluster invariant: every node must sign with the same active key
 live in the `signing_keys` table in PostgreSQL:
 
 - At boot a node loads the full key set. On first boot (empty table) it
-  generates an RS256 key and persists it. A concurrent first boot may persist a
+  generates an EdDSA key and persists it. A concurrent first boot may persist a
   second key — benign: both are published in JWKS and validate; all nodes sign
   with the newest active key.
 - Keys survive restarts, so outstanding tokens stay valid across deploys.

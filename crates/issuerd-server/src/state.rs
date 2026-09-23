@@ -563,24 +563,26 @@ impl ServerState {
 /// On first boot (empty key set) a fresh key is generated and persisted so
 /// every node — and every restart — converges on the same keys. A concurrent
 /// first boot may persist a second key; that is benign: both are published in
-/// JWKS, both validate, and all nodes sign with the newest active key.
+/// JWKS, both validate, and all nodes sign with the newest active key. The
+/// generated key uses the server-default algorithm (EdDSA): deployments
+/// upgrading with an existing key set keep their stored keys untouched.
 async fn bootstrap_crypto_provider(
     storage: &dyn Storage,
 ) -> Result<Arc<issuerd_token::RingCryptoProvider>, IssuerdError> {
+    let crypto_config = issuerd_token::CryptoConfig::default();
     let mut keys = storage.list_signing_keys().await?;
     if keys.is_empty() {
-        let generated =
-            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::Rs256, 2048)?;
+        let generated = issuerd_token::KeyStore::generate_key(
+            crypto_config.default_alg,
+            crypto_config.rsa_key_size,
+        )?;
         let stored = generated.to_stored(true);
         storage.create_signing_key(&stored).await?;
-        info!(kid = %stored.kid, "generated and persisted initial signing key");
+        info!(kid = %stored.kid, alg = %stored.alg, "generated and persisted initial signing key");
         // Re-list so keys persisted by a concurrently booting node are picked up.
         keys = storage.list_signing_keys().await?;
     }
-    let provider = issuerd_token::RingCryptoProvider::from_signing_keys(
-        issuerd_token::CryptoConfig::default(),
-        &keys,
-    )?;
+    let provider = issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys)?;
     Ok(Arc::new(provider))
 }
 

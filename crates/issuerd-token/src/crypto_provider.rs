@@ -23,6 +23,15 @@ use rsa::traits::PublicKeyParts;
 /// Configuration for cryptographic operations.
 #[derive(Debug, Clone)]
 pub struct CryptoConfig {
+    /// Server-default token-signing algorithm for realms that do not set the
+    /// `default_signature_algorithm` attribute, and the algorithm of keys
+    /// generated without an explicit algorithm choice (first boot, bare
+    /// rotation). Defaults to EdDSA (Ed25519): new deployments start on a
+    /// fast, modern elliptic-curve algorithm and RSA key generation stays an
+    /// explicit, opt-in compatibility choice. When no active key of this
+    /// algorithm exists, issuance falls back to the newest active key
+    /// overall, so pre-existing RS256-only deployments keep signing RS256
+    /// until an EdDSA key is deliberately rotated in.
     pub default_alg: Algorithm,
     pub rsa_key_size: u32,
 }
@@ -30,7 +39,7 @@ pub struct CryptoConfig {
 impl Default for CryptoConfig {
     fn default() -> Self {
         Self {
-            default_alg: Algorithm::Rs256,
+            default_alg: Algorithm::EdDsa,
             rsa_key_size: 2048,
         }
     }
@@ -952,7 +961,9 @@ mod tests {
     #[test]
     fn crypto_config_default() {
         let config = CryptoConfig::default();
-        assert_eq!(config.default_alg, Algorithm::Rs256);
+        // Asymmetric-first policy: new realms/keys default to EdDSA; RS256
+        // remains selectable as an explicit compatibility choice.
+        assert_eq!(config.default_alg, Algorithm::EdDsa);
         assert_eq!(config.rsa_key_size, 2048);
     }
 
@@ -1519,14 +1530,18 @@ mod tests {
         let provider = RingCryptoProvider::from_signing_keys(CryptoConfig::default(), &[]).unwrap();
         let jwks = provider.get_public_keys().await.unwrap();
         assert_eq!(jwks.keys.len(), 1);
+        // The generated key follows the server-default algorithm (EdDSA).
+        assert_eq!(jwks.keys[0].alg, Algorithm::EdDsa);
     }
 
     #[tokio::test]
     async fn reload_keys_replaces_set_and_empty_slice_is_noop() {
         let provider = RingCryptoProvider::new(CryptoConfig::default()).unwrap();
-        let old_kid = provider.get_public_keys().await.unwrap().keys[0].kid.clone();
+        let initial = provider.get_public_keys().await.unwrap();
+        let old_kid = initial.keys[0].kid.clone();
+        let old_alg = initial.keys[0].alg;
         let payload = r#"{"sub":"user-1"}"#;
-        let old_token = provider.sign(payload, Algorithm::Rs256, &old_kid).await.unwrap();
+        let old_token = provider.sign(payload, old_alg, &old_kid).await.unwrap();
 
         let new_key = KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
         let new_kid = new_key.kid.clone();
@@ -1540,7 +1555,7 @@ mod tests {
         let jwks = provider.get_public_keys().await.unwrap();
         assert_eq!(jwks.keys.len(), 1);
         assert!(!jwks.keys.iter().any(|j| j.kid == old_kid));
-        let result = provider.verify(&old_token, Algorithm::Rs256, &old_kid).await;
+        let result = provider.verify(&old_token, old_alg, &old_kid).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown key id"));
 

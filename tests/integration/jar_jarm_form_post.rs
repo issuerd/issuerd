@@ -165,12 +165,23 @@ async fn verify_jarm(
         .iter()
         .find(|k| k["kid"].as_str() == Some(kid))
         .expect("realm JWKS covers the JARM kid");
-    let key = jsonwebtoken::DecodingKey::from_rsa_components(
-        jwk["n"].as_str().unwrap(),
-        jwk["e"].as_str().unwrap(),
-    )
-    .unwrap();
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    // Build the decoding key from the JWK family so the helper follows
+    // whichever algorithm the realm's signing key uses (EdDSA by default).
+    let key = match jwk["kty"].as_str().unwrap() {
+        "RSA" => jsonwebtoken::DecodingKey::from_rsa_components(
+            jwk["n"].as_str().unwrap(),
+            jwk["e"].as_str().unwrap(),
+        )
+        .unwrap(),
+        "OKP" => jsonwebtoken::DecodingKey::from_ed_components(jwk["x"].as_str().unwrap()).unwrap(),
+        "EC" => jsonwebtoken::DecodingKey::from_ec_components(
+            jwk["x"].as_str().unwrap(),
+            jwk["y"].as_str().unwrap(),
+        )
+        .unwrap(),
+        other => panic!("unexpected JWK kty for JARM verification: {other}"),
+    };
+    let mut validation = jsonwebtoken::Validation::new(header.alg);
     validation.set_audience(&[client_id]);
     jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(jwt, &key, &validation)
         .expect("JARM JWT verifies against the realm JWKS")
@@ -828,5 +839,6 @@ async fn discovery_advertises_jar_jarm_form_post_truthfully() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(jarm_algs.contains(&"RS256"));
+    // JARM responses sign with the realm key set (EdDSA boot key by default).
+    assert!(jarm_algs.contains(&"EdDSA"));
 }

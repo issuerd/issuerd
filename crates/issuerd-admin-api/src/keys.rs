@@ -124,7 +124,7 @@ pub async fn get_keys(
     path = "/admin/realms/{realm}/keys/rotate",
     tag = "Keys",
     summary = "Rotate the active signing key",
-    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (RS256/2048 when no key exists). The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
+    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists). The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
     params(("realm" = String, Path, description = "Realm name")),
     request_body(content = Option<RotateKeyRequest>, description = "Optional algorithm/size for the new key"),
     responses(
@@ -147,14 +147,14 @@ pub async fn rotate_keys(
 
     let existing = state.storage.list_signing_keys().await?;
     // Default rotation parameters come from the newest active key; fall back
-    // to RS256/2048 when no key exists.
+    // to the server-default algorithm (EdDSA) when no key exists.
     let current = existing
         .iter()
         .filter(|k| k.active)
         .max_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.kid.cmp(&b.kid)));
     let (default_alg, default_bits) = current
         .map(|k| key_params(&k.public_jwk))
-        .unwrap_or((issuerd_core::Algorithm::Rs256, 2048));
+        .unwrap_or((issuerd_core::Algorithm::EdDsa, 2048));
 
     let body = body.map(|Json(b)| b);
     let alg = match body.as_ref().and_then(|b| b.algorithm.as_deref()) {
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_keys_without_existing_keys_uses_rs256_fallback() {
+    async fn rotate_keys_without_existing_keys_uses_server_default_fallback() {
         let storage = crate::test_utils::tests::storage_with_master_realm();
         create_test_realm(&storage, false).await;
 
@@ -525,7 +525,8 @@ mod tests {
         let meta: KeysMetadataRepresentation = serde_json::from_slice(&body).unwrap();
         assert_eq!(meta.active.len(), 1);
         assert_eq!(meta.passive.len(), 1);
-        assert_eq!(meta.passive[0].algorithm, Algorithm::Rs256);
+        // The no-keys fallback is the server-default algorithm (EdDSA).
+        assert_eq!(meta.passive[0].algorithm, Algorithm::EdDsa);
         assert_eq!(meta.passive[0].status, issuerd_core::KeyStatus::Active);
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }

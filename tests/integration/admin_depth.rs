@@ -1530,11 +1530,11 @@ async fn keys_rotate_and_disable() {
     let harness = TestHarness::new().await;
     let admin = harness.get_admin_token("master", "admin", "admin").await;
 
-    // One active RS256 key at boot; the admin token was signed with it.
+    // One active EdDSA key at boot; the admin token was signed with it.
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let keys = body_json(resp).await;
-    let kid0 = keys["active"]["RS256"].as_str().unwrap().to_string();
+    let kid0 = keys["active"]["EdDSA"].as_str().unwrap().to_string();
     assert_eq!(jwt_header(&admin)["kid"], kid0);
 
     // Rotate: a new active key takes over signing; the old one goes passive.
@@ -1543,7 +1543,7 @@ async fn keys_rotate_and_disable() {
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let keys = body_json(resp).await;
-    let kid1 = keys["active"]["RS256"].as_str().unwrap().to_string();
+    let kid1 = keys["active"]["EdDSA"].as_str().unwrap().to_string();
     assert_ne!(kid0, kid1, "rotation installs a new active key");
     assert_eq!(keys["passive"][0]["status"], "ACTIVE");
     assert_eq!(keys["passive"][0]["kid"], kid1);
@@ -1735,14 +1735,14 @@ async fn keys_rotation_propagates_to_peer_node() {
 
     let admin = node_a.get_admin_token("master", "admin", "admin").await;
     let resp = node_a.get_auth("/admin/realms/master/keys", &admin).await;
-    let kid0 = body_json(resp).await["active"]["RS256"].as_str().unwrap().to_string();
+    let kid0 = body_json(resp).await["active"]["EdDSA"].as_str().unwrap().to_string();
 
     // Rotate on node A: the same-node reload hook fires immediately.
     let resp = node_a
         .post_json_auth("/admin/realms/master/keys/rotate", &admin, serde_json::json!({}))
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let kid1 = body_json(resp).await["active"]["RS256"].as_str().unwrap().to_string();
+    let kid1 = body_json(resp).await["active"]["EdDSA"].as_str().unwrap().to_string();
     assert_ne!(kid0, kid1);
 
     // Node B converges via the JWKS polling task (1 s interval). Generous

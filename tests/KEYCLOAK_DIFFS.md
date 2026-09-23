@@ -243,7 +243,8 @@ ES512 (P-521) signing. Deliberate divergences and design notes:
 - **Rotation keeps one active key PER ALGORITHM**: `POST
   /admin/realms/{r}/keys/rotate` accepts an optional body
   `{ "algorithm": "ES256", "key_size": 2048 }` (both default to the newest
-  active key's parameters, RS256/2048 when no key exists; unknown algorithms
+  active key's parameters, the server-default algorithm EdDSA when no key
+  exists; unknown algorithms
   → 400). Only same-algorithm active keys are demoted. The last remaining
   active key overall cannot be disabled; disabling an algorithm's only active
   key makes realms pinned to it fall back to the default signing key.
@@ -254,11 +255,19 @@ ES512 (P-521) signing. Deliberate divergences and design notes:
   configured provider, so it never needs this fallback; Issuerd admins
   create the key first (rotate with the algorithm, e.g. from the Keys page),
   which switches the realm over on the next issued token.
-- **Realms without the attribute keep RS256**: issuance resolves the realm
-  attribute, then the server default (`CryptoConfig::default_alg`, RS256),
-  then — only when no key of that algorithm is active — the newest active
-  key. Adding an ES256 key therefore never silently re-signs realms that did
-  not opt in.
+- **Realms without the attribute follow the EdDSA server default**: issuance
+  resolves the realm attribute, then the server default
+  (`CryptoConfig::default_alg`, EdDSA since the asymmetric-first policy
+  change), then — only when no key of that algorithm is active — the newest
+  active key. Fresh deployments therefore boot on an Ed25519 key and never
+  generate RSA unless an operator opts in (RS256 remains an explicit
+  compatibility choice: rotate an RSA key in and pin the realm attribute).
+  Upgraded deployments with an RS256-only key set are unaffected — the EdDSA
+  default has no matching key and falls back to the existing key — until an
+  EdDSA key is deliberately rotated in; from that moment un-pinned realms
+  switch to EdDSA (previously issued RS256 tokens keep validating — both keys
+  stay published), so pin `default_signature_algorithm=RS256` on realms that
+  must stay on RSA before rotating EdDSA in.
 - **Discovery**: `id_token_signing_alg_values_supported` lists exactly the
   algorithms of the ACTIVE signing keys (newest first), computed per request
   from the keystore — not Keycloak's static everything-supported list.
@@ -268,7 +277,8 @@ ES512 (P-521) signing. Deliberate divergences and design notes:
   JWKS snapshot. `Realm::default_signature_algorithm()` therefore ignores
   symmetric values (falls back like an unset/invalid attribute). HS* keys can
   still be generated via rotation (they simply never sign realm tokens) and
-  the Keys page lists all algorithms from `serverinfo.algorithms`.
+  the Keys page lists all algorithms from `serverinfo.algorithms`, whose HS*
+  descriptions disclose the "not applicable to realm token signing" exclusion.
 
 
 ## DPoP (RFC 9449)

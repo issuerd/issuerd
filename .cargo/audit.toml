@@ -5,7 +5,12 @@
 ignore = [
     # rsa crate has a timing side-channel in RSA decryption / signature verification
     # (Marvin Attack). We only use rsa::RsaPrivateKey::new for key generation;
-    # signing and verification are done via ring.
+    # signing and verification are done via ring, and issuerd performs no RSA
+    # decryption at all, so the padding oracle the advisory targets is unreachable.
+    # Residual plan: RSA stays only as an explicit compatibility choice — new
+    # deployments default to EdDSA signing keys, so fresh installs never generate
+    # RSA keys unless an operator opts in; switch key generation to a maintained
+    # crate if a fix/fork of the rsa crate lands.
     "RUSTSEC-2023-0071",
     # rustls-pemfile is unmaintained but still a transitive dependency of redis
     # and rustls-native-certs. Direct usage migrated to rustls-pki-types.

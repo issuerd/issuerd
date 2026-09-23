@@ -8,7 +8,7 @@
 //! Two full Issuerd instances ("nodes") are booted sequentially in the same
 //! process via [`ServerState::from_components`], sharing one
 //! [`issuerd_storage::InMemoryStorage`] and one [`issuerd_cluster::InMemoryCache`].
-//! Node A performs the first-boot work (persists the shared RS256 signing key
+//! Node A performs the first-boot work (persists the shared EdDSA signing key
 //! into storage, bootstraps the `master` realm with `admin`/`admin` and the
 //! public `admin-cli` client); node B then loads the shared key set and
 //! publishes the same JWKS.
