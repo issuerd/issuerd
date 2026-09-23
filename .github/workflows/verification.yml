@@ -64,8 +64,13 @@ jobs:
   mirai:
     name: cargo mirai (abstract interpretation)
     runs-on: ubuntu-latest
-    # Preparation stage: MIRAI's findings on a real codebase need triage before
-    # this job can gate merges.
+    # Currently hard-blocked upstream: MIRAI pins nightly-2025-01-10 (~rustc
+    # 1.86, baked into the cargo-mirai binary at build time) while this
+    # workspace requires rustc >= 1.95, so cargo refuses the build at resolve
+    # time. --ignore-rust-version would lift the gate but the 1.86 toolchain
+    # still cannot compile 2026-era code/deps (and cargo-mirai ignores -p,
+    # analyzing the root package). Revisit once MIRAI bumps its pinned
+    # toolchain to >= 1.95. Stays continue-on-error meanwhile.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

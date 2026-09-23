@@ -218,6 +218,12 @@ As-run status (Kani 0.68 / CBMC 6.11, cargo-flux c460561, WSL):
   rustc); the job stays `continue-on-error` because flux installs from its
   `main` branch. After a flux bump that fixes #1666, widen back to bare
   `cargo flux` (full-crate) via `scripts/flux.sh`.
+- **MIRAI: hard-blocked upstream, cannot run at all.** MIRAI pins
+  `nightly-2025-01-10` (~rustc 1.86) and bakes it into the `cargo-mirai`
+  binary, while this workspace requires rustc >= 1.95 — cargo refuses at
+  resolve time (`rustc 1.86.0-nightly is not supported`). The job stays
+  `continue-on-error`; re-enable for real once MIRAI bumps its pinned
+  toolchain to >= 1.95.
 - Kani/Flux/MIRAI are Linux/macOS-only; on Windows run them in WSL (needs
   `sudo apt-get install -y build-essential pkg-config libssl-dev libkrb5-dev`;
   MIRAI additionally needs `cmake clang`).
