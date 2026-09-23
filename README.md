@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/issuerd/issuerd/actions/workflows/ci.yml"><img src="https://github.com/issuerd/issuerd/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV: 1.95"></a>
   <a href="tests/conformance/README.md"><img src="https://img.shields.io/badge/OIDC%20conformance-Basic%20%C2%B7%20Form%20Post%20%C2%B7%20Config%20OP-brightgreen" alt="OIDC Conformance: Basic · Form Post · Config OP"></a>
