@@ -35,6 +35,9 @@ pub struct ServerConfig {
     /// OAuth/OIDC protocol tuning (`[oauth]` section).
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// DPoP (RFC 9449) settings (`[dpop]` section).
+    #[serde(default)]
+    pub dpop: DpopConfig,
     /// Crypto settings (`[crypto]` section).
     #[serde(default)]
     pub crypto: CryptoSettings,
@@ -62,6 +65,7 @@ impl Default for ServerConfig {
             smtp: SmtpConfig::default(),
             cache: CacheConfig::default(),
             oauth: OAuthConfig::default(),
+            dpop: DpopConfig::default(),
             crypto: CryptoSettings::default(),
             themes: ThemesConfig::default(),
             provision: None,
@@ -158,6 +162,7 @@ impl ServerConfig {
             },
             cache: CacheConfig::default(),
             oauth: OAuthConfig::default(),
+            dpop: DpopConfig::default(),
             crypto: CryptoSettings::default(),
             provision: Some(PathBuf::from("provision.yaml")),
         }
@@ -393,6 +398,85 @@ impl OAuthConfig {
             .filter(|v| (AUTH_CODE_TTL_MIN_SECS..=AUTH_CODE_TTL_MAX_SECS).contains(v))
             .unwrap_or(self.auth_code_ttl_secs);
         std::time::Duration::from_secs(secs)
+    }
+}
+
+/// Default server-nonce lifetime: 30 seconds (the value Keycloak documents
+/// for its own DPoP nonce).
+pub const DPOP_NONCE_LIFETIME_DEFAULT_SECS: u64 = 30;
+/// Shortest accepted server-nonce lifetime.
+pub const DPOP_NONCE_LIFETIME_MIN_SECS: u64 = 5;
+/// Longest accepted server-nonce lifetime. The nonce exists to bound proof
+/// freshness below the proof acceptance window (300 s) — keep it there.
+pub const DPOP_NONCE_LIFETIME_MAX_SECS: u64 = 300;
+
+/// DPoP (RFC 9449) settings (`[dpop]` section).
+///
+/// The whole section is optional and every key has a default, so existing
+/// configuration files keep booting unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DpopConfig {
+    /// Server-provided nonces (`[dpop.nonce]`, RFC 9449 §8/§9). Disabled by
+    /// default — replay protection then rides on single-use `jti` plus the
+    /// proof acceptance window, as before.
+    #[serde(default)]
+    pub nonce: DpopNonceConfig,
+}
+
+impl DpopConfig {
+    /// Boot-time validation: reject out-of-range values with a clear error
+    /// instead of silently clamping them.
+    pub fn validate(&self) -> Result<(), IssuerdError> {
+        let lifetime = self.nonce.lifetime_secs;
+        if !(DPOP_NONCE_LIFETIME_MIN_SECS..=DPOP_NONCE_LIFETIME_MAX_SECS).contains(&lifetime) {
+            return Err(IssuerdError::InvalidRequest(format!(
+                "dpop.nonce.lifetime_secs must be within \
+                 {DPOP_NONCE_LIFETIME_MIN_SECS}..={DPOP_NONCE_LIFETIME_MAX_SECS} seconds, \
+                 got {lifetime}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// How the server treats the DPoP `nonce` claim (`[dpop.nonce] mode`).
+///
+/// Nonces are unguessable random values the server issues via the
+/// `DPoP-Nonce` response header and the client echoes in the proof's `nonce`
+/// claim; each nonce is single-use and expires after `lifetime_secs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DpopNonceMode {
+    /// No nonces issued or verified (default; pre-feature behavior).
+    #[default]
+    Disabled,
+    /// A fresh nonce rides every response to a proof-carrying request. A
+    /// proof without a `nonce` claim is accepted; a proof carrying an
+    /// unknown/stale nonce is challenged with `use_dpop_nonce` (the
+    /// RFC 9449 §8/§9 retry path — compliant clients recover transparently).
+    Supported,
+    /// Every proof MUST carry a live server-issued nonce; absence or an
+    /// unknown/stale value is rejected with `use_dpop_nonce` plus a fresh
+    /// nonce. Requests without a `DPoP` proof header are unaffected.
+    Required,
+}
+
+/// Server-provided DPoP nonces (`[dpop.nonce]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DpopNonceConfig {
+    /// Issuance/verification mode (`"disabled" | "supported" | "required"`).
+    pub mode: DpopNonceMode,
+    /// Nonce lifetime in seconds — the cache TTL. Default 30, accepted range
+    /// 5–300; out-of-range values abort the boot.
+    pub lifetime_secs: u64,
+}
+
+impl Default for DpopNonceConfig {
+    fn default() -> Self {
+        Self {
+            mode: DpopNonceMode::Disabled,
+            lifetime_secs: DPOP_NONCE_LIFETIME_DEFAULT_SECS,
+        }
     }
 }
 
@@ -1013,6 +1097,85 @@ key_base64 = "{}"
         };
         realm.attributes.clear();
         assert_eq!(strict.auth_code_ttl(&realm), std::time::Duration::from_secs(30));
+    }
+
+    // ------------------------------------------------------------------
+    // [dpop]
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dpop_nonce_disabled_by_default() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.dpop.nonce.mode, DpopNonceMode::Disabled);
+        assert_eq!(cfg.dpop.nonce.lifetime_secs, DPOP_NONCE_LIFETIME_DEFAULT_SECS);
+        cfg.dpop.validate().unwrap();
+        // The generated example carries the same defaults.
+        let example = ServerConfig::generate_example();
+        assert_eq!(example.dpop.nonce.mode, DpopNonceMode::Disabled);
+        assert_eq!(example.dpop.nonce.lifetime_secs, 30);
+    }
+
+    #[test]
+    fn dpop_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("dpop_toml", "toml");
+        fs::write(&path, "[dpop.nonce]\nmode = \"required\"\nlifetime_secs = 15\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert_eq!(cfg.dpop.nonce.mode, DpopNonceMode::Required);
+        assert_eq!(cfg.dpop.nonce.lifetime_secs, 15);
+        cfg.dpop.validate().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dpop_mode_snake_case_values() {
+        assert_eq!(
+            serde_json::from_value::<DpopNonceMode>(serde_json::json!("disabled")).unwrap(),
+            DpopNonceMode::Disabled
+        );
+        assert_eq!(
+            serde_json::from_value::<DpopNonceMode>(serde_json::json!("supported")).unwrap(),
+            DpopNonceMode::Supported
+        );
+        assert_eq!(
+            serde_json::from_value::<DpopNonceMode>(serde_json::json!("required")).unwrap(),
+            DpopNonceMode::Required
+        );
+        assert!(serde_json::from_value::<DpopNonceMode>(serde_json::json!("Required")).is_err());
+    }
+
+    #[test]
+    fn dpop_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_DPOP__NONCE__MODE", "supported");
+        std::env::set_var("ISSUERD_DPOP__NONCE__LIFETIME_SECS", "45");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_DPOP__NONCE__MODE");
+        std::env::remove_var("ISSUERD_DPOP__NONCE__LIFETIME_SECS");
+        assert_eq!(cfg.dpop.nonce.mode, DpopNonceMode::Supported);
+        assert_eq!(cfg.dpop.nonce.lifetime_secs, 45);
+    }
+
+    #[test]
+    fn dpop_validate_enforces_bounds() {
+        let nonce = |lifetime_secs| DpopConfig {
+            nonce: DpopNonceConfig {
+                mode: DpopNonceMode::Supported,
+                lifetime_secs,
+            },
+        };
+        for ok in [
+            DPOP_NONCE_LIFETIME_MIN_SECS,
+            30,
+            DPOP_NONCE_LIFETIME_MAX_SECS,
+        ] {
+            nonce(ok)
+                .validate()
+                .unwrap_or_else(|e| panic!("{ok}s must pass validation: {e}"));
+        }
+        for bad in [0, 4, 301, 6000] {
+            assert!(nonce(bad).validate().is_err(), "{bad}s must fail validation");
+        }
     }
 
     #[test]

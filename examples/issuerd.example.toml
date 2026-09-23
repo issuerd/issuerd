@@ -46,6 +46,10 @@ read_cache_ttl_secs = 60
 [oauth]
 auth_code_ttl_secs = 600
 
+[dpop.nonce]
+mode = "disabled"
+lifetime_secs = 30
+
 [crypto]
 
 [themes]

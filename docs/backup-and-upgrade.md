@@ -49,6 +49,7 @@ All Redis content is short-lived runtime state. The key prefixes below are defin
 | `login-lockout:{realm}:{username}:{ip}` | Brute-force lockout markers | Computed lockout duration |
 | `action:{token_id}` | Action tokens (reset-credentials / execute-actions email links) | Action-token lifetime |
 | `dpop_jti:{realm}:{jti}` | DPoP proof single-use markers | Proof acceptance window |
+| `dpop-nonce:{realm}:{nonce}` | Server-provided DPoP nonces (opt-in `[dpop.nonce]`; single-use, consumed on verification) | `[dpop.nonce] lifetime_secs` (default 30 s) |
 | `email-code:{realm}:{user_id}` | Passwordless email-login codes | Code lifetime |
 | `webauthn-reg:{realm}:{user_id}`, `totp-enroll:{realm}:{user_id}` | In-flight passkey registration ceremonies and unverified TOTP enrollment secrets | Ceremony/enrollment lifetime |
 | `broker_state:`, `broker_fbl:` | Identity-brokering SSO state and first-broker-login flows | 600 s |

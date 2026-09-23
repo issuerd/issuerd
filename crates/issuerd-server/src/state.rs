@@ -215,6 +215,7 @@ impl ServerState {
         // Bounded protocol values: reject out-of-range settings instead of
         // silently clamping them (e.g. an operator typo of 6000 s).
         config.oauth.validate()?;
+        config.dpop.validate()?;
         // Log only the storage variant — the full config would leak the
         // Postgres password into the logs.
         let storage_kind = match &config.storage {

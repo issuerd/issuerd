@@ -131,6 +131,15 @@ pub mod cache_keys {
         format!("action:{token_id}")
     }
 
+    /// `dpop-nonce:{realm}:{nonce}` — server-provided DPoP nonces
+    /// (RFC 9449 §8/§9, opt-in via `[dpop.nonce]`). Existence is the only
+    /// state: entries carry a marker value, expire with the configured nonce
+    /// lifetime, and are consumed atomically (`get_and_delete`) on
+    /// verification, making each nonce single-use.
+    pub fn dpop_nonce(realm: &str, nonce: &str) -> String {
+        format!("dpop-nonce:{realm}:{nonce}")
+    }
+
     /// `events:{realm}`
     pub fn event_channel(realm: &str) -> String {
         format!("events:{realm}")
@@ -215,6 +224,13 @@ mod tests {
     #[test]
     fn action_token_key_format() {
         assert_eq!(cache_keys::action_token("tok-123"), "action:tok-123");
+    }
+
+    #[test]
+    fn dpop_nonce_key_format() {
+        assert_eq!(cache_keys::dpop_nonce("master", "abc123"), "dpop-nonce:master:abc123");
+        // Distinct keyspace from the jti replay markers (`dpop_jti:`).
+        assert_ne!(cache_keys::dpop_nonce("master", "x"), "dpop_jti:master:x");
     }
 
     #[test]

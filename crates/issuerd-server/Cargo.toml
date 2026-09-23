@@ -51,6 +51,7 @@ argon2 = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
+ring = { workspace = true }
 ipnet = { workspace = true }
 lettre = { workspace = true }
 qrcodegen = { workspace = true }
@@ -65,4 +66,3 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 mockall = { workspace = true }
 rcgen = { workspace = true }
 jsonwebtoken = { workspace = true }
-ring = { workspace = true }

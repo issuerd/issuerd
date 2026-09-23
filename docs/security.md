@@ -530,7 +530,12 @@ fresh proof whose thumbprint matches and whose `ath` ties it to the token — ot
 a bound refresh token presented without its proof fails with `invalid_grant`. Proof `jti` values
 are single-use, enforced through the distributed cache (`dpop_jti:{realm}:{jti}`, failing closed
 when the cache is down); proofs older than 300 s (60 s future leeway) are rejected. Server-provided
-nonces (RFC 9449 §8) are intentionally not implemented.
+nonces (RFC 9449 §8/§9) are available as an opt-in strict mode (`[dpop.nonce]`, default
+`"disabled"`): the server issues unguessable single-use nonces in the `DPoP-Nonce` response
+header (`dpop-nonce:{realm}:{nonce}` cache entries with the configured TTL), and in `"required"`
+mode a proof without a live nonce is rejected with the RFC `use_dpop_nonce` challenge — a
+captured proof can no longer be replayed even with a freshly minted `iat`/`jti`. See
+[configuration.md](configuration.md) — "[dpop]".
 
 ### PKCE
 

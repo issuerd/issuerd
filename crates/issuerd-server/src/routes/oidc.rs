@@ -2767,9 +2767,10 @@ pub async fn token_handler(
     }
 
     // DPoP (RFC 9449): when the request carries a `DPoP` proof
-    // header, verify it (htm/htu/iat/jti single-use) — tokens issued below are
+    // header, verify it (htm/htu/iat/jti single-use, plus the server-nonce
+    // gate when `[dpop.nonce]` is enabled) — tokens issued below are
     // then bound to the proof key via `cnf.jkt`. No header: plain Bearer flow.
-    let dpop_jkt: Option<String> = match crate::dpop::verify_proof_header(
+    let dpop = match crate::dpop::verify_proof_header(
         &state,
         &realm_id,
         Some(realm.name.as_ref()),
@@ -2780,12 +2781,22 @@ pub async fn token_handler(
     )
     .await
     {
-        Ok(proof) => proof.map(|p| p.jkt),
-        Err(e) => {
-            warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "DPoP proof rejected at token endpoint");
-            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        Ok(outcome) => outcome,
+        Err(crate::dpop::DpopRejection::UseDpopNonce(nonce)) => {
+            debug!(realm = %realm_id, client_id = %client.client_id, "DPoP proof without a live server nonce at token endpoint — challenging");
+            return crate::dpop::use_dpop_nonce_response(&nonce);
+        }
+        Err(crate::dpop::DpopRejection::InvalidProof) => {
+            warn!(realm = %realm_id, client_id = %client.client_id, "DPoP proof rejected at token endpoint");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(error_response(&IssuerdError::InvalidDpopProof)),
+            )
+                .into_response();
         }
     };
+    let dpop_jkt: Option<String> = dpop.proof.map(|p| p.jkt);
+    let dpop_response_nonce = dpop.response_nonce;
 
     if let Err(e) = token_req.validate(&realm, &client) {
         warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "token request validation failed");
@@ -2807,7 +2818,7 @@ pub async fn token_handler(
         return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
 
-    match token_req.grant_type {
+    let response = match token_req.grant_type {
         GrantType::AuthorizationCode => {
             let code = token_req.code.as_deref().unwrap_or("");
             let cache_key = format!("auth_code:{code}");
@@ -4767,7 +4778,13 @@ pub async fn token_handler(
             Json(serde_json::json!({"error": "unsupported_grant_type"})),
         )
             .into_response(),
-    }
+    };
+    // RFC 9449 §8/§9: when the nonce mode issued a fresh server nonce for a
+    // proof-carrying request, advertise it on the response so the client
+    // echoes it in its next proof. (Early error returns above skip the
+    // header — RFC-required only on `use_dpop_nonce` responses, which carry
+    // it at the verification site.)
+    crate::dpop::with_nonce_header(response, dpop_response_nonce.as_deref())
 }
 
 fn verify_pkce(verifier: &str, challenge: &str, method: Option<PkceCodeChallengeMethod>) -> bool {
@@ -4945,6 +4962,7 @@ async fn userinfo_handler_inner(
             // whose key thumbprint matches the binding (`ath` ties the proof
             // to this very token). The DPoP scheme on an unbound token is
             // equally rejected.
+            let mut dpop_response_nonce: Option<String> = None;
             if dpop_scheme || claims.cnf.is_some() {
                 // Issuers are realm-NAME based: resolve the segment as a
                 // realm name, then use the realm id for the replay cache.
@@ -4952,10 +4970,11 @@ async fn userinfo_handler_inner(
                     return crate::dpop::challenge_response(
                         "invalid_token",
                         "token issuer is not a realm",
+                        None,
                     );
                 };
                 let realm_id = realm.id.clone();
-                let proof = match crate::dpop::verify_proof_header(
+                let dpop = match crate::dpop::verify_proof_header(
                     &state,
                     &realm_id,
                     realm_name.as_deref(),
@@ -4966,31 +4985,48 @@ async fn userinfo_handler_inner(
                 )
                 .await
                 {
-                    Ok(Some(proof)) => proof,
-                    Ok(None) if dpop_scheme => {
+                    Ok(outcome) => outcome,
+                    // RFC 9449 §9: the nonce challenge carries the fresh
+                    // nonce in the `DPoP-Nonce` header.
+                    Err(crate::dpop::DpopRejection::UseDpopNonce(nonce)) => {
                         return crate::dpop::challenge_response(
-                            "invalid_dpop_proof",
-                            "DPoP proof required",
+                            "use_dpop_nonce",
+                            "Resource server requires nonce in DPoP proof",
+                            Some(&nonce),
                         );
                     }
-                    // Bearer presentation of a bound token (downgrade).
-                    Ok(None) => {
-                        return crate::dpop::challenge_response(
-                            "invalid_token",
-                            "the token is DPoP-bound; present it with the DPoP scheme and a proof",
-                        );
-                    }
-                    Err(_) => {
+                    Err(crate::dpop::DpopRejection::InvalidProof) => {
                         return crate::dpop::challenge_response(
                             "invalid_dpop_proof",
                             "the DPoP proof is invalid",
+                            None,
                         );
                     }
                 };
+                let proof = match dpop.proof {
+                    Some(proof) => proof,
+                    None if dpop_scheme => {
+                        return crate::dpop::challenge_response(
+                            "invalid_dpop_proof",
+                            "DPoP proof required",
+                            None,
+                        );
+                    }
+                    // Bearer presentation of a bound token (downgrade).
+                    None => {
+                        return crate::dpop::challenge_response(
+                            "invalid_token",
+                            "the token is DPoP-bound; present it with the DPoP scheme and a proof",
+                            None,
+                        );
+                    }
+                };
+                dpop_response_nonce = dpop.response_nonce;
                 if claims.cnf.as_ref().map(|c| c.jkt.as_str()) != Some(proof.jkt.as_str()) {
                     return crate::dpop::challenge_response(
                         "invalid_token",
                         "the token is not bound to the proof key",
+                        None,
                     );
                 }
             }
@@ -5060,7 +5096,10 @@ async fn userinfo_handler_inner(
                 if let Some(body) =
                     crate::userinfo_cache::read(&state, realm_id, user_id, client_id, fp).await
                 {
-                    return raw_json_response(body);
+                    return crate::dpop::with_nonce_header(
+                        raw_json_response(body),
+                        dpop_response_nonce.as_deref(),
+                    );
                 }
             }
 
@@ -5292,11 +5331,17 @@ async fn userinfo_handler_inner(
                             &state, realm_id, user_id, client_id, fp, &body,
                         )
                         .await;
-                        return raw_json_response(body);
+                        return crate::dpop::with_nonce_header(
+                            raw_json_response(body),
+                            dpop_response_nonce.as_deref(),
+                        );
                     }
                 }
             }
-            Json(value).into_response()
+            crate::dpop::with_nonce_header(
+                Json(value).into_response(),
+                dpop_response_nonce.as_deref(),
+            )
         }
         Err(e) => (StatusCode::UNAUTHORIZED, Json(error_response(&e))).into_response(),
     }

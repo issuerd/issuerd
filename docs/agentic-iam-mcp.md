@@ -31,7 +31,7 @@ The answer is not a bigger prompt. It is three properties enforced cryptographic
 - A client presents a DPoP proof (a signed JWT in the `DPoP` header, keyed by an ephemeral or persistent asymmetric key) when redeeming an authorization code, refreshing, polling a CIBA request, or running a token exchange. Issuerd validates `htm` (HTTP method) and `htu` (URL) against the actual request, checks the proof age (300 s maximum, 60 s leeway), and burns the proof's `jti` into a distributed single-use replay cache (`dpop_jti:{realm}:{jti}`, TTL = the proof's remaining acceptance window, fail-closed when the cache is unavailable).
 - When a proof accompanies issuance, the minted access token carries `cnf.jkt` (the SHA-256 thumbprint of the proof key) and its `token_type` becomes `DPoP`. Refresh tokens issued alongside are bound to the same key.
 - Binding is opt-in per token: a token issued without a proof remains an ordinary bearer token. Resource servers that see `cnf.jkt` must demand a matching proof; Issuerd's own protected endpoints do.
-- DPoP nonces (RFC 9449 §8/§9, OPTIONAL) are not implemented; replay protection rides on single-use `jti` plus tight proof expiry.
+- DPoP server-provided nonces (RFC 9449 §8/§9, OPTIONAL) are available as an opt-in strict mode (`[dpop.nonce] mode = "supported" | "required"`); by default replay protection rides on single-use `jti` plus tight proof expiry. See [configuration.md](configuration.md) — "[dpop]".
 
 Implementation: `crates/issuerd-server/src/dpop.rs`; binding overlay at every issuance site in `crates/issuerd-server/src/routes/oidc.rs`.
 

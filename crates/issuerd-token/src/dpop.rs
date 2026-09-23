@@ -22,8 +22,12 @@
 //!   present, public only (no private members), family-matching `alg`;
 //! - signature against the embedded `jwk`;
 //! - claims: `jti` present (bounded length), `htm`/`htu` match the request,
-//!   `iat` within the acceptance window, and `ath` (SHA-256 of the presented
-//!   access token, §4.2) when the caller requires it.
+//!   `iat` within the acceptance window, `ath` (SHA-256 of the presented
+//!   access token, §4.2) when the caller requires it, and `nonce` equal to
+//!   the caller-supplied expected value (§8/§9 server-provided nonces) when
+//!   one is set — the crate stays storage-free: the caller (issuerd-server)
+//!   verifies the nonce against its distributed cache and passes the consumed
+//!   value in.
 //!
 //! All failures map to the uniform [`IssuerdError::InvalidDpopProof`]; the
 //! endpoint logs specifics itself.
@@ -39,6 +43,10 @@ pub const DPOP_PROOF_TYP: &str = "dpop+jwt";
 
 /// Upper bound on the accepted `jti` length — bounds replay-cache key size.
 const MAX_JTI_LEN: usize = 256;
+
+/// Upper bound on the accepted `nonce` length — bounds nonce-cache key size
+/// (server-issued nonces are 43 chars; the cap exists for hostile claims).
+const MAX_NONCE_LEN: usize = 256;
 
 /// JWK members that carry private (or symmetric) key material. A proof
 /// embedding any of them is rejected outright (RFC 9449 §4.2: the `jwk`
@@ -64,6 +72,13 @@ pub struct DpopProofRequirements<'a> {
     pub leeway_secs: i64,
     /// Current time (injected so validation stays pure/testable).
     pub now: i64,
+    /// RFC 9449 §8/§9 server-provided nonce: when `Some`, the proof MUST
+    /// carry a `nonce` claim equal to this value (bounded length). The
+    /// caller obtained the value from its nonce store — verification here
+    /// binds it to the signed claims; the store's existence/TTL/single-use
+    /// semantics live in the caller. When `None`, no nonce is required and
+    /// a `nonce` claim is ignored.
+    pub expected_nonce: Option<&'a str>,
 }
 
 /// A verified DPoP proof: everything the endpoint needs to bind tokens and
@@ -107,6 +122,7 @@ struct DpopClaims {
     htu: Option<String>,
     iat: Option<i64>,
     ath: Option<String>,
+    nonce: Option<String>,
 }
 
 fn b64url_encode(bytes: &[u8]) -> String {
@@ -253,6 +269,15 @@ pub fn validate_dpop_proof(
         }
     }
 
+    // RFC 9449 §8/§9: when the caller expects a server-provided nonce, the
+    // proof must echo exactly that value in its `nonce` claim.
+    if let Some(expected) = requirements.expected_nonce {
+        match claims.nonce {
+            Some(ref nonce) if nonce.len() <= MAX_NONCE_LEN && nonce == expected => {}
+            _ => return Err(IssuerdError::InvalidDpopProof),
+        }
+    }
+
     Ok(VerifiedDpopProof { jkt, jti, iat })
 }
 
@@ -271,6 +296,7 @@ mod tests {
             max_age_secs: 300,
             leeway_secs: 60,
             now: chrono::Utc::now().timestamp(),
+            expected_nonce: None,
         }
     }
 
@@ -614,6 +640,48 @@ mod tests {
         // Inside leeway both ways is fine.
         let mut claims = valid_claims();
         claims["iat"] = serde_json::json!(now + 30);
+        let proof = key.proof(claims);
+        assert!(validate_dpop_proof(&proof, &requirements()).is_ok());
+    }
+
+    #[test]
+    fn nonce_checked_when_expected() {
+        let key = gen_ec();
+        let req = DpopProofRequirements {
+            expected_nonce: Some("server-nonce-1"),
+            ..requirements()
+        };
+
+        // Matching nonce claim: accepted.
+        let mut claims = valid_claims();
+        claims["nonce"] = serde_json::json!("server-nonce-1");
+        let proof = key.proof(claims);
+        assert!(validate_dpop_proof(&proof, &req).is_ok());
+
+        // Wrong value: rejected.
+        let mut claims = valid_claims();
+        claims["nonce"] = serde_json::json!("server-nonce-2");
+        let proof = key.proof(claims);
+        assert!(matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)));
+
+        // Missing claim: rejected.
+        let proof = key.proof(valid_claims());
+        assert!(matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)));
+
+        // Oversized claim: rejected even when it starts with the expected
+        // value (bounds the nonce-store key size).
+        let mut claims = valid_claims();
+        claims["nonce"] = serde_json::json!("x".repeat(MAX_NONCE_LEN + 1));
+        let proof = key.proof(claims);
+        assert!(matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)));
+    }
+
+    #[test]
+    fn nonce_ignored_when_not_expected() {
+        // Disabled mode: a `nonce` claim neither helps nor hurts.
+        let key = gen_ec();
+        let mut claims = valid_claims();
+        claims["nonce"] = serde_json::json!("anything");
         let proof = key.proof(claims);
         assert!(validate_dpop_proof(&proof, &requirements()).is_ok());
     }

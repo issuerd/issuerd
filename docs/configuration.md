@@ -22,6 +22,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[cluster]](#cluster)
 - [[cache]](#cache)
 - [[oauth]](#oauth)
+- [[dpop]](#dpop)
 - [[crypto.key_encryption]](#cryptokey_encryption)
 - [[themes]](#themes)
 - [[smtp]](#smtp)
@@ -60,6 +61,7 @@ Configuration is assembled from three layers, later layers winning:
    | `ISSUERD_CLUSTER__JWKS_REFRESH_INTERVAL_SECS=15` | `cluster.jwks_refresh_interval_secs` |
    | `ISSUERD_CACHE__READ_CACHE_TTL_SECS=0` | `cache.read_cache_ttl_secs` |
    | `ISSUERD_OAUTH__AUTH_CODE_TTL_SECS=60` | `oauth.auth_code_ttl_secs` |
+   | `ISSUERD_DPOP__NONCE__MODE=required` | `dpop.nonce.mode` |
    | `ISSUERD_SMTP__ENABLED=true` / `ISSUERD_SMTP__HOST=mail.example.com` | `smtp.enabled` / `smtp.host` |
    | `ISSUERD_PROXY__TRUST_X_FORWARDED_FOR=false` | `proxy.trust_x_forwarded_for` |
 
@@ -426,6 +428,52 @@ profile needs; full FAPI 2.0 conformance (message signing beyond the
 already-implemented JARM, mTLS sender-constrained tokens) remains out of
 scope.
 
+## [dpop]
+
+DPoP (RFC 9449) settings. The whole section is optional.
+
+### [dpop.nonce]
+
+Server-provided DPoP nonces (RFC 9449 §8/§9) as an opt-in strict mode. With
+nonces enabled the server issues an unguessable random value in the
+`DPoP-Nonce` response header; the client echoes it in the `nonce` claim of its
+next proof. Nonces are stored in the distributed cache
+(`dpop-nonce:{realm}:{nonce}`, TTL = `lifetime_secs`) and are **single-use**:
+the first proof presenting a nonce consumes it, and every proof-carrying
+response issues the next one. Without the section the behavior is exactly the
+pre-feature one: replay protection rides on single-use `jti` plus the proof
+acceptance window.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `"disabled"` | `"disabled"` — no nonces issued or verified. `"supported"` — a fresh nonce rides every response to a proof-carrying request; proofs without a `nonce` claim are accepted, but a proof carrying an unknown/stale/used nonce is challenged. `"required"` — every proof must carry a live server-issued nonce; absence or an unknown/stale/used value is rejected. |
+| `lifetime_secs` | integer | `30` | Nonce lifetime (the cache TTL). Accepted range **5–300** seconds; an out-of-range value aborts the boot with a clear error. |
+
+```toml
+[dpop.nonce]
+mode = "disabled"     # "disabled" | "supported" | "required"
+lifetime_secs = 30
+```
+
+Environment equivalents: `ISSUERD_DPOP__NONCE__MODE` and
+`ISSUERD_DPOP__NONCE__LIFETIME_SECS`.
+
+**Challenge contract.** On a nonce-gate failure the client receives the
+RFC 9449 retry signal — the token endpoint answers `400` with
+`{"error": "use_dpop_nonce"}`, the resource endpoint (userinfo) answers `401`
+with `WWW-Authenticate: DPoP error="use_dpop_nonce"`, and both carry a fresh
+nonce in the `DPoP-Nonce` header. Compliant clients retry with that nonce and
+recover transparently. Requests without a `DPoP` proof header (plain Bearer
+flows) are never affected by the mode. Suggested rollout: `supported` first
+(clients learn nonces, nothing breaks), then `required` (captured proofs
+become useless within seconds — a fresh `iat`/`jti` cannot substitute for the
+server-issued nonce). Nonces are realm-scoped and shared between the token
+endpoint and userinfo (Issuerd is both the authorization and the resource
+server); a nonce issued by one endpoint is valid at the other until consumed
+or expired. RFC 9449 defines no discovery metadata for nonce support, so none
+is advertised — clients discover the requirement from the
+`use_dpop_nonce`/`DPoP-Nonce` signals.
+
 ## [crypto.key_encryption]
 
 Envelope encryption for the cluster-wide JWT **signing keys at rest**
@@ -677,6 +725,11 @@ read_cache_ttl_secs = 60        # read-model cache TTL; 0 disables all read-mode
 # ---- OAuth/OIDC protocol tuning ----------------------------------------------
 [oauth]
 auth_code_ttl_secs = 600        # authorization-code redemption window; 10-600, FAPI 2.0 profiles want <= 60
+
+# ---- DPoP (RFC 9449) ----------------------------------------------------------
+[dpop.nonce]
+mode = "disabled"               # server-provided proof nonces: "disabled" | "supported" | "required"
+lifetime_secs = 30              # single-use nonce TTL; 5-300
 
 # ---- Signing-key encryption at rest ------------------------------------------
 # Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).

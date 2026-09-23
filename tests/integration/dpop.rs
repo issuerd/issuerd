@@ -97,6 +97,7 @@ struct ProofOpts {
     iat: i64,
     ath: Option<String>,
     typ: String,
+    nonce: Option<String>,
 }
 
 impl DpopKey {
@@ -116,6 +117,9 @@ impl DpopKey {
         if let Some(ref ath) = opts.ath {
             claims["ath"] = serde_json::json!(issuerd_token::access_token_hash(ath));
         }
+        if let Some(ref nonce) = opts.nonce {
+            claims["nonce"] = serde_json::json!(nonce);
+        }
         let input = format!(
             "{}.{}",
             b64(&serde_json::to_vec(&header).unwrap()),
@@ -127,6 +131,15 @@ impl DpopKey {
     }
 
     fn token_proof(&self, harness: &TestHarness, realm: &str) -> String {
+        self.token_proof_with_nonce(harness, realm, None)
+    }
+
+    fn token_proof_with_nonce(
+        &self,
+        harness: &TestHarness,
+        realm: &str,
+        nonce: Option<&str>,
+    ) -> String {
         self.proof(&ProofOpts {
             htm: "POST".to_string(),
             htu: token_htu(harness, realm),
@@ -134,10 +147,22 @@ impl DpopKey {
             iat: chrono::Utc::now().timestamp(),
             ath: None,
             typ: "dpop+jwt".to_string(),
+            nonce: nonce.map(str::to_string),
         })
     }
 
     fn userinfo_proof(&self, harness: &TestHarness, realm: &str, method: &str, at: &str) -> String {
+        self.userinfo_proof_with_nonce(harness, realm, method, at, None)
+    }
+
+    fn userinfo_proof_with_nonce(
+        &self,
+        harness: &TestHarness,
+        realm: &str,
+        method: &str,
+        at: &str,
+        nonce: Option<&str>,
+    ) -> String {
         self.proof(&ProofOpts {
             htm: method.to_string(),
             htu: userinfo_htu(harness, realm),
@@ -145,6 +170,7 @@ impl DpopKey {
             iat: chrono::Utc::now().timestamp(),
             ath: Some(at.to_string()),
             typ: "dpop+jwt".to_string(),
+            nonce: nonce.map(str::to_string),
         })
     }
 }
@@ -309,6 +335,7 @@ async fn proof_rejection_matrix() {
             iat: now,
             ath: None,
             typ: "dpop+jwt".to_string(),
+            nonce: None,
         },
         // htu mismatch (userinfo URL against the token endpoint)
         ProofOpts {
@@ -318,6 +345,7 @@ async fn proof_rejection_matrix() {
             iat: now,
             ath: None,
             typ: "dpop+jwt".to_string(),
+            nonce: None,
         },
         // stale iat
         ProofOpts {
@@ -327,6 +355,7 @@ async fn proof_rejection_matrix() {
             iat: now - 600,
             ath: None,
             typ: "dpop+jwt".to_string(),
+            nonce: None,
         },
         // wrong typ
         ProofOpts {
@@ -336,6 +365,7 @@ async fn proof_rejection_matrix() {
             iat: now,
             ath: None,
             typ: "JWT".to_string(),
+            nonce: None,
         },
     ];
 
@@ -592,4 +622,190 @@ async fn discovery_advertises_dpop_algs() {
         json["dpop_signing_alg_values_supported"],
         serde_json::json!(["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"])
     );
+}
+
+// ---------------------------------------------------------------------------
+// Server-provided nonces ([dpop.nonce], RFC 9449 §8/§9)
+// ---------------------------------------------------------------------------
+
+/// Harness variant with a specific nonce mode (`TestHarness::new` runs the
+/// default `disabled`).
+async fn harness_with_nonce_mode(mode: issuerd_server::config::DpopNonceMode) -> TestHarness {
+    let mut config = issuerd_server::config::ServerConfig::default();
+    config.dpop.nonce.mode = mode;
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+    );
+    TestHarness::with_state(state)
+}
+
+/// The `DPoP-Nonce` response header value, if present.
+fn response_nonce(resp: &Response) -> Option<String> {
+    resp.headers().get("dpop-nonce").map(|v| v.to_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn disabled_mode_never_sends_a_nonce_header() {
+    let harness = TestHarness::new().await;
+    let fx = fixture(&harness).await;
+    let key = dpop_key();
+
+    // Proof without a nonce claim: current behavior, no header.
+    let proof = key.token_proof(&harness, &fx.realm);
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_none());
+    assert_eq!(json_body(resp).await["token_type"], "DPoP");
+
+    // A nonce claim is ignored (not verified, no header issued).
+    let proof = key.token_proof_with_nonce(&harness, &fx.realm, Some("made-up"));
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_none());
+
+    // Plain Bearer: no header either.
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_none());
+}
+
+#[tokio::test]
+async fn required_mode_token_endpoint_nonce_flow() {
+    let harness = harness_with_nonce_mode(issuerd_server::config::DpopNonceMode::Required).await;
+    let fx = fixture(&harness).await;
+    let key = dpop_key();
+
+    // Plain Bearer requests are untouched (no proof → no nonce semantics).
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_none());
+
+    // A well-formed proof with a fresh iat/jti but no server nonce is
+    // rejected: 400 + `use_dpop_nonce` + a fresh nonce in the header.
+    let proof = key.token_proof(&harness, &fx.realm);
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let nonce = response_nonce(&resp).expect("challenge carries a fresh nonce");
+    let json = json_body(resp).await;
+    assert_eq!(json["error"], "use_dpop_nonce");
+
+    // Replaying the exact captured proof changes nothing (the nonce gate
+    // fires before the jti burn, so the jti is still unused — it is the
+    // missing nonce that dooms it).
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
+
+    // A made-up nonce never validates.
+    let forged = key.token_proof_with_nonce(&harness, &fx.realm, Some("attacker-guess"));
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&forged)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
+
+    // Retry echoing the server-issued nonce: success, the token is bound,
+    // and the response issues the NEXT nonce.
+    let proof = key.token_proof_with_nonce(&harness, &fx.realm, Some(&nonce));
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let next = response_nonce(&resp).expect("success issues the next nonce");
+    assert_ne!(next, nonce);
+    let json = json_body(resp).await;
+    assert_eq!(json["token_type"], "DPoP");
+    let access = decode_payload(json["access_token"].as_str().unwrap());
+    assert_eq!(access["cnf"]["jkt"], key.jkt().as_str());
+
+    // The consumed nonce is burned (single-use): a fresh proof reusing it is
+    // challenged again.
+    let proof = key.token_proof_with_nonce(&harness, &fx.realm, Some(&nonce));
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(response_nonce(&resp).is_some());
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
+}
+
+#[tokio::test]
+async fn supported_mode_accepts_absent_nonce_and_challenges_unknown() {
+    let harness = harness_with_nonce_mode(issuerd_server::config::DpopNonceMode::Supported).await;
+    let fx = fixture(&harness).await;
+    let key = dpop_key();
+
+    // Absence is not an error: success, and a fresh nonce rides the header.
+    let proof = key.token_proof(&harness, &fx.realm);
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let nonce = response_nonce(&resp).expect("supported mode always issues");
+    let json = json_body(resp).await;
+    let access = json["access_token"].as_str().unwrap().to_string();
+
+    // Nonces are realm-scoped: the token-endpoint nonce is equally valid at
+    // userinfo (Issuerd is both the authorization and the resource server).
+    let proof = key.userinfo_proof_with_nonce(&harness, &fx.realm, "GET", &access, Some(&nonce));
+    let resp =
+        userinfo_request(&harness, &fx.realm, "GET", Some(&format!("DPoP {access}")), Some(&proof))
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_some());
+
+    // A presented nonce must still be live: unknown values get the RFC
+    // challenge (401 + WWW-Authenticate at the resource endpoint).
+    let proof = key.userinfo_proof_with_nonce(&harness, &fx.realm, "GET", &access, Some("stale"));
+    let resp =
+        userinfo_request(&harness, &fx.realm, "GET", Some(&format!("DPoP {access}")), Some(&proof))
+            .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_nonce(&resp).is_some());
+    let www = resp.headers().get("www-authenticate").unwrap().to_str().unwrap().to_string();
+    assert!(www.starts_with("DPoP error=\"use_dpop_nonce\""), "got: {www}");
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
+
+    // Plain Bearer requests carry no header in this mode either.
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_none());
+}
+
+#[tokio::test]
+async fn required_mode_userinfo_nonce_flow() {
+    let harness = harness_with_nonce_mode(issuerd_server::config::DpopNonceMode::Required).await;
+    let fx = fixture(&harness).await;
+    let key = dpop_key();
+
+    // Mint a bound token the required-mode way: challenged, then retried
+    // with the server nonce.
+    let proof = key.token_proof(&harness, &fx.realm);
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let nonce = response_nonce(&resp).unwrap();
+    let proof = key.token_proof_with_nonce(&harness, &fx.realm, Some(&nonce));
+    let resp = post_token(&harness, &fx.realm, &fx.password_form(), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let access = json["access_token"].as_str().unwrap().to_string();
+    let auth = format!("DPoP {access}");
+
+    // userinfo proof (correct ath/jti/iat) without a nonce: 401 +
+    // `use_dpop_nonce` challenge with a fresh nonce.
+    let proof = key.userinfo_proof(&harness, &fx.realm, "GET", &access);
+    let resp = userinfo_request(&harness, &fx.realm, "GET", Some(&auth), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response_nonce(&resp).expect("401 challenge carries a fresh nonce");
+    let www = resp.headers().get("www-authenticate").unwrap().to_str().unwrap().to_string();
+    assert!(www.starts_with("DPoP error=\"use_dpop_nonce\""), "got: {www}");
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
+
+    // Retry with the server nonce: success.
+    let proof =
+        key.userinfo_proof_with_nonce(&harness, &fx.realm, "GET", &access, Some(&challenge));
+    let resp = userinfo_request(&harness, &fx.realm, "GET", Some(&auth), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(response_nonce(&resp).is_some());
+    assert_eq!(json_body(resp).await["sub"], fx.user_id.as_str());
+
+    // Replaying the same nonce (fresh jti, valid ath) is challenged: the
+    // nonce is single-use.
+    let proof =
+        key.userinfo_proof_with_nonce(&harness, &fx.realm, "GET", &access, Some(&challenge));
+    let resp = userinfo_request(&harness, &fx.realm, "GET", Some(&auth), Some(&proof)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(resp).await["error"], "use_dpop_nonce");
 }

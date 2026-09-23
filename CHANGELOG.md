@@ -112,6 +112,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names, `HttpOnly`, `SameSite=Lax`, and paths are unchanged; a `__Host-`
   prefix migration was considered and deferred (renaming cookies would break
   in-flight login flows on upgrade and requires a compat read path).
+- **DPoP server-provided nonces** (RFC 9449 §8/§9) as an opt-in strict mode:
+  the new `[dpop.nonce]` config section (`mode = "disabled" | "supported" |
+  "required"`, default `disabled` — **existing deployments are unaffected**;
+  `lifetime_secs`, default 30, accepted range 5–300, env
+  `ISSUERD_DPOP__NONCE__MODE` / `ISSUERD_DPOP__NONCE__LIFETIME_SECS`). When
+  enabled, the server issues unguessable random nonces in the `DPoP-Nonce`
+  response header, stores them in the distributed cache
+  (`dpop-nonce:{realm}:{nonce}` with the configured TTL), and consumes them
+  atomically on verification — each nonce is single-use, and every
+  proof-carrying response issues the next one. In `supported` mode proofs
+  without a `nonce` claim are accepted but an unknown/stale/used nonce is
+  challenged; in `required` mode every proof must carry a live nonce.
+  Challenges follow the RFC retry contract: `400` with
+  `{"error": "use_dpop_nonce"}` at the token endpoint, `401` with
+  `WWW-Authenticate: DPoP error="use_dpop_nonce"` at userinfo, both with a
+  fresh `DPoP-Nonce` header — compliant clients recover transparently, and
+  plain Bearer requests (no `DPoP` header) are never affected. Under
+  `required`, a captured proof can no longer be replayed with a freshly
+  minted `iat`/`jti`: only the server issues nonces. RFC 9449 defines no
+  discovery metadata for nonce support, so none is advertised. See
+  `docs/configuration.md` — "[dpop]", and `docs/security.md` — "DPoP
+  sender-constraining".
 
 ### Added
 
