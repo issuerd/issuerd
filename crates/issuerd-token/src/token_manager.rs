@@ -12,9 +12,10 @@ use chrono::Utc;
 use issuerd_core::{
     AccessTokenClaims, Acr, Algorithm, Audience, Client, ClientIdentifier, CryptoProvider,
     IdTokenClaims, IntrospectionResponse, Issuer, IssuerdError, Jwk, JwkKty, JwkSet, JwsType,
-    JwtType, KeyId, LogoutToken, LogoutTokenClaims, Nonce, Realm, RealmAccess, RefreshTokenClaims,
-    SessionId, User, UserSession, ValidatedAccessToken, ValidatedRefreshToken,
+    JwtType, KeyId, LogoutToken, LogoutTokenClaims, Nonce, Realm, RealmAccess, RealmName,
+    RefreshTokenClaims, SessionId, User, UserSession, ValidatedAccessToken, ValidatedRefreshToken,
 };
+use url::Url;
 
 use crate::hash::{compute_at_hash, compute_c_hash};
 use crate::jwt::{AccessToken, IdToken, RefreshToken};
@@ -23,6 +24,10 @@ use crate::jwt::{AccessToken, IdToken, RefreshToken};
 pub struct TokenManager<C: CryptoProvider> {
     crypto: Arc<C>,
     issuer_base_url: String,
+    /// Parsed form of `issuer_base_url`, used for structural issuer
+    /// validation. `None` (an unparseable base URL) fails every issuer
+    /// check closed.
+    issuer_base_parsed: Option<Url>,
     clock_skew: std::time::Duration,
     /// Full published key set (active + passive) — used for verification.
     jwks: std::sync::RwLock<JwkSet>,
@@ -96,10 +101,13 @@ impl<C: CryptoProvider> TokenManager<C> {
         jwks: JwkSet,
         default_alg: Algorithm,
     ) -> Self {
+        // Normalize once: every derived issuer/URL assumes no trailing `/`.
+        let issuer_base_url = issuer_base_url.trim_end_matches('/').to_string();
+        let issuer_base_parsed = Url::parse(&issuer_base_url).ok();
         Self {
             crypto,
-            // Normalize once: every derived issuer/URL assumes no trailing `/`.
-            issuer_base_url: issuer_base_url.trim_end_matches('/').to_string(),
+            issuer_base_url,
+            issuer_base_parsed,
             clock_skew,
             active_jwks: std::sync::RwLock::new(jwks.clone()),
             jwks: std::sync::RwLock::new(jwks),
@@ -110,6 +118,42 @@ impl<C: CryptoProvider> TokenManager<C> {
 
     fn issuer_for_realm(&self, realm: &Realm) -> Issuer {
         Issuer::new(format!("{}/realms/{}", self.issuer_base_url, realm.name.as_str())).unwrap()
+    }
+
+    /// Structural check that `iss` names a realm of this deployment: parsed
+    /// as a URL, its scheme, host, and port must equal the configured issuer
+    /// base URL exactly, the path must be exactly
+    /// `{base_path}/realms/{name}` where `{name}` passes [`RealmName`]
+    /// validation (a single safe segment — this rejects trailing slashes and
+    /// extra path segments, which leave a `/` or a URL-reserved character in
+    /// the candidate name), and there must be no userinfo, query, or
+    /// fragment. Issuers are realm-NAME based; pre-switch id-spelled issuers
+    /// stay rejected downstream by name-only realm resolution.
+    fn is_realm_issuer(&self, iss: &str) -> bool {
+        let Some(base) = &self.issuer_base_parsed else {
+            return false;
+        };
+        let Ok(url) = Url::parse(iss) else {
+            return false;
+        };
+        if url.scheme() != base.scheme()
+            || url.host_str() != base.host_str()
+            || url.port_or_known_default() != base.port_or_known_default()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return false;
+        }
+        let Some(name) = url
+            .path()
+            .strip_prefix(base.path().trim_end_matches('/'))
+            .and_then(|rest| rest.strip_prefix("/realms/"))
+        else {
+            return false;
+        };
+        RealmName::new(name).is_ok()
     }
 
     /// Refresh the cached JWK sets from the crypto provider: the full
@@ -431,9 +475,8 @@ impl<C: CryptoProvider> TokenManager<C> {
             return Err(IssuerdError::InvalidToken);
         }
 
-        // Validate issuer manually to support realm-specific issuers.
-        let iss = claims.iss.as_str();
-        if !iss.starts_with(&self.issuer_base_url) || !iss.contains("/realms/") {
+        // Validate issuer structurally to support realm-specific issuers.
+        if !self.is_realm_issuer(claims.iss.as_str()) {
             return Err(IssuerdError::InvalidToken);
         }
 
@@ -469,9 +512,8 @@ impl<C: CryptoProvider> TokenManager<C> {
             return Err(IssuerdError::InvalidToken);
         }
 
-        // Validate issuer manually to support realm-specific issuers.
-        let iss = claims.iss.as_str();
-        if !iss.starts_with(&self.issuer_base_url) || !iss.contains("/realms/") {
+        // Validate issuer structurally to support realm-specific issuers.
+        if !self.is_realm_issuer(claims.iss.as_str()) {
             return Err(IssuerdError::InvalidToken);
         }
 
@@ -501,11 +543,10 @@ impl<C: CryptoProvider> TokenManager<C> {
             return Err(IssuerdError::InvalidToken);
         }
 
-        // Validate issuer using the realm-family check (base URL + `/realms/`),
-        // same as the other validators: issuers are realm-NAME based, and the
+        // Validate issuer using the structural realm-family check, same as
+        // the other validators: issuers are realm-NAME based, and the
         // client's realm name is not available here.
-        let iss = claims.iss.as_str();
-        if !iss.starts_with(&self.issuer_base_url) || !iss.contains("/realms/") {
+        if !self.is_realm_issuer(claims.iss.as_str()) {
             return Err(IssuerdError::InvalidToken);
         }
 
@@ -542,9 +583,8 @@ impl<C: CryptoProvider> TokenManager<C> {
             return Err(IssuerdError::InvalidToken);
         }
 
-        // Validate issuer manually to support realm-specific issuers.
-        let iss = claims.iss.as_str();
-        if !iss.starts_with(&self.issuer_base_url) || !iss.contains("/realms/") {
+        // Validate issuer structurally to support realm-specific issuers.
+        if !self.is_realm_issuer(claims.iss.as_str()) {
             return Err(IssuerdError::InvalidToken);
         }
 
@@ -2236,6 +2276,219 @@ mod tests {
         ));
     }
 
+    /// Token manager for pure issuer-check tests: the check never touches
+    /// the crypto provider, so an expectation-less mock is fine.
+    fn issuer_check_tm(base: &str) -> TokenManager<issuerd_core::MockCryptoProvider> {
+        TokenManager::new(
+            Arc::new(issuerd_core::MockCryptoProvider::new()),
+            base.to_string(),
+            Duration::from_secs(60),
+            JwkSet { keys: vec![] },
+        )
+    }
+
+    #[test]
+    fn realm_issuer_check_accepts_legitimate_issuers() {
+        let tm = issuer_check_tm("https://ex.com");
+        for iss in [
+            "https://ex.com/realms/master",
+            "https://ex.com/realms/my-realm_1.2",
+            // An explicit default port still names the same origin.
+            "https://ex.com:443/realms/master",
+        ] {
+            assert!(tm.is_realm_issuer(iss), "expected {iss} to be accepted");
+        }
+
+        // Base URL with an explicit non-default port.
+        let tm = issuer_check_tm("https://ex.com:8443");
+        assert!(tm.is_realm_issuer("https://ex.com:8443/realms/master"));
+
+        // Base URL carrying a path prefix.
+        let tm = issuer_check_tm("https://ex.com/iam");
+        assert!(tm.is_realm_issuer("https://ex.com/iam/realms/master"));
+    }
+
+    #[test]
+    fn realm_issuer_check_rejects_malformed_issuers() {
+        let tm = issuer_check_tm("https://ex.com");
+        for iss in [
+            // Trailing slash.
+            "https://ex.com/realms/master/",
+            // Extra path segment.
+            "https://ex.com/realms/master/extra",
+            // The `realms` path segment is case-sensitive.
+            "https://ex.com/REALMS/master",
+            "https://ex.com/Realms/master",
+            // Missing realm name.
+            "https://ex.com/realms",
+            "https://ex.com/realms/",
+            // URL normalization swallows the dot segment, leaving no name.
+            "https://ex.com/realms/..",
+            // Scheme mismatch (http vs https).
+            "http://ex.com/realms/master",
+            // Non-default port where the base has none.
+            "https://ex.com:8443/realms/master",
+            // Host suffix collision the old starts_with check accepted.
+            "https://ex.com.evil.com/realms/master",
+            // Userinfo must not smuggle a foreign authority past the check.
+            "https://ex.com@evil.com/realms/master",
+            "https://evil.com@ex.com/realms/master",
+            // Query and fragment are not part of an issuer.
+            "https://ex.com/realms/master?x=1",
+            "https://ex.com/realms/master#frag",
+            // Percent-encoded / otherwise invalid realm names.
+            "https://ex.com/realms/my%20realm",
+            "https://ex.com/realms/a%2Fb",
+            // Different host, wrong path shape, not a URL, empty.
+            "https://evil.com/realms/master",
+            "https://ex.com/other/master",
+            "not-a-url",
+            "",
+        ] {
+            assert!(!tm.is_realm_issuer(iss), "expected {iss} to be rejected");
+        }
+
+        // Explicit-port base rejects a missing or different port.
+        let tm = issuer_check_tm("https://ex.com:8443");
+        assert!(!tm.is_realm_issuer("https://ex.com/realms/master"));
+        assert!(!tm.is_realm_issuer("https://ex.com:443/realms/master"));
+
+        // Path-prefix base requires the prefix.
+        let tm = issuer_check_tm("https://ex.com/iam");
+        assert!(!tm.is_realm_issuer("https://ex.com/realms/master"));
+    }
+
+    fn access_claims_with_issuer(iss: &str) -> AccessTokenClaims {
+        AccessTokenClaims {
+            jti: issuerd_core::JwtId::new("jti").unwrap(),
+            iss: Issuer::new(iss).unwrap(),
+            sub: UserId::new("user-1").unwrap(),
+            aud: Audience::new("aud").unwrap(),
+            exp: Utc::now().timestamp() + 300,
+            iat: Utc::now().timestamp(),
+            nbf: Utc::now().timestamp() - 1,
+            scope: issuerd_core::Scope::parse("openid"),
+            typ: JwtType::Bearer,
+            azp: None,
+            session_state: None,
+            realm_access: None,
+            resource_access: None,
+            sid: Some(SessionId::new("s1").unwrap()),
+            claims: None,
+            cnf: None,
+            authorization_details: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn access_token_malformed_issuer_rejected() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(60), jwks);
+
+        // Sanity: the legitimate realm issuer still validates end-to-end.
+        let (token, _) = tm
+            .sign_claims(&access_claims_with_issuer("https://issuer/realms/test"), Algorithm::Rs256)
+            .await
+            .unwrap();
+        assert!(tm.validate_access_token(&token).is_ok());
+
+        for bad_iss in [
+            // Host suffix collision: starts with the base URL string.
+            "https://issuer.evil.com/realms/test",
+            "https://issuer/realms/test/",
+            "https://issuer/realms/test/extra",
+            "http://issuer/realms/test",
+            "https://issuer/realms/test?x=1",
+        ] {
+            let (token, _) = tm
+                .sign_claims(&access_claims_with_issuer(bad_iss), Algorithm::Rs256)
+                .await
+                .unwrap();
+            assert!(
+                matches!(tm.validate_access_token(&token), Err(IssuerdError::InvalidToken)),
+                "expected {bad_iss} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn id_token_malformed_issuer_rejected() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(60), jwks);
+
+        let id_claims = |iss: &str| IdTokenClaims {
+            iss: Issuer::new(iss).unwrap(),
+            sub: UserId::new("user-1").unwrap(),
+            aud: Audience::new("my-app").unwrap(),
+            exp: Utc::now().timestamp() + 300,
+            iat: Utc::now().timestamp(),
+            auth_time: Some(Utc::now().timestamp()),
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            sid: Some(SessionId::new("s1").unwrap()),
+            at_hash: None,
+            c_hash: None,
+            name: None,
+            given_name: None,
+            family_name: None,
+            preferred_username: None,
+            email: None,
+            email_verified: None,
+            address: None,
+            phone_number: None,
+            phone_number_verified: None,
+            realm_access: None,
+            resource_access: None,
+        };
+
+        // Sanity: the legitimate realm issuer still validates end-to-end.
+        let (token, _) = tm
+            .sign_claims(&id_claims("https://issuer/realms/test"), Algorithm::Rs256)
+            .await
+            .unwrap();
+        assert!(tm.validate_id_token(&token, &test_client(), None).is_ok());
+        assert!(tm.validate_id_token_hint(&token).is_ok());
+
+        for bad_iss in [
+            "https://issuer.evil.com/realms/test",
+            "https://issuer/realms/test/",
+            "https://issuer/realms/test/extra",
+            "http://issuer/realms/test",
+            "https://issuer/realms/test#frag",
+        ] {
+            let (token, _) = tm.sign_claims(&id_claims(bad_iss), Algorithm::Rs256).await.unwrap();
+            assert!(
+                matches!(
+                    tm.validate_id_token(&token, &test_client(), None),
+                    Err(IssuerdError::InvalidToken)
+                ),
+                "expected {bad_iss} to be rejected by validate_id_token"
+            );
+            assert!(
+                matches!(tm.validate_id_token_hint(&token), Err(IssuerdError::InvalidToken)),
+                "expected {bad_iss} to be rejected by validate_id_token_hint"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn introspection_active_and_inactive() {
         let crypto = Arc::new(
@@ -3654,6 +3907,59 @@ mod tests {
 
         let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();
         assert!(matches!(tm.validate_refresh_token(&token), Err(IssuerdError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn refresh_token_malformed_issuer_rejected() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm = TokenManager::new(
+            crypto.clone(),
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            jwks,
+        );
+
+        let refresh_claims = |iss: &str| RefreshTokenClaims {
+            jti: issuerd_core::JwtId::new("jti").unwrap(),
+            iss: Issuer::new(iss).unwrap(),
+            sub: UserId::new("user-1").unwrap(),
+            aud: Audience::new("aud").unwrap(),
+            exp: Utc::now().timestamp() + 300,
+            iat: Utc::now().timestamp(),
+            scope: issuerd_core::Scope::parse("openid"),
+            typ: JwtType::Refresh,
+            sid: SessionId::new("s1").unwrap(),
+            cnf: None,
+            authorization_details: None,
+        };
+
+        // Sanity: the legitimate realm issuer still validates end-to-end.
+        let (token, _) = tm
+            .sign_claims(&refresh_claims("https://issuer/realms/test"), Algorithm::Rs256)
+            .await
+            .unwrap();
+        assert!(tm.validate_refresh_token(&token).is_ok());
+
+        for bad_iss in [
+            "https://issuer.evil.com/realms/test",
+            "https://issuer/realms/test/",
+            "https://issuer/realms/test/extra",
+            "http://issuer/realms/test",
+        ] {
+            let (token, _) =
+                tm.sign_claims(&refresh_claims(bad_iss), Algorithm::Rs256).await.unwrap();
+            assert!(
+                matches!(tm.validate_refresh_token(&token), Err(IssuerdError::InvalidToken)),
+                "expected {bad_iss} to be rejected"
+            );
+        }
     }
 
     #[tokio::test]

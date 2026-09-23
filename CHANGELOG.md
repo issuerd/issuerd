@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Token issuer (`iss`) validation is now **exact-match**: access, refresh,
+  and ID token issuers are parsed as URLs and must equal the configured
+  issuer base URL in scheme, host, and port, with a path of exactly
+  `/realms/{name}` (a single valid realm-name segment; no userinfo, query,
+  or fragment). The previous prefix check accepted look-alike issuers whose
+  host merely starts with the configured one (e.g.
+  `https://issuer.example.com.evil.test/realms/x`) and URLs with trailing
+  slashes or extra path segments. Legitimate realm issuers are unaffected.
 - CIBA and device-authorization grants now consume an approved `auth_req_id` /
   device code **atomically** (`DistributedCache::get_and_delete` — Redis
   `GETDEL`), matching the authorization-code grant. Previously the token poll
