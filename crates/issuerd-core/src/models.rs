@@ -2267,8 +2267,11 @@ impl From<PasswordLength> for u32 {
 impl TryFrom<u32> for PasswordLength {
     type Error = IssuerdError;
 
+    // Comparison instead of `(MIN..=MAX).contains()`: flux flags the range
+    // constructor as MightPanic (E0999) in full-crate runs.
+    #[allow(clippy::manual_range_contains)]
     fn try_from(length: u32) -> Result<Self, Self::Error> {
-        if !(Self::MIN..=Self::MAX).contains(&length) {
+        if length < Self::MIN || length > Self::MAX {
             return Err(IssuerdError::InvalidRequest(format!(
                 "password length must be between {} and {}",
                 Self::MIN,

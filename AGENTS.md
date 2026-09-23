@@ -206,12 +206,18 @@ As-run status (Kani 0.68 / CBMC 6.11, cargo-flux c460561, WSL):
   `str::from_utf8`), no symbolic SHA-256, no `RandomState` HashMaps (symbolic
   SipHash keys). Kani also caught a real spec bug during bring-up: the
   plain-method property must include the RFC 7636 43–128 length guard.
-- **Flux: installed and runs, but the current driver ICEs** on ordinary
-  iterator chains (`flux-infer/src/projections.rs:382`, reproducible on
-  `issuerd-core::roles::expand_composites` and further sites — a driver limitation,
-  not a code issue). The `SecondsNonZero` refinement annotations stay in place
-  (inert under plain rustc); the CI job stays `continue-on-error` until the
-  upstream fix lands — re-run `scripts/flux.sh` after a flux bump.
+- **Flux: green in CI in scoped mode.** The current driver still ICEs on
+  ordinary iterator chains in full-crate runs (`flux-infer/src/projections.rs:382`
+  on `issuerd-core::roles::expand_composites` — upstream
+  [flux-rs/flux#1666](https://github.com/flux-rs/flux/issues/1666) — and
+  `flux-infer/src/infer.rs:484` on `reconcile_group_memberships_indexed`; driver
+  limitations, not code issues). The `verification.yml` job therefore checks
+  only the annotated defs: `cargo flux check -p issuerd-core
+  --only-check="def:models::SecondsNonZero"` (everything else is auto-trusted).
+  The `SecondsNonZero` refinement annotations stay in place (inert under plain
+  rustc); the job stays `continue-on-error` because flux installs from its
+  `main` branch. After a flux bump that fixes #1666, widen back to bare
+  `cargo flux` (full-crate) via `scripts/flux.sh`.
 - Kani/Flux/MIRAI are Linux/macOS-only; on Windows run them in WSL (needs
   `sudo apt-get install -y build-essential pkg-config libssl-dev libkrb5-dev`;
   MIRAI additionally needs `cmake clang`).
