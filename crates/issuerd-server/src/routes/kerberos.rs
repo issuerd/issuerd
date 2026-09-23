@@ -46,8 +46,8 @@ pub async fn handle_spnego(
     };
     // Resolve the realm by name so storage queries use the canonical realm ID
     // (realm IDs may be UUIDs while URLs carry the human-readable name).
-    let realm_id = match state.resolve_realm(realm_name).await {
-        Ok(Some(r)) => r.id,
+    let realm = match state.resolve_realm(realm_name).await {
+        Ok(Some(r)) => r,
         Ok(None) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -64,6 +64,7 @@ pub async fn handle_spnego(
                 .into_response();
         }
     };
+    let realm_id = realm.id.clone();
 
     let token = match headers
         .get(axum::http::header::AUTHORIZATION)
@@ -371,7 +372,13 @@ pub async fn handle_spnego(
                     claims: None,
                     authorization_details: None,
                 };
-                if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await
+                if let Err(e) = super::oidc::store_auth_code(
+                    &state.cache,
+                    &code,
+                    &code_data,
+                    state.config.oauth.auth_code_ttl(&realm),
+                )
+                .await
                 {
                     tracing::error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to persist authorization code");
                     let mut details = HashMap::new();

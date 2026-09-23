@@ -212,6 +212,9 @@ impl ServerState {
                 )));
             }
         }
+        // Bounded protocol values: reject out-of-range settings instead of
+        // silently clamping them (e.g. an operator typo of 6000 s).
+        config.oauth.validate()?;
         // Log only the storage variant — the full config would leak the
         // Postgres password into the logs.
         let storage_kind = match &config.storage {
@@ -861,6 +864,26 @@ mod tests {
         let realms = state.storage.list_realms(&issuerd_core::Pagination::default()).await.unwrap();
         assert!(!realms.is_empty());
         assert_eq!(realms[0].name, "master");
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_out_of_range_auth_code_ttl() {
+        for bad in [0, 9, 601] {
+            let cfg = ServerConfig {
+                oauth: crate::config::OAuthConfig {
+                    auth_code_ttl_secs: bad,
+                },
+                ..Default::default()
+            };
+            let err = match ServerState::from_config(&cfg).await {
+                Ok(_) => panic!("out-of-range auth_code_ttl_secs ({bad}) must abort boot"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("auth_code_ttl_secs"),
+                "error must name the offending key: {err}"
+            );
+        }
     }
 
     #[tokio::test]

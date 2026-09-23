@@ -206,7 +206,10 @@ async fn remember_me_login_sets_cookie_and_marks_session() {
     assert_eq!(claims["realm"].as_str().unwrap(), realm.id.as_ref());
     assert_eq!(claims["auth_time"].as_i64(), Some(session.auth_time.timestamp()));
 
-    // Cookie attributes: long-lived, browser-hardened.
+    // Cookie attributes: long-lived, browser-hardened. This harness runs a
+    // plain-HTTP issuer, so `Secure` is deliberately absent (the browser would
+    // drop the cookie); the HTTPS-issuer variant is covered by
+    // `remember_me_cookie_secure_flag_follows_issuer_scheme` below.
     let exec = start_auth_flow(&harness, "rm-login", client.client_id.as_ref()).await;
     let resp =
         submit_login_form(&harness, "rm-login", &exec, "carol", "password123", Some("on")).await;
@@ -215,7 +218,7 @@ async fn remember_me_login_sets_cookie_and_marks_session() {
         .find(|c| c.starts_with(&format!("{}=", remember_cookie_name(&realm.id))))
         .expect("issuerd_remember set-cookie header");
     assert!(header.contains("HttpOnly"), "header: {header}");
-    assert!(header.contains("Secure"), "header: {header}");
+    assert!(!header.contains("Secure"), "header: {header}");
     assert!(header.contains("SameSite=Lax"), "header: {header}");
     assert!(header.contains("Path=/"), "header: {header}");
     assert!(header.contains("Max-Age=604800"), "header: {header}");
@@ -230,6 +233,55 @@ async fn remember_me_login_sets_cookie_and_marks_session() {
     let sso = cookie_value(&cookies, &sso_cookie_name(&realm.id)).expect("issuerd_session cookie");
     let session = session_for_sso_cookie(&harness, &realm.id, &sso).await;
     assert!(!session.remember_me);
+}
+
+/// With an HTTPS `issuer_url` every authentication cookie — SSO session,
+/// remember-me, and the flow correlation cookie — carries the `Secure`
+/// attribute (plain-HTTP issuers omit it so development rigs keep working).
+#[tokio::test]
+async fn remember_me_cookie_secure_flag_follows_issuer_scheme() {
+    let config = issuerd_server::config::ServerConfig {
+        issuer_url: "https://issuerd.test.internal".to_string(),
+        ..Default::default()
+    };
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+    );
+    let harness = TestHarness::with_state(state);
+    let realm = create_realm_with_remember_me(&harness, "rm-secure", true).await;
+    let client = harness.create_client("rm-secure", false).await;
+    let _user = harness.create_user("rm-secure", "erin", "password123").await;
+
+    // The flow correlation cookie on the authorize redirect.
+    let auth_path = format!(
+        "/realms/rm-secure/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http://localhost:8080/cb&scope=openid&state=xyz",
+        client.client_id
+    );
+    let resp = harness.get(&auth_path).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let flow_header = set_cookies(&resp)
+        .into_iter()
+        .find(|c| c.starts_with("issuerd_flow_"))
+        .expect("issuerd_flow set-cookie header");
+    assert!(flow_header.contains("HttpOnly"), "header: {flow_header}");
+    assert!(flow_header.contains("; Secure"), "header: {flow_header}");
+
+    // The SSO session and remember-me cookies on the login response.
+    let exec = start_auth_flow(&harness, "rm-secure", client.client_id.as_ref()).await;
+    let resp =
+        submit_login_form(&harness, "rm-secure", &exec, "erin", "password123", Some("on")).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookies = set_cookies(&resp);
+    let sso_header = cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", sso_cookie_name(&realm.id))))
+        .expect("issuerd_session set-cookie header");
+    assert!(sso_header.contains("; Secure"), "header: {sso_header}");
+    let remember_header = cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{}=", remember_cookie_name(&realm.id))))
+        .expect("issuerd_remember set-cookie header");
+    assert!(remember_header.contains("; Secure"), "header: {remember_header}");
 }
 
 #[tokio::test]

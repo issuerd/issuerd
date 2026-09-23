@@ -699,7 +699,10 @@ async fn finish_login(
                 url_path_segment(realm_segment)
             );
             let mut resp = Redirect::to(&url).into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(&execution)) {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(
+                &execution,
+                state.config.secure_cookies(),
+            )) {
                 resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
             }
             resp

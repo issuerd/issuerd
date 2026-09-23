@@ -90,6 +90,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record a `login_error` event instead of redirecting with a code that could
   never be exchanged. Adds `IssuerdError::TemporarilyUnavailable`
   (`temporarily_unavailable` / HTTP 503).
+- The authorization-code TTL is now **configurable**: `[oauth]
+  auth_code_ttl_secs` (default 600 s — unchanged behavior, matching Keycloak;
+  env `ISSUERD_OAUTH__AUTH_CODE_TTL_SECS`), with an optional per-realm
+  override via the `auth_code_ttl_secs` realm attribute. Accepted range is
+  10–600 seconds; out-of-range server values abort the boot with a clear
+  error, and a malformed/out-of-range realm attribute falls back to the
+  server value. A FAPI 2.0 high-assurance profile requires ≤ 60 s — set 60
+  globally or per realm when assembling one (full FAPI 2.0 message signing
+  remains out of scope). See `docs/configuration.md` — "[oauth]".
+- Authentication cookies now carry the **`Secure` attribute whenever the
+  configured `issuer_url` is `https://`** (`ServerConfig::secure_cookies`,
+  derived from config, never from the request): the `issuerd_flow_{id}` flow
+  correlation cookie previously went without it, and the SSO session
+  (`issuerd_session_{realm-id}`), remember-me
+  (`issuerd_remember_{realm-id}`), and logout-clear cookies — which
+  unconditionally sent `Secure` — now follow the same rule. TLS deployments
+  (direct or behind a TLS-terminating proxy with an `https` `issuer_url`)
+  are unaffected; plain-HTTP development rigs now work on any hostname, not
+  just `localhost`, because browsers no longer drop the cookies there. Cookie
+  names, `HttpOnly`, `SameSite=Lax`, and paths are unchanged; a `__Host-`
+  prefix migration was considered and deferred (renaming cookies would break
+  in-flight login flows on upgrade and requires a compat read path).
 
 ### Added
 

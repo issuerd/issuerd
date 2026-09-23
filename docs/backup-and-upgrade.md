@@ -35,7 +35,7 @@ All Redis content is short-lived runtime state. The key prefixes below are defin
 
 | Key prefix | Contents | TTL |
 |---|---|---|
-| `auth_code:{code}` | Authorization codes not yet exchanged at the token endpoint | 600 s |
+| `auth_code:{code}` | Authorization codes not yet exchanged at the token endpoint | `[oauth] auth_code_ttl_secs` (default 600 s; per-realm `auth_code_ttl_secs` attribute) |
 | `used_auth_code:{code}` | Reuse-detection markers for exchanged codes (hold the minted tokens so a replay revokes them) | Remaining lifetime of the minted tokens |
 | `pending_auth:{realm}:{flow_id}` | In-flight browser login flows (multi-step authenticators, MFA challenges) | Flow lifetime |
 | `pending_consent:{realm}:{execution}` | Consent screens awaiting a user decision | Flow lifetime |

@@ -145,7 +145,7 @@ pub(crate) async fn begin_consent(
         .await;
 
     let url = continuation_url(realm_name, &execution);
-    let cookie = flow_cookie_header(&execution);
+    let cookie = flow_cookie_header(&execution, state.config.secure_cookies());
     if entry.is_browser_form {
         let mut resp = axum::response::Redirect::to(&url).into_response();
         if let Ok(v) = HeaderValue::from_str(&cookie) {

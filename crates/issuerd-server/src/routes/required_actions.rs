@@ -175,7 +175,7 @@ pub(crate) async fn dispatch_actions_continuation(
         .await;
 
     let url = continuation_url(realm_name, flow_id);
-    let cookie = flow_cookie_header(flow_id);
+    let cookie = flow_cookie_header(flow_id, state.config.secure_cookies());
     if is_browser_form {
         let mut resp = Redirect::to(&url).into_response();
         if let Ok(v) = HeaderValue::from_str(&cookie) {
@@ -772,9 +772,11 @@ pub async fn required_action_page(
     headers: HeaderMap,
 ) -> Response {
     let mint_cookie = !has_flow_cookie(&headers, &execution);
+    // Resolved before `state` moves into the page renderer.
+    let secure_cookies = state.config.secure_cookies();
     let mut resp = required_action_page_inner(state, realm_name, execution.clone()).await;
     if mint_cookie {
-        if let Ok(v) = HeaderValue::from_str(&flow_cookie_header(&execution)) {
+        if let Ok(v) = HeaderValue::from_str(&flow_cookie_header(&execution, secure_cookies)) {
             resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
         }
     }

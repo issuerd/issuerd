@@ -32,6 +32,9 @@ pub struct ServerConfig {
     /// Read-model cache settings (`[cache]` section).
     #[serde(default)]
     pub cache: CacheConfig,
+    /// OAuth/OIDC protocol tuning (`[oauth]` section).
+    #[serde(default)]
+    pub oauth: OAuthConfig,
     /// Crypto settings (`[crypto]` section).
     #[serde(default)]
     pub crypto: CryptoSettings,
@@ -58,6 +61,7 @@ impl Default for ServerConfig {
             cluster: ClusterConfig::default(),
             smtp: SmtpConfig::default(),
             cache: CacheConfig::default(),
+            oauth: OAuthConfig::default(),
             crypto: CryptoSettings::default(),
             themes: ThemesConfig::default(),
             provision: None,
@@ -101,6 +105,18 @@ impl ServerConfig {
             .map_err(|e| IssuerdError::ServerError(format!("config load failed: {e}")))
     }
 
+    /// Whether server-set browser cookies carry the `Secure` attribute.
+    ///
+    /// Derived from the configured `issuer_url` — never from the request:
+    /// `true` exactly when the public scheme is `https`. Every TLS deployment
+    /// (direct, or behind a TLS-terminating proxy where `issuer_url` keeps
+    /// the public `https` scheme) gets `Secure` on all authentication
+    /// cookies — SSO session, remember-me, flow correlation, and the logout
+    /// clears — while plain-HTTP development rigs keep working.
+    pub fn secure_cookies(&self) -> bool {
+        url::Url::parse(&self.issuer_url).is_ok_and(|u| u.scheme() == "https")
+    }
+
     /// Generate a fully-populated example config for documentation / CLI usage.
     pub fn generate_example() -> Self {
         Self {
@@ -141,6 +157,7 @@ impl ServerConfig {
                 password: None,
             },
             cache: CacheConfig::default(),
+            oauth: OAuthConfig::default(),
             crypto: CryptoSettings::default(),
             provision: Some(PathBuf::from("provision.yaml")),
         }
@@ -307,6 +324,75 @@ impl Default for CacheConfig {
         Self {
             read_cache_ttl_secs: 60,
         }
+    }
+}
+
+/// Default authorization-code lifetime: 10 minutes — the common interoperable
+/// value (Keycloak uses the same).
+pub const AUTH_CODE_TTL_DEFAULT_SECS: u64 = 600;
+/// Shortest accepted authorization-code lifetime.
+pub const AUTH_CODE_TTL_MIN_SECS: u64 = 10;
+/// Longest accepted authorization-code lifetime. Codes are bearer grants
+/// delivered through the browser — keep the redemption window short.
+pub const AUTH_CODE_TTL_MAX_SECS: u64 = 600;
+
+/// OAuth/OIDC protocol tuning (`[oauth]` section).
+///
+/// The whole section is optional and every key has a default, so existing
+/// configuration files keep booting unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Lifetime of an authorization code in seconds: how long the client has
+    /// to redeem it at the token endpoint
+    /// (`[oauth] auth_code_ttl_secs`, env
+    /// `ISSUERD_OAUTH__AUTH_CODE_TTL_SECS`). Default 600, accepted range
+    /// 10–600; out-of-range values abort the boot. A FAPI 2.0 high-assurance
+    /// profile wants ≤ 60 s — set 60 here or per realm (see
+    /// [`OAuthConfig::REALM_AUTH_CODE_TTL_ATTRIBUTE`]) when building such a
+    /// profile. (Full FAPI 2.0 message signing is out of scope; this is only
+    /// the TTL knob a profile needs.)
+    pub auth_code_ttl_secs: u64,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            auth_code_ttl_secs: AUTH_CODE_TTL_DEFAULT_SECS,
+        }
+    }
+}
+
+impl OAuthConfig {
+    /// Realm attribute that overrides [`OAuthConfig::auth_code_ttl_secs`]
+    /// for one realm (set via the realm representation's `attributes` map or
+    /// the provision YAML `attributes` block). Must parse as an integer
+    /// within the same 10–600 bounds; an absent, malformed, or out-of-range
+    /// value falls back to the server-wide setting.
+    pub const REALM_AUTH_CODE_TTL_ATTRIBUTE: &'static str = "auth_code_ttl_secs";
+
+    /// Boot-time validation: reject out-of-range values with a clear error
+    /// instead of silently clamping them.
+    pub fn validate(&self) -> Result<(), IssuerdError> {
+        if !(AUTH_CODE_TTL_MIN_SECS..=AUTH_CODE_TTL_MAX_SECS).contains(&self.auth_code_ttl_secs) {
+            return Err(IssuerdError::InvalidRequest(format!(
+                "oauth.auth_code_ttl_secs must be within \
+                 {AUTH_CODE_TTL_MIN_SECS}..={AUTH_CODE_TTL_MAX_SECS} seconds, got {}",
+                self.auth_code_ttl_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// Effective authorization-code TTL for a realm: the realm attribute when
+    /// present and in bounds, else the server-wide value.
+    pub fn auth_code_ttl(&self, realm: &issuerd_core::Realm) -> std::time::Duration {
+        let secs = realm
+            .attributes
+            .get(Self::REALM_AUTH_CODE_TTL_ATTRIBUTE)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| (AUTH_CODE_TTL_MIN_SECS..=AUTH_CODE_TTL_MAX_SECS).contains(v))
+            .unwrap_or(self.auth_code_ttl_secs);
+        std::time::Duration::from_secs(secs)
     }
 }
 
@@ -533,6 +619,7 @@ mod tests {
         assert!(!cfg.smtp.starttls);
         assert!(!cfg.smtp.ssl);
         assert_eq!(cfg.cache.read_cache_ttl_secs, 60);
+        assert_eq!(cfg.oauth.auth_code_ttl_secs, 600);
     }
 
     #[test]
@@ -839,6 +926,117 @@ key_base64 = "{}"
             };
             assert!(settings.build_kek_provider().is_err(), "{label} must fail validation");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // [oauth]
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn oauth_default_auth_code_ttl_unchanged() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.oauth.auth_code_ttl_secs, AUTH_CODE_TTL_DEFAULT_SECS);
+        assert_eq!(cfg.oauth.auth_code_ttl_secs, 600);
+        cfg.oauth.validate().unwrap();
+        // The generated example carries the same default.
+        assert_eq!(ServerConfig::generate_example().oauth.auth_code_ttl_secs, 600);
+    }
+
+    #[test]
+    fn oauth_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("oauth_toml", "toml");
+        fs::write(&path, "[oauth]\nauth_code_ttl_secs = 60\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert_eq!(cfg.oauth.auth_code_ttl_secs, 60);
+        cfg.oauth.validate().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_OAUTH__AUTH_CODE_TTL_SECS", "45");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_OAUTH__AUTH_CODE_TTL_SECS");
+        assert_eq!(cfg.oauth.auth_code_ttl_secs, 45);
+    }
+
+    #[test]
+    fn oauth_validate_enforces_bounds() {
+        for ok in [AUTH_CODE_TTL_MIN_SECS, 60, AUTH_CODE_TTL_MAX_SECS] {
+            OAuthConfig {
+                auth_code_ttl_secs: ok,
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("{ok}s must pass validation: {e}"));
+        }
+        for bad in [0, 9, 601, 6000] {
+            assert!(
+                OAuthConfig {
+                    auth_code_ttl_secs: bad
+                }
+                .validate()
+                .is_err(),
+                "{bad}s must fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_code_ttl_realm_override() {
+        let oauth = OAuthConfig {
+            auth_code_ttl_secs: 600,
+        };
+        let mut realm = issuerd_core::Realm::default();
+        // Absent attribute -> server default.
+        assert_eq!(oauth.auth_code_ttl(&realm), std::time::Duration::from_secs(600));
+        // A valid override is honored (the FAPI 2.0 profile value).
+        realm
+            .attributes
+            .insert(OAuthConfig::REALM_AUTH_CODE_TTL_ATTRIBUTE.to_string(), "60".to_string());
+        assert_eq!(oauth.auth_code_ttl(&realm), std::time::Duration::from_secs(60));
+        // Malformed or out-of-range attributes fall back to the server value.
+        for bad in ["abc", "", "5", "601", "-10", "60.5"] {
+            realm
+                .attributes
+                .insert(OAuthConfig::REALM_AUTH_CODE_TTL_ATTRIBUTE.to_string(), bad.to_string());
+            assert_eq!(
+                oauth.auth_code_ttl(&realm),
+                std::time::Duration::from_secs(600),
+                "attribute {bad:?} must fall back to the server default"
+            );
+        }
+        // The fallback base is the configured server value, not a hardcoded one.
+        let strict = OAuthConfig {
+            auth_code_ttl_secs: 30,
+        };
+        realm.attributes.clear();
+        assert_eq!(strict.auth_code_ttl(&realm), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn secure_cookies_follows_issuer_scheme() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.secure_cookies(), "http issuer -> no Secure flag");
+        let https = ServerConfig {
+            issuer_url: "https://idp.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(https.secure_cookies(), "https issuer -> Secure flag");
+        let upper = ServerConfig {
+            issuer_url: "HTTPS://idp.example.com:8443".to_string(),
+            ..Default::default()
+        };
+        assert!(upper.secure_cookies(), "URL schemes are case-insensitive");
+        let garbage = ServerConfig {
+            issuer_url: "not a url".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !garbage.secure_cookies(),
+            "unparseable issuer -> no Secure flag (boot rejects such configs anyway)"
+        );
     }
 
     #[test]

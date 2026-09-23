@@ -43,6 +43,9 @@ ssl = false
 [cache]
 read_cache_ttl_secs = 60
 
+[oauth]
+auth_code_ttl_secs = 600
+
 [crypto]
 
 [themes]

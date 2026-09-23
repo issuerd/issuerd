@@ -21,6 +21,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[cors]](#cors)
 - [[cluster]](#cluster)
 - [[cache]](#cache)
+- [[oauth]](#oauth)
 - [[crypto.key_encryption]](#cryptokey_encryption)
 - [[themes]](#themes)
 - [[smtp]](#smtp)
@@ -58,6 +59,7 @@ Configuration is assembled from three layers, later layers winning:
    | `ISSUERD_CLUSTER__ENABLED=true` | `cluster.enabled` |
    | `ISSUERD_CLUSTER__JWKS_REFRESH_INTERVAL_SECS=15` | `cluster.jwks_refresh_interval_secs` |
    | `ISSUERD_CACHE__READ_CACHE_TTL_SECS=0` | `cache.read_cache_ttl_secs` |
+   | `ISSUERD_OAUTH__AUTH_CODE_TTL_SECS=60` | `oauth.auth_code_ttl_secs` |
    | `ISSUERD_SMTP__ENABLED=true` / `ISSUERD_SMTP__HOST=mail.example.com` | `smtp.enabled` / `smtp.host` |
    | `ISSUERD_PROXY__TRUST_X_FORWARDED_FOR=false` | `proxy.trust_x_forwarded_for` |
 
@@ -144,6 +146,12 @@ This is the most consequential value in the file:
   public `https` scheme even though the daemon itself serves plain HTTP.
 - In a cluster it must be the load balancer's URL and **identical on every
   node** (see [CLUSTERING.md](CLUSTERING.md)).
+- Its scheme drives the `Secure` attribute on every authentication cookie the
+  server sets (SSO session `issuerd_session_{realm-id}`, remember-me
+  `issuerd_remember_{realm-id}`, the `issuerd_flow_{id}` flow correlation
+  cookie, and the logout clears): `https` ⇒ all cookies carry `Secure`;
+  `http` ⇒ they do not, so plain-HTTP development rigs keep working. The flag
+  is derived from this config value, never from the request.
 - Changing it later effectively changes every realm's issuer: outstanding
   tokens, sessions, and stored client configurations that reference the old
   issuer stop validating, and users must re-authenticate. Treat it as
@@ -386,6 +394,37 @@ that bypasses both (e.g. a direct database edit) stays hidden for at most
 `read_cache_ttl_secs`: the consciously accepted bounded-staleness window, the
 same class as Keycloak's Infinispan propagation. Set `0` for pure-DB behavior
 (useful in tests, or when debugging unexpected staleness).
+
+## [oauth]
+
+OAuth/OIDC protocol tuning. The whole section is optional.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `auth_code_ttl_secs` | integer | `600` | Lifetime of an authorization code: how long the client has to redeem it at the token endpoint. Accepted range **10–600** seconds; an out-of-range value aborts the boot with a clear error (no silent clamping). |
+
+```toml
+[oauth]
+auth_code_ttl_secs = 600
+```
+
+The default of 600 s (10 minutes) is the common interoperable value (Keycloak
+uses the same) and matches every pre-existing deployment — codes minted before
+an upgrade are unaffected (they keep the TTL they were written with).
+
+**Per-realm override.** The realm attribute `auth_code_ttl_secs` (set via the
+realm representation's `attributes` map, the provision YAML `attributes`
+block, or the admin console's realm attributes) overrides the server value
+for one realm. It must parse as an integer within the same 10–600 bounds; an
+absent, malformed, or out-of-range attribute is ignored and the server-wide
+value applies.
+
+**FAPI 2.0 note.** A FAPI 2.0 high-assurance profile requires authorization
+codes to expire within **60 seconds** — set `auth_code_ttl_secs = 60` (globally
+or per realm) when assembling such a profile. This exposes only the TTL knob a
+profile needs; full FAPI 2.0 conformance (message signing beyond the
+already-implemented JARM, mTLS sender-constrained tokens) remains out of
+scope.
 
 ## [crypto.key_encryption]
 
@@ -634,6 +673,10 @@ ssl           = false
 # ---- Cache ------------------------------------------------------------------
 [cache]
 read_cache_ttl_secs = 60        # read-model cache TTL; 0 disables all read-model caches (pure-DB behavior)
+
+# ---- OAuth/OIDC protocol tuning ----------------------------------------------
+[oauth]
+auth_code_ttl_secs = 600        # authorization-code redemption window; 10-600, FAPI 2.0 profiles want <= 60
 
 # ---- Signing-key encryption at rest ------------------------------------------
 # Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).

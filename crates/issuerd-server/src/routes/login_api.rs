@@ -610,10 +610,18 @@ pub async fn logout_api_handler(
 
     clear_names.sort();
     clear_names.dedup();
+    // The clears carry the same `Secure` flag as the cookies they retire
+    // (https issuers only) — a `Secure` clear sent over plain HTTP would be
+    // dropped by the browser and the cookie would survive the logout.
+    let secure_attr = if state.config.secure_cookies() {
+        "; Secure"
+    } else {
+        ""
+    };
     let mut resp = StatusCode::NO_CONTENT.into_response();
     for name in clear_names {
         if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
-            "{name}=; Max-Age=0; Path=/; Secure; SameSite=Lax; HttpOnly"
+            "{name}=; Max-Age=0; Path=/{secure_attr}; SameSite=Lax; HttpOnly"
         )) {
             resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
         }
@@ -944,8 +952,13 @@ pub(crate) async fn complete_login_with_method(
         }
     };
 
+    let secure_attr = if state.config.secure_cookies() {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie_value = format!(
-        "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/",
+        "{}={}; HttpOnly{secure_attr}; SameSite=Lax; Path=/",
         super::oidc::session_cookie_name(&realm_id),
         sso_token.token
     );
@@ -965,7 +978,7 @@ pub(crate) async fn complete_login_with_method(
         match issuerd_token::action_tokens::issue_action_token(state.crypto.as_ref(), &claims).await
         {
             Ok(token) => Some(format!(
-                "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+                "{}={}; HttpOnly{secure_attr}; SameSite=Lax; Path=/; Max-Age={}",
                 super::oidc::remember_cookie_name(&realm_id),
                 token,
                 realm.remember_me_session_idle_secs.get()
@@ -1065,7 +1078,14 @@ pub(crate) async fn complete_login_with_method(
                 &session_id,
                 result_auth_time,
             );
-            if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await {
+            if let Err(e) = super::oidc::store_auth_code(
+                &state.cache,
+                &code,
+                &code_data,
+                state.config.oauth.auth_code_ttl(&realm),
+            )
+            .await
+            {
                 return auth_code_store_failure(
                     state,
                     &realm,
@@ -1139,7 +1159,14 @@ pub(crate) async fn complete_login_with_method(
                 &session_id,
                 result_auth_time,
             );
-            if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await {
+            if let Err(e) = super::oidc::store_auth_code(
+                &state.cache,
+                &code,
+                &code_data,
+                state.config.oauth.auth_code_ttl(&realm),
+            )
+            .await
+            {
                 return auth_code_store_failure(
                     state,
                     &realm,
@@ -1879,10 +1906,89 @@ pub(crate) mod tests {
             .unwrap()
             .to_string();
         assert!(set_cookie.starts_with("issuerd_session_master="), "cookie: {set_cookie}");
+        // Plain-HTTP issuer (this rig): no `Secure` flag, so the browser still
+        // stores the cookie; HTTPS issuers get it (https variant below).
+        assert!(!set_cookie.contains("Secure"), "cookie: {set_cookie}");
         let json = extract_json(response).await;
         assert!(json["code"].as_str().unwrap().len() > 5);
         assert!(json["id_token"].is_null());
         assert_eq!(json["redirect_uri"], "http://localhost:8080/cb");
+    }
+
+    #[tokio::test]
+    async fn login_success_session_cookie_secure_under_https_issuer() {
+        let config = ServerConfig {
+            issuer_url: "https://issuerd.test.internal".to_string(),
+            ..Default::default()
+        };
+        let state = Arc::new(ServerState::from_config(&config).await.unwrap());
+        let execution_id = FlowStageId::new("username-password").unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: execution_id.clone(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        };
+        let cache_key = crate::routes::oidc::pending_auth_cache_key(
+            &issuerd_core::RealmId::new("master").unwrap(),
+            &execution_id.0,
+        );
+        let cache_value = serde_json::to_vec(&pending).unwrap();
+        state
+            .cache
+            .set(&cache_key, cache_value, Some(std::time::Duration::from_secs(600)))
+            .await
+            .unwrap();
+
+        let response = login_handler(
+            State(state.clone()),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            Query(std::collections::HashMap::new()),
+            headers_with_flow_cookie(&execution_id.0),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&LoginRequest {
+                    execution_id,
+                    username: "admin".to_string(),
+                    password: "admin".to_string(),
+                    otp: None,
+                    remember_me: None,
+                    webauthn_assertion: None,
+                    resend: None,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("issuerd_session_master="), "cookie: {set_cookie}");
+        assert!(set_cookie.contains("; Secure"), "cookie: {set_cookie}");
     }
 
     #[tokio::test]

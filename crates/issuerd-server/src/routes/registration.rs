@@ -313,7 +313,9 @@ pub async fn register_page(
         realm.registration_require_names(),
         realm.registration_passwordless(),
     );
-    if let Ok(v) = HeaderValue::from_str(&flow_cookie_header(&flow_id)) {
+    if let Ok(v) =
+        HeaderValue::from_str(&flow_cookie_header(&flow_id, state.config.secure_cookies()))
+    {
         resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
     }
     resp

@@ -201,9 +201,21 @@ pub(crate) fn flow_cookie_name(flow_id: &str) -> String {
 }
 
 /// `Set-Cookie` value for the flow correlation cookie (matches the pending
-/// entry's 10-minute TTL).
-pub(crate) fn flow_cookie_header(flow_id: &str) -> String {
-    format!("{}=1; Path=/; HttpOnly; SameSite=Lax; Max-Age=600", flow_cookie_name(flow_id))
+/// entry's 10-minute TTL). `secure` appends the `Secure` attribute — pass
+/// [`crate::config::ServerConfig::secure_cookies`] so TLS deployments get it
+/// while plain-HTTP development rigs keep working.
+///
+/// Deliberately NOT renamed to a `__Host-` prefix: that would harden against
+/// cookie injection from sibling domains, but renaming any cookie breaks
+/// in-flight login flows on upgrade unless a compat read path accepts both
+/// names — deferred as follow-up work (same conclusion for the SSO and
+/// remember-me cookies).
+pub(crate) fn flow_cookie_header(flow_id: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=1; Path=/; HttpOnly; SameSite=Lax; Max-Age=600{secure_attr}",
+        flow_cookie_name(flow_id)
+    )
 }
 
 /// Check whether the request carries the correlation cookie for `flow_id`.
@@ -328,7 +340,7 @@ pub struct AuthCodeData {
     pub claims: Option<serde_json::Value>,
     /// RAR authorization details attached to the grant.
     /// `#[serde(default)]` keeps codes minted before a rolling upgrade
-    /// (600 s TTL window) deserializable.
+    /// (auth-code TTL window) deserializable.
     #[serde(default)]
     pub authorization_details: Option<Vec<serde_json::Value>>,
 }
@@ -359,7 +371,11 @@ impl AuthCodeData {
     }
 }
 
-/// Persist an authorization code for the token endpoint (`auth_code:{code}`, 10 min TTL).
+/// Persist an authorization code for the token endpoint (`auth_code:{code}`).
+///
+/// `ttl` is the code's redemption window — callers pass
+/// [`crate::config::OAuthConfig::auth_code_ttl`] (`[oauth]
+/// auth_code_ttl_secs`, optionally overridden per realm).
 ///
 /// Fail-closed: the cache write must be confirmed before the code leaves the
 /// server — a code that was never persisted can never be exchanged, so the
@@ -368,12 +384,11 @@ pub(crate) async fn store_auth_code(
     cache: &Arc<dyn issuerd_core::DistributedCache>,
     code: &str,
     data: &AuthCodeData,
+    ttl: std::time::Duration,
 ) -> Result<(), IssuerdError> {
     // Serialization cannot fail: every field is a plain String/Option/Vec.
     let value = serde_json::to_vec(data).unwrap();
-    cache
-        .set(&format!("auth_code:{code}"), value, Some(std::time::Duration::from_secs(600)))
-        .await
+    cache.set(&format!("auth_code:{code}"), value, Some(ttl)).await
 }
 
 /// Fail-closed surface for a failed [`store_auth_code`] write on the
@@ -1350,7 +1365,10 @@ async fn handle_auth_request(
                 _ => build_redirect_url("/login.html", &redirect_params, false),
             };
             let mut resp = Redirect::to(&location).into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(&flow_id)) {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(
+                &flow_id,
+                state.config.secure_cookies(),
+            )) {
                 resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
             }
             resp
@@ -1416,7 +1434,10 @@ async fn handle_auth_request(
                 build_redirect_url("/login.html", &redirect_params, false)
             };
             let mut resp = Redirect::to(&location).into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(&flow_id)) {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(
+                &flow_id,
+                state.config.secure_cookies(),
+            )) {
                 resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
             }
             resp
@@ -1599,7 +1620,14 @@ pub(crate) async fn finish_sso_login(
         "code id_token" => {
             let code = issuerd_core::utils::generate_id();
             let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(&state.cache, &code, &code_data).await {
+            if let Err(e) = store_auth_code(
+                &state.cache,
+                &code,
+                &code_data,
+                state.config.oauth.auth_code_ttl(realm),
+            )
+            .await
+            {
                 return auth_code_store_failure(
                     state, realm, client, &user_id, session_id, &ip, pending, &e,
                 )
@@ -1650,7 +1678,14 @@ pub(crate) async fn finish_sso_login(
         _ => {
             let code = issuerd_core::utils::generate_id();
             let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(&state.cache, &code, &code_data).await {
+            if let Err(e) = store_auth_code(
+                &state.cache,
+                &code,
+                &code_data,
+                state.config.oauth.auth_code_ttl(realm),
+            )
+            .await
+            {
                 return auth_code_store_failure(
                     state, realm, client, &user_id, session_id, &ip, pending, &e,
                 )
@@ -6612,6 +6647,73 @@ mod tests {
         assert!(entry.is_some(), "pending entry must exist for the flow");
     }
 
+    #[test]
+    fn flow_cookie_header_secure_flag() {
+        let secure = flow_cookie_header("flow-1", true);
+        assert!(secure.contains("issuerd_flow_flow-1=1"), "cookie: {secure}");
+        assert!(secure.contains("HttpOnly"), "cookie: {secure}");
+        assert!(secure.contains("SameSite=Lax"), "cookie: {secure}");
+        assert!(secure.contains("; Secure"), "cookie: {secure}");
+
+        let plain = flow_cookie_header("flow-1", false);
+        assert!(plain.contains("issuerd_flow_flow-1=1"), "cookie: {plain}");
+        assert!(!plain.contains("Secure"), "http rigs must not get the flag: {plain}");
+    }
+
+    /// Run the authorize endpoint against `state` and return the flow
+    /// correlation `Set-Cookie` header value. `redirect_uri` must be one the
+    /// bootstrapped `admin-cli` client registered — the master-realm
+    /// bootstrap derives it from the configured `issuer_url`.
+    async fn authorize_flow_set_cookie(state: Arc<ServerState>, redirect_uri: &str) -> String {
+        let mut params = std::collections::HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "admin-cli".to_string());
+        params.insert("redirect_uri".to_string(), redirect_uri.to_string());
+        params.insert("scope".to_string(), "openid".to_string());
+        params.insert("code_challenge".to_string(), "challenge".to_string());
+        let response = auth_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok().map(str::to_string))
+            .expect("authorize redirect sets the flow correlation cookie")
+    }
+
+    #[tokio::test]
+    async fn auth_flow_cookie_secure_flag_follows_issuer_scheme() {
+        // HTTPS issuer: the flow correlation cookie carries `Secure`.
+        let config = ServerConfig {
+            issuer_url: "https://issuerd.test.internal".to_string(),
+            ..Default::default()
+        };
+        let state = Arc::new(ServerState::from_config(&config).await.unwrap());
+        let set_cookie = authorize_flow_set_cookie(
+            state,
+            "https://issuerd.test.internal/admin/console/callback",
+        )
+        .await;
+        assert!(set_cookie.contains("issuerd_flow_"), "set-cookie: {set_cookie}");
+        assert!(set_cookie.contains("; Secure"), "set-cookie: {set_cookie}");
+
+        // Plain-HTTP issuer (development rigs): no `Secure`, so the browser
+        // still stores the cookie.
+        let state = setup_state().await;
+        let set_cookie =
+            authorize_flow_set_cookie(state, "http://localhost:8080/admin/console/callback").await;
+        assert!(set_cookie.contains("issuerd_flow_"), "set-cookie: {set_cookie}");
+        assert!(!set_cookie.contains("Secure"), "set-cookie: {set_cookie}");
+    }
+
     #[tokio::test]
     async fn auth_handler_post_succeeds() {
         let state = setup_state().await;
@@ -9240,13 +9342,14 @@ mod tests {
         let failing: Arc<dyn issuerd_core::DistributedCache> = Arc::new(FailAuthCodeSet {
             inner: issuerd_cluster::InMemoryCache::new(),
         });
-        let result = store_auth_code(&failing, "code-1", &data).await;
+        let ttl = std::time::Duration::from_secs(crate::config::AUTH_CODE_TTL_DEFAULT_SECS);
+        let result = store_auth_code(&failing, "code-1", &data, ttl).await;
         assert!(result.is_err(), "cache failure must propagate");
 
         // A confirmed write returns Ok and the entry is readable back.
         let cache = Arc::new(issuerd_cluster::InMemoryCache::new());
         let as_dyn: Arc<dyn issuerd_core::DistributedCache> = cache.clone();
-        store_auth_code(&as_dyn, "code-2", &data).await.unwrap();
+        store_auth_code(&as_dyn, "code-2", &data, ttl).await.unwrap();
         let stored = issuerd_core::DistributedCache::get(cache.as_ref(), "auth_code:code-2")
             .await
             .unwrap();
