@@ -1,9 +1,9 @@
 name: Verification
 
 # Extended verification toolchain beyond ci.yml: unsafe-code census (geiger),
-# model checking (Kani), refinement types (Flux), abstract interpretation
-# (MIRAI). Local equivalents: scripts/kani.sh, scripts/flux.sh,
-# scripts/mirai.sh and `scripts/test.sh geiger`.
+# model checking (Kani), refinement types (Flux). Local equivalents:
+# scripts/kani.sh, scripts/flux.sh and `scripts/test.sh geiger`.
+# MIRAI (abstract interpretation) is disabled — see the note at the bottom.
 
 on:
   push:
@@ -61,27 +61,12 @@ jobs:
       # to bare `cargo flux` after a flux bump that resolves #1666.
       - run: cargo flux check -p issuerd-core --only-check="def:models::SecondsNonZero"
 
-  mirai:
-    name: cargo mirai (abstract interpretation)
-    runs-on: ubuntu-latest
-    # Currently hard-blocked upstream: MIRAI pins nightly-2025-01-10 (~rustc
-    # 1.86, baked into the cargo-mirai binary at build time) while this
-    # workspace requires rustc >= 1.95, so cargo refuses the build at resolve
-    # time. --ignore-rust-version would lift the gate but the 1.86 toolchain
-    # still cannot compile 2026-era code/deps (and cargo-mirai ignores -p,
-    # analyzing the root package). Revisit once MIRAI bumps its pinned
-    # toolchain to >= 1.95. Stays continue-on-error meanwhile.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: System dependencies (cmake, clang)
-        run: sudo apt-get update && sudo apt-get install -y cmake clang
-      - name: Install MIRAI checker
-        run: |
-          git clone --depth 1 https://github.com/endorlabs/MIRAI.git /tmp/mirai-src
-          cd /tmp/mirai-src
-          cargo install --locked --path ./checker
-      - run: cargo mirai -p issuerd-protocol -p issuerd-core
-        env:
-          MIRAI_FLAGS: --diag=default
+  # MIRAI (abstract interpretation) — job disabled: hard-blocked upstream.
+  # MIRAI pins nightly-2025-01-10 (~rustc 1.86, baked into the cargo-mirai
+  # binary at build time) while this workspace requires rustc >= 1.95, so
+  # cargo refuses the build at resolve time ("rustc 1.86.0-nightly is not
+  # supported"). --ignore-rust-version lifts the gate but the 1.86 toolchain
+  # still cannot compile 2026-era code/deps (and cargo-mirai ignores -p,
+  # analyzing the root package). Re-add the job once MIRAI bumps its pinned
+  # toolchain to >= 1.95 (the old job definition is in git history; see the
+  # MIRAI bullet in AGENTS.md "Verification Tooling").
