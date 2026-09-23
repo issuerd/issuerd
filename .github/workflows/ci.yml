@@ -5,10 +5,28 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref (rapid pushes, PR updates).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   check:
     name: cargo check
     runs-on: ubuntu-latest
@@ -17,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo check --locked --all-targets --all-features
 
   clippy:
@@ -30,7 +48,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
@@ -41,14 +59,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
-      - run: cargo test --workspace
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      # Docker-dependent suites (federation, cluster E2E, Keycloak dual-target)
+      # skip gracefully here and run for real in nightly.yml.
+      - run: cargo test --locked --workspace
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - run: cargo doc --locked --workspace --no-deps
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # cargo audit is a cargo subcommand — needs cargo on PATH, which bare
+      # (self-hosted / container) runners do not provide out of the box.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
@@ -57,5 +91,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
+
+  webclient:
+    name: web client (test + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webclientsrc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # generated/ is gitignored — regenerate the SDK from the committed
+      # openapi.json before type-checking/building (mirrors the Dockerfile).
+      - run: npm ci
+      - run: npm run generate-api
+      - run: npm run test
+      - run: npm run build
+
+  openapi-sync:
+    name: openapi.json in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - name: Regenerate the spec from the backend
+        run: cargo run --locked --bin issuerd -- openapi -o /tmp/openapi.json
+      - name: Diff against the committed spec
+        run: |
+          if ! diff -u webclientsrc/openapi.json /tmp/openapi.json; then
+            echo "::error::webclientsrc/openapi.json is stale. Regenerate with: cargo run --bin issuerd -- openapi -o webclientsrc/openapi.json"
+            exit 1
+          fi

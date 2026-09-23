@@ -5671,6 +5671,7 @@ pub(crate) fn raw_json_response(bytes: Vec<u8>) -> Response {
 ///
 /// Failure must not be swallowed (P3-4): an untracked session would keep
 /// issuing tokens while being invisible to logout and admin session views.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn persist_session(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
@@ -5701,6 +5702,7 @@ pub(crate) async fn persist_session(
 /// authentication: per RFC 6749 §5.2 those responses carry a
 /// `WWW-Authenticate` challenge. The status stays 401 either way (Keycloak
 /// parity; the conformance suite pins it).
+#[allow(clippy::result_large_err)]
 pub(crate) async fn authenticate_form_client(
     state: &Arc<ServerState>,
     realm: &Realm,

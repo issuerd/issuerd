@@ -1601,6 +1601,7 @@ fn policy_error_response(err: PasswordPolicyError) -> Response {
 }
 
 /// Load the authenticated user, mapping storage failures to error responses.
+#[allow(clippy::result_large_err)]
 async fn load_user(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
@@ -1617,6 +1618,7 @@ async fn load_user(
 }
 
 /// Load the realm the guard is bound to (login flags, password policy).
+#[allow(clippy::result_large_err)]
 async fn load_realm(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
@@ -1634,6 +1636,7 @@ async fn load_realm(
 
 /// Resolve the user's realm-role names and build the `me` response object.
 /// Shared by GET and PUT so both return the identical shape.
+#[allow(clippy::result_large_err)]
 async fn build_me_response(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
@@ -1663,6 +1666,7 @@ async fn build_me_response(
 
 /// `true` when the user has at least one credential of the given type.
 /// Password-history credentials use a custom type and are never counted here.
+#[allow(clippy::result_large_err)]
 async fn has_credential(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
@@ -1689,6 +1693,7 @@ fn parse_optional_name(value: Option<String>) -> Result<Option<DisplayName>, Str
 /// Apply an email change to `user`, enforcing uniqueness and verification
 /// rules. Returns `true` when a verification email must be sent after the
 /// update has been persisted.
+#[allow(clippy::result_large_err)]
 async fn apply_email_change(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
@@ -1754,6 +1759,7 @@ fn token_is_expired(token: &str) -> bool {
         .is_some_and(|exp| exp < chrono::Utc::now().timestamp())
 }
 
+#[allow(clippy::result_large_err)]
 async fn extract_auth(
     state: &Arc<ServerState>,
     realm: &Option<String>,

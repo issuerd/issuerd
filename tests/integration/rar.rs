@@ -575,7 +575,7 @@ async fn rar_jar_roundtrip() {
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &serde_json::json!({
             "iss": client.client_id.as_ref(),
-            "aud": format!("http://localhost:8080/realms/rar-jar"),
+            "aud": "http://localhost:8080/realms/rar-jar".to_string(),
             "exp": chrono::Utc::now().timestamp() + 300,
             "response_type": "code",
             "client_id": client.client_id.as_ref(),

@@ -134,6 +134,7 @@ fn callback_url(state: &ServerState, realm_segment: &str, alias: &str) -> String
 
 /// Resolve the realm + IdP config for a broker request, with all the
 /// precondition failures rendered as sign-in error pages.
+#[allow(clippy::result_large_err)]
 async fn load_broker_target(
     state: &Arc<ServerState>,
     realm_segment: &Option<String>,
@@ -914,6 +915,7 @@ async fn create_brokered_user(
 /// user so a retry does not hit username-uniqueness ghosts. The
 /// `external_refresh_token` argument must already have the `storeTokens`
 /// config applied by the caller (None = not stored).
+#[allow(clippy::result_large_err)]
 async fn create_link_for_new_user(
     state: &Arc<ServerState>,
     realm: &Realm,

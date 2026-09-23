@@ -186,6 +186,7 @@ async fn store_entry(
 
 /// Load the paused consent entry, the realm, and the client — shared by the
 /// GET page and the POST submit handler.
+#[allow(clippy::result_large_err)]
 async fn load_consent_context(
     state: &Arc<ServerState>,
     realm_name: &str,
@@ -444,6 +445,7 @@ async fn resume_after_consent(
     .await
 }
 
+#[allow(clippy::result_large_err)]
 async fn load_user_and_client(
     state: &Arc<ServerState>,
     realm_id: &RealmId,

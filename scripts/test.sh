@@ -24,7 +24,7 @@ case "$MODE" in
     ;;
   fmt)
     echo "Checking formatting..."
-    cargo fmt --check --workspace
+    cargo fmt --all -- --check
     ;;
   clippy)
     echo "Running clippy..."

@@ -163,10 +163,26 @@ This makes the Problems tab match `cargo clippy --workspace --all-targets --all-
 
 ### Verification Tooling (static analysis & model checking)
 
-Beyond fmt/clippy/test, the repo wires in four extra analysis tools. The five
-core gate commands (`check --locked --all-targets --all-features`, clippy,
-test, audit, deny) run in `.github/workflows/ci.yml`; the extended tools run in
-`.github/workflows/verification.yml` (flux/mirai are `continue-on-error` for now).
+Beyond fmt/clippy/test, the repo wires in four extra analysis tools. The GitHub
+Actions layout:
+
+- `.github/workflows/ci.yml` (push to `main` + PRs) — the per-commit gates:
+  `cargo fmt --all -- --check`, `check --locked --all-targets --all-features`,
+  `clippy --locked --all-targets --all-features -- -D warnings`,
+  `test --locked --workspace`, `doc --locked --workspace --no-deps`, `audit`,
+  `deny check`, the web client (`npm ci` → `generate-api` → `npm run test` →
+  `npm run build`), and an `openapi-sync` job that regenerates the spec and
+  diffs it against the committed `webclientsrc/openapi.json`. Docker-dependent
+  test suites skip gracefully here.
+- `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
+  `CHANGELOG.md` or carries the `no-changelog` label (see "Picking Up Work").
+- `.github/workflows/heavy.yml` (manual `workflow_dispatch`; the nightly
+  schedule is currently disabled) — the heavy Docker suites: federation vs
+  Samba AD DC + OpenLDAP, the two-node cluster E2E, the Keycloak dual-target
+  parity run (`ISSUERD_TEST_TARGET=both`), and the release binary build
+  (embeds the web client; release panics without `webclientsrc/dist`).
+- `.github/workflows/verification.yml` (push to `main` + PRs) — the extended
+  tools below (flux/mirai are `continue-on-error` for now).
 
 | Tool | Purpose | Command | Notes |
 |------|---------|---------|-------|
@@ -759,6 +775,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 2. Create a feature branch: `git checkout -b feat/<feature-name>`.
 3. Implement with tests first (TDD is encouraged).
 4. Ensure `cargo test --workspace` and `cargo clippy --workspace --all-features -- -D warnings` pass.
+5. Add a `CHANGELOG.md` entry under `## [Unreleased]` (Keep a Changelog format — see the header of that file). The `changelog.yml` PR gate fails otherwise; label the PR `no-changelog` for changes with no user-visible impact (CI, docs, pure refactorings).
 
 ### Key Files for Agents
 

@@ -253,6 +253,7 @@ fn par_endpoint_error(error: &IssuerdError) -> Response {
 /// other pre-validation authorization-endpoint errors (error page for
 /// browsers, JSON otherwise) — no client redirect is possible at this point
 /// because no redirect_uri has been validated yet.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_par_params(
     state: &Arc<ServerState>,
     realm: &Realm,

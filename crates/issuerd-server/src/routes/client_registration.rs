@@ -95,6 +95,7 @@ fn invalid_token_response(description: &str) -> Response {
 /// Resolve the realm from the path segment and enforce the registration toggle.
 /// Everything else (unknown realm, disabled toggle) is a uniform 404 — a
 /// disabled realm must not reveal whether the realm exists.
+#[allow(clippy::result_large_err)]
 async fn resolve_enabled_realm(
     state: &Arc<ServerState>,
     realm_segment: Option<&str>,
@@ -274,6 +275,7 @@ async fn register_client(
 }
 
 /// Mint and store a fresh registration access token for `client`.
+#[allow(clippy::result_large_err)]
 async fn mint_registration_access_token(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
@@ -348,6 +350,7 @@ fn build_registration_response(
 /// public `client_id` path segment and verify the bearer registration access
 /// token against the stored hash in constant time. Unknown clients, bad
 /// tokens, and disabled clients are a uniform 401.
+#[allow(clippy::result_large_err)]
 async fn authenticate_registration_access(
     state: &Arc<ServerState>,
     realm: &Realm,

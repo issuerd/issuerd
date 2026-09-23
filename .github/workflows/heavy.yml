@@ -1,0 +1,110 @@
+name: Heavy suites
+
+# Heavy Docker-based suites that are too slow for per-commit CI (and skip
+# gracefully there): federation against real Samba AD DC + OpenLDAP, the
+# two-node cluster E2E, the Keycloak dual-target parity run, and the release
+# binary build (which embeds the web client). Manual trigger only (Actions →
+# "Heavy suites" → Run workflow); the nightly schedule is disabled for now —
+# re-add a `schedule: cron` trigger when recurring coverage is wanted.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  federation:
+    name: federation (Samba AD DC + OpenLDAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      # --wait blocks until the samba-dc/openldap healthchecks (real LDAP
+      # binds, see docker-compose.integration.yml) report healthy.
+      - name: Start the federation stack
+        run: >
+          docker compose -f docker-compose.integration.yml
+          up -d --wait --wait-timeout 300 postgres samba-dc openldap
+      - name: Seed OpenLDAP fixtures
+        run: ./scripts/seed-openldap.sh
+      - name: Samba AD DC tests
+        run: cargo test --locked --test integration federation_samba
+      - name: OpenLDAP tests
+        run: cargo test --locked --test integration federation_ldap -- --ignored
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v
+
+  cluster-e2e:
+    name: cluster E2E (two nodes behind nginx)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - name: Build and start the two-node cluster
+        run: docker compose -f docker-compose.cluster.yml up -d --build
+      - name: Wait for the load balancer
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8088/ready >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose -f docker-compose.cluster.yml logs
+          echo "cluster did not become ready in 5 minutes"
+          exit 1
+      - name: Cluster E2E tests
+        run: ISSUERD_CLUSTER_E2E=1 cargo test --locked --test integration cluster_e2e
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.cluster.yml down -v
+
+  keycloak-parity:
+    name: dual-target parity vs Keycloak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - name: Start reference Keycloak
+        run: docker compose -f docker-compose.integration.yml up -d --wait --wait-timeout 300 keycloak
+      - name: Run integration tests against Issuerd AND Keycloak
+        run: ISSUERD_TEST_TARGET=both cargo test --locked --test integration
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v
+
+  release-build:
+    name: release binary (embedded web UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build panics without webclientsrc/dist
+      # (crates/issuerd-server/build.rs) — build the SPA first.
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - run: cargo build --locked --bin issuerd --release
+      - name: Smoke-run the binary
+        run: ./target/release/issuerd --version
