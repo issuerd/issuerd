@@ -1,0 +1,83 @@
+# Issuerd local demo stack.
+#
+# One command gives you a complete single-node Issuerd instance with the web
+# consoles, backed by PostgreSQL (persistent state) and Redis (transient state):
+#
+#   docker compose up --build
+#
+# Then open:
+#   - Admin console:   http://localhost:8080/admin/console   (admin / admin)
+#   - Account console: http://localhost:8080/realms/myrealm/account   (alice / changeme)
+#   - Discovery:       http://localhost:8080/realms/myrealm/.well-known/openid-configuration
+#
+# The first build compiles the release binary and the embedded web client —
+# expect it to take a while; subsequent starts reuse the image.
+#
+# Stop with Ctrl+C or `docker compose down`; wipe all demo data with
+# `docker compose down -v`.
+#
+# Other stacks in this repository:
+#   - docker-compose.integration.yml — contributor test infrastructure
+#     (reference Keycloak, Bind9, Samba AD DC, OpenLDAP, extra PostgreSQL)
+#   - docker-compose.cluster.yml     — two-node cluster behind an nginx LB
+
+name: issuerd-demo
+
+services:
+  issuerd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: issuerd:local
+    container_name: issuerd-demo-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./examples/issuerd.demo.toml:/etc/issuerd/issuerd.toml:ro
+      - ./examples/provision.demo.yaml:/etc/issuerd/provision.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "issuerd", "healthcheck", "--url", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: issuerd-demo-postgres
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # No host port published on purpose: the demo is self-contained and must
+    # not collide with the integration stack's PostgreSQL on 5432/5433.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: issuerd-demo-redis
+    # Purely transient state — no persistence needed.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+    driver: local

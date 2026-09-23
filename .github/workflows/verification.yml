@@ -1,0 +1,77 @@
+name: Verification
+
+# Extended verification toolchain beyond ci.yml: unsafe-code census (geiger),
+# model checking (Kani), refinement types (Flux), abstract interpretation
+# (MIRAI). Local equivalents: scripts/kani.sh, scripts/flux.sh,
+# scripts/mirai.sh and `scripts/test.sh geiger`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  geiger:
+    name: cargo geiger (unsafe census)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+      # Informational report: geiger has no pass/fail threshold and exits 1 on
+      # warnings (e.g. unscanned embedded assets), so never fail the job.
+      - run: cargo geiger --all-features --output-format GitHubMarkdown >> "$GITHUB_STEP_SUMMARY" || true
+      - run: cargo geiger --all-features || true
+
+  kani:
+    name: cargo kani (model checking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - run: cargo kani -p issuerd-protocol
+
+  flux:
+    name: cargo flux (refinement types)
+    runs-on: ubuntu-latest
+    # Informational: flux builds its compiler fork from its main branch, so an
+    # upstream change can break this job independently of our code.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Flux (z3 + liquid-fixpoint + cargo-flux)
+        run: curl -fsSL https://raw.githubusercontent.com/flux-rs/flux/main/install.sh | bash
+      - run: cargo flux
+
+  mirai:
+    name: cargo mirai (abstract interpretation)
+    runs-on: ubuntu-latest
+    # Preparation stage: MIRAI's findings on a real codebase need triage before
+    # this job can gate merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies (cmake, clang)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang
+      - name: Install MIRAI checker
+        run: |
+          git clone --depth 1 https://github.com/endorlabs/MIRAI.git /tmp/mirai-src
+          cd /tmp/mirai-src
+          cargo install --locked --path ./checker
+      - run: cargo mirai -p issuerd-protocol -p issuerd-core
+        env:
+          MIRAI_FLAGS: --diag=default

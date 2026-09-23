@@ -1,0 +1,33 @@
+# Issuerd configuration for the root local demo stack (docker-compose.yml).
+# Single node: PostgreSQL for persistence, Redis for transient state, plain
+# HTTP on :8080. Put a TLS-terminating proxy in front for anything beyond
+# local evaluation.
+
+bind = "0.0.0.0"
+port = 8080
+
+# Public base URL as reached by browsers; baked into the `iss` claim and the
+# discovery document, so it must match how clients access the container.
+issuer_url = "http://localhost:8080"
+
+# Transient coordination state (auth codes, pending flows, single-use tokens,
+# login-failure counters).
+redis = "redis://redis:6379"
+
+# Demo realm content (master with admin/admin, myrealm with alice/changeme,
+# the console clients and the sample clients my-app / public-app), applied
+# exactly once at first startup against an empty database. Remove this line to
+# start completely empty (note: the master realm is only auto-bootstrapped for
+# the in-memory/json backends, so without provisioning you must create it via
+# the API or `issuerd provision`).
+provision = "/etc/issuerd/provision.yaml"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@postgres:5432/issuerd"
+
+[logging]
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true

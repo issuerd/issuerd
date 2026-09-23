@@ -1,0 +1,16 @@
+[
+  {
+    "test-name": "oidcc-unsigned-request-object-supported-correctly-or-rejected-as-unsupported",
+    "configuration-filename": "*",
+    "variant": "*",
+    "condition": "*",
+    "current-block": "*"
+  },
+  {
+    "test-name": "oidcc-ensure-request-object-with-redirect-uri",
+    "configuration-filename": "*",
+    "variant": "*",
+    "condition": "*",
+    "current-block": "*"
+  }
+]

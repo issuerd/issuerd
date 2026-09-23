@@ -1,0 +1,121 @@
+marker: default
+realms:
+- name: myrealm
+  display_name: My Realm
+  enabled: true
+  ssl_required: external
+  login_theme: null
+  email_theme: null
+  admin_theme: null
+  default_role: user
+  access_token_lifespan: 300
+  refresh_token_lifespan: 1800
+  sso_session_idle_timeout: 1800
+  sso_session_max_lifespan: 36000
+  offline_session_idle_timeout: 2592000
+  registration_enabled: true
+  verify_email_enabled: true
+  reset_password_allowed: true
+  remember_me_enabled: true
+  login_with_email_allowed: true
+  browser_flow: browser
+  registration_flow: registration
+  attributes:
+    custom_attr: value
+roles:
+- realm: myrealm
+  name: admin
+  description: Administrator role
+- realm: myrealm
+  name: user
+  description: Standard user role
+groups:
+- realm: myrealm
+  name: developers
+  path: /developers
+  attributes: {}
+- realm: myrealm
+  name: ops
+  path: null
+  attributes: {}
+clients:
+- realm: myrealm
+  client_id: my-app
+  name: My Application
+  description: Main web application
+  enabled: true
+  public_client: false
+  bearer_only: false
+  secret: null
+  redirect_uris:
+  - http://localhost:3000/callback
+  - http://localhost:3000/login
+  web_origins:
+  - http://localhost:3000
+  default_scopes:
+  - openid
+  - profile
+  optional_scopes:
+  - email
+  consent_required: false
+  full_scope_allowed: true
+- realm: myrealm
+  client_id: public-app
+  name: Public SPA
+  description: Single-page application
+  enabled: true
+  public_client: true
+  bearer_only: false
+  secret: null
+  redirect_uris:
+  - http://localhost:4000/callback
+  web_origins:
+  - http://localhost:4000
+  default_scopes:
+  - openid
+  optional_scopes: []
+  consent_required: false
+  full_scope_allowed: true
+users:
+- realm: myrealm
+  username: alice
+  email: alice@example.com
+  email_verified: true
+  first_name: Alice
+  last_name: Anderson
+  enabled: true
+  password: changeme
+  realm_roles:
+  - admin
+  - user
+  groups:
+  - developers
+  attributes:
+    department:
+    - engineering
+identity_providers:
+- realm: myrealm
+  alias: corporate-ldap
+  provider_id: ldap
+  enabled: true
+  config:
+    url: ldap://localhost:389
+    bind_dn: cn=admin,dc=example,dc=com
+    users_dn: ou=users,dc=example,dc=com
+flow_configs:
+- realm: myrealm
+  alias: browser
+  provider_id: basic-flow
+  top_level: true
+  built_in: false
+  stages:
+  - id: cookie
+    requirement: alternative
+    authenticator: auth-cookie
+    priority: 10
+    sub_flow_alias: null
+  - id: username-password
+    requirement: required
+    authenticator: auth-username-password
+    priority: 20
+    sub_flow_alias: null

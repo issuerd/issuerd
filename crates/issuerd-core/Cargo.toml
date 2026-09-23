@@ -1,0 +1,35 @@
+[package]
+name = "issuerd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Enable Flux refinement-type checking for this crate (`cargo flux`,
+# scripts/flux.sh). Flux only checks crates that opt in here.
+[package.metadata.flux]
+enabled = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }
+mockall = { workspace = true }
+utoipa = { version = "5.5" }
+# Flux refinement annotations (e.g. on `SecondsNonZero` in models.rs). The
+# proc-macro shim expands to nothing in normal builds; only `cargo flux`
+# interprets it. Not published on crates.io — pinned by Cargo.lock.
+flux-rs = { git = "https://github.com/flux-rs/flux.git" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rstest = { workspace = true }
+serde_yaml = { workspace = true }
+toml = "0.8"

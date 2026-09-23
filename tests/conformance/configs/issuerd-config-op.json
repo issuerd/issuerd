@@ -1,0 +1,7 @@
+{
+  "alias": "issuerd",
+  "description": "Issuerd Config OP test",
+  "server": {
+    "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
+  }
+}

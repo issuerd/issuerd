@@ -1,0 +1,13 @@
+# Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
+# deny.toml (cargo deny and cargo audit read separate config files).
+
+[advisories]
+ignore = [
+    # rsa crate has a timing side-channel in RSA decryption / signature verification
+    # (Marvin Attack). We only use rsa::RsaPrivateKey::new for key generation;
+    # signing and verification are done via ring.
+    "RUSTSEC-2023-0071",
+    # rustls-pemfile is unmaintained but still a transitive dependency of redis
+    # and rustls-native-certs. Direct usage migrated to rustls-pki-types.
+    "RUSTSEC-2025-0134",
+]

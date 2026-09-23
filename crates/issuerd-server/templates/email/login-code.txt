@@ -1,0 +1,16 @@
+{{realm_label}}
+{{heading}}
+{{heading_underline}}
+
+{{greeting}}
+
+{{intro}}
+
+{{code}}
+
+{{expiry_note}}
+
+{{ignore_note}}
+
+--
+{{footer}}

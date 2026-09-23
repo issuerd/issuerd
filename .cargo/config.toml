@@ -1,0 +1,7 @@
+# Windows: point the vendored OpenSSL build (webauthn-rs-core -> openssl-src)
+# at the portable Strawberry Perl in tools/, so plain `cargo build/test` works
+# in a Visual Studio Developer Prompt without editing PATH. Harmless elsewhere:
+# openssl-src only compiles in the Windows-targeted vendored build, and a
+# pre-existing OPENSSL_SRC_PERL in the environment takes precedence.
+[env]
+OPENSSL_SRC_PERL = { value = "tools/strawberry-perl/perl/bin/perl.exe", relative = true }

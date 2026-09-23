@@ -1,0 +1,2 @@
+# Samba DC exported keytab — generated at runtime, do not commit.
+*.keytab

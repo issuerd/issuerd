@@ -1,0 +1,11 @@
+target/
+results/
+*.log
+conformance-suite-image/
+conformance-suite/.git
+conformance-suite/target
+conformance-suite/frontend/node_modules
+# PKI secrets stay on the host; the suite image imports the CA at container
+# start (see scripts/suite-entrypoint.sh), so no PKI material is needed in
+# any build context.
+pki/*

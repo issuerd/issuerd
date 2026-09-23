@@ -1,0 +1,81 @@
+# Issuerd dependency audit configuration
+# Run: cargo deny check
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# --- Advisory checks ---
+[advisories]
+yanked = "deny"
+# Ignore specific advisories by ID if needed:
+ignore = [
+    # rustls-pemfile is unmaintained but still a transitive dependency of redis
+    # and rustls-native-certs. We migrated our direct usage to rustls-pki-types.
+    { id = "RUSTSEC-2025-0134", reason = "transitive dep via redis/rustls-native-certs; direct usage migrated to rustls-pki-types" },
+    # rsa crate has a timing side-channel in RSA decryption / signature verification (Marvin Attack).
+    # We only use rsa::RsaPrivateKey::new for key generation; signing and verification are done via ring.
+    { id = "RUSTSEC-2023-0071", reason = "only used for RSA key generation, not decryption or verification" },
+]
+
+# --- License checks ---
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+]
+confidence-threshold = 0.8
+
+# ring uses a custom OpenSSL-style license
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+# The flux-rs workspace crates (scripts/flux.sh annotation shim) ship no
+# license field in their manifests; the repository root LICENSE is MIT.
+# https://github.com/flux-rs/flux/blob/main/LICENSE
+[[licenses.clarify]]
+crate = "flux-rs"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "flux-attrs"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "flux-attrs-impl"
+expression = "MIT"
+license-files = []
+
+# --- Ban checks ---
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+# --- Source checks ---
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# flux-rs: Flux refinement-annotation proc-macro shim (scripts/flux.sh);
+# not published on crates.io. Commit pinned in Cargo.lock.
+allow-git = ["https://github.com/flux-rs/flux"]

@@ -1,0 +1,34 @@
+/*
+ * Issuerd default login theme ("issuerd").
+ *
+ * Served at `/realms/{realm}/theme/login.css`. The login page consumes these
+ * custom properties with built-in fallbacks (`var(--issuerd-bg, #0a0a0a)`), so a
+ * custom theme only needs to redefine the variables it changes — and the
+ * server falls back to this file for anything a custom theme does not ship.
+ */
+:root {
+    --issuerd-font-body: 'Inter', system-ui, -apple-system, sans-serif;
+    --issuerd-font-display: 'Space Grotesk', system-ui, sans-serif;
+
+    --issuerd-bg: #0a0a0a;
+    --issuerd-fg: #fafafa;
+    --issuerd-muted: #a3a3a3;
+
+    --issuerd-card-bg: #141414;
+    --issuerd-card-border: #262626;
+    --issuerd-card-radius: 12px;
+
+    --issuerd-accent: #00e5ff;
+
+    --issuerd-input-bg: rgba(255, 255, 255, 0.03);
+    --issuerd-input-border: #262626;
+    --issuerd-input-radius: 8px;
+
+    --issuerd-button-bg: #ffffff;
+    --issuerd-button-fg: #0a0a0a;
+    --issuerd-button-radius: 8px;
+    --issuerd-button-glow: rgba(255, 255, 255, 0.15);
+
+    --issuerd-error: #ef4444;
+    --issuerd-success: #22c55e;
+}

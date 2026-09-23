@@ -1,0 +1,156 @@
+{
+  "alias": "issuerd",
+  "description": "Issuerd Form Post OP test",
+  "server": {
+    "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
+  },
+  "client": {
+    "client_id": "conformance-client",
+    "client_secret": "conformance-secret"
+  },
+  "client2": {
+    "client_id": "conformance-client-2",
+    "client_secret": "conformance-secret-2"
+  },
+  "client_secret_post": {
+    "client_id": "conformance-client",
+    "client_secret": "conformance-secret"
+  },
+  "browser": [
+    {
+      "match": "https://op.conformance.test:8443/*",
+      "tasks": [
+        {
+          "task": "Login",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/*execution_id*",
+          "commands": [
+            ["text", "id", "username", "conformance-user"],
+            ["text", "id", "password", "conformance-password"],
+            ["click", "css", "button[type=submit]"]
+          ]
+        },
+        {
+          "task": "Authorization Error Page",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/realms/*/protocol/openid-connect/auth*",
+          "commands": [
+            ["wait", "xpath", "//body", 10, "(?s).*error.*", "update-image-placeholder-optional"]
+          ]
+        },
+        {
+          "task": "Login Page Error",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/*login.html*error*",
+          "commands": [
+            ["wait", "contains", "error=", 10]
+          ]
+        },
+        {
+          "task": "Consent",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/realms/*/login/consent/*",
+          "commands": [
+            ["click", "css", "button[value=allow]"]
+          ]
+        },
+        {
+          "task": "Verify Complete",
+          "optional": true,
+          "match": "https://suite.conformance.test:8443/test/*/callback*",
+          "commands": [
+            ["wait", "id", "submission_complete", 10]
+          ]
+        },
+        {
+          "task": "Terminal Page Reached",
+          "match": "*"
+        }
+      ]
+    }
+  ],
+  "override": {
+    "oidcc-prompt-login": {
+      "browser": [
+        {
+          "comment": "fills the expected-second-login-page placeholder during the second authorization",
+          "match": "https://op.conformance.test:8443/*",
+          "tasks": [
+            {
+              "task": "Login",
+              "optional": true,
+              "match": "https://op.conformance.test:8443/*execution_id*",
+              "commands": [
+                ["wait", "xpath", "//*", 10, "Sign In", "update-image-placeholder-optional"],
+                ["text", "id", "username", "conformance-user"],
+                ["text", "id", "password", "conformance-password"],
+                ["click", "css", "button[type=submit]"]
+              ]
+            },
+            {
+              "task": "Consent",
+              "optional": true,
+              "match": "https://op.conformance.test:8443/realms/*/login/consent/*",
+              "commands": [
+                ["click", "css", "button[value=allow]"]
+              ]
+            },
+            {
+              "task": "Verify Complete",
+              "optional": true,
+              "match": "https://suite.conformance.test:8443/test/*/callback*",
+              "commands": [
+                ["wait", "id", "submission_complete", 10]
+              ]
+            },
+            {
+              "task": "Terminal Page Reached",
+              "match": "*"
+            }
+          ]
+        }
+      ]
+    },
+    "oidcc-max-age-1": {
+      "browser": [
+        {
+          "comment": "fills the expected-second-login-page placeholder during the second authorization",
+          "match": "https://op.conformance.test:8443/*",
+          "tasks": [
+            {
+              "task": "Login",
+              "optional": true,
+              "match": "https://op.conformance.test:8443/*execution_id*",
+              "commands": [
+                ["wait", "xpath", "//*", 10, "Sign In", "update-image-placeholder-optional"],
+                ["text", "id", "username", "conformance-user"],
+                ["text", "id", "password", "conformance-password"],
+                ["click", "css", "button[type=submit]"]
+              ]
+            },
+            {
+              "task": "Consent",
+              "optional": true,
+              "match": "https://op.conformance.test:8443/realms/*/login/consent/*",
+              "commands": [
+                ["click", "css", "button[value=allow]"]
+              ]
+            },
+            {
+              "task": "Verify Complete",
+              "optional": true,
+              "match": "https://suite.conformance.test:8443/test/*/callback*",
+              "commands": [
+                ["wait", "id", "submission_complete", 10]
+              ]
+            },
+            {
+              "task": "Terminal Page Reached",
+              "match": "*"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

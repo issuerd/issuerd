@@ -1,0 +1,42 @@
+[tarpaulin]
+# Coverage engine: llvm for best accuracy with Rust 1.95
+engine = "Llvm"
+
+# Workspace coverage
+workspace = true
+
+# Exclude non-test directories
+exclude-files = [
+    "*/target/*",
+    "*/tests/*",
+    "*/benches/*",
+    "*/examples/*",
+    "*/Issuerd/*",
+    "*/webclientsrc/*",
+]
+
+# Include only our crates
+packages = [
+    "issuerd-core",
+    "issuerd-protocol",
+    "issuerd-auth-flow",
+    "issuerd-token",
+    "issuerd-storage",
+    "issuerd-federation",
+    "issuerd-admin-api",
+    "issuerd-cluster",
+    "issuerd-server",
+]
+
+# Coverage targets
+target-dir = "target/coverage"
+out = ["Html", "Xml", "Lcov", "Stdout"]
+output-dir = "coverage"
+
+# Test configuration
+verbose = true
+timeout = "300s"
+
+# Fail if coverage below threshold (enforced in CI)
+# Uncomment after baseline established:
+# fail-under = 80

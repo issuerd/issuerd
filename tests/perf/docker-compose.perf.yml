@@ -1,0 +1,217 @@
+# Issuerd performance benchmark stack (project `issuerd-perf`).
+#
+# Fully isolated (`internal: true`) — no internet access in either direction at
+# runtime, nothing is published anywhere (unlike rig/, which uses frpc). All
+# images must be present locally before `up` (see README.md). k6 traffic stays
+# on the compose network; results land in the bind-mounted ./results/.
+#
+# Usage (see scripts/run.sh for the full matrix):
+#   python scripts/gen_kc_realm.py            # one-time: keycloak/realm-perf.json
+#   docker compose -f docker-compose.perf.yml build keycloak   # one-time: optimized KC image
+#   docker compose -f docker-compose.perf.yml up -d postgres-issuerd issuerd
+#   docker compose -f docker-compose.perf.yml run --rm k6 run /scripts/smoke.js
+#
+# Sizing tiers are applied to the app containers via ISSUERD_CPUS/ISSUERD_MEM and
+# KC_CPUS/KC_MEM (change requires a recreate: `up -d --force-recreate`):
+#   small  = 1.0 CPU / 512 MiB · medium = 2.0 CPU / 1 GiB · large = 4.0 CPU / 2 GiB
+# PostgreSQL containers are fixed at 2 CPU / 2 GiB so the database is not the
+# bottleneck; the k6 load generator gets 4 CPUs.
+name: issuerd-perf
+
+services:
+  postgres-issuerd:
+    image: postgres:15-alpine
+    container_name: issuerd-perf-postgres-issuerd
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - pg-issuerd-data:/var/lib/postgresql/data
+    networks:
+      perf-net:
+        ipv4_address: 172.34.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  issuerd:
+    # Built from the repo root Dockerfile:
+    #   docker build -t issuerd:perf -f Dockerfile .   (from the repo root)
+    image: issuerd:perf
+    container_name: issuerd-perf-issuerd
+    command: ["daemon", "-c", "/etc/issuerd/issuerd.toml"]
+    volumes:
+      - ./issuerd.perf.toml:/etc/issuerd/issuerd.toml:ro
+      - ./provision.perf.yaml:/etc/issuerd/provision.yaml:ro
+    depends_on:
+      postgres-issuerd:
+        condition: service_healthy
+    networks:
+      perf-net:
+        ipv4_address: 172.34.0.11
+    healthcheck:
+      # The runtime image ships no curl/shell — use the binary's own probe.
+      test: ["CMD", "issuerd", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "${ISSUERD_CPUS:-2.0}"
+          memory: "${ISSUERD_MEM:-1g}"
+
+  postgres-kc:
+    image: postgres:15-alpine
+    container_name: issuerd-perf-postgres-kc
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak_secret
+      POSTGRES_DB: keycloak
+    volumes:
+      - pg-kc-data:/var/lib/postgresql/data
+    networks:
+      perf-net:
+        ipv4_address: 172.34.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  keycloak:
+    # Optimized production build: `kc.sh build` bakes the build-time options
+    # (db=postgres, health, metrics) into the image at build time, and the
+    # container runs `start --optimized` — Keycloak's documented production
+    # container shape, not the start-dev quickstart. Build once:
+    #   docker compose -f docker-compose.perf.yml build keycloak
+    build:
+      context: ./keycloak
+    image: keycloak-optimized:26.7.4
+    container_name: issuerd-perf-keycloak
+    command:
+      - start
+      - --optimized
+      # Pin the public base URL (production deployments set this to the edge
+      # URL; inside this hermetic rig the servers speak plain HTTP). Hostname
+      # v2 (KC 25+): --hostname takes a full URL; with an http:// URL HTTPS is
+      # not enforced and the old --hostname-url/--hostname-strict flags are
+      # gone.
+      - --hostname=http://keycloak:8080
+      - --http-enabled=true
+      # NOTE: --db / health / metrics are build-time options baked into the
+      # image (keycloak/Dockerfile) — `start --optimized` rejects them here.
+      - --db-url=jdbc:postgresql://postgres-kc:5432/keycloak
+      - --db-username=keycloak
+      - --db-password=keycloak_secret
+      - --import-realm
+      # CIBA (supported & default-on in KC 26): point the built-in HTTP auth
+      # channel at the ad-simulator, which auto-approves every backchannel
+      # auth request on the user's behalf (see ad-simulator/server.py).
+      - --spi-ciba-auth-channel-ciba-http-auth-channel-http-authentication-channel-uri=http://ad-simulator:8080/ciba
+    environment:
+      # KC 26 bootstrap admin (KEYCLOAK_ADMIN* is deprecated since 26.0).
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      # Generated by scripts/gen_kc_realm.py (gitignored — regenerate, do not
+      # commit: it carries 1000 seeded users).
+      - ./keycloak/realm-perf.json:/opt/keycloak/data/import/realm-perf.json:ro
+    depends_on:
+      postgres-kc:
+        condition: service_healthy
+      ad-simulator:
+        condition: service_started
+    networks:
+      perf-net:
+        ipv4_address: 172.34.0.13
+    healthcheck:
+      # Since KC 25 health/metrics live on the management interface (:9000),
+      # not the main port. First boot hashes the 1000 imported users with
+      # Argon2id (KC 25+ default; KC 24 used PBKDF2) — much slower import, so
+      # the start grace period is generous.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 600s
+    deploy:
+      resources:
+        limits:
+          cpus: "${KC_CPUS:-2.0}"
+          memory: "${KC_MEM:-1g}"
+
+  # Authentication-device simulator for Keycloak CIBA (poll mode). KC's
+  # ciba-http-auth-channel POSTs each backchannel auth request here; the
+  # simulator approves it synchronously via KC's CIBA callback endpoint with
+  # the bearer token KC provided, so the k6 poll succeeds without a browser —
+  # the KC-side analogue of issuerd's ext/ciba/approve call. Deliberately NOT
+  # part of app_containers() stats sampling (issuerd needs no such helper).
+  ad-simulator:
+    image: python:3.12-alpine
+    container_name: issuerd-perf-ad-simulator
+    command: ["python", "/app/server.py"]
+    volumes:
+      - ./ad-simulator/server.py:/app/server.py:ro
+    networks:
+      perf-net:
+        ipv4_address: 172.34.0.14
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+
+  # Load generator. Never started by `up` (profile), invoked per scenario:
+  #   docker compose -f docker-compose.perf.yml run --rm k6 run /scripts/scenarios/discovery.js
+  k6:
+    image: grafana/k6:2.1.0
+    profiles: ["tools"]
+    environment:
+      # Defensive: the perf network is internal anyway, but never phone home.
+      K6_NO_USAGE_REPORT: "true"
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    networks:
+      - perf-net
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 2g
+
+networks:
+  perf-net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        # 172.34.0.0/24 is free on this host (172.29/30/31/33 are taken by the
+        # integration, conformance and lab-rig stacks).
+        - subnet: 172.34.0.0/24
+
+volumes:
+  pg-issuerd-data:
+    driver: local
+  pg-kc-data:
+    driver: local

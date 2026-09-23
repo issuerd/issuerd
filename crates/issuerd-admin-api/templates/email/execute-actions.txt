@@ -1,0 +1,15 @@
+Complete required actions for your account
+===========================================
+
+Hi {{user}},
+
+An administrator has asked you to complete required actions for your {{realm}} account.
+
+{{link}}
+
+This link expires in {{link_expiration_minutes}} minutes.
+
+If you were not expecting this message, you can safely ignore it — no changes will be made to your account until you open the link.
+
+--
+This is an automated message from {{realm}}. Please do not reply.

@@ -1,0 +1,247 @@
+# Hermetic OIDC conformance environment.
+#
+#   docker compose up
+#
+# ...builds everything (pristine suite JAR from conformance-suite/,
+# Issuerd OP from the repo root Dockerfile, runner), generates the local
+# PKI, starts the isolated stack, bootstraps the realm, runs all three
+# OIDCC test plans and writes results into ./results/.
+#
+# The network is fully isolated (`internal: true`) — no internet access in
+# either direction at runtime. bind9 is the only DNS resolver for every
+# container and is authoritative for `conformance.test` only — all other
+# names get an instant REFUSED. All HTTP traffic between the test runner,
+# the conformance suite, its HtmlUnit browser and the Issuerd OP is TLS
+# with certificates from the local root CA (pki/gen-certs.sh).
+name: issuerd-conformance
+
+x-runner-common: &runner-common
+  image: issuerd/conformance-runner
+  # Run as the host user so files written into the bind-mounted /results
+  # and /pki stay owned by the host user. Override via DOCKER_HOST_UID/GID.
+  user: "${DOCKER_HOST_UID:-1000}:${DOCKER_HOST_GID:-1000}"
+  dns:
+    - 172.31.0.2
+  environment:
+    CONFORMANCE_SERVER: "https://suite.conformance.test:8443"
+    CONFORMANCE_DEV_MODE: "1"
+    PYTHONUNBUFFERED: "1"
+    HOME: "/tmp"
+
+services:
+  bind9:
+    image: internetsystemsconsortium/bind9:9.18
+    container_name: issuerd-conformance-bind9
+    # The image's bind user can't read bind-mounted configs directly on some
+    # hosts; copy into /var/cache/bind first.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /var/cache/bind/zones
+        cp /etc/bind/named.conf /var/cache/bind/named.conf
+        cp /etc/bind/zones/* /var/cache/bind/zones/
+        chmod -R 755 /var/cache/bind
+        sed -i 's|/etc/bind/zones|/var/cache/bind/zones|g' /var/cache/bind/named.conf
+        exec /usr/sbin/named -u bind -g -c /var/cache/bind/named.conf
+    volumes:
+      - ./dns/named.conf:/etc/bind/named.conf:ro
+      - ./dns/zones:/etc/bind/zones:ro
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "dig @127.0.0.1 op.conformance.test +time=2 +tries=1 +short | grep -q 172.31.0.12"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongodb:
+    image: mongo:6.0
+    container_name: issuerd-conformance-mongo
+    # --quiet suppresses the per-connection NETWORK INFO lines (the 5s
+    # healthcheck would otherwise log two entries per probe).
+    command: ["--quiet"]
+    dns:
+      - 172.31.0.2
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.10
+    depends_on:
+      bind9:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'db.runCommand(\"ping\").ok' | mongosh localhost:27017/test_suite --quiet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: generate the local PKI (root CA + server certs + Spring
+  # keystore) into ./pki. Idempotent — skips when everything exists.
+  # Static IP: starts in parallel with bind9 and must not grab 172.31.0.2
+  # from the dynamic pool (bind9's fixed address). In fact EVERY service in
+  # this stack must carry a static IP: an exited one-shot container releases
+  # its address, and a dynamic allocation can then land on a reserved IP,
+  # breaking the next `up` with "Address already in use".
+  pki-init:
+    <<: *runner-common
+    container_name: issuerd-conformance-pki-init
+    volumes:
+      - ./pki:/pki
+    working_dir: /pki
+    command: ["bash", "/pki/gen-certs.sh"]
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.3
+
+  conformance-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.suite
+    image: issuerd/conformance-suite
+    container_name: issuerd-conformance-suite
+    dns:
+      - 172.31.0.2
+    environment:
+      BASE_URL: "https://suite.conformance.test:8443"
+      BASE_MTLS_URL: "https://suite.conformance.test:8443"
+      MONGODB_HOST: "mongo.conformance.test"
+      KEYSTORE_PASSWORD: "conformance"
+    volumes:
+      - ./pki/ca.crt:/pki/ca.crt:ro
+      - ./pki/suite-keystore.p12:/pki/suite-keystore.p12:ro
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.11
+    depends_on:
+      bind9:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      pki-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sfk https://localhost:8443/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  issuerd-op:
+    build:
+      # Canonical Issuerd image from the repository root Dockerfile.
+      context: ../..
+      dockerfile: Dockerfile
+    image: issuerd/conformance-op
+    container_name: issuerd-conformance-op
+    dns:
+      - 172.31.0.2
+    volumes:
+      - ./issuerd.toml:/etc/issuerd/issuerd.toml:ro
+      - ./pki/op.crt:/pki/op.crt:ro
+      - ./pki/op.key:/pki/op.key:ro
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.12
+    depends_on:
+      bind9:
+        condition: service_healthy
+      pki-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "issuerd", "healthcheck", "--url", "https://localhost:8443/health/ready", "--insecure"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Answers the suite web UI's external CDN requests (bootstrap, jquery,
+  # datatables, Google Fonts css, …) inside the isolated network: bind9 maps
+  # the CDN hostnames here, nginx serves the vendored mirror from ./cdn-shim
+  # over TLS with a cert from our root CA (already trusted by the suite JVM).
+  # Suite sources stay pristine; HtmlUnit stops logging UnknownHostException.
+  cdn-shim:
+    image: nginx:1.27-alpine
+    container_name: issuerd-conformance-cdn-shim
+    dns:
+      - 172.31.0.2
+    volumes:
+      - ./cdn-shim:/srv:ro
+      - ./cdn-shim/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./pki/cdn.crt:/etc/nginx/shim-certs/cdn.crt:ro
+      - ./pki/cdn.key:/etc/nginx/shim-certs/cdn.key:ro
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.15
+    depends_on:
+      bind9:
+        condition: service_healthy
+      pki-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://cdn.jsdelivr.net/npm/jquery@3.6.4/dist/jquery.min.js || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: the actual conformance run. Exits 0 when all plans pass.
+  conformance-run:
+    <<: *runner-common
+    container_name: issuerd-conformance-run
+    volumes:
+      - ./configs:/conformance-suite-configs:ro
+      - ./results:/results
+      # Pristine upstream runner scripts, mounted verbatim from the
+      # untouched conformance suite checkout.
+      - ./conformance-suite/scripts:/upstream-scripts:ro
+      # Our own harness-side helpers; not part of the suite.
+      - ./scripts:/harness-scripts:ro
+      - ./bootstrap-issuerd.sh:/usr/local/bin/issuerd-bootstrap:ro
+      - ./pki/ca.crt:/pki/ca.crt:ro
+    working_dir: /results
+    command: ["bash", "/harness-scripts/run-conformance.sh"]
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.13
+    depends_on:
+      conformance-server:
+        condition: service_healthy
+      issuerd-op:
+        condition: service_healthy
+      cdn-shim:
+        condition: service_healthy
+
+  # Long-lived container for interactive/debug use (run-focus.sh, manual
+  # docker compose exec ...). Not required for the conformance run itself.
+  test-runner:
+    <<: *runner-common
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    container_name: issuerd-conformance-runner
+    volumes:
+      - ./configs:/conformance-suite-configs:ro
+      - ./results:/results
+      - ./conformance-suite/scripts:/upstream-scripts:ro
+      - ./scripts:/harness-scripts:ro
+      - ./bootstrap-issuerd.sh:/usr/local/bin/issuerd-bootstrap:ro
+      - ./pki/ca.crt:/pki/ca.crt:ro
+    working_dir: /results
+    command: ["sleep", "infinity"]
+    networks:
+      conformance-net:
+        ipv4_address: 172.31.0.14
+    depends_on:
+      conformance-server:
+        condition: service_healthy
+      issuerd-op:
+        condition: service_healthy
+      cdn-shim:
+        condition: service_healthy
+
+networks:
+  conformance-net:
+    driver: bridge
+    # Hard isolation: no outbound/inbound routing for containers.
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16

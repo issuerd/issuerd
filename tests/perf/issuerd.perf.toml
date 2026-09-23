@@ -1,0 +1,26 @@
+# Issuerd configuration for the tests/perf benchmark stack.
+# Single node, PostgreSQL storage, in-memory cache (no Redis), plain HTTP on
+# :8080 inside the isolated perf network, JSON logs at INFO on stdout (measured
+# for the log-volume numbers in docs/PERFORMANCE.md).
+
+bind = "0.0.0.0"
+port = 8080
+
+# Baked into the `iss` claim and the discovery document; matches the service
+# name that k6 and the browsers-in-scripts use on the compose network.
+issuer_url = "http://issuerd:8080"
+
+# Realm/client/user seed content, applied exactly once against an empty
+# database. Wipe with `docker compose -f docker-compose.perf.yml down -v` to
+# re-provision.
+provision = "/etc/issuerd/provision.yaml"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@postgres-issuerd:5432/issuerd"
+
+[logging]
+format = "json"
+level = "info"
+
+[web_ui]
+enabled = true

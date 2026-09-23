@@ -1,0 +1,157 @@
+# Cluster demo provisioning: applied exactly once at first boot (atomic marker
+# claim makes parallel first boots of both nodes safe).
+#
+# Creates:
+#   - master realm with admin/admin (realm-management roles → admin API + SPA)
+#   - demo realm with user demo/demo123
+#   - demo-app public client (browser/password-grant flows through the LB)
+#   - demo-service confidential client (introspection/revocation auth)
+#
+# All URLs point at the load balancer (http://localhost:8088).
+
+marker: cluster-demo
+
+realms:
+  - name: master
+    display_name: Master
+    enabled: true
+    ssl_required: external
+    default_role: user
+
+  - name: demo
+    display_name: Demo Realm
+    enabled: true
+    ssl_required: external
+    default_role: user
+
+roles:
+  - realm: master
+    name: admin
+    description: Realm administrator
+  - realm: master
+    name: user
+    description: Standard user
+  - realm: master
+    name: manage-realm
+    description: Manage realm settings
+  - realm: master
+    name: view-realm
+    description: View realm settings
+  - realm: master
+    name: manage-users
+    description: Manage users
+  - realm: master
+    name: view-users
+    description: View users
+  - realm: master
+    name: manage-clients
+    description: Manage clients
+  - realm: master
+    name: view-clients
+    description: View clients
+  - realm: demo
+    name: user
+    description: Standard user
+
+clients:
+  - realm: master
+    client_id: admin-cli
+    name: Admin CLI
+    description: Public client used by the admin console SPA.
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:8088/*
+    web_origins:
+      - http://localhost:8088
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes: []
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: demo
+    client_id: demo-app
+    name: Demo Application
+    description: Public client for browser and password-grant flows via the LB.
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:8088/*
+    web_origins:
+      - http://localhost:8088
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: demo
+    client_id: demo-service
+    name: Demo Service Account
+    description: Confidential client for introspection and revocation calls.
+    enabled: true
+    public_client: false
+    bearer_only: false
+    secret: demo-service-secret
+    redirect_uris: []
+    web_origins: []
+    default_scopes:
+      - openid
+    optional_scopes: []
+    consent_required: false
+    full_scope_allowed: true
+
+users:
+  - realm: master
+    username: admin
+    email: admin@issuerd.local
+    email_verified: true
+    first_name: Admin
+    last_name: User
+    enabled: true
+    password: admin
+    realm_roles:
+      - admin
+      - user
+      - manage-realm
+      - view-realm
+      - manage-users
+      - view-users
+      - manage-clients
+      - view-clients
+    groups: []
+    attributes: {}
+
+  - realm: demo
+    username: demo
+    email: demo@issuerd.local
+    email_verified: true
+    first_name: Demo
+    last_name: User
+    enabled: true
+    password: demo123
+    realm_roles:
+      - user
+    groups: []
+    attributes: {}
+
+  # Dedicated to the brute-force lockout E2E test — that test intentionally
+  # locks this account, so no other test may use it.
+  - realm: demo
+    username: lockme
+    email: lockme@issuerd.local
+    email_verified: true
+    first_name: Lock
+    last_name: Me
+    enabled: true
+    password: lockme123
+    realm_roles:
+      - user
+    groups: []
+    attributes: {}

@@ -1,0 +1,14 @@
+# Test runner image for the hermetic conformance environment.
+# Dependencies are baked in at build time — the network is fully isolated at
+# runtime, so `pip install` inside a running container is impossible.
+# openssl is needed by the pki-init one-shot service (gen-certs.sh).
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir httpx pyparsing \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /results
+
+CMD ["sleep", "infinity"]

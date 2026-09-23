@@ -1,0 +1,38 @@
+[package]
+name = "issuerd-auth-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issuerd-core = { workspace = true }
+issuerd-token = { workspace = true }
+issuerd-cluster = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+mockall = { workspace = true }
+chrono = { workspace = true }
+argon2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+ring = { workspace = true }
+webauthn-rs = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+issuerd-storage = { workspace = true }
+base64 = { workspace = true }
+
+# webauthn-rs-core needs openssl with no feature gate; on Windows (no system
+# OpenSSL) build it vendored from source. Requires a native Windows perl
+# (e.g. Strawberry Perl) and MSVC build tools on PATH.
+[target.'cfg(windows)'.dependencies]
+openssl = { workspace = true }

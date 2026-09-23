@@ -1,0 +1,286 @@
+# Issuerd Federation Provision Config
+# Applied exactly once on first startup. Delete the postgres volume to re-provision.
+#
+# Usage:
+#   1. docker compose -f docker-compose.integration.yml up -d issuerd-postgres samba-dc openldap
+#   2. Wait for samba-dc healthcheck (keytab is exported to tests/fixtures/samba-dc/shared/issuerd.keytab)
+#   3. cargo run --bin issuerd -- daemon -c issuerd.toml
+#      (copy examples/issuerd.example.toml and set provision = "examples/provision.federation.yaml")
+#
+# Realms:
+#   - master          : Admin realm with local admin user
+#   - ad              : Windows Active Directory (replace ad.example.com placeholders)
+#   - samba           : Samba DC LDAP (localhost:389)
+#   - openldap        : OpenLDAP (localhost:1389)
+#   - kerberos        : Kerberos / SPNEGO via Samba DC KDC (localhost:88)
+#
+# Note: Kerberos SPNEGO requires Unix (Linux/WSL). On native Windows the
+#       auth-spnego authenticator returns NotSupported.
+
+marker: federation-provision-v1
+
+realms:
+  - name: master
+    display_name: Master
+    enabled: true
+    ssl_required: external
+
+  - name: ad
+    display_name: Windows AD
+    enabled: true
+    ssl_required: external
+
+  - name: samba
+    display_name: Samba DC
+    enabled: true
+    ssl_required: external
+
+  - name: openldap
+    display_name: OpenLDAP
+    enabled: true
+    ssl_required: external
+
+  - name: kerberos
+    display_name: Kerberos
+    enabled: true
+    ssl_required: external
+
+roles:
+  - realm: master
+    name: manage-realm
+    description: manage-realm role
+  - realm: master
+    name: view-realm
+    description: view-realm role
+  - realm: master
+    name: manage-users
+    description: manage-users role
+  - realm: master
+    name: view-users
+    description: view-users role
+  - realm: master
+    name: manage-clients
+    description: manage-clients role
+  - realm: master
+    name: view-clients
+    description: view-clients role
+
+users:
+  - realm: master
+    username: admin
+    email: admin@localhost.local
+    email_verified: true
+    first_name: Admin
+    last_name: User
+    enabled: true
+    password: admin
+    realm_roles:
+      - manage-realm
+      - view-realm
+      - manage-users
+      - view-users
+      - manage-clients
+      - view-clients
+    groups: []
+
+clients:
+  # Master realm clients
+  - realm: master
+    client_id: admin-cli
+    name: Admin CLI
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/
+      - https://issuerd.test.internal/callback
+      - https://issuerd.test.internal/swagger-ui/oauth2-redirect.html
+    web_origins:
+      - https://issuerd.test.internal
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: master
+    client_id: account-console
+    name: Account Console
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/
+      - https://issuerd.test.internal/callback
+      - https://issuerd.test.internal/realms/master/account
+    web_origins:
+      - https://issuerd.test.internal
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  # Federation test clients
+  - realm: ad
+    client_id: test-client
+    name: AD Test Client
+    enabled: true
+    public_client: false
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/callback
+      - http://localhost:8080/cb
+    web_origins:
+      - https://issuerd.test.internal
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: samba
+    client_id: test-client
+    name: Samba Test Client
+    enabled: true
+    public_client: false
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/callback
+      - http://localhost:8080/cb
+    web_origins:
+      - https://issuerd.test.internal
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: openldap
+    client_id: test-client
+    name: OpenLDAP Test Client
+    enabled: true
+    public_client: false
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/callback
+      - http://localhost:8080/cb
+    web_origins:
+      - https://issuerd.test.internal
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: kerberos
+    client_id: test-client
+    name: Kerberos Test Client
+    enabled: true
+    public_client: false
+    bearer_only: false
+    redirect_uris:
+      - https://issuerd.test.internal/callback
+      - http://localhost:8080/cb
+    web_origins:
+      - https://issuerd.test.internal
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+identity_providers:
+  # Windows AD example — point connectionUrl/bindDn/bindCredential at your
+  # own AD DS lab before use; the placeholders below are intentionally inert.
+  - realm: ad
+    alias: ad-ldap
+    provider_id: ldap
+    enabled: true
+    config:
+      connectionUrl: ldap://ad.example.com:389
+      bindDn: CN=ldapbind,OU=IssuerdUsers,DC=test,DC=issuerd,DC=local
+      bindCredential: CHANGE_ME
+      usersDn: OU=IssuerdUsers,DC=test,DC=issuerd,DC=local
+      baseDn: DC=test,DC=issuerd,DC=local
+      usernameLdapAttribute: sAMAccountName
+      rdnLdapAttribute: cn
+      uuidLdapAttribute: objectGUID
+      userObjectClasses: person,organizationalPerson,user
+      vendor: ACTIVE_DIRECTORY
+      searchScope: SUBTREE
+      editMode: WRITABLE
+      pagination: "true"
+      batchSize: "5000"
+      priority: "1"
+
+  - realm: samba
+    alias: samba-ldap
+    provider_id: ldap
+    enabled: true
+    config:
+      connectionUrl: ldap://localhost:389
+      bindDn: CN=Administrator,CN=Users,DC=test,DC=issuerd,DC=local
+      bindCredential: AdminPass123!
+      usersDn: CN=Users,DC=test,DC=issuerd,DC=local
+      baseDn: DC=test,DC=issuerd,DC=local
+      usernameLdapAttribute: sAMAccountName
+      rdnLdapAttribute: cn
+      uuidLdapAttribute: objectGUID
+      userObjectClasses: person,organizationalPerson,user
+      vendor: ACTIVE_DIRECTORY
+      searchScope: SUBTREE
+      editMode: WRITABLE
+      pagination: "true"
+      batchSize: "5000"
+      priority: "1"
+
+  - realm: openldap
+    alias: openldap
+    provider_id: ldap
+    enabled: true
+    config:
+      connectionUrl: ldap://localhost:1389
+      bindDn: cn=admin,dc=test,dc=issuerd,dc=local
+      bindCredential: admin
+      usersDn: ou=users,dc=test,dc=issuerd,dc=local
+      baseDn: dc=test,dc=issuerd,dc=local
+      usernameLdapAttribute: uid
+      rdnLdapAttribute: uid
+      uuidLdapAttribute: entryUUID
+      userObjectClasses: inetOrgPerson,organizationalPerson
+      vendor: GENERIC
+      searchScope: SUBTREE
+      editMode: WRITABLE
+      pagination: "true"
+      batchSize: "2000"
+      priority: "1"
+
+  - realm: kerberos
+    alias: samba-kerberos
+    provider_id: kerberos
+    enabled: true
+    config:
+      kerberosRealm: TEST.ISSUERD.LOCAL
+      serverPrincipal: HTTP/issuerd.test.issuerd.local@TEST.ISSUERD.LOCAL
+      keyTab: tests/fixtures/samba-dc/shared/issuerd.keytab
+      allowKerberosAuthentication: "true"
+      allowPasswordAuthentication: "false"
+      updateProfileFirstLogin: "true"
+      priority: "1"

@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# Pristine OpenID Foundation conformance suite image, self-contained:
+# `docker compose up` builds the JAR from the untouched upstream sources
+# (conformance-suite/) and never patches it. The ONLY deviation from a
+# stock deployment happens at container start: the local test root CA is
+# imported into the JVM truststore (see scripts/suite-entrypoint.sh), so
+# the suite's HtmlUnit browser trusts the TLS endpoints in the hermetic
+# network.
+
+# --- Stage 1: build the suite JAR from the pristine upstream sources ---
+FROM maven:3-eclipse-temurin-21 AS jar
+WORKDIR /build
+COPY conformance-suite/ ./
+# BuildKit cache keeps the maven repository across builds on this host
+# (first build downloads the world; later builds are fast).
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -Dmaven.test.skip -Dpmd.skip -Dcheckstyle.skip -Dmaven.gitcommitid.skip=true \
+    clean package
+
+# --- Stage 2: runtime ---
+FROM eclipse-temurin:21-jre
+
+# curl: used by the compose healthcheck and for in-container debugging.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=jar /build/target/fapi-test-suite.jar /server/fapi-test-suite.jar
+COPY scripts/suite-entrypoint.sh /usr/local/bin/suite-entrypoint.sh
+
+ENV BASE_URL=https://suite.conformance.test:8443
+ENV BASE_MTLS_URL=https://suite.conformance.test:8443
+ENV MONGODB_HOST=mongo.conformance.test
+ENV KEYSTORE_PASSWORD=conformance
+ENV JAVA_EXTRA_ARGS=
+
+EXPOSE 8443
+
+ENTRYPOINT ["bash", "/usr/local/bin/suite-entrypoint.sh"]

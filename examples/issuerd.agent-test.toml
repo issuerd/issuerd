@@ -1,0 +1,15 @@
+bind = "127.0.0.1"
+port = 18080
+issuer_url = "http://localhost:18080"
+
+[logging]
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true
+
+[proxy]
+trusted_proxies = []
+trust_x_forwarded_for = true
+trust_x_real_ip = true

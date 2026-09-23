@@ -1,0 +1,65 @@
+[package]
+name = "issuerd-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issuerd-core = { workspace = true }
+issuerd-protocol = { workspace = true }
+issuerd-auth-flow = { workspace = true }
+issuerd-token = { workspace = true }
+issuerd-storage = { workspace = true }
+issuerd-cluster = { workspace = true }
+issuerd-federation = { workspace = true }
+issuerd-admin-api = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+figment = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+serde_yaml = { workspace = true }
+toml = "0.8"
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+include_dir = { workspace = true }
+mime_guess = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+ipnet = { workspace = true }
+lettre = { workspace = true }
+qrcodegen = { workspace = true }
+webauthn-rs = { workspace = true }
+reqwest = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+mockall = { workspace = true }
+rcgen = { workspace = true }
+jsonwebtoken = { workspace = true }
+ring = { workspace = true }

@@ -1,0 +1,31 @@
+[package]
+name = "issuerd-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+issuerd-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+# Verification tooling: no-op annotations consumed by MIRAI (scripts/mirai.sh).
+# Kani proof harnesses are `cfg(kani)`-gated and need no dependency.
+mirai-annotations = "1.12"
+
+[lints.rust]
+# `kani` (proof harnesses) and `mirai` (abstract interpretation) cfg gates are
+# set by their respective verification tools, not by cargo features.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(mirai)"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rstest = { workspace = true }
+proptest = { workspace = true }
+rand = { workspace = true }

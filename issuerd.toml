@@ -1,0 +1,49 @@
+# Local development rig: in-memory storage, plain HTTP on :8080.
+# Works out of the box on a fresh clone: `cargo run --bin issuerd -- daemon`.
+# The master realm is auto-bootstrapped with admin/admin; the provision file
+# below adds the "myrealm" demo content (user alice/changeme, clients my-app
+# and public-app). The Vite dev server (webclientsrc) proxies /admin, /realms,
+# /api and /login.html to this daemon.
+bind = "127.0.0.1"
+port = 8080
+issuer_url = "http://localhost:8080"
+provision = "examples/provision.example.yaml"
+
+# To run over HTTPS (see the manual-testing section in AGENTS.md), generate a
+# certificate and switch the issuer scheme to https, e.g.:
+# issuer_url = "https://issuerd.test.internal:8080"
+#
+# [tls]
+# cert_path = "certs/issuerd.test.internal.crt"
+# key_path = "certs/issuerd.test.internal.key"
+
+[logging]
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true
+
+[proxy]
+trusted_proxies = []
+trust_x_forwarded_for = true
+trust_x_real_ip = true
+
+[cors]
+allowed_origins = []
+
+[cluster]
+enabled = false
+redis_nodes = []
+jwks_refresh_interval_secs = 30
+
+# SMTP is disabled by default so a fresh clone boots cleanly. To exercise
+# verification/reset emails locally, run a catch-all SMTP sink (e.g. Mailpit)
+# on 127.0.0.1:1025 and set enabled = true.
+[smtp]
+enabled = false
+host = "127.0.0.1"
+port = 1025
+from = "issuerd@test.internal"
+starttls = false
+ssl = false

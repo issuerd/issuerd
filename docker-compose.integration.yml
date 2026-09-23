@@ -1,0 +1,220 @@
+# Issuerd Integration Test Stack
+# Provides isolated infrastructure for testing against a reference Keycloak implementation.
+#
+# Usage:
+#   docker compose -f docker-compose.integration.yml up -d
+#   cargo test --test integration
+#
+# (The root docker-compose.yml is the standalone local demo — it does not
+# contain these services.)
+#
+# Services:
+#   - postgres   PostgreSQL 15 (persistent state)
+#   - redis      Redis 7 (sessions, cache, events)
+#   - bind9      Local DNS for private network resolution
+#   - keycloak   Reference Keycloak implementation (QA baseline)
+#
+# Networks:
+#   - backend    Internal service mesh (no external DNS)
+#   - test       Test-facing network with bind9 resolver
+
+# Explicit project name (was historically implicit from the checkout directory),
+# so runtime volume names stay stable regardless of where the repo is cloned.
+name: issuerd
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: issuerd-keycloak-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.20
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: issuerd-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.21
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bind9:
+    image: internetsystemsconsortium/bind9:9.18
+    container_name: issuerd-bind9
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /var/cache/bind/zones
+        cp /etc/bind/named.conf /var/cache/bind/named.conf
+        cp /etc/bind/zones/* /var/cache/bind/zones/
+        chmod -R 755 /var/cache/bind
+        sed -i 's|/etc/bind/zones|/var/cache/bind/zones|g' /var/cache/bind/named.conf
+        exec /usr/sbin/named -u bind -g -c /var/cache/bind/named.conf
+    volumes:
+      - ./dns/bind9/named.conf:/etc/bind/named.conf:ro
+      - ./dns/bind9/zones:/etc/bind/zones:ro
+    ports:
+      - "5533:53/udp"
+      - "5533:53/tcp"
+    networks:
+      test:
+        ipv4_address: 172.30.0.2
+    cap_add:
+      - NET_BIND_SERVICE
+
+  keycloak:
+    image: keycloak/keycloak:24.0
+    container_name: issuerd-keycloak-ref
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --hostname=keycloak.test.local
+      - --hostname-strict=false
+      - --proxy=edge
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_LOG_LEVEL: info
+    ports:
+      - "8081:8080"
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  samba-dc:
+    build:
+      context: ./tests/fixtures/samba-dc
+      dockerfile: Dockerfile
+    container_name: issuerd-samba-dc
+    hostname: samba-dc
+    domainname: test.issuerd.local
+    privileged: true
+    environment:
+      REALM: "TEST.ISSUERD.LOCAL"
+      DOMAIN: "ISSUERD"
+      ADMIN_PASSWORD: "AdminPass123!"
+    ports:
+      - "389:389"
+      - "636:636"
+      - "88:88"
+      - "88:88/udp"
+      - "464:464"
+      - "464:464/udp"
+      - "445:445"
+    volumes:
+      - samba-data:/var/lib/samba
+      - ./tests/fixtures/samba-dc/shared:/shared
+      - ./tests/fixtures/samba-dc/scripts:/scripts:ro
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost -D 'CN=Administrator,CN=Users,DC=test,DC=issuerd,DC=local' -w 'AdminPass123!' -b 'DC=test,DC=issuerd,DC=local' '(sAMAccountName=testuser)' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: issuerd-openldap
+    environment:
+      LDAP_ORGANISATION: "Issuerd Test"
+      LDAP_DOMAIN: "test.issuerd.local"
+      LDAP_ADMIN_PASSWORD: "admin"
+    ports:
+      - "1389:389"
+    # Note: custom bootstrap LDIF removed because osixia/openldap cannot
+    # remove a bind-mounted directory during cleanup. Add users via ldapadd
+    # after startup if needed.
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.31
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost -D 'cn=admin,dc=test,dc=issuerd,dc=local' -w 'admin' -b 'dc=test,dc=issuerd,dc=local' '(objectClass=*)' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Dedicated PostgreSQL for Issuerd (separate from the test-stack postgres).
+  # Wipe with: docker compose -f docker-compose.integration.yml down && docker volume rm issuerd_issuerd_postgres_data
+  issuerd-postgres:
+    image: postgres:15-alpine
+    container_name: issuerd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - issuerd_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      backend:
+      test:
+        ipv4_address: 172.30.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  samba-data:
+    driver: local
+  issuerd_postgres_data:
+    driver: local
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+  test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

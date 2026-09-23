@@ -1,0 +1,1 @@
+ALTER TABLE user_sessions ADD COLUMN auth_time TIMESTAMPTZ NOT NULL DEFAULT now();

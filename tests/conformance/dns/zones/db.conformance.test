@@ -1,0 +1,16 @@
+$TTL 60
+@   IN  SOA ns.conformance.test. admin.conformance.test. (
+        2026091301 ; Serial
+        3600       ; Refresh
+        1800       ; Retry
+        604800     ; Expire
+        60         ; Minimum TTL
+)
+
+@       IN  NS  ns.conformance.test.
+
+; Static IPs must match docker-compose.yml (conformance-net 172.31.0.0/16).
+ns      IN  A   172.31.0.2
+mongo   IN  A   172.31.0.10
+suite   IN  A   172.31.0.11
+op      IN  A   172.31.0.12

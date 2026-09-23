@@ -1,0 +1,6 @@
+results/*
+!results/.gitkeep
+*.log
+# Local PKI artifacts (regenerate via pki/gen-certs.sh or `docker compose up`)
+pki/*
+!pki/gen-certs.sh

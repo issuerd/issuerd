@@ -1,0 +1,47 @@
+# Issuerd node configuration for the cluster demo stack.
+# Mounted identically into every node; per-node identity comes from the
+# ISSUERD_CLUSTER__NODE_ID environment variable set in docker-compose.
+
+bind = "0.0.0.0"
+port = 8080
+
+# Public base URL of the load balancer. MUST be identical on every node and
+# MUST match how clients reach the LB — it is baked into the `iss` claim and
+# the discovery document.
+issuer_url = "http://localhost:8088"
+
+# Shared ephemeral state (auth codes, pending auth, revocation blocklist,
+# login-failure counters).
+redis = "redis://redis:6379"
+
+provision = "/etc/issuerd/provision.yaml"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@postgres:5432/issuerd"
+
+[logging]
+# NOTE: this whole section is parsed but never consulted at runtime — log
+# verbosity comes from the -v/-q CLI flags and the RUST_LOG environment
+# variable (src/logging.rs).
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true
+
+[proxy]
+# The cluster-net subnet (see docker-compose.cluster.yml). The nginx LB is the
+# only reverse proxy, so X-Forwarded-For/X-Real-IP from that subnet are trusted.
+trusted_proxies = ["172.32.0.0/24"]
+trust_x_forwarded_for = true
+trust_x_real_ip = true
+
+[cors]
+allowed_origins = []
+
+[cluster]
+enabled = true
+# node_id is per container via ISSUERD_CLUSTER__NODE_ID.
+# How often this node re-reads the shared signing-key set from PostgreSQL so
+# keys added/rotated by peers propagate without a restart.
+jwks_refresh_interval_secs = 15

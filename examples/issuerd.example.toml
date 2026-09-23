@@ -1,0 +1,47 @@
+bind = "0.0.0.0"
+port = 8080
+issuer_url = "http://localhost:8080"
+redis = "redis://localhost:6379"
+provision = "provision.yaml"
+
+[tls]
+cert_path = "certs/issuerd.test.internal.crt"
+key_path = "certs/issuerd.test.internal.key"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@localhost:5433/issuerd"
+
+[logging]
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true
+
+[proxy]
+trusted_proxies = []
+trust_x_forwarded_for = true
+trust_x_real_ip = true
+
+[cors]
+allowed_origins = []
+
+[cluster]
+enabled = false
+redis_nodes = []
+jwks_refresh_interval_secs = 30
+
+[smtp]
+enabled = false
+host = "127.0.0.1"
+port = 1025
+from = "issuerd@test.internal"
+from_display = "Issuerd"
+starttls = false
+ssl = false
+
+[cache]
+read_cache_ttl_secs = 60
+
+[themes]
+dir = "themes"

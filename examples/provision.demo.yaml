@@ -1,0 +1,219 @@
+# Local demo provisioning for the root docker-compose.yml stack.
+# Applied exactly once at first startup against an empty database (marker
+# claim); wipe the volume with `docker compose down -v` to re-provision.
+#
+# Creates:
+#   - master realm with admin/admin (realm-management roles → admin API + SPA)
+#   - myrealm demo realm with alice/changeme and the developers group
+#   - admin-cli / account-console clients (admin SPA and account SPA login)
+#   - my-app (confidential) and public-app (public) sample clients in myrealm
+#
+# All URLs point at http://localhost:8080 (the published container port).
+
+marker: local-demo
+
+realms:
+  - name: master
+    display_name: Master
+    enabled: true
+    ssl_required: external
+    default_role: user
+
+  - name: myrealm
+    display_name: My Realm
+    enabled: true
+    ssl_required: external
+    default_role: user
+    registration_enabled: true
+    verify_email_enabled: false
+    reset_password_allowed: true
+    remember_me_enabled: true
+    login_with_email_allowed: true
+    attributes: {}
+
+roles:
+  - realm: master
+    name: admin
+    description: Realm administrator
+  - realm: master
+    name: user
+    description: Standard user
+  - realm: master
+    name: manage-realm
+    description: Manage realm settings
+  - realm: master
+    name: view-realm
+    description: View realm settings
+  - realm: master
+    name: manage-users
+    description: Manage users
+  - realm: master
+    name: view-users
+    description: View users
+  - realm: master
+    name: manage-clients
+    description: Manage clients
+  - realm: master
+    name: view-clients
+    description: View clients
+  - realm: master
+    name: impersonation
+    description: Impersonate users
+  - realm: myrealm
+    name: admin
+    description: Administrator role
+  - realm: myrealm
+    name: user
+    description: Standard user role
+
+groups:
+  - realm: myrealm
+    name: developers
+    path: /developers
+    attributes: {}
+  - realm: myrealm
+    name: ops
+    path: null
+    attributes: {}
+
+clients:
+  # Public client used by the admin console SPA (redirect URIs mirror
+  # build_admin_cli_client for the in-memory bootstrap).
+  - realm: master
+    client_id: admin-cli
+    name: Admin CLI
+    description: Public client used by the admin console SPA.
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:8080/
+      - http://localhost:8080/admin/console/callback
+      - http://localhost:8080/swagger-ui/oauth2-redirect.html
+    web_origins:
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: master
+    client_id: account-console
+    name: Account Console
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:8080/
+      - http://localhost:8080/realms/master/account
+    web_origins:
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: myrealm
+    client_id: account-console
+    name: Account Console
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:8080/
+      - http://localhost:8080/realms/myrealm/account
+    web_origins:
+      - http://localhost:8080
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  # Sample confidential client: try the token endpoint with
+  # client_id=my-app, client_secret=my-app-secret.
+  - realm: myrealm
+    client_id: my-app
+    name: My Application
+    description: Sample confidential web application client.
+    enabled: true
+    public_client: false
+    bearer_only: false
+    secret: my-app-secret
+    redirect_uris:
+      - http://localhost:3000/callback
+      - http://localhost:3000/login
+    web_origins:
+      - http://localhost:3000
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes:
+      - email
+    consent_required: false
+    full_scope_allowed: true
+
+  - realm: myrealm
+    client_id: public-app
+    name: Public SPA
+    description: Sample public single-page application client (PKCE).
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://localhost:4000/callback
+    web_origins:
+      - http://localhost:4000
+    default_scopes:
+      - openid
+      - profile
+    optional_scopes: []
+    consent_required: false
+    full_scope_allowed: true
+
+users:
+  - realm: master
+    username: admin
+    email: admin@issuerd.local
+    email_verified: true
+    first_name: Admin
+    last_name: User
+    enabled: true
+    password: admin
+    realm_roles:
+      - admin
+      - user
+      - manage-realm
+      - view-realm
+      - manage-users
+      - view-users
+      - manage-clients
+      - view-clients
+      - impersonation
+    groups: []
+    attributes: {}
+
+  - realm: myrealm
+    username: alice
+    email: alice@example.com
+    email_verified: true
+    first_name: Alice
+    last_name: Anderson
+    enabled: true
+    password: changeme
+    realm_roles:
+      - admin
+      - user
+    groups:
+      - developers
+    attributes:
+      department:
+        - engineering

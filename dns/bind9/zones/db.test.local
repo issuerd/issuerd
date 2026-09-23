@@ -1,0 +1,17 @@
+$TTL 3600
+@   IN  SOA ns.test.local. admin.test.local. (
+        2025061601  ; Serial
+        3600        ; Refresh
+        1800        ; Retry
+        604800      ; Expire
+        86400       ; Minimum TTL
+)
+
+@       IN  NS  ns.test.local.
+ns      IN  A   172.30.0.2
+keycloak IN  A   172.30.0.10
+issuerd IN A  172.30.0.11
+postgres IN  A   172.30.0.20
+redis   IN  A   172.30.0.21
+samba   IN  A   172.30.0.30
+openldap IN A   172.30.0.31
