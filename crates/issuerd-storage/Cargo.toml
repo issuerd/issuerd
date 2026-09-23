@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Storage backends (PostgreSQL via sqlx, in-memory, JSON file) for the Issuerd IAM server"
+keywords = ["oidc", "iam", "postgresql"]
+categories = ["authentication", "database"]
 
 [dependencies]
 issuerd-core = { workspace = true }

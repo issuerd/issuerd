@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "JWT/JWS/JWK creation, signing and validation for the Issuerd IAM server"
+keywords = ["oidc", "oauth2", "jwt", "jwk"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 issuerd-core = { workspace = true }

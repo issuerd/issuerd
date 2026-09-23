@@ -791,6 +791,19 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 4. Ensure `cargo test --workspace` and `cargo clippy --workspace --all-features -- -D warnings` pass.
 5. Add a `CHANGELOG.md` entry under `## [Unreleased]` (Keep a Changelog format — see the header of that file). The `changelog.yml` PR gate fails otherwise; label the PR `no-changelog` for changes with no user-visible impact (CI, docs, pure refactorings).
 
+### Publishing to crates.io
+
+All 10 crates share the workspace version and are published in dependency order with:
+
+```bash
+python scripts/publish.py          # dry-run rehearsal (default, no upload)
+python scripts/publish.py --real   # real publish (CARGO_REGISTRY_TOKEN/CRATES_TOKEN or cargo login)
+```
+
+The script stages a copy of the workspace because `issuerd-core` carries a **git dependency** on the `flux-rs` shim (crates.io rejects git deps): the staged copy strips that dep and the `#[flux_rs::...]` attribute lines — the compiled code is identical (the shim expands to nothing under plain rustc). Dry-run fully rehearses `issuerd-core` (packaged + verify-built); the dependent crates cannot even be packaged until their `issuerd-*` deps are live, because `cargo package`/`publish` strips path deps and re-resolves them against the registry — so `--real` publishes in order with a pause between crates for index propagation.
+
+**Open before publishing the root `issuerd` binary:** `crates/issuerd-server/build.rs` locates the web client at `../../webclientsrc/dist` (outside the packaged crate), so a crates.io build of `issuerd-server` cannot embed the SPA and `cargo install issuerd` (release profile) would hit the `DIST_MISSING` panic. Fix first: copy `webclientsrc/dist` into the server crate's package and teach build.rs a crate-local fallback path.
+
 ### Key Files for Agents
 
 | File | Purpose |

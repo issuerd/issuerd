@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Pure OIDC/OAuth2 protocol parsing and validation for the Issuerd IAM server"
+keywords = ["oidc", "oauth2", "iam"]
+categories = ["authentication", "parsing"]
 
 [dependencies]
 issuerd-core = { workspace = true }

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Distributed cache (Redis) and clustering primitives for the Issuerd IAM server"
+keywords = ["redis", "cluster", "iam", "caching"]
+categories = ["authentication", "caching"]
 
 [dependencies]
 issuerd-core = { workspace = true }

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Core types, traits, errors and models for the Issuerd IAM server (OIDC/OAuth2)"
+keywords = ["oidc", "oauth2", "iam", "identity"]
+categories = ["authentication"]
 
 # Enable Flux refinement-type checking for this crate (`cargo flux`,
 # scripts/flux.sh). Flux only checks crates that opt in here.
@@ -25,7 +28,8 @@ mockall = { workspace = true }
 utoipa = { version = "5.5" }
 # Flux refinement annotations (e.g. on `SecondsNonZero` in models.rs). The
 # proc-macro shim expands to nothing in normal builds; only `cargo flux`
-# interprets it. Not published on crates.io — pinned by Cargo.lock.
+# interprets it. Not published on crates.io — scripts/publish.py strips this
+# dependency (and the attribute lines it enables) when staging a publish.
 flux-rs = { git = "https://github.com/flux-rs/flux.git" }
 
 [dev-dependencies]

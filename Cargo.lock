@@ -2138,6 +2138,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "issuerd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "enable-ansi-support",
+ "figment",
+ "futures",
+ "issuerd-admin-api",
+ "issuerd-auth-flow",
+ "issuerd-cluster",
+ "issuerd-core",
+ "issuerd-federation",
+ "issuerd-protocol",
+ "issuerd-server",
+ "issuerd-storage",
+ "issuerd-token",
+ "jsonwebtoken",
+ "ldap3",
+ "rand 0.8.6",
+ "reqwest",
+ "ring",
+ "rustls",
+ "sd-notify",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "single-instance",
+ "sqlx",
+ "testcontainers",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-journald",
+ "tracing-log",
+ "tracing-subscriber",
+ "url",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "issuerd-admin-api"
 version = "0.1.0"
 dependencies = [
@@ -2363,55 +2412,6 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "issuerd-workspace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap",
- "enable-ansi-support",
- "figment",
- "futures",
- "issuerd-admin-api",
- "issuerd-auth-flow",
- "issuerd-cluster",
- "issuerd-core",
- "issuerd-federation",
- "issuerd-protocol",
- "issuerd-server",
- "issuerd-storage",
- "issuerd-token",
- "jsonwebtoken",
- "ldap3",
- "rand 0.8.6",
- "reqwest",
- "ring",
- "rustls",
- "sd-notify",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2",
- "single-instance",
- "sqlx",
- "testcontainers",
- "tokio",
- "tower",
- "tracing",
- "tracing-journald",
- "tracing-log",
- "tracing-subscriber",
- "url",
- "utoipa",
  "uuid",
 ]
 

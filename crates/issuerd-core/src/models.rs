@@ -28,7 +28,9 @@ use crate::traits::Algorithm;
 ///
 /// Flux: the refinement annotations let `cargo flux` (scripts/flux.sh) prove
 /// that `new`/`get` preserve the stored value. They come from the `flux-rs`
-/// proc-macro shim, which expands to nothing in normal builds.
+/// proc-macro shim, which expands to nothing in normal builds. The shim is a
+/// git dependency, so scripts/publish.py strips these lines when staging a
+/// crates.io publish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 #[flux_rs::refined_by(seconds: int)]

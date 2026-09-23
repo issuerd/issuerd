@@ -13,14 +13,17 @@ members = [
 resolver = "2"
 
 [package]
-name = "issuerd-workspace"
+name = "issuerd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-publish = false
+description = "Issuerd: a horizontally scalable, modular IAM server implementing OIDC/OAuth2 (Keycloak-inspired), with embedded admin/account web consoles"
+keywords = ["oidc", "oauth2", "iam", "identity", "keycloak"]
+categories = ["authentication", "network-programming", "web-programming"]
+readme = "README.md"
 
 [dependencies]
 issuerd-core = { workspace = true }
@@ -200,16 +203,16 @@ qrcodegen = "1.8"
 openssl = { version = "0.10", features = ["vendored"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 
-# Internal crates (version pinned to workspace)
-issuerd-core = { path = "crates/issuerd-core" }
-issuerd-protocol = { path = "crates/issuerd-protocol" }
-issuerd-auth-flow = { path = "crates/issuerd-auth-flow" }
-issuerd-token = { path = "crates/issuerd-token" }
-issuerd-storage = { path = "crates/issuerd-storage" }
-issuerd-federation = { path = "crates/issuerd-federation" }
-issuerd-admin-api = { path = "crates/issuerd-admin-api" }
-issuerd-cluster = { path = "crates/issuerd-cluster" }
-issuerd-server = { path = "crates/issuerd-server" }
+# Internal crates (version pinned to workspace; version required for crates.io publish)
+issuerd-core = { path = "crates/issuerd-core", version = "0.1.0" }
+issuerd-protocol = { path = "crates/issuerd-protocol", version = "0.1.0" }
+issuerd-auth-flow = { path = "crates/issuerd-auth-flow", version = "0.1.0" }
+issuerd-token = { path = "crates/issuerd-token", version = "0.1.0" }
+issuerd-storage = { path = "crates/issuerd-storage", version = "0.1.0" }
+issuerd-federation = { path = "crates/issuerd-federation", version = "0.1.0" }
+issuerd-admin-api = { path = "crates/issuerd-admin-api", version = "0.1.0" }
+issuerd-cluster = { path = "crates/issuerd-cluster", version = "0.1.0" }
+issuerd-server = { path = "crates/issuerd-server", version = "0.1.0" }
 
 [profile.release]
 # Strip the symbol table from the release binary: production images ship

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "HTTP server bootstrap, middleware, TLS and OIDC endpoints for the Issuerd IAM server"
+keywords = ["oidc", "oauth2", "iam"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 issuerd-core = { workspace = true }

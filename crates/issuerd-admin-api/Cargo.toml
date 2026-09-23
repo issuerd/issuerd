@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Keycloak-compatible REST Admin API with OpenAPI for the Issuerd IAM server"
+keywords = ["oidc", "iam", "keycloak", "openapi"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 issuerd-core = { workspace = true }

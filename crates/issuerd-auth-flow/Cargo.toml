@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description = "Pluggable authentication flow engine (authenticators, required actions, MFA) for the Issuerd IAM server"
+keywords = ["oidc", "iam", "authentication", "mfa"]
+categories = ["authentication"]
 
 [dependencies]
 issuerd-core = { workspace = true }
