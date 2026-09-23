@@ -3323,6 +3323,12 @@ pub struct Jwk {
 /// exposed through any public API response; only `public_jwk` may leave the
 /// server. Multi-node clusters load the shared key set at boot so every node
 /// signs with the same active key and validates tokens issued by its peers.
+///
+/// `private_der` is zeroized on drop so transient copies (e.g. the decrypted
+/// form produced by envelope-encrypted storage backends) do not linger in
+/// freed memory. The resident copy inside the token crate's keystore cannot be
+/// zeroized while the key is in use — see the issuerd-storage `key_encryption`
+/// module docs for the honest limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSigningKey {
     pub kid: KeyId,
@@ -3337,6 +3343,12 @@ pub struct StoredSigningKey {
     pub active: bool,
 }
 
+impl Drop for StoredSigningKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_der);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3347,6 +3359,40 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    /// Recorded JSON exactly as a pre-envelope-encryption version wrote a
+    /// `StoredSigningKey` into a JsonFileStorage snapshot. The model must stay
+    /// byte-compatible so old snapshots keep loading (backward-compat policy).
+    const OLD_FORMAT_STORED_SIGNING_KEY_JSON: &str = r#"{
+        "kid": "4f8c2a1e-7b3d-4e5f-9a6c-1d2e3f4a5b6c",
+        "alg": "RS256",
+        "created_at": "2026-01-01T00:00:00Z",
+        "private_der": [48, 130, 4, 161, 2, 1],
+        "public_jwk": {
+            "kty": "RSA",
+            "kid": "4f8c2a1e-7b3d-4e5f-9a6c-1d2e3f4a5b6c",
+            "alg": "RS256",
+            "use": "sig",
+            "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2",
+            "e": "AQAB"
+        },
+        "active": true
+    }"#;
+
+    #[test]
+    fn stored_signing_key_old_format_json_still_loads() {
+        let key: StoredSigningKey =
+            serde_json::from_str(OLD_FORMAT_STORED_SIGNING_KEY_JSON).unwrap();
+        assert_eq!(key.kid.as_ref(), "4f8c2a1e-7b3d-4e5f-9a6c-1d2e3f4a5b6c");
+        assert_eq!(key.alg, Algorithm::Rs256);
+        assert_eq!(key.private_der, vec![48, 130, 4, 161, 2, 1]);
+        assert!(key.active);
+        // Byte-stable round-trip: re-serializing yields the same document.
+        let written = serde_json::to_value(&key).unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_str(OLD_FORMAT_STORED_SIGNING_KEY_JSON).unwrap();
+        assert_eq!(written, recorded);
     }
 
     #[test]

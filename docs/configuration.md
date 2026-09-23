@@ -21,6 +21,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[cors]](#cors)
 - [[cluster]](#cluster)
 - [[cache]](#cache)
+- [[crypto.key_encryption]](#cryptokey_encryption)
 - [[themes]](#themes)
 - [[smtp]](#smtp)
 - [Token signing algorithm](#token-signing-algorithm)
@@ -386,6 +387,70 @@ that bypasses both (e.g. a direct database edit) stays hidden for at most
 same class as Keycloak's Infinispan propagation. Set `0` for pure-DB behavior
 (useful in tests, or when debugging unexpected staleness).
 
+## [crypto.key_encryption]
+
+Envelope encryption for the cluster-wide JWT **signing keys at rest**
+(PostgreSQL storage only). Without this section the `signing_keys` table holds
+private key material (PKCS#8 DER) in plaintext, and a database dump yields
+keys that can mint tokens for every realm. With it, `PostgresStorage`
+encrypts each key with a config-provided **Key Encryption Key (KEK)** before
+writing (AES-256-GCM, random per-key nonce), and the table only ever holds
+ciphertext. Decryption is transparent on read; the KEK is never stored in the
+database.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `key_id` | string | — | Identifier of the active KEK, persisted on every encrypted row (`kek_kid`) so a later rotation knows which KEK must decrypt it. Non-empty, ≤ 64 chars. |
+| `key_base64` | string | — | Base64-encoded 32-byte KEK (AES-256). Generate with `openssl rand -base64 32`. Prefer the env var over committing it to the file. |
+| `previous_keys` | array of tables | `[]` | Retired KEKs (`key_id` + `key_base64`) accepted for **decryption only** — the KEK-rotation window. File-only setting (env vars cannot index into arrays). |
+
+```toml
+[crypto.key_encryption]
+key_id     = "kek-2026-01"
+key_base64 = "…"   # prefer ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64
+
+# KEK rotation window: the retired KEK stays until every row is re-encrypted.
+# [[crypto.key_encryption.previous_keys]]
+# key_id     = "kek-2025-01"
+# key_base64 = "…"
+```
+
+Environment equivalents: `ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_ID` and
+`ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64`.
+
+**Behavior contract:**
+
+- **Absent section** = current plaintext behavior, plus a startup WARN on
+  PostgreSQL deployments (`signing keys are stored in PLAINTEXT …`). Existing
+  deployments boot unchanged.
+- **First enablement / rotation**: at boot — after migrations, before the
+  keystore loads — a sweep re-encrypts every row that is still plaintext or
+  was encrypted under a non-active KEK (`re-encrypted signing keys at rest`
+  log line with the row count). New keys and every admin rotation
+  (`keys/rotate`, `keys/{kid}/disable`) are written encrypted from the start.
+- **Fail closed**: a boot whose KEK cannot decrypt a row (wrong key bytes,
+  unknown `kek_kid`) aborts with a `signing-key encryption error` naming the
+  row `kid` and `kek_kid`. There is never a plaintext fallback. An invalid
+  section (bad base64, key not exactly 32 bytes, empty/duplicate `key_id`)
+  also aborts boot.
+- **Mixed-version clusters**: rows written by a KEK-enabled binary have
+  `private_der = NULL`, which a pre-encryption binary cannot read. Enable the
+  section only after **every** node runs the new version, and give all nodes
+  the identical section (see [CLUSTERING.md](CLUSTERING.md)).
+- **KEK rotation**: set the new `key_id`/`key_base64`, move the old pair into
+  `previous_keys`, roll the config to all nodes and restart — each boot sweep
+  re-encrypts the rows under the new KEK. Verify with
+  `SELECT DISTINCT kek_kid FROM signing_keys`, then drop the `previous_keys`
+  entry. Full procedure in [backup-and-upgrade.md](backup-and-upgrade.md).
+- **PostgreSQL-only**: with the in-memory or JSON-file backends the section is
+  ignored (boot WARN) — protect JSON snapshots at the filesystem level; they
+  hold plaintext keys by design (dev/manual-test backend).
+- **Memory-hygiene limits**: decrypted key material is zeroized on drop
+  (`StoredSigningKey`, the keystore's retired keys, and transient buffers).
+  What cannot be zeroized is the resident signing key while it is in use and
+  the internal copies `ring`/`jsonwebtoken` make per sign call — the guarantee
+  is "no additional long-lived plaintext copies beyond the resident key".
+
 ## [themes]
 
 | Key | Type | Default |
@@ -569,6 +634,18 @@ ssl           = false
 # ---- Cache ------------------------------------------------------------------
 [cache]
 read_cache_ttl_secs = 60        # read-model cache TTL; 0 disables all read-model caches (pure-DB behavior)
+
+# ---- Signing-key encryption at rest ------------------------------------------
+# Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).
+# Uncomment to envelope-encrypt them (AES-256-GCM; KEK from env, never the DB).
+# Enable only after EVERY cluster node runs a version that supports it.
+# [crypto.key_encryption]
+# key_id     = "kek-2026-01"      # persisted on each row; change on KEK rotation
+# key_base64 = "..."              # 32 bytes, base64 — prefer env:
+#                                 # ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64
+# [[crypto.key_encryption.previous_keys]]   # retired KEKs, decrypt-only (rotation window)
+# key_id     = "kek-2025-01"
+# key_base64 = "..."
 
 # ---- Themes -----------------------------------------------------------------
 [themes]

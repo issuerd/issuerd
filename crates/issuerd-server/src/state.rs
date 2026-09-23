@@ -249,17 +249,52 @@ impl ServerState {
             "node identity"
         );
 
+        // Envelope encryption of signing keys at rest: validate and build the
+        // KEK provider up front so an invalid [crypto.key_encryption] section
+        // aborts boot before any connection is opened.
+        let kek = config.crypto.build_kek_provider()?;
+
         // Storage
         let storage: Arc<dyn Storage> = match &config.storage {
             crate::config::StorageConfig::InMemory => {
+                if kek.is_some() {
+                    tracing::warn!(
+                        "[crypto.key_encryption] is only supported with PostgreSQL storage; \
+                         ignoring it for the in-memory backend"
+                    );
+                }
                 Arc::new(issuerd_storage::InMemoryStorage::new())
             }
             crate::config::StorageConfig::Postgres { url } => {
-                let pg = issuerd_storage::PostgresStorage::connect(url).await?;
+                let pg =
+                    issuerd_storage::PostgresStorage::connect_with_key_encryption(url, kek.clone())
+                        .await?;
                 pg.run_migrations().await?;
+                if kek.is_some() {
+                    // Expand pass: legacy plaintext rows (and rows encrypted
+                    // under a previous KEK) are rewritten under the active KEK
+                    // before the keystore loads. A wrong KEK fails the daemon
+                    // here — never a plaintext fallback.
+                    let rewritten = pg.reencrypt_signing_keys_with_active_kek().await?;
+                    if rewritten > 0 {
+                        info!(count = rewritten, "re-encrypted signing keys at rest");
+                    }
+                } else {
+                    tracing::warn!(
+                        "signing keys are stored in PLAINTEXT in PostgreSQL; \
+                         configure [crypto.key_encryption] to encrypt them at rest"
+                    );
+                }
                 Arc::new(pg)
             }
             crate::config::StorageConfig::JsonFile { path } => {
+                if kek.is_some() {
+                    tracing::warn!(
+                        "[crypto.key_encryption] is only supported with PostgreSQL storage; \
+                         ignoring it for the JSON-file backend (protect the snapshot file at \
+                         the filesystem level)"
+                    );
+                }
                 Arc::new(issuerd_storage::JsonFileStorage::new(path)?)
             }
         };

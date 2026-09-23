@@ -49,6 +49,25 @@ live in the `signing_keys` table in PostgreSQL:
   `default_signature_algorithm` attribute selects which active key signs its
   tokens; all nodes resolve the same key from the shared set.
 
+#### Encrypting the keys at rest
+
+With `[crypto.key_encryption]` configured (see
+[configuration.md](configuration.md#cryptokey_encryption)) the table holds
+AES-256-GCM ciphertext instead of plaintext DER. Cluster rules:
+
+- **Every node must carry the identical section** (same active `key_id` /
+  `key_base64` and the same `previous_keys`): nodes decrypt the shared rows
+  with it, and any node may be the one to write a rotated key. A node booted
+  with the wrong KEK fails closed at startup.
+- **Enable only after every node runs a version that supports it.** Rows
+  written by a KEK-enabled binary have `private_der = NULL`, which an older
+  binary cannot read — during a rolling upgrade, keep the section off until
+  the last node is on the new version.
+- Each boot runs a **re-encryption sweep** (after migrations, before the
+  keystore loads) that rewrites any plaintext rows or rows encrypted under a
+  previous KEK under the active KEK — that is what makes first-time enablement
+  and KEK rotation converge across the cluster.
+
 ### Login-failure counters
 
 Brute-force lockout counters use an atomic `increment` (Redis `INCR`), so

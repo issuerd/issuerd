@@ -49,7 +49,7 @@ fn json_to_scope(value: Value) -> Result<Scope, IssuerdError> {
         .map_err(|e| IssuerdError::ServerError(format!("json deserialization error: {e}")))
 }
 
-fn map_to_json<T: serde::Serialize>(value: T) -> Result<Value, IssuerdError> {
+pub(crate) fn map_to_json<T: serde::Serialize>(value: T) -> Result<Value, IssuerdError> {
     serde_json::to_value(value)
         .map_err(|e| IssuerdError::ServerError(format!("json serialization error: {e}")))
 }
@@ -1082,28 +1082,54 @@ impl TryFrom<&FlowConfig> for PgFlowConfig {
 // ------------------------------------------------------------------
 // StoredSigningKey
 // ------------------------------------------------------------------
+//
+// Row shape after migration 017 (envelope encryption, expand phase):
+// `private_der` holds plaintext for legacy/unencrypted rows and is NULL for
+// rows written by a KEK-enabled binary, which carry `private_der_enc`
+// (ciphertext blob: version || nonce || ciphertext || tag) plus the `kek_kid`
+// naming the KEK that encrypted them. Runtime `FromRow` maps by column name
+// and ignores extra columns, so pre-encryption binaries keep reading the
+// table (they only cannot decode encrypted-only rows — a documented
+// mixed-version caveat).
 #[derive(Debug, FromRow)]
 pub struct PgSigningKey {
     pub kid: String,
     pub alg: String,
     pub created_at: DateTime<Utc>,
-    pub private_der: Vec<u8>,
+    pub private_der: Option<Vec<u8>>,
+    pub private_der_enc: Option<Vec<u8>>,
+    pub kek_kid: Option<String>,
     pub public_jwk: Value,
     pub active: bool,
+}
+
+impl Drop for PgSigningKey {
+    fn drop(&mut self) {
+        if let Some(der) = &mut self.private_der {
+            zeroize::Zeroize::zeroize(der);
+        }
+    }
 }
 
 impl TryFrom<PgSigningKey> for StoredSigningKey {
     type Error = IssuerdError;
 
-    fn try_from(pg: PgSigningKey) -> Result<Self, Self::Error> {
+    fn try_from(mut pg: PgSigningKey) -> Result<Self, Self::Error> {
         Ok(Self {
-            kid: KeyId::new(pg.kid)?,
+            kid: KeyId::new(std::mem::take(&mut pg.kid))?,
             alg: pg.alg.parse()?,
             created_at: pg.created_at,
-            private_der: pg.private_der,
-            public_jwk: serde_json::from_value(pg.public_jwk).map_err(|e| {
-                IssuerdError::ServerError(format!("json deserialization error: {e}"))
+            // Decryption of ciphertext-only rows happens in
+            // `PostgresStorage::list_signing_keys` before this conversion;
+            // reaching here without plaintext is a caller bug.
+            private_der: pg.private_der.take().ok_or_else(|| {
+                IssuerdError::KeyEncryption(
+                    "signing-key row carries no plaintext (decrypt it first)".to_string(),
+                )
             })?,
+            public_jwk: serde_json::from_value(std::mem::take(&mut pg.public_jwk)).map_err(
+                |e| IssuerdError::ServerError(format!("json deserialization error: {e}")),
+            )?,
             active: pg.active,
         })
     }
@@ -1117,7 +1143,9 @@ impl TryFrom<&StoredSigningKey> for PgSigningKey {
             kid: k.kid.to_string(),
             alg: k.alg.as_str().to_string(),
             created_at: k.created_at,
-            private_der: k.private_der.clone(),
+            private_der: Some(k.private_der.clone()),
+            private_der_enc: None,
+            kek_kid: None,
             public_jwk: map_to_json(&k.public_jwk)?,
             active: k.active,
         })

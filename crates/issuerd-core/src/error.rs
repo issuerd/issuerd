@@ -186,6 +186,8 @@ pub enum IssuerdError {
     InvalidDpopProof,
     #[error("invalid authorization details: {0}")]
     InvalidAuthorizationDetails(String),
+    #[error("signing-key encryption error: {0}")]
+    KeyEncryption(String),
 }
 
 impl IssuerdError {
@@ -212,6 +214,7 @@ impl IssuerdError {
             IssuerdError::InvalidAuthorizationDetails(_) => {
                 OAuth2ErrorCode::InvalidAuthorizationDetails
             }
+            IssuerdError::KeyEncryption(_) => OAuth2ErrorCode::ServerError,
         }
     }
 
@@ -236,6 +239,7 @@ impl IssuerdError {
             IssuerdError::RequestNotSupported => 400,
             IssuerdError::InvalidDpopProof => 400,
             IssuerdError::InvalidAuthorizationDetails(_) => 400,
+            IssuerdError::KeyEncryption(_) => 500,
         }
     }
 
@@ -280,6 +284,11 @@ mod tests {
     #[case(IssuerdError::NotFound, OAuth2ErrorCode::ServerError, 404)]
     #[case(IssuerdError::Conflict, OAuth2ErrorCode::ServerError, 409)]
     #[case(
+        IssuerdError::KeyEncryption("bad KEK".into()),
+        OAuth2ErrorCode::ServerError,
+        500
+    )]
+    #[case(
         IssuerdError::UnsupportedOperation,
         OAuth2ErrorCode::UnsupportedOperation,
         501
@@ -321,6 +330,7 @@ mod tests {
             IssuerdError::RequestNotSupported,
             IssuerdError::InvalidDpopProof,
             IssuerdError::InvalidAuthorizationDetails("x".into()),
+            IssuerdError::KeyEncryption("x".into()),
         ];
         for err in variants {
             let oe = err.to_oauth2_error();

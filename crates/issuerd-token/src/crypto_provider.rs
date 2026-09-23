@@ -52,6 +52,12 @@ pub struct KeyStore {
 }
 
 /// A single signing key with its metadata and PKCS#8 DER private key.
+///
+/// `private_der` is zeroized on drop: the resident copy must stay usable while
+/// the key signs, but retired keys (keystore reload) and transient copies are
+/// erased promptly. `ring` / `jsonwebtoken::EncodingKey` still hold internal
+/// copies outside our control (see the issuerd-storage `key_encryption` module
+/// docs for the honest limits).
 #[derive(Debug, Clone)]
 pub struct SigningKey {
     pub kid: KeyId,
@@ -61,6 +67,12 @@ pub struct SigningKey {
     pub private_der: Vec<u8>,
     /// Public key represented as a JWK.
     pub public_jwk: Jwk,
+}
+
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_der);
+    }
 }
 
 impl SigningKey {

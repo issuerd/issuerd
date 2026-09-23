@@ -22,6 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Envelope encryption for signing keys at rest** (opt-in,
+  `[crypto.key_encryption]` config section): the cluster-wide JWT signing keys
+  in the PostgreSQL `signing_keys` table are now encrypted with a
+  config/env-provided 32-byte Key Encryption Key (AES-256-GCM, random per-key
+  nonce, KEK id persisted per row for rotation), so a database dump yields
+  only ciphertext. The KEK is never stored in the database; the
+  `KeyEncryptionKeyProvider` trait in `issuerd-core` is the SPI seam for a
+  future external KMS/HSM backend. Reads decrypt transparently and legacy
+  plaintext rows keep working: a boot-time sweep re-encrypts them under the
+  active KEK, and new keys plus admin rotations write ciphertext from the
+  start (expand-phase migration `017_signing_key_encryption.sql`; dropping the
+  plaintext column is a later contract migration). Boot **fails closed** when
+  the KEK cannot decrypt a row (wrong key or unknown `kek_kid`) — never a
+  plaintext fallback. Decrypted key material is zeroized on drop
+  (`zeroize` crate; residual copies inside `ring`/`jsonwebtoken` per sign call
+  are documented). **Existing deployments boot unchanged**: without the
+  section the behavior is identical to before, with a new startup WARN on
+  PostgreSQL deployments recommending the feature. With a non-PostgreSQL
+  backend the section is ignored (WARN) — protect JSON snapshots at the
+  filesystem level. Enable on a cluster only after every node runs this
+  version, with the identical section on all nodes; see
+  `docs/configuration.md` — "[crypto.key_encryption]",
+  `docs/CLUSTERING.md`, and `docs/backup-and-upgrade.md` (KEK backup and
+  rotation procedure).
+
 - The default token-signing algorithm is now **EdDSA (Ed25519)** instead of
   RS256 (asymmetric-first policy). New deployments generate an EdDSA signing
   key on first boot, and realms without a `default_signature_algorithm`

@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn es512_missing_jwk_coordinates_error() {
-        let mut jwk = KeyStore::generate_key(Algorithm::Es512, 2048).unwrap().public_jwk;
+        let mut jwk = KeyStore::generate_key(Algorithm::Es512, 2048).unwrap().public_jwk.clone();
         jwk.x = None;
         let result = verify_es512(&jwk, b"msg", &[0u8; 132]);
         assert!(result.is_err());

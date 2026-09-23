@@ -4,21 +4,44 @@
 // PostgreSQL storage adapter (sqlx).
 
 use async_trait::async_trait;
+use std::sync::Arc;
 // chrono unused at top level; used via db_types
 use issuerd_core::*;
 use sqlx::PgPool;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
+use zeroize::Zeroizing;
 
 use crate::db_types::*;
 
 /// PostgreSQL storage adapter.
 pub struct PostgresStorage {
     pool: PgPool,
+    /// Envelope-encryption (KEK) provider for signing keys at rest. `None`
+    /// keeps the pre-encryption behavior: keys are stored in plaintext and
+    /// ciphertext-only rows are rejected with a hard error.
+    kek: Option<Arc<dyn KeyEncryptionKeyProvider>>,
 }
 
 impl PostgresStorage {
     #[instrument(skip_all)]
     pub async fn connect(database_url: &str) -> Result<Self, IssuerdError> {
+        Self::connect_with_key_encryption(database_url, None).await
+    }
+
+    /// Connect, optionally enabling envelope encryption of signing keys at
+    /// rest (SECURITY_REVIEW_PLAN.md, item 3).
+    ///
+    /// With a KEK provider, `create_signing_key`/`update_signing_key` write
+    /// ciphertext-only rows (`private_der` NULL) and `list_signing_keys`
+    /// transparently decrypts; legacy plaintext rows stay readable and are
+    /// rewritten by [`Self::reencrypt_signing_keys_with_active_kek`]. Without
+    /// one, behavior is byte-identical to pre-encryption versions except that
+    /// ciphertext-only rows now fail loudly instead of decoding garbage.
+    #[instrument(skip_all)]
+    pub async fn connect_with_key_encryption(
+        database_url: &str,
+        kek: Option<Arc<dyn KeyEncryptionKeyProvider>>,
+    ) -> Result<Self, IssuerdError> {
         info!("connecting to PostgreSQL");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(20)
@@ -28,7 +51,7 @@ impl PostgresStorage {
                 error!(error = %e, "PostgreSQL connection failed");
                 IssuerdError::ServerError(format!("db connect failed: {e}"))
             })?;
-        Ok(Self { pool })
+        Ok(Self { pool, kek })
     }
 
     pub async fn run_migrations(&self) -> Result<(), IssuerdError> {
@@ -55,6 +78,125 @@ impl PostgresStorage {
 
     fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    // ------------------------------------------------------------------
+    // Signing-key envelope encryption (transparent to the Storage trait)
+    // ------------------------------------------------------------------
+
+    /// Resolve the plaintext private key material of one signing-key row per
+    /// the read matrix:
+    ///
+    /// | Row state              | KEK configured | Result |
+    /// |------------------------|----------------|--------|
+    /// | plaintext only         | any            | serve plaintext |
+    /// | plaintext + ciphertext | no             | serve plaintext + WARN |
+    /// | plaintext + ciphertext | yes            | decrypt (ciphertext authoritative) |
+    /// | ciphertext only        | yes, kid known | decrypt |
+    /// | ciphertext only        | no / kid unknown / wrong KEK | hard error (fail closed) |
+    /// | neither                | any            | hard error (corrupt row) |
+    fn resolve_signing_key_plaintext(
+        &self,
+        row: &PgSigningKey,
+    ) -> Result<Zeroizing<Vec<u8>>, IssuerdError> {
+        match (&row.private_der, &row.private_der_enc) {
+            (Some(der), None) => Ok(Zeroizing::new(der.clone())),
+            (Some(der), Some(_)) => {
+                if self.kek.is_some() {
+                    self.decrypt_signing_key_row(row)
+                } else {
+                    warn!(
+                        kid = %row.kid,
+                        "signing-key row holds both plaintext and ciphertext key material; \
+                         serving plaintext (configure [crypto.key_encryption] to encrypt at rest)"
+                    );
+                    Ok(Zeroizing::new(der.clone()))
+                }
+            }
+            (None, Some(_)) => {
+                if self.kek.is_none() {
+                    return Err(IssuerdError::KeyEncryption(format!(
+                        "signing key '{}' is encrypted at rest (kek_kid '{}') but no \
+                         [crypto.key_encryption] KEK is configured",
+                        row.kid,
+                        row.kek_kid.as_deref().unwrap_or("<none>")
+                    )));
+                }
+                self.decrypt_signing_key_row(row)
+            }
+            (None, None) => Err(IssuerdError::KeyEncryption(format!(
+                "signing key '{}' row holds neither plaintext nor ciphertext key material",
+                row.kid
+            ))),
+        }
+    }
+
+    /// Decrypt the ciphertext of a row with the KEK named by its `kek_kid`.
+    /// Callers must have established that the row carries ciphertext and that
+    /// a KEK provider is configured.
+    fn decrypt_signing_key_row(
+        &self,
+        row: &PgSigningKey,
+    ) -> Result<Zeroizing<Vec<u8>>, IssuerdError> {
+        let kek = self.kek.as_ref().expect("caller checked KEK is configured");
+        let blob = row.private_der_enc.as_ref().expect("caller checked ciphertext present");
+        let kek_kid = row.kek_kid.as_deref().ok_or_else(|| {
+            IssuerdError::KeyEncryption(format!(
+                "signing key '{}' carries ciphertext but no kek_kid",
+                row.kid
+            ))
+        })?;
+        kek.decrypt(kek_kid, blob)
+            .map(Zeroizing::new)
+            .map_err(|e| IssuerdError::KeyEncryption(format!("signing key '{}': {e}", row.kid)))
+    }
+
+    /// One-shot expand pass for envelope encryption: rewrite every signing-key
+    /// row that is not already ciphertext-only under the active KEK — legacy
+    /// plaintext rows, plaintext+ciphertext rows (normalized to
+    /// ciphertext-only), and rows encrypted under a previous KEK (KEK rotation
+    /// convergence). Returns the number of rewritten rows; a no-op without a
+    /// configured KEK.
+    ///
+    /// Fails closed: an undecryptable row (wrong/missing KEK) aborts the sweep
+    /// — and with it daemon boot, which calls this between migrations and the
+    /// keystore load. Never falls back to plaintext.
+    pub async fn reencrypt_signing_keys_with_active_kek(&self) -> Result<u64, IssuerdError> {
+        let Some(kek) = &self.kek else {
+            return Ok(0);
+        };
+        let rows: Vec<PgSigningKey> =
+            sqlx::query_as("SELECT * FROM signing_keys ORDER BY created_at ASC, kid ASC")
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_err)?;
+        let mut rewritten = 0u64;
+        for row in rows {
+            let current = row.private_der.is_none()
+                && row.private_der_enc.is_some()
+                && row.kek_kid.as_deref() == Some(kek.active_key_id());
+            // Resolve (decrypt) EVERY row, including ones that look current:
+            // a KEK whose bytes changed under a reused key_id is otherwise
+            // invisible to the sweep, and the wrong-KEK case must surface
+            // here as a boot-fatal error naming the row kid.
+            let der = self.resolve_signing_key_plaintext(&row)?;
+            if current {
+                continue;
+            }
+            let blob = kek.encrypt(&der)?;
+            sqlx::query(
+                "UPDATE signing_keys SET private_der = NULL, private_der_enc = $2, kek_kid = $3 \
+                 WHERE kid = $1",
+            )
+            .bind(&row.kid)
+            .bind(blob)
+            .bind(kek.active_key_id())
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
     }
 }
 
@@ -2505,10 +2647,39 @@ impl Storage for PostgresStorage {
                 .fetch_all(self.pool())
                 .await
                 .map_err(sqlx_err)?;
-        rows.into_iter().map(|k| k.try_into()).collect()
+        let mut keys = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            // Transparent decrypt-on-read; the returned buffer moves into the
+            // model (whose Drop zeroizes it), the wrapper keeps nothing.
+            let mut der = self.resolve_signing_key_plaintext(&row)?;
+            row.private_der = Some(std::mem::take(&mut *der));
+            keys.push(row.try_into()?);
+        }
+        Ok(keys)
     }
 
     async fn create_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
+        if let Some(kek) = &self.kek {
+            // Encrypt-on-write: the row carries ciphertext only. Callers still
+            // pass the plaintext model; encryption happens at the SQL boundary.
+            let blob = kek.encrypt(&key.private_der)?;
+            sqlx::query(
+                r#"INSERT INTO signing_keys (
+                    kid, alg, created_at, private_der, private_der_enc, kek_kid, public_jwk, active
+                ) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)"#,
+            )
+            .bind(key.kid.to_string())
+            .bind(key.alg.as_str())
+            .bind(key.created_at)
+            .bind(blob)
+            .bind(kek.active_key_id())
+            .bind(map_to_json(&key.public_jwk)?)
+            .bind(key.active)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+            return Ok(());
+        }
         let pg: PgSigningKey = key.try_into()?;
         sqlx::query(
             r#"INSERT INTO signing_keys (
@@ -2528,12 +2699,30 @@ impl Storage for PostgresStorage {
     }
 
     async fn update_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
-        let result = sqlx::query("UPDATE signing_keys SET active = $2 WHERE kid = $1")
+        let result = if let Some(kek) = &self.kek {
+            // Re-encrypt-on-write: every update normalizes the row to
+            // ciphertext-only under the active KEK. Admin rotation calls this
+            // for every key, so each rotation rewrites the table encrypted.
+            let blob = kek.encrypt(&key.private_der)?;
+            sqlx::query(
+                "UPDATE signing_keys SET active = $2, private_der = NULL, private_der_enc = $3, \
+                 kek_kid = $4 WHERE kid = $1",
+            )
             .bind(key.kid.to_string())
             .bind(key.active)
+            .bind(blob)
+            .bind(kek.active_key_id())
             .execute(self.pool())
             .await
-            .map_err(sqlx_err)?;
+            .map_err(sqlx_err)?
+        } else {
+            sqlx::query("UPDATE signing_keys SET active = $2 WHERE kid = $1")
+                .bind(key.kid.to_string())
+                .bind(key.active)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_err)?
+        };
         if result.rows_affected() == 0 {
             return Err(IssuerdError::NotFound);
         }
@@ -2548,7 +2737,7 @@ mod tests {
     use std::collections::HashMap;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
-    async fn setup_pg() -> (PostgresStorage, testcontainers::ContainerAsync<GenericImage>) {
+    async fn start_pg_container() -> (String, testcontainers::ContainerAsync<GenericImage>) {
         let img = GenericImage::new("postgres", "15-alpine")
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",
@@ -2560,9 +2749,33 @@ mod tests {
         let host = container.get_host().await.expect("host");
         let port = container.get_host_port_ipv4(5432).await.expect("port");
         let url = format!("postgres://postgres:postgres@{host}:{port}/test");
+        (url, container)
+    }
+
+    async fn setup_pg() -> (PostgresStorage, testcontainers::ContainerAsync<GenericImage>) {
+        let (url, container) = start_pg_container().await;
         let storage = PostgresStorage::connect(&url).await.expect("connect");
         storage.run_migrations().await.expect("migrations");
         (storage, container)
+    }
+
+    /// Postgres with an envelope-encryption (KEK) provider wired in.
+    async fn setup_pg_with_kek(
+        kek: Arc<dyn KeyEncryptionKeyProvider>,
+    ) -> (PostgresStorage, testcontainers::ContainerAsync<GenericImage>) {
+        let (url, container) = start_pg_container().await;
+        let storage = PostgresStorage::connect_with_key_encryption(&url, Some(kek))
+            .await
+            .expect("connect");
+        storage.run_migrations().await.expect("migrations");
+        (storage, container)
+    }
+
+    fn test_kek(kid: &str, byte: u8) -> Arc<dyn KeyEncryptionKeyProvider> {
+        Arc::new(
+            crate::key_encryption::Aes256GcmKekProvider::new(kid.to_string(), [byte; 32], vec![])
+                .unwrap(),
+        )
     }
 
     fn test_realm() -> Realm {
@@ -3104,6 +3317,205 @@ mod tests {
 
         // Duplicate kid is rejected with a primary-key violation.
         assert!(storage.create_signing_key(&older).await.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Signing-key envelope encryption (KEK at rest)
+    // ------------------------------------------------------------------
+
+    /// Raw row state of one signing key: (private_der, private_der_enc, kek_kid).
+    async fn raw_signing_key_row(
+        storage: &PostgresStorage,
+        kid: &str,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) {
+        sqlx::query_as(
+            "SELECT private_der, private_der_enc, kek_kid FROM signing_keys WHERE kid = $1",
+        )
+        .bind(kid)
+        .fetch_one(storage.pool())
+        .await
+        .expect("raw signing-key row")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_encrypted_roundtrip() {
+        let (storage, _container) = setup_pg_with_kek(test_kek("kek-1", 7)).await;
+        let key = test_signing_key(
+            "key-enc",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+
+        storage.create_signing_key(&key).await.unwrap();
+
+        // The DB holds ciphertext only — the acceptance criterion.
+        let (der, enc, kek_kid) = raw_signing_key_row(&storage, "key-enc").await;
+        assert!(der.is_none(), "private_der must be NULL");
+        assert!(enc.is_some(), "private_der_enc must hold the ciphertext blob");
+        assert_eq!(kek_kid.as_deref(), Some("kek-1"));
+
+        // Transparent decrypt-on-read returns the original model.
+        let keys = storage.list_signing_keys().await.unwrap();
+        assert_eq!(keys, vec![key]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_legacy_plaintext_row_swept_to_ciphertext() {
+        let (url, _container) = start_pg_container().await;
+        // Legacy binary (no KEK): writes a plaintext row with the six old columns.
+        let plain = PostgresStorage::connect(&url).await.unwrap();
+        plain.run_migrations().await.unwrap();
+        let key = test_signing_key(
+            "key-legacy",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        plain.create_signing_key(&key).await.unwrap();
+        let (der, enc, kek_kid) = raw_signing_key_row(&plain, "key-legacy").await;
+        assert!(der.is_some() && enc.is_none() && kek_kid.is_none());
+
+        // New binary with KEK: decrypt-on-read serves the legacy row...
+        let with_kek =
+            PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-1", 7)))
+                .await
+                .unwrap();
+        assert_eq!(with_kek.list_signing_keys().await.unwrap(), vec![key.clone()]);
+
+        // ...the boot sweep rewrites it to ciphertext-only...
+        assert_eq!(with_kek.reencrypt_signing_keys_with_active_kek().await.unwrap(), 1);
+        let (der, enc, kek_kid) = raw_signing_key_row(&with_kek, "key-legacy").await;
+        assert!(der.is_none() && enc.is_some());
+        assert_eq!(kek_kid.as_deref(), Some("kek-1"));
+
+        // ...a repeat sweep converges (no-op) and the row still reads back.
+        assert_eq!(with_kek.reencrypt_signing_keys_with_active_kek().await.unwrap(), 0);
+        assert_eq!(with_kek.list_signing_keys().await.unwrap(), vec![key]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_update_reencrypts_plaintext_row() {
+        let (url, _container) = start_pg_container().await;
+        let plain = PostgresStorage::connect(&url).await.unwrap();
+        plain.run_migrations().await.unwrap();
+        let key = test_signing_key(
+            "key-upd",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        plain.create_signing_key(&key).await.unwrap();
+
+        let with_kek =
+            PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-1", 7)))
+                .await
+                .unwrap();
+        // Admin rotation calls update_signing_key for every key — each call
+        // normalizes its row to ciphertext-only (re-encrypt-on-write).
+        let mut disabled = key.clone();
+        disabled.active = false;
+        with_kek.update_signing_key(&disabled).await.unwrap();
+
+        let (der, enc, kek_kid) = raw_signing_key_row(&with_kek, "key-upd").await;
+        assert!(der.is_none() && enc.is_some());
+        assert_eq!(kek_kid.as_deref(), Some("kek-1"));
+        let keys = with_kek.list_signing_keys().await.unwrap();
+        assert_eq!(keys, vec![disabled]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_encrypted_row_without_kek_fails_closed() {
+        let (url, _container) = start_pg_container().await;
+        let with_kek =
+            PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-1", 7)))
+                .await
+                .unwrap();
+        with_kek.run_migrations().await.unwrap();
+        let key = test_signing_key(
+            "key-sealed",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        with_kek.create_signing_key(&key).await.unwrap();
+
+        // A node without the KEK must fail loudly, naming kid and kek_kid.
+        let plain = PostgresStorage::connect(&url).await.unwrap();
+        let err = plain.list_signing_keys().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, IssuerdError::KeyEncryption(_)));
+        assert!(msg.contains("key-sealed"), "error names the row kid: {msg}");
+        assert!(msg.contains("kek-1"), "error names the kek_kid: {msg}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_wrong_kek_fails_closed() {
+        let (url, _container) = start_pg_container().await;
+        let with_kek =
+            PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-1", 1)))
+                .await
+                .unwrap();
+        with_kek.run_migrations().await.unwrap();
+        let key = test_signing_key(
+            "key-wrong",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        with_kek.create_signing_key(&key).await.unwrap();
+
+        // Same key_id, different key bytes: read and sweep both fail closed.
+        let wrong = PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-1", 2)))
+            .await
+            .unwrap();
+        assert!(wrong.list_signing_keys().await.is_err());
+        assert!(wrong.reencrypt_signing_keys_with_active_kek().await.is_err());
+
+        // Unknown kek_kid on the row: hard error naming both ids.
+        let other = PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("kek-2", 1)))
+            .await
+            .unwrap();
+        let err = other.list_signing_keys().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("key-wrong"), "error names the row kid: {msg}");
+        assert!(msg.contains("kek-1"), "error names the row kek_kid: {msg}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_signing_key_kek_rotation_via_previous_keys() {
+        let (url, _container) = start_pg_container().await;
+        let old_kek = PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("old", 9)))
+            .await
+            .unwrap();
+        old_kek.run_migrations().await.unwrap();
+        let key = test_signing_key(
+            "key-rot",
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        );
+        old_kek.create_signing_key(&key).await.unwrap();
+
+        // Rotation window: new active KEK, old one demoted to previous_keys.
+        let rotated: Arc<dyn KeyEncryptionKeyProvider> = Arc::new(
+            crate::key_encryption::Aes256GcmKekProvider::new(
+                "new".to_string(),
+                [8u8; 32],
+                vec![("old".to_string(), [9u8; 32])],
+            )
+            .unwrap(),
+        );
+        let new_kek =
+            PostgresStorage::connect_with_key_encryption(&url, Some(rotated)).await.unwrap();
+        // Decrypt-on-read via the previous KEK...
+        assert_eq!(new_kek.list_signing_keys().await.unwrap(), vec![key.clone()]);
+        // ...and the boot sweep migrates the row to the active KEK.
+        assert_eq!(new_kek.reencrypt_signing_keys_with_active_kek().await.unwrap(), 1);
+        let (der, enc, kek_kid) = raw_signing_key_row(&new_kek, "key-rot").await;
+        assert!(der.is_none() && enc.is_some());
+        assert_eq!(kek_kid.as_deref(), Some("new"));
+
+        // After the sweep the old KEK can leave the config: the row reads
+        // under the new KEK alone.
+        let new_only = PostgresStorage::connect_with_key_encryption(&url, Some(test_kek("new", 8)))
+            .await
+            .unwrap();
+        assert_eq!(new_only.list_signing_keys().await.unwrap(), vec![key]);
     }
 
     // ------------------------------------------------------------------

@@ -55,6 +55,8 @@ mod identity_brokering;
 mod jar_jarm_form_post;
 #[path = "integration/jwt_client_auth.rs"]
 mod jwt_client_auth;
+#[path = "integration/key_encryption.rs"]
+mod key_encryption;
 #[path = "integration/logout_channels.rs"]
 mod logout_channels;
 #[path = "integration/mfa.rs"]

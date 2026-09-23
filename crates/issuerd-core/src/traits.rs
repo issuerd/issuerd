@@ -646,6 +646,37 @@ pub trait Storage: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// KeyEncryptionKeyProvider trait
+// ---------------------------------------------------------------------------
+
+/// Envelope-encryption (KEK) provider for signing keys at rest.
+///
+/// A Key Encryption Key encrypts the per-row private key material before it is
+/// written to storage; the database then only ever holds ciphertext. Rows
+/// carry the id of the KEK that encrypted them so KEKs can rotate: providers
+/// decrypt with any configured KEK but encrypt new rows with the active one
+/// only.
+///
+/// This trait is the SPI seam for future external backends (cloud KMS, HSM):
+/// those implement `decrypt` as a remote call and never expose key material.
+/// Only the local AES-256-GCM implementation ships today (issuerd-storage).
+///
+/// Implementations must use an AEAD construction with a fresh random nonce per
+/// encryption; the KEK itself must never be persisted alongside the data.
+pub trait KeyEncryptionKeyProvider: Send + Sync {
+    /// Id of the KEK used for NEW encryptions (persisted on each encrypted row
+    /// so a later rotation can tell which KEK must decrypt it).
+    fn active_key_id(&self) -> &str;
+    /// Encrypt `plaintext` under the active KEK, returning the self-describing
+    /// ciphertext blob (version tag || nonce || ciphertext || auth tag).
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, IssuerdError>;
+    /// Decrypt `blob` with the KEK named `key_id` (the active KEK or a
+    /// configured previous one). Fails closed: an unknown `key_id`, malformed
+    /// blob, or wrong KEK returns an error — never a plaintext fallback.
+    fn decrypt(&self, key_id: &str, blob: &[u8]) -> Result<Vec<u8>, IssuerdError>;
+}
+
+// ---------------------------------------------------------------------------
 // CryptoProvider trait
 // ---------------------------------------------------------------------------
 

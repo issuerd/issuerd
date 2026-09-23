@@ -137,6 +137,27 @@ cluster node signs with the same active key and validates tokens issued by its p
 > endpoints is namespace parity with Keycloak only. See [CLUSTERING.md](CLUSTERING.md) for the
 > multi-node contract.
 
+### Encryption at rest
+
+By default the `signing_keys` table holds private key material in **plaintext** — anyone who can
+read a database dump can mint tokens for every realm. The optional
+[`[crypto.key_encryption]`](configuration.md#cryptokey_encryption) section enables **envelope
+encryption**: the server encrypts each signing key with a config/env-provided 32-byte Key
+Encryption Key (AES-256-GCM, random per-key nonce) before writing, so the table only ever holds
+ciphertext and the KEK never touches the database.
+
+- **Enablement is transparent**: a boot-time sweep re-encrypts legacy plaintext rows, reads
+  decrypt on the fly, and key rotation writes ciphertext from the start. Existing deployments
+  without the section boot unchanged (with a startup WARN recommending the feature).
+- **Fail closed**: a node booted with the wrong KEK refuses to start; there is no plaintext
+  fallback. Every cluster node must carry the identical section.
+- **Operational consequences move to the KEK**: back it up alongside the config (a dump without
+  the KEK cannot recover the signing keys), and rotate it via the `previous_keys` window —
+  procedures in [backup-and-upgrade.md](backup-and-upgrade.md#signing-key-encryption-kek).
+- **Residual exposure**: while the server runs, the resident signing key lives in process memory
+  (it must sign); envelope encryption protects the database at rest, not the running node.
+  Transient decrypted buffers and retired keys are zeroized on drop.
+
 ### Per-realm signing algorithm
 
 Supported signing algorithms: **RS256/RS384/RS512** (RSA), **ES256/ES384/ES512** (ECDSA, ES512 via

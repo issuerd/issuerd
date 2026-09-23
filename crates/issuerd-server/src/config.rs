@@ -32,6 +32,9 @@ pub struct ServerConfig {
     /// Read-model cache settings (`[cache]` section).
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Crypto settings (`[crypto]` section).
+    #[serde(default)]
+    pub crypto: CryptoSettings,
     /// Login-theme asset directory (`[themes]` section).
     pub themes: ThemesConfig,
     /// Optional path to a provision config file (YAML/TOML/JSON).
@@ -55,6 +58,7 @@ impl Default for ServerConfig {
             cluster: ClusterConfig::default(),
             smtp: SmtpConfig::default(),
             cache: CacheConfig::default(),
+            crypto: CryptoSettings::default(),
             themes: ThemesConfig::default(),
             provision: None,
         }
@@ -137,6 +141,7 @@ impl ServerConfig {
                 password: None,
             },
             cache: CacheConfig::default(),
+            crypto: CryptoSettings::default(),
             provision: Some(PathBuf::from("provision.yaml")),
         }
     }
@@ -303,6 +308,102 @@ impl Default for CacheConfig {
             read_cache_ttl_secs: 60,
         }
     }
+}
+
+/// Crypto settings (`[crypto]` section).
+///
+/// Currently only envelope encryption of signing keys at rest. The whole
+/// section is optional and defaults to "not configured".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CryptoSettings {
+    /// Envelope encryption of signing keys at rest (`[crypto.key_encryption]`,
+    /// PostgreSQL storage only). Absent keeps the pre-encryption behavior —
+    /// signing keys are stored in plaintext — and the daemon logs a startup
+    /// WARN on PostgreSQL deployments.
+    pub key_encryption: Option<KeyEncryptionConfig>,
+}
+
+impl CryptoSettings {
+    /// Validate `[crypto.key_encryption]` (when present) and build the KEK
+    /// provider. `Ok(None)` means the section is absent (plaintext mode).
+    /// Invalid configuration — malformed base64, a key that is not exactly
+    /// 32 bytes, empty/overlong/duplicate key ids — is a boot-fatal error.
+    pub fn build_kek_provider(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn issuerd_core::KeyEncryptionKeyProvider>>, IssuerdError>
+    {
+        self.key_encryption
+            .as_ref()
+            .map(KeyEncryptionConfig::build_provider)
+            .transpose()
+    }
+}
+
+/// Envelope encryption of signing keys at rest (`[crypto.key_encryption]`).
+///
+/// The Key Encryption Key (KEK) encrypts the cluster-wide JWT signing keys
+/// before they are written to PostgreSQL, so a database dump yields only
+/// ciphertext. The KEK itself must never be stored in the database; source it
+/// from the environment (`ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64`) or a
+/// permission-protected config file. Generate one with `openssl rand -base64 32`.
+///
+/// PostgreSQL-only: with any other storage backend the section is ignored
+/// (boot WARN) — protect JSON snapshots at the filesystem level instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyEncryptionConfig {
+    /// Identifier of the active KEK, stored on every encrypted row so a later
+    /// rotation knows which KEK must decrypt it. Non-empty, at most 64 chars,
+    /// unique across `previous_keys`.
+    pub key_id: String,
+    /// Base64-encoded 32-byte KEK (AES-256). Prefer the
+    /// `ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64` env var over the file.
+    pub key_base64: String,
+    /// Previous KEKs, accepted for decryption only: the KEK-rotation window.
+    /// File-only setting (env vars cannot index into arrays).
+    #[serde(default)]
+    pub previous_keys: Vec<PreviousKekConfig>,
+}
+
+impl KeyEncryptionConfig {
+    fn build_provider(
+        &self,
+    ) -> Result<std::sync::Arc<dyn issuerd_core::KeyEncryptionKeyProvider>, IssuerdError> {
+        let active = decode_kek(&self.key_base64)?;
+        let mut previous = Vec::with_capacity(self.previous_keys.len());
+        for prev in &self.previous_keys {
+            previous.push((prev.key_id.clone(), decode_kek(&prev.key_base64)?));
+        }
+        let provider =
+            issuerd_storage::Aes256GcmKekProvider::new(self.key_id.clone(), active, previous)?;
+        Ok(std::sync::Arc::new(provider))
+    }
+}
+
+/// A retired KEK kept for decryption during a KEK-rotation window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviousKekConfig {
+    /// The `key_id` the KEK had while it was active (matches the `kek_kid`
+    /// stored on rows it encrypted).
+    pub key_id: String,
+    /// Base64-encoded 32-byte KEK.
+    pub key_base64: String,
+}
+
+/// Decode a configured KEK: standard base64 of exactly 32 bytes (AES-256).
+fn decode_kek(key_base64: &str) -> Result<[u8; 32], IssuerdError> {
+    use base64::Engine;
+    let bytes =
+        base64::engine::general_purpose::STANDARD
+            .decode(key_base64.trim())
+            .map_err(|e| {
+                IssuerdError::KeyEncryption(format!("KEK key_base64 is not valid base64: {e}"))
+            })?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        IssuerdError::KeyEncryption(format!(
+            "KEK must decode to exactly 32 bytes (AES-256), got {}",
+            bytes.len()
+        ))
+    })
 }
 
 /// Login-theme asset configuration (`[themes]` section).
@@ -601,6 +702,143 @@ issuer_url = "http://example.com"
         let cfg = ServerConfig::load(None).unwrap();
         assert_eq!(cfg.issuer_url, "http://env-override:9999");
         std::env::remove_var("ISSUERD_ISSUER_URL");
+    }
+
+    // ------------------------------------------------------------------
+    // [crypto.key_encryption]
+    // ------------------------------------------------------------------
+
+    fn test_kek_base64(byte: u8) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+    }
+
+    #[test]
+    fn key_encryption_absent_by_default() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.crypto.key_encryption.is_none());
+        assert!(cfg.crypto.build_kek_provider().unwrap().is_none());
+        assert!(ServerConfig::generate_example().crypto.key_encryption.is_none());
+    }
+
+    #[test]
+    fn key_encryption_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("crypto_toml", "toml");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[crypto.key_encryption]
+key_id = "kek-2026-01"
+key_base64 = "{}"
+
+[[crypto.key_encryption.previous_keys]]
+key_id = "kek-2025-01"
+key_base64 = "{}"
+"#,
+                test_kek_base64(7),
+                test_kek_base64(9)
+            ),
+        )
+        .unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        let kec = cfg.crypto.key_encryption.as_ref().expect("section parsed");
+        assert_eq!(kec.key_id, "kek-2026-01");
+        assert_eq!(kec.previous_keys.len(), 1);
+        assert_eq!(kec.previous_keys[0].key_id, "kek-2025-01");
+
+        // The section builds a working provider (round-trip through both KEKs).
+        let kek = cfg.crypto.build_kek_provider().unwrap().expect("provider");
+        assert_eq!(kek.active_key_id(), "kek-2026-01");
+        let blob = kek.encrypt(b"der").unwrap();
+        assert_eq!(kek.decrypt("kek-2026-01", &blob).unwrap(), b"der");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_encryption_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_ID", "env-kek");
+        std::env::set_var("ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64", test_kek_base64(3));
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_ID");
+        std::env::remove_var("ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_BASE64");
+        let kec = cfg.crypto.key_encryption.as_ref().expect("env section parsed");
+        assert_eq!(kec.key_id, "env-kek");
+        assert!(cfg.crypto.build_kek_provider().unwrap().is_some());
+    }
+
+    #[test]
+    fn key_encryption_invalid_configs_fail_boot_validation() {
+        let valid = test_kek_base64(1);
+        for (label, kec) in [
+            (
+                "bad base64",
+                KeyEncryptionConfig {
+                    key_id: "k".to_string(),
+                    key_base64: "!!! not base64 !!!".to_string(),
+                    previous_keys: vec![],
+                },
+            ),
+            (
+                "31-byte key",
+                KeyEncryptionConfig {
+                    key_id: "k".to_string(),
+                    key_base64: {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.encode([1u8; 31])
+                    },
+                    previous_keys: vec![],
+                },
+            ),
+            (
+                "33-byte key",
+                KeyEncryptionConfig {
+                    key_id: "k".to_string(),
+                    key_base64: {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.encode([1u8; 33])
+                    },
+                    previous_keys: vec![],
+                },
+            ),
+            (
+                "empty key_id",
+                KeyEncryptionConfig {
+                    key_id: String::new(),
+                    key_base64: valid.clone(),
+                    previous_keys: vec![],
+                },
+            ),
+            (
+                "duplicate key_id",
+                KeyEncryptionConfig {
+                    key_id: "dup".to_string(),
+                    key_base64: valid.clone(),
+                    previous_keys: vec![PreviousKekConfig {
+                        key_id: "dup".to_string(),
+                        key_base64: test_kek_base64(2),
+                    }],
+                },
+            ),
+            (
+                "bad previous key",
+                KeyEncryptionConfig {
+                    key_id: "k".to_string(),
+                    key_base64: valid.clone(),
+                    previous_keys: vec![PreviousKekConfig {
+                        key_id: "old".to_string(),
+                        key_base64: "c2hvcnQ=".to_string(), // 5 bytes
+                    }],
+                },
+            ),
+        ] {
+            let settings = CryptoSettings {
+                key_encryption: Some(kec),
+            };
+            assert!(settings.build_kek_provider().is_err(), "{label} must fail validation");
+        }
     }
 
     #[test]

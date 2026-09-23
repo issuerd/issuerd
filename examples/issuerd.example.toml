@@ -43,5 +43,7 @@ ssl = false
 [cache]
 read_cache_ttl_secs = 60
 
+[crypto]
+
 [themes]
 dir = "themes"

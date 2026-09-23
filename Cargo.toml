@@ -166,6 +166,8 @@ argon2 = "0.5"
 pbkdf2 = "0.12"
 sha2 = "0.10"
 subtle = "2.6"
+# Secret memory hygiene (zeroize-on-drop for key material buffers)
+zeroize = "1.8"
 
 # Email (SMTP)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1", "tokio1-rustls-tls"] }
