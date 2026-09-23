@@ -371,7 +371,57 @@ pub async fn handle_spnego(
                     claims: None,
                     authorization_details: None,
                 };
-                super::oidc::store_auth_code(&state.cache, &code, &code_data).await;
+                if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await
+                {
+                    tracing::error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to persist authorization code");
+                    let mut details = HashMap::new();
+                    details.insert("error".to_string(), "temporarily_unavailable".to_string());
+                    emit_oidc_event(
+                        &state,
+                        &realm_id,
+                        EventType::LoginError,
+                        &ip,
+                        Some(client_id.clone()),
+                        Some(user.id.clone()),
+                        Some(session_id.clone()),
+                        Some("temporarily_unavailable".to_string()),
+                        details,
+                    )
+                    .await;
+                    // Same response_mode handling as the success redirect
+                    // below (RFC 6749 §4.1.2.1 — the redirect URI was
+                    // validated above); JARM wraps error responses exactly
+                    // like success responses.
+                    let requested_mode = params.get("response_mode").and_then(|m| {
+                        m.parse::<issuerd_protocol::authorization::ResponseMode>().ok()
+                    });
+                    if let Some(mode) = requested_mode {
+                        if let Ok(Some(realm)) = state.storage.get_realm(&realm_id).await {
+                            let packaging = super::auth_response::ResponsePackaging {
+                                realm: &realm,
+                                client_id: client.client_id.as_str(),
+                                requested_mode: Some(mode),
+                                default_fragment: false,
+                            };
+                            return super::auth_response::oauth_error_redirect(
+                                &state,
+                                &redirect_uri_str,
+                                &issuerd_core::IssuerdError::TemporarilyUnavailable,
+                                params.get("state").map(|s| s.as_str()),
+                                &packaging,
+                            )
+                            .await;
+                        }
+                    }
+                    let mut redirect_params: Vec<(&str, &str)> =
+                        vec![("error", "temporarily_unavailable")];
+                    if let Some(s) = params.get("state") {
+                        redirect_params.push(("state", s.as_str()));
+                    }
+                    let url =
+                        super::oidc::build_redirect_url(&redirect_uri_str, &redirect_params, false);
+                    return (StatusCode::FOUND, [("Location", url)]).into_response();
+                }
 
                 let mut redirect_params: Vec<(&str, &str)> = vec![("code", code.as_str())];
                 if let Some(s) = params.get("state") {

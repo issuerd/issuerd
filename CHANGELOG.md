@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- CIBA and device-authorization grants now consume an approved `auth_req_id` /
+  device code **atomically** (`DistributedCache::get_and_delete` — Redis
+  `GETDEL`), matching the authorization-code grant. Previously the token poll
+  read the cache entry and deleted it after validation, so concurrent polls of
+  one approved request could each mint a token set. Only the first concurrent
+  poller now succeeds; the rest receive `expired_token`. Poll pacing
+  (`slow_down`) and single-request behavior are unchanged.
+- Authorization-code issuance is now **fail-closed**: a code is only released
+  to the client after the cache confirms its persistence. When the write fails
+  (e.g. Redis outage), authorize/login endpoints return
+  `error=temporarily_unavailable` (packaged per the requested `response_mode`
+  on browser redirects, HTTP 503 on the SPA/API login), log an ERROR, and
+  record a `login_error` event instead of redirecting with a code that could
+  never be exchanged. Adds `IssuerdError::TemporarilyUnavailable`
+  (`temporarily_unavailable` / HTTP 503).
+
 ### Added
 
 - Initial implementation of the Issuerd IAM server: OIDC/OAuth2 provider with

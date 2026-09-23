@@ -130,11 +130,12 @@ impl OAuth2Error {
 /// | `unsupported_response_type` | `UnsupportedResponseType`        |
 /// | `invalid_scope`          | `InvalidScope`                        |
 /// | `server_error`           | `ServerError`, `NotFound`, `Conflict` |
+/// | `temporarily_unavailable` | `TemporarilyUnavailable`             |
 ///
-/// The following RFC 6749 codes are **intentionally omitted** because they do not
-/// arise in this architecture:
-/// - `temporarily_unavailable` — handled at the infrastructure / load-balancer layer.
-///
+/// `temporarily_unavailable` (RFC 6749 Section 4.1.2.1) is reserved for transient
+/// infrastructure failures the client may retry — e.g. the distributed cache being
+/// unreachable when an authorization code must be persisted. Permanent failures keep
+/// mapping to `server_error`.
 /// Additional variants (`InvalidGrant`, `InvalidToken`, `InsufficientScope`) map to
 /// Bearer Token usage errors defined in RFC 6750.
 ///
@@ -167,6 +168,8 @@ pub enum IssuerdError {
     InsufficientScope,
     #[error("server error: {0}")]
     ServerError(String),
+    #[error("temporarily unavailable")]
+    TemporarilyUnavailable,
     #[error("not found")]
     NotFound,
     #[error("conflict")]
@@ -198,6 +201,7 @@ impl IssuerdError {
             IssuerdError::InvalidToken => OAuth2ErrorCode::InvalidToken,
             IssuerdError::InsufficientScope => OAuth2ErrorCode::InsufficientScope,
             IssuerdError::ServerError(_) => OAuth2ErrorCode::ServerError,
+            IssuerdError::TemporarilyUnavailable => OAuth2ErrorCode::TemporarilyUnavailable,
             IssuerdError::NotFound => OAuth2ErrorCode::ServerError,
             IssuerdError::Conflict => OAuth2ErrorCode::ServerError,
             IssuerdError::UnsupportedOperation => OAuth2ErrorCode::UnsupportedOperation,
@@ -223,6 +227,7 @@ impl IssuerdError {
             IssuerdError::InvalidToken => 401,
             IssuerdError::InsufficientScope => 403,
             IssuerdError::ServerError(_) => 500,
+            IssuerdError::TemporarilyUnavailable => 503,
             IssuerdError::NotFound => 404,
             IssuerdError::Conflict => 409,
             IssuerdError::LoginRequired => 400,
@@ -267,6 +272,11 @@ mod tests {
         403
     )]
     #[case(IssuerdError::ServerError("boom".into()), OAuth2ErrorCode::ServerError, 500)]
+    #[case(
+        IssuerdError::TemporarilyUnavailable,
+        OAuth2ErrorCode::TemporarilyUnavailable,
+        503
+    )]
     #[case(IssuerdError::NotFound, OAuth2ErrorCode::ServerError, 404)]
     #[case(IssuerdError::Conflict, OAuth2ErrorCode::ServerError, 409)]
     #[case(
@@ -303,6 +313,7 @@ mod tests {
             IssuerdError::InvalidToken,
             IssuerdError::InsufficientScope,
             IssuerdError::ServerError("x".into()),
+            IssuerdError::TemporarilyUnavailable,
             IssuerdError::NotFound,
             IssuerdError::Conflict,
             IssuerdError::LoginRequired,

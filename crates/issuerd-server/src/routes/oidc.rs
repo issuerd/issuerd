@@ -360,16 +360,61 @@ impl AuthCodeData {
 }
 
 /// Persist an authorization code for the token endpoint (`auth_code:{code}`, 10 min TTL).
+///
+/// Fail-closed: the cache write must be confirmed before the code leaves the
+/// server — a code that was never persisted can never be exchanged, so the
+/// caller must surface the error instead of emitting the code.
 pub(crate) async fn store_auth_code(
     cache: &Arc<dyn issuerd_core::DistributedCache>,
     code: &str,
     data: &AuthCodeData,
-) {
+) -> Result<(), IssuerdError> {
     // Serialization cannot fail: every field is a plain String/Option/Vec.
     let value = serde_json::to_vec(data).unwrap();
-    let _ = cache
+    cache
         .set(&format!("auth_code:{code}"), value, Some(std::time::Duration::from_secs(600)))
-        .await;
+        .await
+}
+
+/// Fail-closed surface for a failed [`store_auth_code`] write on the
+/// redirect-based login paths: ERROR log plus `login_error` event, then
+/// package `temporarily_unavailable` as an authorization error redirect
+/// (RFC 6749 §4.1.2.1 — the redirect URI was validated when the flow
+/// started). The authorization code is never emitted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn auth_code_store_failure(
+    state: &Arc<ServerState>,
+    realm: &issuerd_core::Realm,
+    client: &issuerd_core::Client,
+    user_id: &issuerd_core::UserId,
+    session_id: &issuerd_core::SessionId,
+    ip: &std::net::IpAddr,
+    pending: &PendingAuthData,
+    error: &IssuerdError,
+) -> Response {
+    error!(realm = %realm.id, client_id = %client.client_id, error = %error, "failed to persist authorization code");
+    let mut details = std::collections::HashMap::new();
+    details.insert("error".to_string(), "temporarily_unavailable".to_string());
+    emit_oidc_event(
+        state,
+        &realm.id,
+        EventType::LoginError,
+        ip,
+        Some(client.id.clone()),
+        Some(user_id.clone()),
+        Some(session_id.clone()),
+        Some("temporarily_unavailable".to_string()),
+        details,
+    )
+    .await;
+    crate::routes::auth_response::oauth_error_redirect(
+        state,
+        &pending.redirect_uri,
+        &IssuerdError::TemporarilyUnavailable,
+        pending.state.as_deref(),
+        &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1554,7 +1599,12 @@ pub(crate) async fn finish_sso_login(
         "code id_token" => {
             let code = issuerd_core::utils::generate_id();
             let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            store_auth_code(&state.cache, &code, &code_data).await;
+            if let Err(e) = store_auth_code(&state.cache, &code, &code_data).await {
+                return auth_code_store_failure(
+                    state, realm, client, &user_id, session_id, &ip, pending, &e,
+                )
+                .await;
+            }
 
             let id_token = match state
                 .token_manager
@@ -1600,7 +1650,12 @@ pub(crate) async fn finish_sso_login(
         _ => {
             let code = issuerd_core::utils::generate_id();
             let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            store_auth_code(&state.cache, &code, &code_data).await;
+            if let Err(e) = store_auth_code(&state.cache, &code, &code_data).await {
+                return auth_code_store_failure(
+                    state, realm, client, &user_id, session_id, &ip, pending, &e,
+                )
+                .await;
+            }
 
             let mut redirect_params: Vec<(&str, &str)> = vec![("code", &code)];
             if let Some(ref s) = pending.state {
@@ -4107,15 +4162,52 @@ pub async fn token_handler(
                     }
                 };
 
-            // Delete used device code (single use)
-            let _ = state.cache.delete(&cache_key).await;
+            // Atomic consume: an approved device code is single-use, so any
+            // poll that reaches this point burns it. Only the first
+            // concurrent consumer observes the entry; the rest get
+            // `expired_token`, matching an unknown/expired device code.
+            let consumed: Option<DeviceCodeData> =
+                match state.cache.get_and_delete(&cache_key).await {
+                    Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+                    _ => None,
+                };
+            let Some(consumed) = consumed else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "expired_token"})),
+                )
+                    .into_response();
+            };
+            // The consumed entry may not be the exact write this poller read
+            // (a concurrent approval/pacing write can land between the read
+            // and the consume) — re-validate the payload before issuing:
+            // client binding, user binding, still authorized, not expired.
+            if consumed.client_id != client.client_id.to_string()
+                || consumed.user_id != code_data.user_id
+                || !consumed.authorized
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
+            if remaining_ttl(consumed.expires_at).is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "expired_token"})),
+                )
+                    .into_response();
+            }
+            // Burn the user-code mirror entry too (best effort — the device
+            // code entry above was the redeemable one).
             let _ = state
                 .cache
-                .delete(&issuerd_cluster::cache_keys::user_code(&code_data.user_code))
+                .delete(&issuerd_cluster::cache_keys::user_code(&consumed.user_code))
                 .await;
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
-            let scope = code_data.scope.clone();
+            let scope = consumed.scope.clone();
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -4413,11 +4505,74 @@ pub async fn token_handler(
                     }
                 };
 
-            // Delete used auth req (single use)
-            let _ = state.cache.delete(&cache_key).await;
+            // Atomic consume: an approved auth_req_id is single-use, so any
+            // poll that reaches this point burns it. Only the first
+            // concurrent consumer observes the entry; the rest get
+            // `expired_token`, matching an unknown/expired auth_req_id.
+            let consumed: Option<CibaAuthReqData> =
+                match state.cache.get_and_delete(&cache_key).await {
+                    Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+                    _ => None,
+                };
+            let Some(consumed) = consumed else {
+                emit_ciba_poll_error(
+                    &state,
+                    &realm_id,
+                    &ip,
+                    &client,
+                    req_data.user_id.as_deref(),
+                    "expired_token",
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "expired_token"})),
+                )
+                    .into_response();
+            };
+            // The consumed entry may not be the exact write this poller read
+            // (a concurrent approve/deny or pacing write can land between the
+            // read and the consume) — re-validate the payload before issuing:
+            // client binding, user binding, still authorized, not expired.
+            if consumed.client_id != client.client_id.to_string()
+                || consumed.user_id != req_data.user_id
+                || !consumed.authorized
+                || consumed.denied
+            {
+                emit_ciba_poll_error(
+                    &state,
+                    &realm_id,
+                    &ip,
+                    &client,
+                    req_data.user_id.as_deref(),
+                    "invalid_grant",
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
+            if remaining_ttl(consumed.expires_at).is_none() {
+                emit_ciba_poll_error(
+                    &state,
+                    &realm_id,
+                    &ip,
+                    &client,
+                    req_data.user_id.as_deref(),
+                    "expired_token",
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "expired_token"})),
+                )
+                    .into_response();
+            }
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
-            let scope = req_data.scope.clone();
+            let scope = consumed.scope.clone();
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -9008,6 +9163,202 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert!(location.contains("error=login_required"), "location: {}", location);
+    }
+
+    /// Cache double that fails only authorization-code persistence — every
+    /// other operation delegates to an in-memory cache, so a login flow runs
+    /// normally until the code write.
+    struct FailAuthCodeSet {
+        inner: issuerd_cluster::InMemoryCache,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for FailAuthCodeSet {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            if key.starts_with("auth_code:") {
+                return Err(IssuerdError::ServerError("cache down".to_string()));
+            }
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    fn sample_auth_code_data() -> AuthCodeData {
+        AuthCodeData {
+            user_id: "user-1".to_string(),
+            client_id: "client-1".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: None,
+            nonce: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            session_id: None,
+            auth_time: None,
+            acr_values: vec![],
+            claims: None,
+            authorization_details: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_auth_code_surfaces_cache_errors() {
+        let data = sample_auth_code_data();
+
+        // A failed write propagates — the caller must not emit the code.
+        let failing: Arc<dyn issuerd_core::DistributedCache> = Arc::new(FailAuthCodeSet {
+            inner: issuerd_cluster::InMemoryCache::new(),
+        });
+        let result = store_auth_code(&failing, "code-1", &data).await;
+        assert!(result.is_err(), "cache failure must propagate");
+
+        // A confirmed write returns Ok and the entry is readable back.
+        let cache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let as_dyn: Arc<dyn issuerd_core::DistributedCache> = cache.clone();
+        store_auth_code(&as_dyn, "code-2", &data).await.unwrap();
+        let stored = issuerd_core::DistributedCache::get(cache.as_ref(), "auth_code:code-2")
+            .await
+            .unwrap();
+        assert!(stored.is_some(), "persisted code must be readable");
+    }
+
+    #[tokio::test]
+    async fn auth_handler_code_persistence_failure_redirects_temporarily_unavailable() {
+        let cache: Arc<dyn issuerd_core::DistributedCache> = Arc::new(FailAuthCodeSet {
+            inner: issuerd_cluster::InMemoryCache::new(),
+        });
+        let config = ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let state = Arc::new(ServerState::from_components(&config, storage, cache).await.unwrap());
+
+        // Establish an SSO session for admin (same rig as the prompt=login test).
+        let user = state
+            .storage
+            .get_user(
+                &issuerd_core::RealmId::new("master").unwrap(),
+                &issuerd_core::UserId::new("admin").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &issuerd_core::RealmId::new("master").unwrap(),
+                &ClientIdentifier::new("admin-cli").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let realm = state
+            .storage
+            .get_realm(&issuerd_core::RealmId::new("master").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: issuerd_core::UserId::new("admin").unwrap(),
+            ip_address: "127.0.0.1".parse().unwrap(),
+            login_username: issuerd_core::Username::new("admin").unwrap(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            started: chrono::Utc::now(),
+            last_session_refresh: chrono::Utc::now(),
+            auth_time: chrono::Utc::now(),
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        let access_token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_session={}", access_token.token).parse().unwrap(),
+        );
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "admin-cli".to_string());
+        params.insert(
+            "redirect_uri".to_string(),
+            "http://localhost:8080/admin/console/callback".to_string(),
+        );
+        params.insert("scope".to_string(), "openid".to_string());
+        params.insert("state".to_string(), "xyz".to_string());
+        params.insert("code_challenge".to_string(), "challenge".to_string());
+        params.insert("code_challenge_method".to_string(), "plain".to_string());
+
+        let response = auth_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            headers,
+            Query(params),
+        )
+        .await;
+        // Fail-closed: the client is told to retry later; no code is emitted.
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("error=temporarily_unavailable"), "location: {}", location);
+        assert!(location.contains("state=xyz"), "location: {}", location);
+        assert!(
+            !location.contains("?code=") && !location.contains("&code="),
+            "no authorization code may leak: {}",
+            location
+        );
     }
 
     #[tokio::test]

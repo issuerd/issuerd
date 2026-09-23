@@ -800,7 +800,8 @@ pub trait DistributedCache: Send + Sync {
     /// The default implementation is a non-atomic `get` + `delete`; backends
     /// that support an atomic take (Redis `GETDEL`, `DashMap::remove`)
     /// override it. Callers relying on single-use semantics (authorization
-    /// codes, pending-auth entries) must run on an overriding backend.
+    /// codes, pending-auth entries, approved CIBA/device grants) must run on
+    /// an overriding backend.
     async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
         let value = self.get(key).await?;
         if value.is_some() {

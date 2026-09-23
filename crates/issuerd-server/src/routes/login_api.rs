@@ -645,6 +645,59 @@ async fn browser_auth_response(
     resp
 }
 
+/// Fail-closed surface for a failed authorization-code cache write: ERROR log
+/// plus `login_error` event, then `temporarily_unavailable` — packaged as an
+/// authorization error redirect (with the SSO cookie) for browser forms, as
+/// HTTP 503 for API clients. The authorization code is never emitted.
+#[allow(clippy::too_many_arguments)]
+async fn auth_code_store_failure(
+    state: &Arc<ServerState>,
+    realm: &issuerd_core::Realm,
+    pending: &super::oidc::PendingAuthData,
+    client: &issuerd_core::Client,
+    user_id: &issuerd_core::UserId,
+    session_id: &issuerd_core::SessionId,
+    is_browser_form: bool,
+    cookie_value: &str,
+    error: &issuerd_core::IssuerdError,
+) -> Response {
+    error!(realm = %realm.id, client_id = %client.client_id, error = %error, "failed to persist authorization code");
+    let mut details = std::collections::HashMap::new();
+    details.insert("error".to_string(), "temporarily_unavailable".to_string());
+    super::oidc::emit_oidc_event(
+        state,
+        &realm.id,
+        EventType::LoginError,
+        &pending.ip_address.unwrap_or("127.0.0.1".parse().unwrap()),
+        Some(client.id.clone()),
+        Some(user_id.clone()),
+        Some(session_id.clone()),
+        Some("temporarily_unavailable".to_string()),
+        details,
+    )
+    .await;
+    if is_browser_form {
+        let mut resp = crate::routes::auth_response::oauth_error_redirect(
+            state,
+            &pending.redirect_uri,
+            &issuerd_core::IssuerdError::TemporarilyUnavailable,
+            pending.state.as_deref(),
+            &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
+        )
+        .await;
+        if let Ok(v) = axum::http::HeaderValue::from_str(cookie_value) {
+            resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
+        }
+        resp
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "temporarily_unavailable"})),
+        )
+            .into_response()
+    }
+}
+
 /// Shared post-authentication completion: persist the SSO session, emit the
 /// login event, set the session cookie, and mint the authorization code and/or
 /// id_token per the requested response type.
@@ -1012,7 +1065,20 @@ pub(crate) async fn complete_login_with_method(
                 &session_id,
                 result_auth_time,
             );
-            super::oidc::store_auth_code(&state.cache, &code, &code_data).await;
+            if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await {
+                return auth_code_store_failure(
+                    state,
+                    &realm,
+                    &pending,
+                    &client,
+                    &user_id,
+                    &session_id,
+                    is_browser_form,
+                    &cookie_value,
+                    &e,
+                )
+                .await;
+            }
 
             let id_token = match state
                 .token_manager
@@ -1073,7 +1139,20 @@ pub(crate) async fn complete_login_with_method(
                 &session_id,
                 result_auth_time,
             );
-            super::oidc::store_auth_code(&state.cache, &code, &code_data).await;
+            if let Err(e) = super::oidc::store_auth_code(&state.cache, &code, &code_data).await {
+                return auth_code_store_failure(
+                    state,
+                    &realm,
+                    &pending,
+                    &client,
+                    &user_id,
+                    &session_id,
+                    is_browser_form,
+                    &cookie_value,
+                    &e,
+                )
+                .await;
+            }
 
             if is_browser_form {
                 browser_auth_response(
@@ -1510,6 +1589,117 @@ pub(crate) mod tests {
         assert_eq!(mask_email("no-at-sign"), "***");
         assert_eq!(mask_email("@example.com"), "***@e***.com");
         assert_eq!(mask_email("a@localhost"), "a***@l***");
+    }
+
+    /// Cache double that fails only authorization-code persistence — every
+    /// other operation delegates to an in-memory cache, so a login flow runs
+    /// normally until the code write.
+    struct FailAuthCodeSet {
+        inner: issuerd_cluster::InMemoryCache,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for FailAuthCodeSet {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+            self.inner.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            if key.starts_with("auth_code:") {
+                return Err(issuerd_core::IssuerdError::ServerError("cache down".to_string()));
+            }
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn get_and_delete(
+            &self,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, issuerd_core::IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(
+            &self,
+            channel: &str,
+            message: Vec<u8>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_login_code_persistence_failure_returns_503() {
+        let cache: Arc<dyn issuerd_core::DistributedCache> = Arc::new(FailAuthCodeSet {
+            inner: issuerd_cluster::InMemoryCache::new(),
+        });
+        let cfg = ServerConfig::default();
+        let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let state = Arc::new(ServerState::from_components(&cfg, storage, cache).await.unwrap());
+
+        let realm_id = RealmId::new("master").unwrap();
+        let user_id = issuerd_core::UserId::new("admin").unwrap();
+        let session_id = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: realm_id.0.clone(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/admin/console/callback".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: None,
+            execution_id: issuerd_core::FlowStageId::new(issuerd_core::utils::generate_id())
+                .unwrap(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        };
+
+        let resp = complete_login(
+            &state,
+            &realm_id,
+            &pending,
+            &user_id,
+            &session_id,
+            chrono::Utc::now(),
+            false,
+        )
+        .await;
+        // Fail-closed: the API client gets a retryable 503; no code is emitted.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "temporarily_unavailable");
+        assert!(json.get("code").is_none(), "no authorization code may leak: {json}");
     }
 
     #[tokio::test]
