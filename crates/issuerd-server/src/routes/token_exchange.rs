@@ -18,6 +18,13 @@
 //!   the `impersonator` claim and the same audit treatment applies (admin
 //!   event + gate-bypassing login event).
 //!
+//! The subject token's `aud` is **not** checked by default: any valid access
+//! token of the realm may be presented (see `token_exchange_grant`). The
+//! opt-in `require_requester_in_subject_aud` policy (realm attribute, or
+//! requesting-client attribute override) switches to Keycloak's stricter
+//! semantics — the requesting client must appear in the subject token's
+//! audience — and applies to both modes.
+//!
 //! Out of scope (rejected at protocol validation): delegation
 //! (`actor_token`), non-access-token subject/requested token types.
 
@@ -44,6 +51,20 @@ use crate::state::ServerState;
 /// Client attribute gating internal token exchange to this client as the
 /// target audience.
 pub(crate) const CLIENT_TOKEN_EXCHANGE_ATTRIBUTE: &str = "token.exchange.enabled";
+
+/// Opt-in strict audience policy for token exchange (RFC 8693): when
+/// enabled, the requesting client must appear in the subject token's `aud`
+/// claim — Keycloak's always-on semantics, off here by default for backward
+/// compatibility.
+///
+/// Read as a **realm attribute** (the realm-wide default) with a
+/// **requesting-client attribute override**: a client attribute value of
+/// `"true"`/`"false"` wins over the realm setting in either direction, so a
+/// realm can enforce the policy globally while exempting individual clients
+/// (or enforce it only for selected clients). Applies to internal and
+/// impersonation exchanges alike.
+pub(crate) const REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE: &str =
+    "require_requester_in_subject_aud";
 
 /// Realm role the subject-token owner must hold to run an impersonation
 /// exchange — the same role the admin impersonation endpoint checks.
@@ -117,6 +138,19 @@ pub(crate) async fn token_exchange_grant(
             return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
         }
     };
+
+    // Opt-in strict audience policy (Keycloak's default semantics): the
+    // requesting client must be an audience of the subject token. Without the
+    // flag any valid token of the realm may be presented (the historical
+    // behavior), which lets a client that was handed a token addressed to
+    // someone else re-scope it. The raw `aud` claim is inspected because the
+    // typed claims keep only its first entry.
+    if require_requester_in_subject_aud(realm, client)
+        && !subject_token_audience_contains(subject_token, client.client_id.as_ref())
+    {
+        warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: requesting client not in the subject token's audience (require_requester_in_subject_aud)");
+        return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
+    }
 
     // RFC 9449 §7.1: a DPoP-bound subject token may only be
     // exchanged by its key holder. Without this check a stolen bound token
@@ -518,6 +552,45 @@ async fn impersonation_exchange(
     })
 }
 
+/// Effective `require_requester_in_subject_aud` policy for one exchange: the
+/// requesting client's attribute overrides the realm's in either direction;
+/// absent both, the lenient default (`false`) preserves the pre-policy
+/// behavior.
+fn require_requester_in_subject_aud(realm: &Realm, client: &Client) -> bool {
+    client
+        .attributes
+        .get(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE)
+        .or_else(|| realm.attributes.get(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE))
+        .is_some_and(|v| v == "true")
+}
+
+/// Whether the subject token's raw `aud` claim lists `client_id`, tolerating
+/// both JWT forms (`"aud": "a"` and `"aud": ["a", "b"]`). The payload is
+/// decoded WITHOUT re-verifying the signature — trust comes from
+/// `validate_access_token`, which ran on the same bytes just before
+/// (same pattern as `dpop::unverified_nonce_claim`). The typed
+/// `AccessTokenClaims.aud` cannot answer this: it keeps only the first entry
+/// of a multi-audience claim. Every decode failure fails closed (`false`).
+fn subject_token_audience_contains(subject_token: &str, client_id: &str) -> bool {
+    use base64::Engine as _;
+    let Some(payload) = subject_token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => aud == client_id,
+        Some(serde_json::Value::Array(auds)) => {
+            auds.iter().any(|aud| aud.as_str() == Some(client_id))
+        }
+        _ => false,
+    }
+}
+
 /// Intersect a scope with the target client's assigned scope names
 /// (`default_scopes ∪ optional_scopes`). The claims pipeline resolves scope
 /// names realm-wide, so without this an exchanged token could carry scopes —
@@ -580,4 +653,146 @@ async fn exchange_error(
     )
     .await;
     (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use issuerd_core::{ClientProtocol, Scope};
+
+    fn realm_with_policy(value: Option<&str>) -> Realm {
+        let mut realm = Realm {
+            id: RealmId::new("test").unwrap(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            ..Default::default()
+        };
+        if let Some(v) = value {
+            realm
+                .attributes
+                .insert(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE.to_string(), v.to_string());
+        }
+        realm
+    }
+
+    fn client_with_policy(value: Option<&str>) -> Client {
+        let mut client = Client {
+            id: issuerd_core::ClientId::new("client-uuid-1").unwrap(),
+            realm_id: RealmId::new("test").unwrap(),
+            client_id: ClientIdentifier::new("requester").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: issuerd_core::ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::empty(),
+            optional_scopes: Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        };
+        if let Some(v) = value {
+            client
+                .attributes
+                .insert(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE.to_string(), v.to_string());
+        }
+        client
+    }
+
+    /// Mint an unsigned-shaped JWT carrying `aud` for the audience helper
+    /// (the helper never verifies the signature — the exchange validated the
+    /// token before consulting it).
+    fn token_with_aud(aud: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let b64 = |v: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap())
+        };
+        format!(
+            "{}.{}.sig",
+            b64(serde_json::json!({"alg": "none"})),
+            b64(serde_json::json!({"sub": "user-1", "aud": aud}))
+        )
+    }
+
+    #[test]
+    fn policy_defaults_off_without_attributes() {
+        assert!(!require_requester_in_subject_aud(
+            &realm_with_policy(None),
+            &client_with_policy(None)
+        ));
+    }
+
+    #[test]
+    fn policy_realm_attribute_enables() {
+        assert!(require_requester_in_subject_aud(
+            &realm_with_policy(Some("true")),
+            &client_with_policy(None)
+        ));
+        // Any value other than exactly "true" keeps the policy off.
+        assert!(!require_requester_in_subject_aud(
+            &realm_with_policy(Some("false")),
+            &client_with_policy(None)
+        ));
+        assert!(!require_requester_in_subject_aud(
+            &realm_with_policy(Some("1")),
+            &client_with_policy(None)
+        ));
+    }
+
+    #[test]
+    fn policy_client_attribute_overrides_realm_in_both_directions() {
+        // Client opt-in with the realm default off.
+        assert!(require_requester_in_subject_aud(
+            &realm_with_policy(None),
+            &client_with_policy(Some("true"))
+        ));
+        assert!(require_requester_in_subject_aud(
+            &realm_with_policy(Some("false")),
+            &client_with_policy(Some("true"))
+        ));
+        // Client exemption with the realm enforcing.
+        assert!(!require_requester_in_subject_aud(
+            &realm_with_policy(Some("true")),
+            &client_with_policy(Some("false"))
+        ));
+    }
+
+    #[test]
+    fn audience_string_form_matches_exactly() {
+        let token = token_with_aud(serde_json::json!("requester"));
+        assert!(subject_token_audience_contains(&token, "requester"));
+        assert!(!subject_token_audience_contains(&token, "other-client"));
+        // No substring or case folding.
+        assert!(!subject_token_audience_contains(&token, "request"));
+        assert!(!subject_token_audience_contains(&token, "Requester"));
+    }
+
+    #[test]
+    fn audience_array_form_matches_any_entry() {
+        let token = token_with_aud(serde_json::json!(["frontend", "requester"]));
+        assert!(subject_token_audience_contains(&token, "requester"));
+        assert!(subject_token_audience_contains(&token, "frontend"));
+        assert!(!subject_token_audience_contains(&token, "absent"));
+    }
+
+    #[test]
+    fn audience_missing_or_malformed_fails_closed() {
+        // No `aud` claim at all.
+        let token = token_with_aud(serde_json::Value::Null);
+        assert!(!subject_token_audience_contains(&token, "requester"));
+        // Non-string/array `aud`.
+        let token = token_with_aud(serde_json::json!(42));
+        assert!(!subject_token_audience_contains(&token, "requester"));
+        // Not a JWT.
+        assert!(!subject_token_audience_contains("not-a-jwt", "requester"));
+        // Garbage payload segment.
+        assert!(!subject_token_audience_contains("a.!!!.b", "requester"));
+    }
 }

@@ -134,6 +134,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovery metadata for nonce support, so none is advertised. See
   `docs/configuration.md` — "[dpop]", and `docs/security.md` — "DPoP
   sender-constraining".
+- **Token exchange: opt-in strict audience policy** (RFC 8693): the new
+  `require_requester_in_subject_aud` attribute switches a realm to Keycloak's
+  stricter exchange semantics — the client authenticated at the token endpoint
+  must appear in the subject token's `aud` claim (string or array form), or
+  the exchange is rejected with `invalid_grant`. Without it, any valid access
+  token of the realm may be presented regardless of its audience, which lets a
+  client that was handed a foreign token re-scope it. Set as a **realm
+  attribute** for the realm-wide default; the same-named **requesting-client
+  attribute** overrides the realm setting in either direction (`"true"`
+  enforces, `"false"` exempts). The policy guards internal and impersonation
+  exchanges alike. **Default is off — existing deployments behave exactly as
+  before.** See `docs/client-integration.md` — "Token exchange and
+  impersonation".
 
 ### Added
 

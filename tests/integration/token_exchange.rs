@@ -1037,3 +1037,295 @@ async fn exchange_scope_intersected_with_target_assignments() {
     let json = body_json(resp).await;
     assert_eq!(json["scope"].as_str().unwrap(), "email openid profile");
 }
+
+// ---------------------------------------------------------------------------
+// Requester-in-audience policy (opt-in) — security review remediation
+// ---------------------------------------------------------------------------
+
+/// Realm/client attribute name of the opt-in strict audience policy (mirrors
+/// `REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE` in the server crate).
+const AUD_POLICY_ATTRIBUTE: &str = "require_requester_in_subject_aud";
+
+/// Enable the strict audience policy on a realm. Must run before the realm's
+/// first request — by-name resolutions are cached (`realm-by-name:{name}`),
+/// so the attribute must be stored ahead of any token call.
+async fn create_realm_with_aud_policy(harness: &TestHarness, realm: &str) {
+    let mut r = harness.create_realm(realm).await;
+    r.attributes.insert(AUD_POLICY_ATTRIBUTE.to_string(), "true".to_string());
+    harness.storage.update_realm(&r).await.unwrap();
+}
+
+/// Set (or clear) the audience-policy override on the REQUESTING client
+/// (direct storage write, same pattern as `set_exchange_flag` — the token
+/// endpoint reads the authenticated client from storage).
+async fn set_client_aud_policy(
+    harness: &TestHarness,
+    realm: &str,
+    client: &issuerd_core::Client,
+    value: Option<&str>,
+) {
+    let mut client = client.clone();
+    match value {
+        Some(v) => {
+            client.attributes.insert(AUD_POLICY_ATTRIBUTE.to_string(), v.to_string());
+        }
+        None => {
+            client.attributes.remove(AUD_POLICY_ATTRIBUTE);
+        }
+    }
+    harness
+        .storage
+        .update_client(&issuerd_core::RealmId::new(realm).unwrap(), &client)
+        .await
+        .unwrap();
+}
+
+/// Without the policy flag (the default) a requester may exchange a subject
+/// token addressed to a DIFFERENT client — the historical behavior the flag
+/// tightens.
+#[tokio::test]
+async fn aud_policy_off_by_default_allows_requester_absent_from_audience() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("ex-audpol-off").await;
+    let requesting = harness.create_client("ex-audpol-off", false).await;
+    let minted_for = harness.create_client("ex-audpol-off", false).await;
+    let target = harness.create_client("ex-audpol-off", false).await;
+    set_exchange_flag(&harness, "ex-audpol-off", &target, true).await;
+    harness.create_user("ex-audpol-off", "alice", "Password123!").await;
+
+    let subject = password_grant_token(
+        &harness,
+        "ex-audpol-off",
+        &minted_for,
+        "alice",
+        "Password123!",
+        "openid",
+    )
+    .await;
+    assert_eq!(
+        jwt_claims(&subject)["aud"].as_str().unwrap(),
+        minted_for.client_id.as_ref(),
+        "subject token must be addressed away from the requester"
+    );
+
+    let mut req = ExchangeRequest::new(&subject);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol-off", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// With the realm policy on, a requester absent from the subject token's
+/// `aud` is rejected with `invalid_grant`; a token addressed to the requester
+/// (single-string `aud`) still exchanges.
+#[tokio::test]
+async fn aud_policy_rejects_requester_absent_from_audience() {
+    let harness = TestHarness::new().await;
+    create_realm_with_aud_policy(&harness, "ex-audpol").await;
+    let requesting = harness.create_client("ex-audpol", false).await;
+    let minted_for = harness.create_client("ex-audpol", false).await;
+    let target = harness.create_client("ex-audpol", false).await;
+    set_exchange_flag(&harness, "ex-audpol", &target, true).await;
+    harness.create_user("ex-audpol", "alice", "Password123!").await;
+
+    // Subject token addressed to a different client → rejected.
+    let foreign =
+        password_grant_token(&harness, "ex-audpol", &minted_for, "alice", "Password123!", "openid")
+            .await;
+    let mut req = ExchangeRequest::new(&foreign);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid_grant");
+
+    // Subject token addressed to the requester itself → accepted.
+    let own =
+        password_grant_token(&harness, "ex-audpol", &requesting, "alice", "Password123!", "openid")
+            .await;
+    let mut req = ExchangeRequest::new(&own);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Multi-audience subject tokens (Audience protocol mapper): the requester
+/// counts when it appears as a NON-FIRST `aud` array entry; an array naming
+/// only other clients is rejected.
+#[tokio::test]
+async fn aud_policy_multi_audience_subject_token() {
+    let harness = TestHarness::new().await;
+    create_realm_with_aud_policy(&harness, "ex-audpol-arr").await;
+    let requesting = harness.create_client("ex-audpol-arr", false).await;
+    // Self-exchange target: the requesting client itself.
+    set_exchange_flag(&harness, "ex-audpol-arr", &requesting, true).await;
+    let minted_for = harness.create_client("ex-audpol-arr", false).await;
+    let decoy = harness.create_client("ex-audpol-arr", false).await;
+    harness.create_user("ex-audpol-arr", "alice", "Password123!").await;
+
+    // Audience mappers on the minting client extend `aud` beyond its own id.
+    async fn add_audience_mapper(
+        harness: &TestHarness,
+        admin: &str,
+        client: &issuerd_core::Client,
+        include: &str,
+    ) {
+        let resp = harness
+            .post_json_auth(
+                &format!(
+                    "/admin/realms/ex-audpol-arr/clients/{}/protocol-mappers/models",
+                    client.id
+                ),
+                admin,
+                serde_json::json!({
+                    "name": format!("aud-{include}"),
+                    "protocol": "openid-connect",
+                    "protocol_mapper": "oidc-audience-mapper",
+                    "config": { "included.client.audience": include },
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "add audience mapper");
+    }
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    add_audience_mapper(&harness, &admin, &minted_for, requesting.client_id.as_ref()).await;
+    add_audience_mapper(&harness, &admin, &decoy, minted_for.client_id.as_ref()).await;
+
+    // aud = [minted_for, requesting] — the requester is a non-first entry.
+    let multi = password_grant_token(
+        &harness,
+        "ex-audpol-arr",
+        &minted_for,
+        "alice",
+        "Password123!",
+        "openid",
+    )
+    .await;
+    let aud = &jwt_claims(&multi)["aud"];
+    assert_eq!(
+        *aud,
+        serde_json::json!([minted_for.client_id.as_ref(), requesting.client_id.as_ref()]),
+        "subject token must carry the extended audience array"
+    );
+    let req = ExchangeRequest::new(&multi);
+    let resp = exchange(&harness, "ex-audpol-arr", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // aud = [decoy, minted_for] — the requester is in neither entry.
+    let foreign =
+        password_grant_token(&harness, "ex-audpol-arr", &decoy, "alice", "Password123!", "openid")
+            .await;
+    let req = ExchangeRequest::new(&foreign);
+    let resp = exchange(&harness, "ex-audpol-arr", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid_grant");
+}
+
+/// Client-attribute override with the realm default off: the policy is
+/// enforced for that client alone.
+#[tokio::test]
+async fn aud_policy_client_override_enforces_per_client() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("ex-audpol-cli").await;
+    let requesting = harness.create_client("ex-audpol-cli", false).await;
+    let minted_for = harness.create_client("ex-audpol-cli", false).await;
+    let target = harness.create_client("ex-audpol-cli", false).await;
+    set_exchange_flag(&harness, "ex-audpol-cli", &target, true).await;
+    harness.create_user("ex-audpol-cli", "alice", "Password123!").await;
+
+    // Realm attribute absent; the requesting client opts in alone.
+    set_client_aud_policy(&harness, "ex-audpol-cli", &requesting, Some("true")).await;
+
+    let foreign = password_grant_token(
+        &harness,
+        "ex-audpol-cli",
+        &minted_for,
+        "alice",
+        "Password123!",
+        "openid",
+    )
+    .await;
+    let mut req = ExchangeRequest::new(&foreign);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol-cli", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid_grant");
+
+    // A client WITHOUT the override in the same realm stays lenient.
+    let plain = harness.create_client("ex-audpol-cli", false).await;
+    let mut req = ExchangeRequest::new(&foreign);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol-cli", &plain, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Client-attribute override against a realm-level enforcement: `"false"`
+/// exempts the client.
+#[tokio::test]
+async fn aud_policy_client_override_exempts_from_realm_enforcement() {
+    let harness = TestHarness::new().await;
+    create_realm_with_aud_policy(&harness, "ex-audpol-ex").await;
+    let requesting = harness.create_client("ex-audpol-ex", false).await;
+    let minted_for = harness.create_client("ex-audpol-ex", false).await;
+    let target = harness.create_client("ex-audpol-ex", false).await;
+    set_exchange_flag(&harness, "ex-audpol-ex", &target, true).await;
+    harness.create_user("ex-audpol-ex", "alice", "Password123!").await;
+
+    set_client_aud_policy(&harness, "ex-audpol-ex", &requesting, Some("false")).await;
+
+    let foreign = password_grant_token(
+        &harness,
+        "ex-audpol-ex",
+        &minted_for,
+        "alice",
+        "Password123!",
+        "openid",
+    )
+    .await;
+    let mut req = ExchangeRequest::new(&foreign);
+    req.audience = Some(target.client_id.as_ref());
+    let resp = exchange(&harness, "ex-audpol-ex", &requesting, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The policy guards the impersonation mode too: a foreign subject token is
+/// rejected even when the caller holds the impersonation role.
+#[tokio::test]
+async fn aud_policy_applies_to_impersonation_exchange() {
+    let harness = TestHarness::new().await;
+    create_realm_with_aud_policy(&harness, "ex-audpol-imp").await;
+    let client = harness.create_client("ex-audpol-imp", false).await;
+    let minted_for = harness.create_client("ex-audpol-imp", false).await;
+    let caller = harness.create_user("ex-audpol-imp", "boss", "Password123!").await;
+    let target = harness.create_user("ex-audpol-imp", "victim", "Password123!").await;
+
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    grant_impersonation_role(&harness, "ex-audpol-imp", &admin, &caller.id.0).await;
+
+    // Subject token addressed away from the requester → rejected.
+    let foreign = password_grant_token(
+        &harness,
+        "ex-audpol-imp",
+        &minted_for,
+        "boss",
+        "Password123!",
+        "openid",
+    )
+    .await;
+    let mut req = ExchangeRequest::new(&foreign);
+    req.requested_subject = Some(&target.id.0);
+    let resp = exchange(&harness, "ex-audpol-imp", &client, &req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid_grant");
+
+    // Subject token addressed to the requester → impersonation succeeds.
+    let own =
+        password_grant_token(&harness, "ex-audpol-imp", &client, "boss", "Password123!", "openid")
+            .await;
+    let mut req = ExchangeRequest::new(&own);
+    req.requested_subject = Some(&target.id.0);
+    let resp = exchange(&harness, "ex-audpol-imp", &client, &req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let claims = jwt_claims(json["access_token"].as_str().unwrap());
+    assert_eq!(claims["sub"].as_str().unwrap(), target.id.0);
+    assert_eq!(claims["impersonator"].as_str().unwrap(), caller.id.0);
+}
