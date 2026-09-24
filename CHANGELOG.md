@@ -49,7 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The default token-signing algorithm is now **EdDSA (Ed25519)** instead of
   RS256 (asymmetric-first policy). New deployments generate an EdDSA signing
-  key on first boot, and realms without a `default_signature_algorithm`
+  key AND an active RS256 key on first boot — EdDSA is the signing default,
+  while the RS256 key keeps the OIDC Core mandatory-to-implement algorithm
+  supported and advertised in discovery — and realms without a
+  `default_signature_algorithm`
   attribute resolve to the EdDSA server default (`CryptoConfig::default_alg`,
   `TokenManager::new`, admin key rotation with no existing keys); RS256
   remains fully supported as an explicit compatibility choice. **Existing
@@ -147,6 +150,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exchanges alike. **Default is off — existing deployments behave exactly as
   before.** See `docs/client-integration.md` — "Token exchange and
   impersonation".
+
+### Fixed
+
+- **Fresh deployments again support and advertise RS256** (OIDC Core §3 +
+  §15.1 mandatory-to-implement), fixing a spec-compliance regression
+  introduced on this branch by the EdDSA-by-default change: first boot with an
+  empty `signing_keys` table generated only an EdDSA key, so discovery listed
+  `["EdDSA"]` and the OIDF conformance Config OP plan failed
+  `oidcc-discovery-endpoint-verification` ("RS256 support is required, but the
+  server does not list it in `id_token_signing_alg_values_supported`"). A
+  fresh deployment now boots with an **EdDSA key (the signing default) AND an
+  active RS256 key**, so discovery advertises both and realms explicitly
+  pinned to RS256 work without a rotation; the admin rotate-on-an-empty-key-
+  set fallback establishes the same pair. EdDSA stays the default signing
+  algorithm and existing (non-empty) key sets are untouched.
 
 ### Added
 

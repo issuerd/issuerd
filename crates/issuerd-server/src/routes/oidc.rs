@@ -6313,7 +6313,8 @@ mod tests {
     async fn discovery_lists_active_signing_algorithms() {
         let state = setup_state().await;
 
-        // Default boot key: only EdDSA is active.
+        // Fresh boot key set: EdDSA (default) + the OIDC Core MTI RS256 key,
+        // newest first. RS256 MUST be advertised (OIDC Core §3 + §15.1).
         let response = discovery_handler(
             State(state.clone()),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
@@ -6321,7 +6322,9 @@ mod tests {
         .await;
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["id_token_signing_alg_values_supported"], serde_json::json!(["EdDSA"]));
+        let boot_algs = serde_json::json!(["EdDSA", "RS256"]);
+        assert_eq!(json["id_token_signing_alg_values_supported"], boot_algs);
+        assert_eq!(json["authorization_signing_alg_values_supported"], boot_algs);
 
         // Add an active ES256 key to the shared set (as a per-algorithm
         // rotation would) and reload this node's keystore.
@@ -6342,14 +6345,14 @@ mod tests {
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let algs = json["id_token_signing_alg_values_supported"].clone();
-            if algs != serde_json::json!(["EdDSA"]) {
+            if algs != boot_algs {
                 break algs;
             }
             assert!(std::time::Instant::now() < deadline, "keystore did not reload in time");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         // Exactly the active algorithms, newest first.
-        assert_eq!(algs, serde_json::json!(["ES256", "EdDSA"]));
+        assert_eq!(algs, serde_json::json!(["ES256", "EdDSA", "RS256"]));
     }
 
     #[tokio::test]

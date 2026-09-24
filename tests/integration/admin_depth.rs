@@ -1530,11 +1530,13 @@ async fn keys_rotate_and_disable() {
     let harness = TestHarness::new().await;
     let admin = harness.get_admin_token("master", "admin", "admin").await;
 
-    // One active EdDSA key at boot; the admin token was signed with it.
+    // Boot keeps the EdDSA + RS256 pair active; the admin token was signed
+    // with the EdDSA key (the server-default algorithm).
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let keys = body_json(resp).await;
     let kid0 = keys["active"]["EdDSA"].as_str().unwrap().to_string();
+    let rs256_kid = keys["active"]["RS256"].as_str().unwrap().to_string();
     assert_eq!(jwt_header(&admin)["kid"], kid0);
 
     // Rotate: a new active key takes over signing; the old one goes passive.
@@ -1570,7 +1572,9 @@ async fn keys_rotate_and_disable() {
         .await;
     assert_eq!(resp.status(), StatusCode::OK, "passive key still validates");
 
-    // Disabling the passive key is fine; disabling the only active key is not.
+    // Disabling the passive key is fine. So is disabling an active key that
+    // is not the ONLY active one: with the rotated EdDSA key and the RS256
+    // boot key active, either may be disabled individually.
     let resp = put_json_auth(
         &harness,
         &format!("/admin/realms/master/keys/{kid0}/disable"),
@@ -1579,6 +1583,15 @@ async fn keys_rotate_and_disable() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = put_json_auth(
+        &harness,
+        &format!("/admin/realms/master/keys/{rs256_kid}/disable"),
+        &admin2,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // ...but the last remaining active key cannot be disabled.
     let resp = put_json_auth(
         &harness,
         &format!("/admin/realms/master/keys/{kid1}/disable"),
@@ -1722,7 +1735,7 @@ async fn keys_rotation_propagates_to_peer_node() {
         ..Default::default()
     };
 
-    // Boot node A (first boot: master realm + shared signing key), then node B
+    // Boot node A (first boot: master realm + shared signing keys), then node B
     // (loads the shared key set, starts the JWKS polling task).
     let state_a = ServerState::from_components(&config, Arc::clone(&storage), Arc::clone(&cache))
         .await

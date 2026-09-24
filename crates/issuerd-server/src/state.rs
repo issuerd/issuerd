@@ -599,25 +599,31 @@ impl ServerState {
 
 /// Build the crypto provider from the shared signing-key set in storage.
 ///
-/// On first boot (empty key set) a fresh key is generated and persisted so
-/// every node — and every restart — converges on the same keys. A concurrent
-/// first boot may persist a second key; that is benign: both are published in
-/// JWKS, both validate, and all nodes sign with the newest active key. The
-/// generated key uses the server-default algorithm (EdDSA): deployments
-/// upgrading with an existing key set keep their stored keys untouched.
+/// On first boot (empty key set) the initial key set is generated and
+/// persisted so every node — and every restart — converges on the same keys.
+/// The initial set is a PAIR: the server-default EdDSA key (the signing
+/// default for realms without a `default_signature_algorithm` attribute) and
+/// an active RS256 key — OIDC Core §15.1 makes RS256 mandatory-to-implement,
+/// so discovery must advertise it from the start and realms explicitly pinned
+/// to RS256 work without a rotation. A concurrent first boot may persist a
+/// second pair; that is benign: all keys are published in JWKS, all validate,
+/// and all nodes sign with the newest active key of the resolved algorithm.
+/// Deployments upgrading with an existing key set keep their stored keys
+/// untouched.
 async fn bootstrap_crypto_provider(
     storage: &dyn Storage,
 ) -> Result<Arc<issuerd_token::RingCryptoProvider>, IssuerdError> {
     let crypto_config = issuerd_token::CryptoConfig::default();
     let mut keys = storage.list_signing_keys().await?;
     if keys.is_empty() {
-        let generated = issuerd_token::KeyStore::generate_key(
+        for generated in issuerd_token::KeyStore::generate_initial_key_set(
             crypto_config.default_alg,
             crypto_config.rsa_key_size,
-        )?;
-        let stored = generated.to_stored(true);
-        storage.create_signing_key(&stored).await?;
-        info!(kid = %stored.kid, alg = %stored.alg, "generated and persisted initial signing key");
+        )? {
+            let stored = generated.to_stored(true);
+            storage.create_signing_key(&stored).await?;
+            info!(kid = %stored.kid, alg = %stored.alg, "generated and persisted initial signing key");
+        }
         // Re-list so keys persisted by a concurrently booting node are picked up.
         keys = storage.list_signing_keys().await?;
     }
@@ -1114,11 +1120,16 @@ mod tests {
         let cfg = ServerConfig::default();
         let state = ServerState::from_config(&cfg).await.unwrap();
         let keys = state.storage.list_signing_keys().await.unwrap();
-        assert_eq!(keys.len(), 1);
-        assert!(keys[0].active);
-        // The published JWKS must contain the same key.
+        // Fresh boot persists the initial PAIR: the EdDSA default signing key
+        // and the OIDC Core MTI RS256 key, both active.
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|k| k.active));
+        let algs: Vec<_> = keys.iter().map(|k| k.alg).collect();
+        assert!(algs.contains(&issuerd_core::Algorithm::EdDsa));
+        assert!(algs.contains(&issuerd_core::Algorithm::Rs256));
+        // The published JWKS must contain the same keys.
         let jwks = state.crypto.get_public_keys().await.unwrap();
-        assert!(jwks.keys.iter().any(|k| k.kid == keys[0].kid));
+        assert!(keys.iter().all(|k| jwks.keys.iter().any(|j| j.kid == k.kid)));
     }
 
     #[tokio::test]

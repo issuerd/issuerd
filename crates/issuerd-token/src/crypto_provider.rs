@@ -164,6 +164,33 @@ impl KeyStore {
         })
     }
 
+    /// Generate the signing-key set for a fresh deployment (an empty shared
+    /// `signing_keys` table): the key for `default_alg` — the signing
+    /// default — plus, when that is not already RS256, an RS256 key of
+    /// `rsa_bits` bits.
+    ///
+    /// OIDC Core §15.1 makes RS256 mandatory-to-implement and discovery (§3)
+    /// must advertise it in `id_token_signing_alg_values_supported`, so a
+    /// fresh key set always contains an active RS256 key even when EdDSA is
+    /// the default signing algorithm. The `default_alg` key is strictly the
+    /// newest so "newest active key" selection (JWKS `keys[0]`, discovery
+    /// ordering) prefers it. All returned keys are meant to be persisted
+    /// active.
+    pub fn generate_initial_key_set(
+        default_alg: Algorithm,
+        rsa_bits: u32,
+    ) -> Result<Vec<SigningKey>, IssuerdError> {
+        let primary = Self::generate_key(default_alg, rsa_bits)?;
+        if default_alg == Algorithm::Rs256 {
+            return Ok(vec![primary]);
+        }
+        let mut mti_rsa = Self::generate_key(Algorithm::Rs256, rsa_bits)?;
+        if mti_rsa.created_at >= primary.created_at {
+            mti_rsa.created_at = primary.created_at - chrono::Duration::nanoseconds(1);
+        }
+        Ok(vec![mti_rsa, primary])
+    }
+
     /// Find a key by its key id, searching active then passive.
     pub fn find_key(&self, kid: &KeyId) -> Option<&SigningKey> {
         self.active
@@ -1544,6 +1571,49 @@ mod tests {
         assert_eq!(jwks.keys.len(), 1);
         // The generated key follows the server-default algorithm (EdDSA).
         assert_eq!(jwks.keys[0].alg, Algorithm::EdDsa);
+    }
+
+    #[tokio::test]
+    async fn generate_initial_key_set_pairs_default_with_mti_rs256() {
+        // Fresh deployments boot with the default (EdDSA) key AND an active
+        // RS256 key: OIDC Core §15.1 mandates RS256 support/advertisement.
+        let keys = KeyStore::generate_initial_key_set(Algorithm::EdDsa, 2048).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].alg, Algorithm::Rs256);
+        assert_eq!(keys[1].alg, Algorithm::EdDsa);
+        assert!(
+            keys[1].created_at > keys[0].created_at,
+            "the default-algorithm key must be the newest active key"
+        );
+
+        // Loaded as an all-active shared set, discovery's source
+        // (`active_signing_algorithms`) advertises both, default first.
+        let stored: Vec<_> = keys.iter().map(|k| k.to_stored(true)).collect();
+        let provider =
+            RingCryptoProvider::from_signing_keys(CryptoConfig::default(), &stored).unwrap();
+        assert_eq!(
+            provider.active_signing_algorithms().await.unwrap(),
+            vec![Algorithm::EdDsa, Algorithm::Rs256]
+        );
+        // The newest-active fallback signing key (`keys[0]`) is the EdDSA one.
+        let jwks = provider.get_active_public_keys().await.unwrap();
+        assert_eq!(jwks.keys.len(), 2);
+        assert_eq!(jwks.keys[0].alg, Algorithm::EdDsa);
+        assert_eq!(jwks.keys[1].alg, Algorithm::Rs256);
+    }
+
+    #[test]
+    fn generate_initial_key_set_with_rs256_default_is_single_key() {
+        // RS256 as the requested algorithm already covers the MTI key.
+        let keys = KeyStore::generate_initial_key_set(Algorithm::Rs256, 2048).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].alg, Algorithm::Rs256);
+
+        // Other algorithms pair with RS256 the same way.
+        let keys = KeyStore::generate_initial_key_set(Algorithm::Es256, 2048).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].alg, Algorithm::Rs256);
+        assert_eq!(keys[1].alg, Algorithm::Es256);
     }
 
     #[tokio::test]

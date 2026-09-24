@@ -108,10 +108,12 @@ async fn set_realm_algorithm(harness: &TestHarness, realm_name: &str, alg: &str)
         .unwrap();
 }
 
-/// Fresh deployments start on EdDSA: the first-boot signing key is Ed25519
-/// and realms without a `default_signature_algorithm` attribute get EdDSA
-/// tokens that validate end-to-end. RS256 stays available as an explicit
-/// opt-in (covered by the other tests in this file).
+/// Fresh deployments start on EdDSA: the first-boot signing keys are an
+/// Ed25519 key (the signing default) plus an active RS256 key — OIDC Core
+/// §15.1 makes RS256 mandatory-to-implement, so discovery advertises it and
+/// realms explicitly pinned to RS256 work without a rotation. Realms without
+/// a `default_signature_algorithm` attribute get EdDSA tokens that validate
+/// end-to-end.
 #[tokio::test]
 async fn fresh_deployment_defaults_to_eddsa_signing() {
     let harness = TestHarness::new().await;
@@ -119,14 +121,19 @@ async fn fresh_deployment_defaults_to_eddsa_signing() {
     let client = harness.create_client("default-realm", false).await;
     harness.create_user("default-realm", "dave", "password123").await;
 
-    // The boot key set holds exactly one active key, and it is EdDSA.
+    // The boot key set holds exactly two active keys: EdDSA + RS256.
     let admin = harness.get_admin_token("master", "admin", "admin").await;
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     let meta = body_json(resp).await;
     let boot_kid = meta["active"]["EdDSA"].as_str().expect("EdDSA boot key").to_string();
-    assert_eq!(meta["active"].as_object().unwrap().len(), 1, "fresh boot keeps one active key");
+    let rs256_kid = meta["active"]["RS256"].as_str().expect("RS256 boot key").to_string();
+    assert_eq!(
+        meta["active"].as_object().unwrap().len(),
+        2,
+        "fresh boot keeps the EdDSA + RS256 pair active"
+    );
 
-    // An un-configured realm gets EdDSA tokens signed by the boot key.
+    // An un-configured realm gets EdDSA tokens signed by the EdDSA boot key.
     let tokens = password_grant_ok(&harness, "default-realm", &client, "dave", "password123").await;
     let access = tokens["access_token"].as_str().unwrap();
     let header = jwt_header(access);
@@ -152,6 +159,45 @@ async fn fresh_deployment_defaults_to_eddsa_signing() {
     assert_eq!(key["kty"], "OKP");
     assert_eq!(key["crv"], "Ed25519");
     assert!(key.get("k").is_none() || key["k"].is_null(), "no symmetric material exposed");
+
+    // JWKS also publishes the RS256 boot key (OIDC Core MTI).
+    let rsa_key = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"].as_str() == Some(rs256_kid.as_str()))
+        .expect("RS256 boot key published");
+    assert_eq!(rsa_key["kty"], "RSA");
+    assert_eq!(rsa_key["alg"], "RS256");
+
+    // Discovery advertises RS256 — the exact conformance requirement
+    // (oidcc-discovery-endpoint-verification; OIDC Core §3 + §15.1).
+    let resp = harness.get("/realms/default-realm/.well-known/openid-configuration").await;
+    let discovery = body_json(resp).await;
+    let advertised = discovery["id_token_signing_alg_values_supported"].as_array().unwrap();
+    assert!(
+        advertised.iter().any(|a| a == "RS256"),
+        "OIDC Core MTI: RS256 must be advertised, got {advertised:?}"
+    );
+    assert!(advertised.iter().any(|a| a == "EdDSA"));
+
+    // A realm explicitly pinned to RS256 gets RS256-signed tokens from the
+    // boot RS256 key — no rotation needed.
+    set_realm_algorithm(&harness, "default-realm", "RS256").await;
+    let tokens = password_grant_ok(&harness, "default-realm", &client, "dave", "password123").await;
+    let header = jwt_header(tokens["access_token"].as_str().unwrap());
+    assert_eq!(header["alg"], "RS256");
+    assert_eq!(header["kid"], rs256_kid);
+    assert_eq!(jwt_header(tokens["id_token"].as_str().unwrap())["alg"], "RS256");
+
+    // The RS256 token validates at userinfo too.
+    let resp = harness
+        .get_auth(
+            "/realms/default-realm/protocol/openid-connect/userinfo",
+            tokens["access_token"].as_str().unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -312,26 +358,29 @@ async fn rotate_keeps_one_active_key_per_algorithm() {
     let harness = TestHarness::new().await;
     let admin = harness.get_admin_token("master", "admin", "admin").await;
 
-    // Boot state: one active EdDSA key.
+    // Boot state: the active EdDSA + RS256 pair.
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     let meta = body_json(resp).await;
     let eddsa_kid = meta["active"]["EdDSA"].as_str().unwrap().to_string();
+    let rs256_kid = meta["active"]["RS256"].as_str().unwrap().to_string();
 
-    // ES256 rotation: the EdDSA key stays active alongside.
+    // ES256 rotation: the EdDSA and RS256 keys stay active alongside.
     rotate_and_wait(&harness, &admin, "ES256").await;
     let resp = harness.get_auth("/admin/realms/master/keys", &admin).await;
     let meta = body_json(resp).await;
     assert_eq!(meta["active"]["EdDSA"], eddsa_kid);
+    assert_eq!(meta["active"]["RS256"], rs256_kid);
     let es_kid = meta["active"]["ES256"].as_str().unwrap().to_string();
 
-    // A bare rotate refreshes the newest algorithm's key only; the EdDSA
-    // active key is untouched.
+    // A bare rotate refreshes the newest algorithm's key only; the EdDSA and
+    // RS256 active keys are untouched.
     let resp = harness
         .post_json_auth("/admin/realms/master/keys/rotate", &admin, serde_json::json!({}))
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let meta = body_json(resp).await;
     assert_eq!(meta["active"]["EdDSA"], eddsa_kid);
+    assert_eq!(meta["active"]["RS256"], rs256_kid);
     assert_ne!(meta["active"]["ES256"].as_str().unwrap(), es_kid);
 }
 
@@ -350,12 +399,22 @@ async fn rotate_with_unknown_algorithm_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The exact OIDF conformance requirement (oidcc-discovery-endpoint-
+/// verification): a fresh deployment's discovery document advertises RS256
+/// (OIDC Core §3 + §15.1) alongside the EdDSA default.
 #[tokio::test]
-async fn discovery_default_realm_lists_eddsa_only() {
+async fn discovery_default_realm_advertises_eddsa_and_rs256() {
     let harness = TestHarness::new().await;
     let resp = harness.get("/realms/master/.well-known/openid-configuration").await;
     let discovery = body_json(resp).await;
-    assert_eq!(discovery["id_token_signing_alg_values_supported"], serde_json::json!(["EdDSA"]));
+    assert_eq!(
+        discovery["id_token_signing_alg_values_supported"],
+        serde_json::json!(["EdDSA", "RS256"])
+    );
+    assert_eq!(
+        discovery["authorization_signing_alg_values_supported"],
+        serde_json::json!(["EdDSA", "RS256"])
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -162,10 +162,11 @@ ciphertext and the KEK never touches the database.
 
 Supported signing algorithms: **RS256/RS384/RS512** (RSA), **ES256/ES384/ES512** (ECDSA, ES512 via
 P-521), and **EdDSA** (`crates/issuerd-core/src/traits.rs`). The server default is **EdDSA**: the
-first-boot signing key is Ed25519 and realms without an explicit setting sign with the newest
-active key of the default algorithm, so fresh deployments issue EdDSA tokens and never generate an
-RSA key unless an operator opts in (RS256 remains fully supported as an explicit compatibility
-choice). A realm selects its algorithm with the
+first boot persists an Ed25519 key (the signing default) AND an active RS256 key — OIDC Core §15.1
+makes RS256 mandatory-to-implement, so discovery advertises it from the start — and realms without
+an explicit setting sign with the newest
+active key of the default algorithm, so fresh deployments issue EdDSA tokens (RS256 remains fully
+supported as an explicit compatibility choice; other RSA keys are only generated on operator opt-in). A realm selects its algorithm with the
 realm attribute `default_signature_algorithm` (e.g. `"ES256"`); issuance then picks the newest
 active key of that algorithm. Symmetric `HS*` values are ignored (an HMAC "public" JWK exposes no
 verification material), and absent/invalid values fall back to the newest active key overall.

@@ -124,7 +124,7 @@ pub async fn get_keys(
     path = "/admin/realms/{realm}/keys/rotate",
     tag = "Keys",
     summary = "Rotate the active signing key",
-    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists). The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
+    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists). On an EMPTY key set the rotation establishes the fresh-deployment pair — the requested key plus, unless it is RS256 itself, an active RS256 key — so the OIDC Core mandatory-to-implement RS256 is advertised in discovery from the start. The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
     params(("realm" = String, Path, description = "Realm name")),
     request_body(content = Option<RotateKeyRequest>, description = "Optional algorithm/size for the new key"),
     responses(
@@ -182,14 +182,30 @@ pub async fn rotate_keys(
     }
     let bits = body.as_ref().and_then(|b| b.key_size).unwrap_or(default_bits);
 
-    let generated = issuerd_token::KeyStore::generate_key(alg, bits)
-        .map_err(|e| AdminApiError::BadRequest(format!("cannot generate {alg} key: {e}")))?;
-    let stored = generated.to_stored(true);
-    state.storage.create_signing_key(&stored).await?;
+    // A rotation on an EMPTY key set establishes the fresh-deployment set:
+    // the requested algorithm's key plus — unless that is RS256 itself — an
+    // active RS256 key, so the OIDC Core §15.1 MTI requirement (RS256
+    // supported and advertised in discovery) holds from the start. On a
+    // non-empty set exactly one new key is generated.
+    let generated = if existing.is_empty() {
+        issuerd_token::KeyStore::generate_initial_key_set(alg, bits)
+    } else {
+        issuerd_token::KeyStore::generate_key(alg, bits).map(|key| vec![key])
+    }
+    .map_err(|e| AdminApiError::BadRequest(format!("cannot generate {alg} key: {e}")))?;
+    // The requested key is generated LAST (strictly the newest, so "newest
+    // active key" selection prefers it); every generated key starts active.
+    let mut stored_keys = Vec::with_capacity(generated.len());
+    for key in &generated {
+        let stored = key.to_stored(true);
+        state.storage.create_signing_key(&stored).await?;
+        stored_keys.push(stored);
+    }
+    let new_kids: Vec<issuerd_core::KeyId> = stored_keys.iter().map(|k| k.kid.clone()).collect();
     // Demote the other active keys of the SAME algorithm: exactly one active
-    // key per algorithm going forward.
+    // key per algorithm going forward (a no-op on an empty pre-rotation set).
     for mut key in existing {
-        if key.active && key.alg == alg && key.kid != stored.kid {
+        if key.active && key.alg == alg && !new_kids.contains(&key.kid) {
             key.active = false;
             state.storage.update_signing_key(&key).await?;
         }
@@ -197,7 +213,8 @@ pub async fn rotate_keys(
     // Reload this node's keystore + JWKS snapshot immediately; peer cluster
     // nodes converge via the JWKS polling task.
     (state.signing_key_reload)();
-    info!(kid = %stored.kid, alg = %alg, "signing key rotated");
+    let primary = stored_keys.last().expect("rotation generates at least one key");
+    info!(kid = %primary.kid, alg = %alg, "signing key rotated");
 
     let keys = state.storage.list_signing_keys().await?;
     let metadata = keys_metadata_from_stored(keys);
@@ -523,12 +540,65 @@ mod tests {
             call(key_routes(state.clone()), "POST", "/admin/realms/test/keys/rotate").await;
         assert_eq!(status, StatusCode::OK);
         let meta: KeysMetadataRepresentation = serde_json::from_slice(&body).unwrap();
-        assert_eq!(meta.active.len(), 1);
-        assert_eq!(meta.passive.len(), 1);
-        // The no-keys fallback is the server-default algorithm (EdDSA).
+        // The no-keys fallback establishes the fresh-deployment PAIR: the
+        // server-default algorithm (EdDSA) plus an active RS256 key (OIDC
+        // Core §15.1 — RS256 must be supported and advertised).
+        assert_eq!(meta.active.len(), 2);
+        assert_eq!(meta.passive.len(), 2);
+        assert!(meta.active.contains_key("EdDSA"));
+        assert!(meta.active.contains_key("RS256"));
         assert_eq!(meta.passive[0].algorithm, Algorithm::EdDsa);
         assert_eq!(meta.passive[0].status, issuerd_core::KeyStatus::Active);
+        assert_eq!(meta.passive[1].algorithm, Algorithm::Rs256);
+        assert_eq!(meta.passive[1].status, issuerd_core::KeyStatus::Active);
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rotate_keys_on_empty_set_with_explicit_algorithm_adds_mti_rs256() {
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        create_test_realm(&storage, false).await;
+
+        let (reload, _) = flag_reload();
+        let state = test_state(storage, reload);
+
+        // Explicit non-RSA algorithm on an empty set: the requested key plus
+        // the RS256 MTI key.
+        let (status, body) = call_json(
+            key_routes(state.clone()),
+            "POST",
+            "/admin/realms/test/keys/rotate",
+            serde_json::json!({"algorithm": "ES256"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let meta: KeysMetadataRepresentation = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta.active.len(), 2);
+        assert!(meta.active.contains_key("ES256"));
+        assert!(meta.active.contains_key("RS256"));
+    }
+
+    #[tokio::test]
+    async fn rotate_keys_on_empty_set_with_explicit_rs256_stays_single() {
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        create_test_realm(&storage, false).await;
+
+        let (reload, _) = flag_reload();
+        let state = test_state(storage, reload);
+
+        // Explicit RS256 on an empty set already covers the MTI key — no
+        // second key is generated.
+        let (status, body) = call_json(
+            key_routes(state.clone()),
+            "POST",
+            "/admin/realms/test/keys/rotate",
+            serde_json::json!({"algorithm": "RS256"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let meta: KeysMetadataRepresentation = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta.active.len(), 1);
+        assert!(meta.active.contains_key("RS256"));
     }
 
     // ------------------------------------------------------------------

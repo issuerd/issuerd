@@ -8,10 +8,10 @@
 //! Two full Issuerd instances ("nodes") are booted sequentially in the same
 //! process via [`ServerState::from_components`], sharing one
 //! [`issuerd_storage::InMemoryStorage`] and one [`issuerd_cluster::InMemoryCache`].
-//! Node A performs the first-boot work (persists the shared EdDSA signing key
-//! into storage, bootstraps the `master` realm with `admin`/`admin` and the
-//! public `admin-cli` client); node B then loads the shared key set and
-//! publishes the same JWKS.
+//! Node A performs the first-boot work (persists the shared signing keys — the
+//! EdDSA default + RS256 MTI pair — into storage, bootstraps the `master`
+//! realm with `admin`/`admin` and the public `admin-cli` client); node B then
+//! loads the shared key set and publishes the same JWKS.
 //!
 //! Every test builds its OWN fresh storage+cache pair (`two_node_cluster()`)
 //! so sessions, revocation entries and login-failure counters never leak
@@ -50,7 +50,7 @@ struct TwoNodeCluster {
     cache: Arc<dyn DistributedCache>,
 }
 
-/// Boot node A first (shared signing key + master realm bootstrap), then node B.
+/// Boot node A first (shared signing keys + master realm bootstrap), then node B.
 async fn two_node_cluster() -> TwoNodeCluster {
     let config = ServerConfig::default();
     let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
@@ -268,7 +268,7 @@ async fn create_user(storage: &Arc<dyn Storage>, realm: &str, username: &str, pa
 // ---------------------------------------------------------------------------
 
 /// Both nodes must publish the same non-empty JWKS: node A generated and
-/// persisted the signing key, node B loaded the shared set from storage.
+/// persisted the signing keys, node B loaded the shared set from storage.
 #[tokio::test]
 async fn cluster_nodes_share_jwks() {
     let cluster = two_node_cluster().await;

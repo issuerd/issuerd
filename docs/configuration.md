@@ -619,12 +619,15 @@ There is no config-file key for the token-signing algorithm — it is an
 operational property of the shared signing-key set plus one realm attribute.
 
 - **Server default: EdDSA (Ed25519).** On first boot (empty `signing_keys`
-  table) the server generates and persists an **EdDSA** key
-  (`bootstrap_crypto_provider` in `crates/issuerd-server/src/state.rs`), and
+  table) the server generates and persists an **EdDSA** key AND an **RS256
+  (2048-bit)** key, both active (`bootstrap_crypto_provider` in
+  `crates/issuerd-server/src/state.rs`). The EdDSA key is the signing default:
   realms without an explicit setting sign with the newest active key of the
-  server-default algorithm (`CryptoConfig::default_alg`). Fresh deployments
-  therefore issue EdDSA tokens out of the box — no RSA key is ever generated
-  unless an operator opts in.
+  server-default algorithm (`CryptoConfig::default_alg`). The RS256 key exists
+  because OIDC Core §15.1 makes RS256 **mandatory-to-implement** — discovery
+  must advertise it in `id_token_signing_alg_values_supported`, and realms
+  explicitly pinned to RS256 work out of the box. Fresh deployments therefore
+  issue EdDSA tokens by default while still supporting and advertising RS256.
 - **Per-realm override.** The realm attribute `default_signature_algorithm`
   (set via the realm representation's `attributes` map, the provision YAML
   `attributes` block, or the admin console's Tokens/Keys pages) pins a realm
@@ -635,18 +638,21 @@ operational property of the shared signing-key set plus one realm attribute.
   issuance falls back to the newest active key overall — rotate a key of that
   algorithm first (`POST /admin/realms/{realm}/keys/rotate`).
 - **RS256 as an explicit compatibility choice.** RSA remains fully supported
-  for clients that cannot consume Ed25519/ECDSA keys: rotate in an RSA key
-  (`{"algorithm": "RS256", "key_size": 2048}`) and pin the realm attribute to
-  `RS256`. Note the `rsa` crate is used **only for key generation** (signing
-  and verification go through `ring`), which is why `RUSTSEC-2023-0071`
-  (Marvin) is ignored in `.cargo/audit.toml` / `deny.toml` — issuerd performs
-  no RSA decryption, so the padding oracle is unreachable.
+  for clients that cannot consume Ed25519/ECDSA keys: fresh deployments
+  already carry an active RS256 boot key, and additional RSA keys can be
+  rotated in (`{"algorithm": "RS256", "key_size": 2048}`); pin the realm
+  attribute to `RS256` to use them. Note the `rsa` crate is used **only for
+  key generation** (signing and verification go through `ring`), which is why
+  `RUSTSEC-2023-0071` (Marvin) is ignored in `.cargo/audit.toml` /
+  `deny.toml` — issuerd performs no RSA decryption, so the padding oracle is
+  unreachable.
 - **Upgrading existing deployments.** Stored keys are never touched by an
   upgrade: an existing RS256-only key set keeps signing RS256 for
   un-configured realms (the EdDSA default finds no matching key and falls
   back). Rotating in an EdDSA key switches un-configured realms to EdDSA —
   pin `default_signature_algorithm=RS256` on realms that must stay on RSA
-  before doing so.
+  before doing so. (The EdDSA+RS256 initial pair is only generated on a truly
+  empty `signing_keys` table; upgrades never gain keys implicitly.)
 
 ## Complete annotated example
 

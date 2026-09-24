@@ -246,7 +246,10 @@ ES512 (P-521) signing. Deliberate divergences and design notes:
   `{ "algorithm": "ES256", "key_size": 2048 }` (both default to the newest
   active key's parameters, the server-default algorithm EdDSA when no key
   exists; unknown algorithms
-  → 400). Only same-algorithm active keys are demoted. The last remaining
+  → 400). Only same-algorithm active keys are demoted. On an EMPTY key set the
+  rotation establishes the fresh-deployment pair — the requested key plus,
+  unless it is RS256 itself, an active RS256 key — so the OIDC Core §15.1
+  MTI advertisement holds there too. The last remaining
   active key overall cannot be disabled; disabling an algorithm's only active
   key makes realms pinned to it fall back to the default signing key.
 - **Fallback on missing algorithm**: a realm whose configured algorithm has
@@ -260,9 +263,12 @@ ES512 (P-521) signing. Deliberate divergences and design notes:
   resolves the realm attribute, then the server default
   (`CryptoConfig::default_alg`, EdDSA since the asymmetric-first policy
   change), then — only when no key of that algorithm is active — the newest
-  active key. Fresh deployments therefore boot on an Ed25519 key and never
-  generate RSA unless an operator opts in (RS256 remains an explicit
-  compatibility choice: rotate an RSA key in and pin the realm attribute).
+  active key. Fresh deployments therefore boot with an Ed25519 key (the
+  signing default) AND an active RS256 key — OIDC Core §15.1 makes RS256
+  mandatory-to-implement, so discovery advertises it from the start and
+  realms explicitly pinned to RS256 work without a rotation; RS256 remains an
+  explicit per-realm compatibility choice, and larger/other RSA keys are
+  still only generated when an operator opts in.
   Upgraded deployments with an RS256-only key set are unaffected — the EdDSA
   default has no matching key and falls back to the existing key — until an
   EdDSA key is deliberately rotated in; from that moment un-pinned realms
