@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Empty-body key rotation is deterministic on fresh deployments**: the initial EdDSA+RS256 key pair was stamped with a 1-nanosecond `created_at` gap that PostgreSQL's microsecond-resolution `timestamptz` truncates to a tie, so the rotation endpoint's "newest active key" default-algorithm selection degenerated to a kid-string coin flip and could rotate RS256 instead of the actual signing key. The RS256 MTI key is now stamped a full second older, and timestamp ties prefer the server-default algorithm (EdDSA).
+
 ### Security
 
 - **MFA is now enforced on the non-browser password paths** (Keycloak direct-grant parity). `grant_type=password` and the device-verification endpoint (`POST .../auth/device-verify`) reject accounts with an enrolled OTP credential unless the request carries a valid `totp` code — the matched code's replay watermark is persisted, so it cannot be reused — and reject accounts whose only second factor is WebAuthn, since a WebAuthn ceremony cannot run outside the browser flow. Previously both paths authenticated with the password alone, silently bypassing MFA.

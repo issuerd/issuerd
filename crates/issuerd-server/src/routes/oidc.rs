@@ -5098,6 +5098,11 @@ async fn enforce_oob_second_factor(
 /// every rejection answers `401 invalid_token`. Returns the issuer realm
 /// (when resolvable) and the session snapshot (when the token carries a live
 /// session) so the caller can reuse both without a second lookup.
+///
+/// The `Err` payload is a ready-made 401 response; `Response` is large, but
+/// this helper runs at most once per request, so the lint's performance
+/// concern does not apply.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn enforce_token_validity(
     state: &Arc<ServerState>,
     token: &str,

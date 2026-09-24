@@ -124,7 +124,7 @@ pub async fn get_keys(
     path = "/admin/realms/{realm}/keys/rotate",
     tag = "Keys",
     summary = "Rotate the active signing key",
-    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists). On an EMPTY key set the rotation establishes the fresh-deployment pair — the requested key plus, unless it is RS256 itself, an active RS256 key — so the OIDC Core mandatory-to-implement RS256 is advertised in discovery from the start. The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
+    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists, and on creation-timestamp ties). On an EMPTY key set the rotation establishes the fresh-deployment pair — the requested key plus, unless it is RS256 itself, an active RS256 key — so the OIDC Core mandatory-to-implement RS256 is advertised in discovery from the start. The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
     params(("realm" = String, Path, description = "Realm name")),
     request_body(content = Option<RotateKeyRequest>, description = "Optional algorithm/size for the new key"),
     responses(
@@ -147,11 +147,19 @@ pub async fn rotate_keys(
 
     let existing = state.storage.list_signing_keys().await?;
     // Default rotation parameters come from the newest active key; fall back
-    // to the server-default algorithm (EdDSA) when no key exists.
-    let current = existing
-        .iter()
-        .filter(|k| k.active)
-        .max_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.kid.cmp(&b.kid)));
+    // to the server-default algorithm (EdDSA) when no key exists. Timestamp
+    // ties (the persisted initial pair can land in the same microsecond)
+    // prefer the server-default algorithm, so an empty-body rotation on a
+    // fresh deployment rotates the actual signing key deterministically.
+    let current = existing.iter().filter(|k| k.active).max_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| {
+                (a.alg == issuerd_core::Algorithm::EdDsa)
+                    .cmp(&(b.alg == issuerd_core::Algorithm::EdDsa))
+            })
+            .then_with(|| a.kid.cmp(&b.kid))
+    });
     let (default_alg, default_bits) = current
         .map(|k| key_params(&k.public_jwk))
         .unwrap_or((issuerd_core::Algorithm::EdDsa, 2048));

@@ -186,7 +186,11 @@ impl KeyStore {
         }
         let mut mti_rsa = Self::generate_key(Algorithm::Rs256, rsa_bits)?;
         if mti_rsa.created_at >= primary.created_at {
-            mti_rsa.created_at = primary.created_at - chrono::Duration::nanoseconds(1);
+            // Keep the primary strictly the newest by a margin that survives
+            // persistence: PostgreSQL `timestamptz` truncates to microseconds,
+            // so a sub-microsecond offset would collapse into a tie on reload
+            // and leave "newest active key" selection to the kid coin flip.
+            mti_rsa.created_at = primary.created_at - chrono::Duration::seconds(1);
         }
         Ok(vec![mti_rsa, primary])
     }
