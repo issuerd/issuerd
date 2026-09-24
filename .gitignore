@@ -31,6 +31,9 @@ certs
 
 /ui
 
+# Crate-local web client copy staged by scripts/publish.py (packaging artifact)
+/crates/issuerd-server/webclient-dist/
+
 # Embedded build artifacts (own git repos / extracted suites)
 tests/conformance/conformance-suite/
 

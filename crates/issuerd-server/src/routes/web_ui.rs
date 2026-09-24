@@ -21,7 +21,7 @@ pub const ADMIN_CONSOLE_PREFIX: &str = "/admin/console";
 #[cfg(webclient_present)]
 mod embedded {
     use include_dir::{include_dir, Dir};
-    pub static DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../webclientsrc/dist");
+    pub static DIR: Dir<'_> = include_dir!("$ISSUERD_WEB_DIST");
 }
 
 #[cfg(not(webclient_present))]

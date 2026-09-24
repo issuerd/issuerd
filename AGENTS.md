@@ -798,13 +798,16 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 All 10 crates share the workspace version and are published in dependency order with:
 
 ```bash
-python scripts/publish.py          # dry-run rehearsal (default, no upload)
-python scripts/publish.py --real   # real publish (CARGO_REGISTRY_TOKEN/CRATES_TOKEN or cargo login)
+python scripts/publish.py                    # dry-run rehearsal (default, no upload)
+python scripts/publish.py --real --skip-root # real publish of the 9 library crates
+python scripts/publish.py --real             # real publish incl. the root binary
 ```
 
-The script stages a copy of the workspace because `issuerd-core` carries a **git dependency** on the `flux-rs` shim (crates.io rejects git deps): the staged copy strips that dep and the `#[flux_rs::...]` attribute lines — the compiled code is identical (the shim expands to nothing under plain rustc). Dry-run fully rehearses `issuerd-core` (packaged + verify-built); the dependent crates cannot even be packaged until their `issuerd-*` deps are live, because `cargo package`/`publish` strips path deps and re-resolves them against the registry — so `--real` publishes in order with a pause between crates for index propagation.
+`--skip-root` omits the root `issuerd` binary crate; `--from CRATE` resumes at a given library crate; crates already live on crates.io are skipped on retry. (CARGO_REGISTRY_TOKEN/CRATES_TOKEN or cargo login required for `--real`.)
 
-**Open before publishing the root `issuerd` binary:** `crates/issuerd-server/build.rs` locates the web client at `../../webclientsrc/dist` (outside the packaged crate), so a crates.io build of `issuerd-server` cannot embed the SPA and `cargo install issuerd` (release profile) would hit the `DIST_MISSING` panic. Fix first: copy `webclientsrc/dist` into the server crate's package and teach build.rs a crate-local fallback path.
+The script stages a copy of the workspace for two reasons. First, `issuerd-core` carries a **git dependency** on the `flux-rs` shim (crates.io rejects git deps): the staged copy strips that dep and the `#[flux_rs::...]` attribute lines — the compiled code is identical (the shim expands to nothing under plain rustc). Second, staging copies the built web client (`webclientsrc/dist`) into `crates/issuerd-server/webclient-dist/` (a gitignored packaging artifact): `issuerd-server`'s `build.rs` resolves the web client from that crate-local directory first and falls back to `../../webclientsrc/dist` in the dev workspace, so a crates.io build of the packaged crate embeds the SPA and `cargo install issuerd` (release profile) does not hit the `DIST_MISSING` panic. Staging fails early if `webclientsrc/dist` is missing or empty — run `npm run build` in `webclientsrc/` first.
+
+Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on crates.io (packaged + verify-built); ahead of the first publish only `issuerd-core` can be rehearsed, because `cargo package`/`publish` strips path deps and re-resolves them against the registry — so `--real` publishes in order with a pause between crates for index propagation.
 
 ### Key Files for Agents
 

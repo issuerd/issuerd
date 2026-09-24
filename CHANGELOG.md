@@ -20,6 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-24
+
+### Fixed
+
+- **`cargo install issuerd` now embeds the admin/account web consoles** — the
+  root binary crate is publishable to crates.io. `issuerd-server`'s build
+  script resolves the built web client from the crate-local `webclient-dist/`
+  directory first and falls back to the dev-workspace `webclientsrc/dist`,
+  and the publish staging copies the built SPA into the packaged crate;
+  previously a crates.io release build aborted with the `DIST_MISSING` panic
+  because `webclientsrc/dist` lives outside the packaged crate. The staging
+  now also includes the root `build.rs` (git-hash version stamp), without
+  which the packaged binary crate did not compile.
+
+## [0.1.0] - 2026-09-23
+
 ### Security
 
 - **Envelope encryption for signing keys at rest** (opt-in,

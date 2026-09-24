@@ -10,24 +10,22 @@ in normal builds, so the staged copy drops that dependency together with the
 Steps:
   1. Copy the publishable file set into a temp staging dir (manifests, sources,
      migrations, build scripts, README/LICENSE, root bin + integration tests).
-  2. Strip the flux-rs git dependency from the staged issuerd-core manifest and
+  2. Copy the built web client (webclientsrc/dist) into the staged issuerd-server
+     crate as webclient-dist/ so the packaged crate can embed the SPA.
+  3. Strip the flux-rs git dependency from the staged issuerd-core manifest and
      the `#[flux_rs::...]` attribute lines from its models.rs.
-  3. Run `cargo publish` per crate in dependency order.
+  4. Run `cargo publish` per crate in dependency order.
 
 Usage:
-  python scripts/publish.py              # dry-run (default, no upload)
-  python scripts/publish.py --real       # real publish, pauses between crates
+  python scripts/publish.py                       # dry-run (default, no upload)
+  python scripts/publish.py --real                # real publish, pauses between crates
+  python scripts/publish.py --real --skip-root    # libraries only, no root binary crate
 
 Auth: set CARGO_REGISTRY_TOKEN (CRATES_TOKEN is accepted as an alias) or run
 `cargo login` beforehand. Published versions are immutable — crates.io only
 allows yanking, never deleting. New-crate creation is rate-limited on fresh
-accounts, so --real pauses between crates (override with --pause SECONDS).
-
-Known follow-up before --real: crates/issuerd-server/build.rs looks for
-../../webclientsrc/dist (outside the packaged crate), so `cargo install
-issuerd` (release profile) cannot embed the web UI yet. Publish the libraries
-first; fix the server packaging (crate-local dist copy + build.rs lookup)
-before publishing the root `issuerd` binary crate.
+accounts, so --real pauses between crates (override with --pause SECONDS);
+interrupted runs are resumable (already-uploaded crates are skipped).
 """
 
 import argparse
@@ -62,7 +60,7 @@ def stage(stage_dir: Path) -> Path:
     root = stage_dir / "workspace"
     root.mkdir(parents=True)
 
-    for name in ["Cargo.toml", "Cargo.lock", "README.md"]:
+    for name in ["Cargo.toml", "Cargo.lock", "README.md", "build.rs"]:
         src = REPO_ROOT / name
         if src.exists():
             shutil.copy2(src, root / name)
@@ -84,6 +82,15 @@ def stage(stage_dir: Path) -> Path:
 
     for crate in CRATES:
         shutil.copytree(REPO_ROOT / "crates" / crate, root / "crates" / crate)
+
+    # issuerd-server embeds the built web client, which lives outside the crate
+    # in the dev workspace; stage a crate-local copy so build.rs finds it in the
+    # packaged crate (crates.io builds have no ../../webclientsrc).
+    dist = REPO_ROOT / "webclientsrc" / "dist"
+    if not dist.is_dir() or not any(dist.iterdir()):
+        sys.exit("error: webclientsrc/dist is missing or empty; "
+                 "run `npm run build` in webclientsrc/ first")
+    shutil.copytree(dist, root / "crates" / "issuerd-server" / "webclient-dist")
 
     return root
 
@@ -131,11 +138,18 @@ def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict) -> bool:
     if result.returncode == 0:
         return True
     output = result.stderr + result.stdout
-    # Before the first real publish, dependents cannot even be packaged:
-    # cargo strips path deps and resolves issuerd-* against crates.io, where
-    # they do not exist yet. Their own manifest metadata was already validated
-    # by the time resolution fails, so treat exactly this failure as deferred.
-    if dry_run and "no matching package named `issuerd-" in output:
+    # A retried run hits crates.io's duplicate-version rejection on crates that
+    # already went live — treat those as done so the run is resumable.
+    if not dry_run and "is already uploaded" in output:
+        print(f"skip: {name} is already on crates.io")
+        return True
+    # Before the first real publish (or right after a version bump), dependents
+    # cannot even be packaged: cargo strips path deps and resolves issuerd-*
+    # against crates.io, where the crate or the new version does not exist yet.
+    # Their own manifest metadata was already validated by the time resolution
+    # fails, so treat exactly these failures as deferred.
+    if dry_run and ("no matching package named `issuerd-" in output
+                    or "failed to select a version for the requirement `issuerd-" in output):
         print(f"deferred: {name} can only be packaged once its issuerd-* deps are live on crates.io")
         return False
     sys.exit(f"error: {'dry-run' if dry_run else 'publish'} failed for {name}")
@@ -145,6 +159,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--real", action="store_true", help="actually publish (default: dry-run)")
     parser.add_argument("--pause", type=int, default=30, help="seconds between real publishes (index propagation)")
+    parser.add_argument("--skip-root", action="store_true",
+                        help="skip the root issuerd binary crate (its web-client packaging is not crates.io-ready yet)")
+    parser.add_argument("--from", dest="from_crate", metavar="CRATE",
+                        help="start publishing at CRATE, skipping earlier library crates (for resumed runs)")
     args = parser.parse_args()
 
     env = dict(os.environ)
@@ -158,7 +176,13 @@ def main() -> None:
         strip_flux(root)
 
         targets = [(root / "crates" / name, name) for name in CRATES]
-        targets.append((root, "issuerd"))  # root binary crate, published last
+        if not args.skip_root:
+            targets.append((root, "issuerd"))  # root binary crate, published last
+        if args.from_crate:
+            names = [n for _, n in targets]
+            if args.from_crate not in names:
+                sys.exit(f"error: --from crate must be one of: {', '.join(names)}")
+            targets = targets[names.index(args.from_crate):]
         deferred = []
         for i, (crate_dir, name) in enumerate(targets):
             if not publish_one(crate_dir, name, dry_run=not args.real, env=env):
