@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **MFA is now enforced on the non-browser password paths** (Keycloak direct-grant parity). `grant_type=password` and the device-verification endpoint (`POST .../auth/device-verify`) reject accounts with an enrolled OTP credential unless the request carries a valid `totp` code — the matched code's replay watermark is persisted, so it cannot be reused — and reject accounts whose only second factor is WebAuthn, since a WebAuthn ceremony cannot run outside the browser flow. Previously both paths authenticated with the password alone, silently bypassing MFA.
+- **Device verification now applies the password grant's account checks**: accounts with pending required actions (temporary password, unverified email, …) are rejected, and federated users are validated against their directory (an active rejection is final; a provider error or dead link falls back to local credentials) instead of requiring a local password.
+- **The account-console API enforces the same bearer-token validity gates as userinfo**: explicit revocation (RFC 7009), backing-session existence (logout and admin session revocation take effect immediately instead of at token expiry), and realm `not_before`. DPoP-bound tokens (`cnf.jkt`) presented as plain `Bearer` are rejected — the account API has no proof channel, so accepting them silently dropped sender-constraining.
+
 ## [0.1.1] - 2026-09-24
 
 ### Added

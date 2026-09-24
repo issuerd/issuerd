@@ -35,6 +35,9 @@ pub struct TokenRequest {
     pub scope: Scope,
     pub username: Option<String>,
     pub password: Option<Password>,
+    /// OTP code for the password grant's second factor (Keycloak direct-grant
+    /// `totp` parameter): required when the user has OTP credentials enrolled.
+    pub totp: Option<String>,
     pub assertion: Option<Assertion>,
     pub assertion_type: Option<String>,
     pub device_code: Option<String>,
@@ -100,6 +103,7 @@ impl TokenRequest {
                 .filter(|s| !s.is_empty())
                 .map(|s| Password::new(s.clone()))
                 .transpose()?,
+            totp: body.get("totp").filter(|s| !s.is_empty()).cloned(),
             assertion: body
                 .get("assertion")
                 .filter(|s| !s.is_empty())
@@ -327,6 +331,23 @@ mod tests {
     }
 
     #[test]
+    fn token_request_parse_password_grant_with_totp() {
+        let mut body = HashMap::new();
+        body.insert("grant_type".to_string(), "password".to_string());
+        body.insert("username".to_string(), "alice".to_string());
+        body.insert("password".to_string(), "secret".to_string());
+        body.insert("totp".to_string(), "123456".to_string());
+
+        let req = TokenRequest::parse(&body).unwrap();
+        assert_eq!(req.grant_type, GrantType::Password);
+        assert_eq!(req.totp.as_deref(), Some("123456"));
+
+        // An empty `totp` parameter is treated as absent.
+        body.insert("totp".to_string(), String::new());
+        assert!(TokenRequest::parse(&body).unwrap().totp.is_none());
+    }
+
+    #[test]
     fn token_request_parse_missing_grant_type() {
         let body = HashMap::new();
         assert!(TokenRequest::parse(&body).is_err());
@@ -360,6 +381,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: None,
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,
@@ -389,6 +411,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: None,
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,
@@ -418,6 +441,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: None,
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,
@@ -446,6 +470,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: Some(Password::new("secret").unwrap()),
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,
@@ -474,6 +499,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: None,
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,
@@ -557,6 +583,7 @@ mod tests {
             scope: Scope::empty(),
             username: None,
             password: None,
+            totp: None,
             assertion: None,
             assertion_type: None,
             device_code: None,

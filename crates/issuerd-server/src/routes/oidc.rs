@@ -1941,34 +1941,10 @@ pub async fn device_verify_handler(
         }
     }
 
-    let creds = match state
-        .storage
-        .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
-        .await
-    {
-        Ok(c) => c,
-        _ => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
-                .into_response();
-        }
-    };
-
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let mut matched = false;
-    for cred in &creds {
-        let hash_str = match String::from_utf8(cred.secret_data.clone()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let parsed = match PasswordHash::new(&hash_str) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
-            matched = true;
-            break;
-        }
-    }
+    // Verify the password with browser-flow parity: a federated user is
+    // validated against the external directory first (an active rejection is
+    // final, a provider error falls back to local credentials).
+    let matched = verify_user_password(&state, &realm_id, &user, username, password).await;
 
     if !matched {
         warn!(realm = %realm_id, username = %issuerd_core::utils::sanitize_log_str(username), ip = %ip, "device verification failed: invalid user credentials");
@@ -1984,6 +1960,57 @@ pub async fn device_verify_handler(
                 )
                 .await;
         }
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
+            .into_response();
+    }
+
+    // Second factor — same contract as the password grant (Keycloak
+    // direct-grant parity): an OTP-enrolled user must present a valid `totp`
+    // code; a WebAuthn-only second factor cannot run out-of-band.
+    if let Err(reject) = enforce_oob_second_factor(
+        &state,
+        &realm,
+        &user,
+        body_params.get("totp").map(|s| s.as_str()),
+    )
+    .await
+    {
+        match reject {
+            OobSecondFactorReject::Internal(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                    .into_response();
+            }
+            OobSecondFactorReject::InvalidOtp => {
+                warn!(realm = %realm_id, username = %issuerd_core::utils::sanitize_log_str(username), ip = %ip, "device verification failed: invalid OTP code");
+                if let Some(ref config) = brute_force {
+                    let _ = state
+                        .login_failure_tracker
+                        .record_failure(
+                            &realm_id,
+                            user.username.as_str(),
+                            &ip_key,
+                            state.cache.as_ref(),
+                            config,
+                        )
+                        .await;
+                }
+            }
+            OobSecondFactorReject::MissingOtp => {
+                debug!(realm = %realm_id, username = %user.username, "device verification rejected: OTP credential enrolled but no totp parameter");
+            }
+            OobSecondFactorReject::WebAuthnOnly => {
+                warn!(realm = %realm_id, username = %user.username, "device verification rejected: WebAuthn second factor cannot run out-of-band");
+            }
+        }
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
+            .into_response();
+    }
+
+    // Same contract as the password grant: an account with pending required
+    // actions (e.g. temporary password, unverified email) must complete them
+    // in the browser flow first.
+    if !user.required_actions.is_empty() {
+        warn!(realm = %realm_id, username = %user.username, actions = ?user.required_actions, "device verification rejected: required actions pending");
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
             .into_response();
     }
@@ -3312,67 +3339,10 @@ pub async fn token_handler(
                 }
             }
 
-            // Verify password using built-in authenticator logic
-            let creds = match state
-                .storage
-                .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
-                .await
-            {
-                Ok(c) => c,
-                _ => {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({"error": "invalid_grant"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Federated user: validate against the external directory first,
-            // mirroring the browser flow (UsernamePasswordAuthenticator): an
-            // active rejection is final (no local fallback), while a provider
-            // error or a dead link falls back to local credentials.
-            let mut matched = false;
-            let mut federated_rejected = false;
-            if let Some(ref link) = user.federation_link {
-                match state.federation_manager.providers_for_realm(&realm_id).await {
-                    Ok(providers) => {
-                        for provider in providers {
-                            if provider.id() == *link {
-                                match provider.validate_password(username, password).await {
-                                    Ok(true) => matched = true,
-                                    Ok(false) => federated_rejected = true,
-                                    Err(e) => {
-                                        warn!(realm = %realm_id, username = %user.username, error = %e, "password grant: federation validation error; falling back to local password");
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(realm = %realm_id, username = %user.username, error = %e, "password grant: federation manager error; falling back to local password");
-                    }
-                }
-            }
-
-            if !matched && !federated_rejected {
-                use argon2::{Argon2, PasswordHash, PasswordVerifier};
-                for cred in &creds {
-                    let hash_str = match String::from_utf8(cred.secret_data.clone()) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let parsed = match PasswordHash::new(&hash_str) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
-                        matched = true;
-                        break;
-                    }
-                }
-            }
+            // Verify the password with browser-flow parity: a federated user
+            // is validated against the external directory first (an active
+            // rejection is final, a provider error falls back to local).
+            let matched = verify_user_password(&state, &realm_id, &user, username, password).await;
 
             if !matched {
                 warn!(realm = %realm_id, username = %issuerd_core::utils::sanitize_log_str(username), ip = %ip, "password grant failed: invalid user credentials");
@@ -3400,6 +3370,58 @@ pub async fn token_handler(
                     std::collections::HashMap::new(),
                 )
                 .await;
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
+
+            // Second factor — Keycloak direct-grant parity: an OTP-enrolled
+            // user must present a valid `totp` code; a WebAuthn-only second
+            // factor cannot be completed out-of-band and rejects the grant.
+            if let Err(reject) =
+                enforce_oob_second_factor(&state, &realm, &user, token_req.totp.as_deref()).await
+            {
+                match reject {
+                    OobSecondFactorReject::Internal(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                            .into_response();
+                    }
+                    OobSecondFactorReject::InvalidOtp => {
+                        warn!(realm = %realm_id, username = %issuerd_core::utils::sanitize_log_str(username), ip = %ip, "password grant failed: invalid OTP code");
+                        if let Some(ref config) = brute_force {
+                            let _ = state
+                                .login_failure_tracker
+                                .record_failure(
+                                    &realm_id,
+                                    user.username.as_str(),
+                                    &ip_key,
+                                    state.cache.as_ref(),
+                                    config,
+                                )
+                                .await;
+                        }
+                        emit_oidc_event(
+                            &state,
+                            &realm_id,
+                            EventType::LoginError,
+                            &ip,
+                            Some(client.id.clone()),
+                            Some(user.id.clone()),
+                            None,
+                            Some("invalid_user_credentials".to_string()),
+                            std::collections::HashMap::new(),
+                        )
+                        .await;
+                    }
+                    OobSecondFactorReject::MissingOtp => {
+                        debug!(realm = %realm_id, username = %user.username, "password grant rejected: OTP credential enrolled but no totp parameter");
+                    }
+                    OobSecondFactorReject::WebAuthnOnly => {
+                        warn!(realm = %realm_id, username = %user.username, "password grant rejected: WebAuthn second factor cannot run out-of-band");
+                    }
+                }
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({"error": "invalid_grant"})),
@@ -4893,6 +4915,245 @@ pub(crate) async fn resolve_token_user(
 }
 
 // ---------------------------------------------------------------------------
+// Shared direct-grant authentication helpers
+//
+// The ROPC password grant and the device-verification endpoint authenticate
+// the user outside the browser flow. Both run through the same helpers so
+// their password, federation, and second-factor semantics cannot drift apart.
+// ---------------------------------------------------------------------------
+
+/// Verify a user's password with browser-flow parity
+/// (`UsernamePasswordAuthenticator`): a federated user is validated against
+/// the external directory first — an active rejection is final (no local
+/// fallback), while a provider error or a dead link falls back to local
+/// credentials.
+async fn verify_user_password(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    user: &issuerd_core::User,
+    username: &str,
+    password: &str,
+) -> bool {
+    let mut matched = false;
+    let mut federated_rejected = false;
+    if let Some(ref link) = user.federation_link {
+        match state.federation_manager.providers_for_realm(realm_id).await {
+            Ok(providers) => {
+                for provider in providers {
+                    if provider.id() == *link {
+                        match provider.validate_password(username, password).await {
+                            Ok(true) => matched = true,
+                            Ok(false) => federated_rejected = true,
+                            Err(e) => {
+                                warn!(realm = %realm_id, username = %user.username, error = %e, "direct grant: federation validation error; falling back to local password");
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(realm = %realm_id, username = %user.username, error = %e, "direct grant: federation manager error; falling back to local password");
+            }
+        }
+    }
+
+    if matched || federated_rejected {
+        return matched;
+    }
+
+    let creds = match state
+        .storage
+        .get_credentials(realm_id, &user.id, issuerd_core::CredentialType::Password)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(realm = %realm_id, username = %user.username, error = %e, "direct grant: password credential lookup failed");
+            return false;
+        }
+    };
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    for cred in &creds {
+        let hash_str = match String::from_utf8(cred.secret_data.clone()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let parsed = match PasswordHash::new(&hash_str) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Why a non-browser password grant was rejected at the second-factor gate.
+enum OobSecondFactorReject {
+    /// OTP credentials are enrolled but no `totp` code was presented.
+    MissingOtp,
+    /// The presented `totp` code matched no OTP credential.
+    InvalidOtp,
+    /// The account's only second factor is WebAuthn, which cannot run
+    /// outside the browser flow.
+    WebAuthnOnly,
+    /// A storage read/write failed while checking; the grant fails closed.
+    Internal(IssuerdError),
+}
+
+/// Second-factor gate for password-authenticated non-browser grants (ROPC,
+/// device verification) — Keycloak direct-grant parity: a user with OTP
+/// credentials must present a valid `totp` code; a WebAuthn-only second
+/// factor cannot be completed out-of-band and rejects the grant. On a match
+/// the credential's `last_used_step` replay watermark is persisted before
+/// returning, so the same code cannot be reused for a later grant.
+async fn enforce_oob_second_factor(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    user: &issuerd_core::User,
+    totp_code: Option<&str>,
+) -> Result<(), OobSecondFactorReject> {
+    let realm_id = &realm.id;
+    let otp_creds = {
+        let mut creds = state
+            .storage
+            .get_credentials(realm_id, &user.id, issuerd_core::CredentialType::Totp)
+            .await
+            .map_err(|e| {
+                warn!(realm = %realm_id, user_id = %user.id, error = %e, "direct grant: OTP credential lookup failed");
+                OobSecondFactorReject::Internal(e)
+            })?;
+        // HOTP credentials cannot be verified here (no counter tracking);
+        // their presence still forces the requirement so such an account
+        // fails closed instead of silently dropping its second factor.
+        let hotp = state
+            .storage
+            .get_credentials(realm_id, &user.id, issuerd_core::CredentialType::Hotp)
+            .await
+            .map_err(|e| {
+                warn!(realm = %realm_id, user_id = %user.id, error = %e, "direct grant: OTP credential lookup failed");
+                OobSecondFactorReject::Internal(e)
+            })?;
+        creds.extend(hotp);
+        creds
+    };
+
+    if otp_creds.is_empty() {
+        let webauthn_creds = state
+            .storage
+            .get_credentials(realm_id, &user.id, issuerd_core::CredentialType::WebAuthn)
+            .await
+            .map_err(|e| {
+                warn!(realm = %realm_id, user_id = %user.id, error = %e, "direct grant: WebAuthn credential lookup failed");
+                OobSecondFactorReject::Internal(e)
+            })?;
+        if webauthn_creds.is_empty() {
+            return Ok(());
+        }
+        return Err(OobSecondFactorReject::WebAuthnOnly);
+    }
+
+    let code = totp_code.ok_or(OobSecondFactorReject::MissingOtp)?;
+    let now = issuerd_core::utils::now_secs();
+    for cred in &otp_creds {
+        if cred.credential_type != issuerd_core::CredentialType::Totp {
+            continue;
+        }
+        let secret = match std::str::from_utf8(&cred.secret_data) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let last_used_step = cred.credential_data.get("last_used_step").and_then(|v| v.as_u64());
+        if let Some(matched_step) =
+            issuerd_auth_flow::totp::verify(secret, code, now, &realm.otp_policy, last_used_step)
+        {
+            // Persist the replay watermark before reporting success so the
+            // same code cannot be reused for another grant.
+            let mut updated = cred.clone();
+            updated.credential_data["last_used_step"] = serde_json::json!(matched_step);
+            state
+                .storage
+                .update_credential(realm_id, &user.id, &updated)
+                .await
+                .map_err(|e| {
+                    warn!(realm = %realm_id, user_id = %user.id, error = %e, "direct grant: failed to persist TOTP replay watermark");
+                    OobSecondFactorReject::Internal(e)
+                })?;
+            return Ok(());
+        }
+    }
+    Err(OobSecondFactorReject::InvalidOtp)
+}
+
+// ---------------------------------------------------------------------------
+// Shared bearer-token validity gates
+// ---------------------------------------------------------------------------
+
+/// Token-validity gates shared by endpoints that serve bearer-token callers
+/// (userinfo, the account API): explicit revocation (RFC 7009 / auth-code
+/// reuse teardown), issuer-realm resolution, backing-session existence, and
+/// realm `not_before`. Runs AFTER the stateless cryptographic validation;
+/// every rejection answers `401 invalid_token`. Returns the issuer realm
+/// (when resolvable) and the session snapshot (when the token carries a live
+/// session) so the caller can reuse both without a second lookup.
+pub(crate) async fn enforce_token_validity(
+    state: &Arc<ServerState>,
+    token: &str,
+    claims: &AccessTokenClaims,
+) -> Result<(Option<Realm>, Option<crate::session_cache::SessionSnapshot>), Response> {
+    let invalid = || {
+        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_token"})))
+            .into_response()
+    };
+
+    // Check revocation list first.
+    if matches!(state.cache.get(&format!("revoked:{token}")).await, Ok(Some(_))) {
+        return Err(invalid());
+    }
+
+    // Resolve the token's issuing realm once — the session-validity check
+    // and claims assembly both need it (each use site applies its own
+    // failure policy; the lookup itself is cached).
+    let issuer_realm = state.resolve_issuer_realm(claims.iss.as_str()).await.ok().flatten();
+
+    // Verify the underlying user session still exists.
+    let session = match (claims.sid.as_ref(), issuer_realm.as_ref()) {
+        (Some(sid), Some(realm)) => {
+            crate::session_cache::session_snapshot(state, &realm.id, sid).await
+        }
+        _ => None,
+    };
+    if claims.sid.is_some() {
+        // An unresolvable issuer (deleted realm, pre-switch id-spelled
+        // issuer, storage error) fails closed; a missing session invalidates
+        // too — except session-less client-credentials tokens (synthetic,
+        // never-persisted sid), recognized by shape.
+        let invalidated = match issuer_realm.as_ref() {
+            None => true,
+            Some(realm) => match session.as_ref() {
+                Some(_) => false,
+                None => !is_sessionless_client_token(state, &realm.id, claims).await,
+            },
+        };
+        if invalidated {
+            return Err(invalid());
+        }
+    }
+
+    // Realm not_before: tokens issued before the realm's cutoff are revoked
+    // wholesale (0 = no cutoff).
+    if let Some(realm) = issuer_realm.as_ref() {
+        if realm.not_before > 0 && claims.iat < realm.not_before {
+            return Err(invalid());
+        }
+    }
+
+    Ok((issuer_realm, session))
+}
+
+// ---------------------------------------------------------------------------
 // Userinfo endpoint
 // ---------------------------------------------------------------------------
 
@@ -4940,22 +5201,19 @@ async fn userinfo_handler_inner(
             .into_response();
     }
 
-    // Check revocation list first
-    let revoked = matches!(state.cache.get(&format!("revoked:{token}")).await, Ok(Some(_)));
-    if revoked {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_token"})))
-            .into_response();
-    }
-
     match state.token_service.validate_access_token(&token) {
         Ok(validated) => {
             let claims = validated.claims;
 
-            // Resolve the token's issuing realm once per request — the DPoP
-            // replay cache, the session-validity check, and claims assembly
-            // all need it (each use site below applies its own failure
-            // policy; the lookup itself is cached).
-            let issuer_realm = state.resolve_issuer_realm(claims.iss.as_str()).await.ok().flatten();
+            // Shared validity gates (explicit revocation, backing-session
+            // existence, realm not_before). The resolved issuer realm and
+            // session snapshot are reused by the DPoP check and claims
+            // assembly below.
+            let (issuer_realm, session) =
+                match enforce_token_validity(&state, &token, &claims).await {
+                    Ok(ctx) => ctx,
+                    Err(resp) => return resp,
+                };
 
             // DPoP (RFC 9449 §7.1): a token carrying `cnf.jkt`
             // must be presented with the `DPoP` scheme plus a fresh proof
@@ -5028,49 +5286,6 @@ async fn userinfo_handler_inner(
                         "the token is not bound to the proof key",
                         None,
                     );
-                }
-            }
-
-            // Verify the underlying user session still exists. The realm and
-            // the session snapshot resolved here are reused for user
-            // resolution below — one fetch each per request.
-            let session = match (claims.sid.as_ref(), issuer_realm.as_ref()) {
-                (Some(sid), Some(realm)) => {
-                    crate::session_cache::session_snapshot(&state, &realm.id, sid).await
-                }
-                _ => None,
-            };
-            if claims.sid.is_some() {
-                // An unresolvable issuer (deleted realm, pre-switch id-spelled
-                // issuer, storage error) fails closed; a missing session
-                // invalidates too — except session-less client-credentials
-                // tokens (synthetic, never-persisted sid), recognized by shape.
-                let invalidated = match issuer_realm.as_ref() {
-                    None => true,
-                    Some(realm) => match session.as_ref() {
-                        Some(_) => false,
-                        None => !is_sessionless_client_token(&state, &realm.id, &claims).await,
-                    },
-                };
-                if invalidated {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({"error": "invalid_token"})),
-                    )
-                        .into_response();
-                }
-            }
-
-            // Realm not_before: tokens issued before the realm's cutoff are
-            // revoked wholesale (0 = no cutoff). A validity gate — it must
-            // run per request, ahead of the rendered-response cache below.
-            if let Some(realm) = issuer_realm.as_ref() {
-                if realm.not_before > 0 && claims.iat < realm.not_before {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({"error": "invalid_token"})),
-                    )
-                        .into_response();
                 }
             }
 
@@ -7130,6 +7345,121 @@ mod tests {
         assert_eq!(ropc_grant(&state, "localpass123").await, StatusCode::OK);
     }
 
+    /// Enroll a TOTP credential for `username` in the master realm. The test
+    /// secret is the RFC 4648 pair "JBSWY3DPEHPK3PXP" = b"Hello!\xDE\xAD\xBE\xEF".
+    async fn add_master_totp_credential(state: &Arc<ServerState>, username: &str) {
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, username).await.unwrap().unwrap();
+        let cred = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"JBSWY3DPEHPK3PXP".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 10,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &cred).await.unwrap();
+    }
+
+    /// The TOTP code for the test secret at the current time step (realm
+    /// default policy: HmacSHA1, 6 digits, 30 s period, look-ahead 1).
+    fn current_test_totp() -> String {
+        issuerd_auth_flow::totp::totp_at(
+            b"Hello!\xDE\xAD\xBE\xEF",
+            issuerd_core::utils::now_secs() / 30,
+            6,
+            &issuerd_core::OtpHashAlgorithm::HmacSha1,
+        )
+    }
+
+    /// A code guaranteed to differ from the currently valid one.
+    fn wrong_test_totp() -> String {
+        if current_test_totp() == "000000" {
+            "000001".to_string()
+        } else {
+            "000000".to_string()
+        }
+    }
+
+    async fn password_grant_with(state: &Arc<ServerState>, extra: &str) -> Response {
+        token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid{extra}"
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_otp_user_without_totp_rejected() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let resp = password_grant_with(&state, "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_otp_wrong_code_rejected() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let resp = password_grant_with(&state, &format!("&totp={}", wrong_test_totp())).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_otp_valid_code_accepted() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let resp = password_grant_with(&state, &format!("&totp={}", current_test_totp())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(extract_json(resp).await["access_token"].as_str().unwrap().len() > 10);
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_otp_code_cannot_be_replayed() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let code = current_test_totp();
+        assert_eq!(
+            password_grant_with(&state, &format!("&totp={code}")).await.status(),
+            StatusCode::OK
+        );
+        // The watermark persisted by the first grant retires the code.
+        assert_eq!(
+            password_grant_with(&state, &format!("&totp={code}")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_webauthn_only_user_rejected() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let cred = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"not-a-real-credential".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 10,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &cred).await.unwrap();
+        // A WebAuthn ceremony cannot run inside the token endpoint: the grant
+        // is rejected even though the password is correct.
+        let resp = password_grant_with(&state, "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
     #[tokio::test]
     async fn token_auth_code_invalid_code() {
         let state = setup_state().await;
@@ -8522,6 +8852,115 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = extract_json(response).await;
         assert_eq!(json["error"], "invalid_grant");
+    }
+
+    /// Seed a pending device-code entry for master/admin-cli and return its
+    /// `user_code`.
+    async fn seed_pending_device_code(state: &Arc<ServerState>) -> String {
+        let user_code = "ABCD-EFGH".to_string();
+        let code_data = DeviceCodeData {
+            device_code: "device-123".to_string(),
+            user_code: user_code.clone(),
+            client_id: "admin-cli".to_string(),
+            realm_id: "master".to_string(),
+            scope: vec!["openid".to_string()],
+            user_id: None,
+            authorized: false,
+            last_polled_at: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        };
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::user_code(&user_code),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        user_code
+    }
+
+    async fn device_verify_with(
+        state: &Arc<ServerState>,
+        user_code: &str,
+        extra: &str,
+    ) -> Response {
+        device_verify_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            format!("user_code={user_code}&username=admin&password=admin{extra}"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_otp_user_without_totp_rejected() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let user_code = seed_pending_device_code(&state).await;
+        let resp = device_verify_with(&state, &user_code, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_otp_valid_code_accepted() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let user_code = seed_pending_device_code(&state).await;
+        let resp =
+            device_verify_with(&state, &user_code, &format!("&totp={}", current_test_totp())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_required_actions_rejected() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.required_actions = vec!["UPDATE_PASSWORD".to_string()];
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let user_code = seed_pending_device_code(&state).await;
+        let resp = device_verify_with(&state, &user_code, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_federated_directory_accepts() {
+        let state = setup_federated_ropc_state(Ok(true)).await;
+        let user_code = seed_pending_device_code(&state).await;
+        // The federated user has no usable local password for this grant:
+        // the directory's verdict authenticates them.
+        let resp = device_verify_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            format!("user_code={user_code}&username=feduser&password=directorypass"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_federated_rejection_has_no_local_fallback() {
+        let state = setup_federated_ropc_state(Ok(false)).await;
+        let user_code = seed_pending_device_code(&state).await;
+        // The directory actively rejects; the matching local credential must
+        // not authenticate (password-grant parity).
+        let resp = device_verify_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            format!("user_code={user_code}&username=feduser&password=localpass123"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
     }
 
     #[tokio::test]

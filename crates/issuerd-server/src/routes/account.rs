@@ -1825,6 +1825,30 @@ async fn extract_auth(
             .into_response());
     }
 
+    // The account API honors the same token-validity gates as userinfo:
+    // explicit revocation (RFC 7009), backing-session existence (logout and
+    // admin revocation take effect immediately), and realm `not_before`.
+    // Without them a logged-out or revoked token kept working here until
+    // expiry — including for the mutating endpoints (email change, TOTP and
+    // passkey deletion).
+    let (_issuer_realm, session) =
+        match super::oidc::enforce_token_validity(state, token, &validated.claims).await {
+            Ok(ctx) => ctx,
+            Err(resp) => return Err(resp),
+        };
+
+    // Bearer-only API: a DPoP-bound token (`cnf.jkt`) must be presented with
+    // a proof (RFC 9449 §7.1), which this API does not accept — reject the
+    // downgrade instead of letting a stolen proof-bound token authenticate
+    // as plain Bearer.
+    if validated.claims.cnf.is_some() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid_token"})),
+        )
+            .into_response());
+    }
+
     // Wrap the validated user id in a realm-bound value and then produce the
     // compile-time proof required by account handlers. A token
     // minted for a pairwise client carries an irreversible `sub` — resolve
@@ -1832,7 +1856,7 @@ async fn extract_auth(
     // is public by default, so this only matters when an admin opts a
     // first-party client into pairwise).
     let user_id =
-        match super::oidc::resolve_token_user(state, &realm_id, &validated.claims, None).await {
+        match super::oidc::resolve_token_user(state, &realm_id, &validated.claims, session).await {
             Some(user) => user.id,
             None => validated.claims.sub,
         };
@@ -2049,5 +2073,162 @@ mod tests {
                 "last_updated_at": "2026-01-02T00:00:00+00:00",
             })
         );
+    }
+
+    /// Password-grant an access token for the master `admin` user.
+    async fn password_grant_token(state: &Arc<ServerState>) -> String {
+        let resp = crate::routes::oidc::token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["access_token"].as_str().unwrap().to_string()
+    }
+
+    async fn account_me_with_token(state: &Arc<ServerState>, access_token: &str) -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        account_me_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            headers,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn account_me_accepts_token_with_live_session() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_token_of_deleted_session() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+
+        // Logout / admin revocation deletes the backing session; the account
+        // API must reject the token immediately, like userinfo does.
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let sid = validated.claims.sid.clone().unwrap();
+        state
+            .storage
+            .delete_user_session(&RealmId::new("master").unwrap(), &sid)
+            .await
+            .unwrap();
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_explicitly_revoked_token() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+
+        // RFC 7009 revocation records the raw token in the revocation list.
+        state
+            .cache
+            .set(
+                &format!("revoked:{access_token}"),
+                b"1".to_vec(),
+                Some(std::time::Duration::from_secs(300)),
+            )
+            .await
+            .unwrap();
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_token_issued_before_realm_not_before() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+
+        // Push the realm's not_before cutoff past the token's iat. The realm
+        // was already resolved (and cached) by the grant, so drop the
+        // name-lookup cache entry after the direct storage mutation.
+        let mut realm = state
+            .storage
+            .get_realm(&RealmId::new("master").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        realm.not_before = chrono::Utc::now().timestamp() + 60;
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_dpop_bound_token_presented_as_bearer() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A live session backs the token, so the cnf gate is the only
+        // possible rejection cause.
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: issuerd_core::AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: chrono::Utc::now(),
+            last_session_refresh: chrono::Utc::now(),
+            auth_time: chrono::Utc::now(),
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+
+        // Mint a DPoP-bound token (cnf.jkt) for the live session.
+        let overlay = crate::dpop::bind_cnf_overlay(None, Some("test-jkt"));
+        let token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                overlay,
+            )
+            .await
+            .unwrap();
+
+        // Presented as plain Bearer without a proof, the bound token must be
+        // rejected (RFC 9449 §7.1) instead of silently downgraded.
+        let resp = account_me_with_token(&state, &token.token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

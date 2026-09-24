@@ -48,6 +48,9 @@ pub struct TokenEndpointForm {
     pub code_verifier: Option<String>,
     pub refresh_token: Option<String>,
     pub scope: Option<String>,
+    /// Second-factor OTP code for the password grant (Keycloak direct-grant
+    /// parity): required when the user has OTP credentials enrolled.
+    pub totp: Option<String>,
 }
 
 #[derive(OpenApi)]

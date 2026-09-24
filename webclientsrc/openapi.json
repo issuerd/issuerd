@@ -21574,6 +21574,13 @@
               "string",
               "null"
             ]
+          },
+          "totp": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Second-factor OTP code for the password grant (Keycloak direct-grant\nparity): required when the user has OTP credentials enrolled."
           }
         }
       },
