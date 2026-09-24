@@ -3,18 +3,25 @@
 # One command gives you a complete single-node Issuerd instance with the web
 # consoles, backed by PostgreSQL (persistent state) and Redis (transient state):
 #
-#   docker compose up --build
+#   docker compose up
+#
+# This pulls the published image (issuerd/issuerd:latest) — a fresh clone on a
+# machine with only Docker installed runs the demo without compiling anything.
+# Pin a specific release by editing the image tag below (e.g.
+# issuerd/issuerd:0.1.1) instead of tracking the moving :latest tag.
 #
 # Then open:
 #   - Admin console:   http://localhost:8080/admin/console   (admin / admin)
 #   - Account console: http://localhost:8080/realms/myrealm/account   (alice / changeme)
 #   - Discovery:       http://localhost:8080/realms/myrealm/.well-known/openid-configuration
 #
-# The first build compiles the release binary and the embedded web client —
-# expect it to take a while; subsequent starts reuse the image.
-#
 # Stop with Ctrl+C or `docker compose down`; wipe all demo data with
 # `docker compose down -v`.
+#
+# Contributors: to build from local sources instead of pulling the release,
+# layer on the from-source override:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build
 #
 # Other stacks in this repository:
 #   - docker-compose.integration.yml — contributor test infrastructure
@@ -25,10 +32,7 @@ name: issuerd-demo
 
 services:
   issuerd:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: issuerd:local
+    image: issuerd/issuerd:latest
     container_name: issuerd-demo-server
     ports:
       - "8080:8080"

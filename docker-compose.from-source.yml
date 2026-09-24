@@ -1,0 +1,15 @@
+# Contributor override: build the issuerd image from local sources instead of
+# pulling the published issuerd/issuerd:latest (the default in
+# docker-compose.yml). Usage:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build
+#
+# The first build compiles the release binary and the embedded web client —
+# expect it to take a while; subsequent starts reuse the image.
+
+services:
+  issuerd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: issuerd:local

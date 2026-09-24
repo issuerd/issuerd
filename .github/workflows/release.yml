@@ -1,0 +1,272 @@
+name: Release
+
+# Tag push (v*) → GitHub Release with Linux/Windows binary archives + SBOMs +
+# checksums, and the issuerd/issuerd image on Docker Hub (:latest, :X.Y.Z,
+# :X.Y). The tag must match [workspace.package] version in Cargo.toml and have
+# a dated CHANGELOG.md section — the validate job fails fast otherwise.
+#
+# Local rehearsal: .act/run-release.sh runs this workflow under nektos/act.
+# act sets ACT=true; every step that touches an external service (Docker Hub
+# login/push, release creation, attestations) is gated on `env.ACT != 'true'`
+# so the rehearsal exercises everything except the actual publishing.
+
+on:
+  push:
+    tags: ['v*']
+
+# Never cancel a release run mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: validate tag ↔ version ↔ changelog
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        name: Tag must match workspace version and CHANGELOG section
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -A10 '^\[workspace\.package\]' Cargo.toml | grep '^version' | head -1 | cut -d'"' -f2)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match [workspace.package] version ${cargo_version} — bump Cargo.toml or re-tag."
+            exit 1
+          fi
+          if ! grep -qF "## [$version] - " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated '## [$version] - YYYY-MM-DD' section."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          start=$(grep -nF "## [$VERSION] - " CHANGELOG.md | head -1 | cut -d: -f1)
+          # Section body up to the next '## [' heading, leading blank lines dropped.
+          tail -n +"$((start + 1))" CHANGELOG.md | awk '/^## \[/{exit} {print}' | awk 'NF{p=1} p' > release-notes.md
+          test -s release-notes.md
+          cat >> release-notes.md <<EOF
+
+          ---
+
+          ### Archives
+
+          - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
+          - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
+
+          Each archive contains the binary, LICENSE + NOTICE, README + CHANGELOG, example configs, and a CycloneDX SBOM (also attached standalone). Verify downloads against \`SHA256SUMS.txt\`.
+
+          ### Docker
+
+          \`\`\`
+          docker pull issuerd/issuerd:${VERSION}   # pinned
+          docker pull issuerd/issuerd:latest       # latest release
+          \`\`\`
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  docker:
+    name: docker image → Docker Hub
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Tags/labels computed inline (not docker/metadata-action): the policy is
+      # trivial, and metadata-action calls the GitHub API, which cannot be
+      # rehearsed under act.
+      - name: Image tags and labels
+        id: meta
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "issuerd/issuerd:latest"
+            echo "issuerd/issuerd:$VERSION"
+            echo "issuerd/issuerd:${VERSION%.*}"
+          } | tee tags.txt
+          {
+            echo "tags<<EOF"; cat tags.txt; echo "EOF"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: ${{ env.ACT != 'true' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Under act: build + load locally only (no push, no attestations).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ env.ACT != 'true' }}
+          load: ${{ env.ACT == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=issuerd
+            org.opencontainers.image.description=Horizontally scalable, modular OIDC/OAuth2 IAM server (Keycloak-inspired)
+            org.opencontainers.image.source=https://github.com/issuerd/issuerd
+            org.opencontainers.image.url=https://github.com/issuerd/issuerd
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          sbom: ${{ env.ACT != 'true' }}
+          provenance: ${{ env.ACT != 'true' }}
+          cache-from: type=gha
+          cache-to: ${{ env.ACT != 'true' && 'type=gha,mode=max' || '' }}
+
+  linux-binary:
+    name: linux amd64 binary
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The tarball ships the exact binary the Docker image ships: build the
+      # canonical root Dockerfile and copy the binary out of it.
+      - name: Build the canonical image and extract the binary
+        run: |
+          set -euo pipefail
+          docker build -t issuerd:release-src .
+          cid=$(docker create issuerd:release-src)
+          docker cp "$cid:/usr/local/bin/issuerd" ./issuerd
+          docker rm "$cid"
+          ./issuerd --version
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_linux_amd64.tar.gz | tar -xz -C "$HOME/.local/bin" syft
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/syft" version
+      - name: Package the archive
+        run: bash scripts/package-release.sh linux "${{ needs.validate.outputs.version }}" ./issuerd ./dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: dist/
+          if-no-files-found: error
+
+  windows-binary:
+    name: windows amd64 binary
+    needs: validate
+    # Every step is gated on env.ACT != 'true': act cannot run Windows jobs on
+    # this host (no Windows containers), so the same steps are rehearsed
+    # natively instead (see .act/run-release.sh).
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/checkout@v4
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs).
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      # Vendored openssl (WebAuthn) needs a native perl on PATH; the committed
+      # .cargo/config.toml points at a dev-host path, so override via env.
+      - if: ${{ env.ACT != 'true' }}
+        name: Strawberry Perl (vendored openssl build)
+        run: choco install strawberryperl --no-progress -y
+      - if: ${{ env.ACT != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+      - if: ${{ env.ACT != 'true' }}
+        uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary (same as the
+      # Dockerfile) so the SBOM scan sees every crate.
+      - if: ${{ env.ACT != 'true' }}
+        uses: taiki-e/install-action@cargo-auditable
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the release binary
+        env:
+          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+        run: cargo auditable build --locked --release --bin issuerd
+      - if: ${{ env.ACT != 'true' }}
+        name: Smoke-run the binary
+        run: ./target/release/issuerd.exe --version
+      - if: ${{ env.ACT != 'true' }}
+        name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o syft.zip https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_windows_amd64.zip
+          powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w syft.zip)' -DestinationPath '$(cygpath -w "$HOME/bin")'"
+          rm syft.zip
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - if: ${{ env.ACT != 'true' }}
+        name: Package the archive
+        run: bash scripts/package-release.sh windows "${{ needs.validate.outputs.version }}" target/release/issuerd.exe ./dist
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [validate, linux-binary, windows-binary]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      attestations: write  # build-provenance attestations
+      id-token: write      # OIDC token for the attestation signing
+    steps:
+      - uses: actions/download-artifact@v4
+      # Real runs must ship both platforms; rehearsal (act) has no Windows job.
+      - name: Artifacts complete (real runs)
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
+             windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json
+      - name: SHA256SUMS.txt
+        run: |
+          : > SHA256SUMS.txt
+          for d in linux-dist windows-dist; do
+            if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
+          done
+          cat SHA256SUMS.txt
+      - name: Build-provenance attestation
+        if: ${{ env.ACT != 'true' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            linux-dist/*
+            windows-dist/*
+      - name: Create the GitHub Release
+        if: ${{ env.ACT != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes/release-notes.md
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            linux-dist/*
+            windows-dist/*
+            SHA256SUMS.txt
+      - name: Release contents (always logged — this is what rehearsal inspects)
+        run: |
+          ls -l *-dist/
+          echo '--- release notes ---'
+          cat release-notes/release-notes.md

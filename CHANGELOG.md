@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.1] - 2026-09-24
 
+### Added
+
+- **Release pipeline** (`.github/workflows/release.yml`): pushing a `v*` tag validates the tag against `[workspace.package] version` and the CHANGELOG section, publishes the `issuerd/issuerd` image to Docker Hub (`:latest`, `:X.Y.Z`, `:X.Y`, with SBOM + provenance attestations), and creates a GitHub Release with Linux and Windows binary archives (`issuerd_<ver>_<os>_amd64.{tar.gz,zip}` — binary, LICENSE/NOTICE, README/CHANGELOG, example configs, CycloneDX SBOM), `SHA256SUMS.txt`, build-provenance attestations, and release notes auto-extracted from CHANGELOG.md. Packaging lives in `scripts/package-release.sh` (shared by CI and the local nektos/act rehearsal, `.act/run-release.sh`, where publish steps auto-skip).
+
+### Changed
+
+- **The local demo stack now pulls the published image**: root `docker-compose.yml` uses `issuerd/issuerd:latest` instead of building from source, so a fresh clone with only Docker installed runs `docker compose up` without compiling. Building from local sources moves to the `docker-compose.from-source.yml` override (`docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build`).
+
 ### Fixed
 
 - **`cargo install issuerd` now embeds the admin/account web consoles** — the

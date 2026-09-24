@@ -49,8 +49,10 @@ issuerd/
 │   ├── start-issuerd-dev.ps1 # Visible-console daemon start (Windows, see below)
 │   ├── with-native-env.cmd  # Native openssl build env wrapper (Windows, see below)
 │   ├── kani.sh / flux.sh / mirai.sh # Verification tool runners (Linux/WSL, see below)
+│   ├── package-release.sh       # Release archive packaging (CI + local rehearsal, see below)
 │   └── aggregate_cov.py / show_uncovered.py # Coverage aggregation helpers
-├── docker-compose.yml       # Local demo stack (Issuerd + Postgres + Redis, console on :8080)
+├── docker-compose.yml       # Local demo stack (pulls issuerd/issuerd:latest; console on :8080)
+├── docker-compose.from-source.yml # Override to build the demo image from local sources
 ├── docker-compose.integration.yml # Integration test stack (Postgres, Redis, Bind9, Keycloak ref)
 ├── docker-compose.cluster.yml # Two-node cluster demo (nginx LB + Postgres + Redis)
 ├── cluster/                 # Cluster demo stack config (issuerd.toml, nginx.conf, provision.yaml)
@@ -181,6 +183,15 @@ Actions layout:
   Samba AD DC + OpenLDAP, the two-node cluster E2E, the Keycloak dual-target
   parity run (`ISSUERD_TEST_TARGET=both`), and the release binary build
   (embeds the web client; release panics without `webclientsrc/dist`).
+- `.github/workflows/release.yml` (push of a `v*` tag) — the release pipeline:
+  validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, builds
+  and pushes `issuerd/issuerd` to Docker Hub (`:latest`, `:X.Y.Z`, `:X.Y`),
+  builds the Linux binary (extracted from the canonical Docker build) and the
+  Windows binary, packages both with SBOM + checksums via
+  `scripts/package-release.sh`, and creates the GitHub Release (notes
+  auto-extracted from CHANGELOG.md, build-provenance attestations).
+  Publish steps are gated on `env.ACT != 'true'` so the whole workflow can be
+  rehearsed locally with nektos/act (see "Cutting a release" below).
 - `.github/workflows/verification.yml` (push to `main` + PRs) — the extended
   tools below (flux is `continue-on-error` for now; the MIRAI job is disabled —
   hard-blocked upstream, see the tool notes).
@@ -336,7 +347,7 @@ WindowsApps stub — do not rely on it. For scripting, `python`,
 
 The repository ships five compose stacks:
 
-- **`docker-compose.yml`** (root) — the **local demo stack**: `docker compose up --build` builds the image and starts a single-node Issuerd (project `issuerd-demo`) with PostgreSQL + Redis, the embedded web consoles on `http://localhost:8080/admin/console` (admin/admin), and the demo realm `myrealm` (alice/changeme). Provisioning comes from `examples/provision.demo.yaml` (mounted as `/etc/issuerd/provision.yaml`; server config: `examples/issuerd.demo.toml`) — it must create the master realm explicitly, because the automatic master-realm bootstrap only runs for the in-memory/json backends. This is the quickstart for people evaluating the project.
+- **`docker-compose.yml`** (root) — the **local demo stack**: `docker compose up` **pulls the published image** `issuerd/issuerd:latest` (no build tools needed — a fresh clone with only Docker installed just downloads it) and starts a single-node Issuerd (project `issuerd-demo`) with PostgreSQL + Redis, the embedded web consoles on `http://localhost:8080/admin/console` (admin/admin), and the demo realm `myrealm` (alice/changeme). Provisioning comes from `examples/provision.demo.yaml` (mounted as `/etc/issuerd/provision.yaml`; server config: `examples/issuerd.demo.toml`) — it must create the master realm explicitly, because the automatic master-realm bootstrap only runs for the in-memory/json backends. This is the quickstart for people evaluating the project. Contributors build from local sources with the `docker-compose.from-source.yml` override: `docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build`.
 - **`docker-compose.integration.yml`** — the **reference implementation test environment** (below).
 - **`docker-compose.cluster.yml`** — the two-node cluster demo (see the next section).
 - **`tests/conformance/docker-compose.yml`** — the **hermetic OIDC conformance environment** (below).
@@ -808,6 +819,28 @@ python scripts/publish.py --real             # real publish incl. the root binar
 The script stages a copy of the workspace for two reasons. First, `issuerd-core` carries a **git dependency** on the `flux-rs` shim (crates.io rejects git deps): the staged copy strips that dep and the `#[flux_rs::...]` attribute lines — the compiled code is identical (the shim expands to nothing under plain rustc). Second, staging copies the built web client (`webclientsrc/dist`) into `crates/issuerd-server/webclient-dist/` (a gitignored packaging artifact): `issuerd-server`'s `build.rs` resolves the web client from that crate-local directory first and falls back to `../../webclientsrc/dist` in the dev workspace, so a crates.io build of the packaged crate embeds the SPA and `cargo install issuerd` (release profile) does not hit the `DIST_MISSING` panic. Staging fails early if `webclientsrc/dist` is missing or empty — run `npm run build` in `webclientsrc/` first.
 
 Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on crates.io (packaged + verify-built); ahead of the first publish only `issuerd-core` can be rehearsed, because `cargo package`/`publish` strips path deps and re-resolves them against the registry — so `--real` publishes in order with a pause between crates for index propagation.
+
+### Cutting a Release (GitHub + Docker Hub)
+
+`.github/workflows/release.yml` runs on every pushed `v*` tag:
+
+1. **validate** — the tag (`v0.1.1`) must equal `[workspace.package] version` (`0.1.1`) and CHANGELOG.md must have a dated `## [0.1.1] - …` section; release notes are extracted from that section.
+2. **docker** — builds the root Dockerfile and pushes `issuerd/issuerd:latest`, `:0.1.1`, `:0.1` to Docker Hub (with SBOM + provenance attestations). Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
+3. **linux-binary** — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
+4. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
+5. **release** — `SHA256SUMS.txt`, build-provenance attestations, GitHub Release (`make_latest`).
+
+Each archive (`issuerd_0.1.1_linux_amd64.tar.gz`, `issuerd_0.1.1_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it).
+
+**Release procedure:** bump `[workspace.package] version` → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. crates.io publishing stays a separate manual step (`scripts/publish.py`, above).
+
+**Local rehearsal** (nothing is published; publish steps auto-skip under act via `env.ACT != 'true'`, and the `windows-binary` job — no Windows containers under act — is rehearsed natively on a Windows host):
+
+```bash
+../.act/run-release.sh                 # act run: validate + docker build + linux packaging
+# Windows packaging rehearsal (host): build the web client + release binary, then
+bash scripts/package-release.sh windows 0.1.1 target/release/issuerd.exe /tmp/dist
+```
 
 ### Key Files for Agents
 

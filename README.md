@@ -156,10 +156,12 @@ cd tests/conformance && docker compose up   # or ./run.sh (CI: exit code + teard
 ### Option A — Docker (one command, everything included)
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
-This builds the image and starts a single-node Issuerd with PostgreSQL and Redis on `http://localhost:8080`, seeded on first start with the `master` realm (admin `admin` / `admin`) and a demo realm `myrealm` (user `alice` / `changeme`, sample clients `my-app` and `public-app`). The first build compiles the release binary and the embedded web client, so give it some time; subsequent starts are instant.
+This pulls the published image (`issuerd/issuerd:latest`) and starts a single-node Issuerd with PostgreSQL and Redis on `http://localhost:8080`, seeded on first start with the `master` realm (admin `admin` / `admin`) and a demo realm `myrealm` (user `alice` / `changeme`, sample clients `my-app` and `public-app`). No build tools required — only Docker. Pin a specific release with `issuerd/issuerd:<version>` in `docker-compose.yml`; to build from local sources instead, use `docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build`.
+
+Prebuilt binaries (Linux/Windows, with SBOM and checksums) are attached to each [GitHub Release](https://github.com/issuerd/issuerd/releases).
 
 - **Admin console:** <http://localhost:8080/admin/console>
 - **Account console:** <http://localhost:8080/realms/myrealm/account>
