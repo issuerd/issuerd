@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-26
+
 ### Fixed
 
 - **Fixed failing docs.rs builds:** `utoipa-swagger-ui` now uses the `vendored` feature, bundling the Swagger UI assets into the crate instead of downloading them from GitHub at build time (the download fails in network-isolated environments like docs.rs).
