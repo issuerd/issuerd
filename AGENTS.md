@@ -188,8 +188,11 @@ Actions layout:
 - `.github/workflows/heavy.yml` (manual `workflow_dispatch`; the nightly
   schedule is currently disabled) — the heavy Docker suites: federation vs
   Samba AD DC + OpenLDAP, the two-node cluster E2E, the Keycloak dual-target
-  parity run (`ISSUERD_TEST_TARGET=both`), and the release binary build
-  (embeds the web client; release panics without `webclientsrc/dist`).
+  parity run (`ISSUERD_TEST_TARGET=both`), the OIDF conformance suite
+  (`tests/conformance/run.sh`; clones the pinned suite tag itself and uploads
+  `tests/conformance/results/` as the `conformance-evidence` artifact even on
+  failure), and the release binary build (embeds the web client; release
+  panics without `webclientsrc/dist`).
 - `.github/workflows/release.yml` (push of a `v*` tag) — the release pipeline:
   validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, then:
   Docker Hub gets per-arch images (`issuerd/issuerd:X.Y.Z-amd64` from the

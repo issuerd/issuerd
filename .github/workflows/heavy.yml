@@ -2,10 +2,12 @@ name: Heavy suites
 
 # Heavy Docker-based suites that are too slow for per-commit CI (and skip
 # gracefully there): federation against real Samba AD DC + OpenLDAP, the
-# two-node cluster E2E, the Keycloak dual-target parity run, and the release
-# binary build (which embeds the web client). Manual trigger only (Actions →
-# "Heavy suites" → Run workflow); the nightly schedule is disabled for now —
-# re-add a `schedule: cron` trigger when recurring coverage is wanted.
+# two-node cluster E2E, the Keycloak dual-target parity run, the OIDF
+# conformance suite (with the run reports uploaded as evidence artifacts),
+# and the release binary build (which embeds the web client). Manual trigger
+# only (Actions → "Heavy suites" → Run workflow); the nightly schedule is
+# disabled for now — re-add a `schedule: cron` trigger when recurring
+# coverage is wanted.
 on:
   workflow_dispatch:
 
@@ -108,3 +110,35 @@ jobs:
       - run: cargo build --locked --bin issuerd --release
       - name: Smoke-run the binary
         run: ./target/release/issuerd --version
+
+  conformance:
+    name: OIDF conformance suite (evidence)
+    runs-on: ubuntu-latest
+    # Fresh-runner builds are the slow path: the suite JAR (maven) and the
+    # Issuerd release binary are both compiled inside Docker. Bound hangs.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # The suite sources are gitignored (tests/conformance/conformance-suite)
+      # — clone fresh at the pinned, validated release tag.
+      - name: Clone the OIDF conformance suite
+        run: >
+          git clone --depth 1 --branch release-v5.2.4
+          https://gitlab.com/openid/conformance-suite.git
+          tests/conformance/conformance-suite
+      # run.sh builds images, runs all three plans, exports reports into
+      # tests/conformance/results/, tears the stack down, and propagates the
+      # conformance-run exit code.
+      - name: Run the conformance suite (hermetic stack)
+        working-directory: tests/conformance
+        run: ./run.sh
+      # Evidence: html-reports-*/index.html, export-json/, exports/ zips and
+      # the oidcc-*-output.log runner logs. Uploaded on failure too — a red
+      # run is exactly when the evidence matters.
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-evidence
+          path: tests/conformance/results/
+          retention-days: 30
