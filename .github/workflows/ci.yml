@@ -115,6 +115,80 @@ jobs:
       - run: npm run test
       - run: npm run build
 
+  coverage:
+    name: coverage (rust + webclient)
+    runs-on: ubuntu-latest
+    permissions:
+      # The badge-publish step pushes the badge JSONs to the `badges` branch.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov shells out to llvm-profdata/llvm-cov from this component.
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # --lib keeps the job fast (no Docker-dependent integration suites).
+      # The lcov export feeds scripts/coverage_badges.py and is kept as an
+      # artifact (render locally: `genhtml rust-lcov.info`).
+      - name: Rust coverage (unit tests)
+        run: cargo llvm-cov --locked --workspace --lib --lcov --output-path rust-lcov.info
+      - name: Web client coverage
+        working-directory: webclientsrc
+        run: |
+          npm ci
+          npm run generate-api
+          npm run test -- --coverage
+      - name: Build badge JSONs
+        run: python3 scripts/coverage_badges.py --rust rust-lcov.info --webclient webclientsrc/coverage/coverage-summary.json --outdir badges
+      - name: Job summary
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('## Coverage\n\n| Suite | Line coverage |\n|---|---|\n')
+              for name in ('rust', 'webclient'):
+                  with open(f'badges/{name}.json') as f:
+                      badge = json.load(f)
+                  out.write(f"| {name.capitalize()} | {badge['message']} |\n")
+          EOF
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # rust-lcov.info is renderable locally (genhtml); webclientsrc's
+          # coverage/ includes the browsable lcov-report/ HTML.
+          name: coverage-reports
+          path: |
+            rust-lcov.info
+            webclientsrc/coverage/
+          retention-days: 14
+      # Self-hosted badges: no external coverage service. The two JSONs feed
+      # shields.io endpoint badges via raw.githubusercontent.com/.../badges/*.
+      - name: Publish badges (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 --branch badges "$REPO" /tmp/badges-branch 2>/dev/null \
+            || git clone --depth 1 "$REPO" /tmp/badges-branch
+          cd /tmp/badges-branch
+          git checkout badges 2>/dev/null || git checkout --orphan badges
+          git rm -rf --quiet . 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE"/badges/*.json .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "coverage badges from ${{ github.sha }}" || { echo "badges unchanged"; exit 0; }
+          git push origin badges
+
   openapi-sync:
     name: openapi.json in sync
     runs-on: ubuntu-latest

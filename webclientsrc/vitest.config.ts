@@ -18,6 +18,10 @@ export default defineConfig({
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     coverage: {
+      provider: 'v8',
+      // json-summary feeds scripts/coverage_badges.py (CI coverage job);
+      // lcov.info + lcov-report/ (HTML) go into the CI artifacts.
+      reporter: ['text', 'lcov', 'json-summary'],
       exclude: [
         'generated/**',
         'src/**/*.module.css',

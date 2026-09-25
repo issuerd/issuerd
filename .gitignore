@@ -28,6 +28,8 @@ Thumbs.db
 # Coverage artifacts generated during development
 cov*.txt
 cov*.json
+/rust-lcov.info
+/badges/
 certs
 
 /ui
