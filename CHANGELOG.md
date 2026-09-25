@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Server-info page and OpenAPI spec reported a hardcoded `0.1.0` version:** the admin console's Server Information page rendered a static `Issuerd 0.1.0` placeholder regardless of the actual server version, and the exported OpenAPI document declared `info.version: 0.1.0` on every release. `GET /admin/serverinfo` now returns the real server version in a new additive `version` field (sourced from the Cargo package version at build time), the page renders it, and the OpenAPI `info.version` is the package version as well — both can no longer drift from the released binary.
+- **Fixed failing docs.rs builds:** `utoipa-swagger-ui` now uses the `vendored` feature, bundling the Swagger UI assets into the crate instead of downloading them from GitHub at build time (the download fails in network-isolated environments like docs.rs).
+- **Fixed hardcoded `0.1.0` version reporting:** `GET /admin/serverinfo` returns the real package version in a new `version` field (rendered by the console), and the OpenAPI `info.version` uses it too.
 
 ## [0.1.4] - 2026-09-25
 

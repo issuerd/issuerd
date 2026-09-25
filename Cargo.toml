@@ -184,7 +184,10 @@ libgssapi = "0.11"
 
 # OpenAPI
 utoipa = { version = "5.5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+# "vendored" bundles the Swagger UI assets in the crate — without it the build
+# script downloads them from GitHub, which fails in network-isolated build
+# environments (docs.rs, offline builders).
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
 
 # CLI & embedding
 clap = { version = "4.5", features = ["derive"] }
