@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
 import { Link } from 'react-router-dom'
+import { Fragment } from 'react'
 import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
@@ -32,16 +33,20 @@ export default function PageHeader({ title, icon: Icon, breadcrumbs, actions }: 
         <Breadcrumb className="mb-4">
           <BreadcrumbList>
             {breadcrumbs.map((crumb, i) => (
-              <BreadcrumbItem key={i}>
+              // The separator is its own <li> — it must be a sibling between
+              // BreadcrumbItems, not nested inside one (invalid <li> in <li>).
+              <Fragment key={i}>
                 {i > 0 && <BreadcrumbSeparator />}
-                {crumb.to ? (
-                  <BreadcrumbLink asChild>
-                    <Link to={crumb.to}>{crumb.label}</Link>
-                  </BreadcrumbLink>
-                ) : (
-                  <BreadcrumbPage>{crumb.label}</BreadcrumbPage>
-                )}
-              </BreadcrumbItem>
+                <BreadcrumbItem>
+                  {crumb.to ? (
+                    <BreadcrumbLink asChild>
+                      <Link to={crumb.to}>{crumb.label}</Link>
+                    </BreadcrumbLink>
+                  ) : (
+                    <BreadcrumbPage>{crumb.label}</BreadcrumbPage>
+                  )}
+                </BreadcrumbItem>
+              </Fragment>
             ))}
           </BreadcrumbList>
         </Breadcrumb>
