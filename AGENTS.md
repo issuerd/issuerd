@@ -185,8 +185,8 @@ Actions layout:
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
   `CHANGELOG.md` or carries the `no-changelog` label (see "Picking Up Work").
-- `.github/workflows/heavy.yml` (manual `workflow_dispatch`; the nightly
-  schedule is currently disabled) — the heavy Docker suites: federation vs
+- `.github/workflows/heavy.yml` (nightly at 03:17 UTC + manual
+  `workflow_dispatch`) — the heavy Docker suites: federation vs
   Samba AD DC + OpenLDAP, the two-node cluster E2E, the Keycloak dual-target
   parity run (`ISSUERD_TEST_TARGET=both`), the OIDF conformance suite
   (`tests/conformance/run.sh`; clones the pinned suite tag itself and uploads

@@ -4,11 +4,13 @@ name: Heavy suites
 # gracefully there): federation against real Samba AD DC + OpenLDAP, the
 # two-node cluster E2E, the Keycloak dual-target parity run, the OIDF
 # conformance suite (with the run reports uploaded as evidence artifacts),
-# and the release binary build (which embeds the web client). Manual trigger
-# only (Actions → "Heavy suites" → Run workflow); the nightly schedule is
-# disabled for now — re-add a `schedule: cron` trigger when recurring
-# coverage is wanted.
+# and the release binary build (which embeds the web client). Runs nightly
+# at 03:17 UTC (off the top-of-hour herd) and on manual trigger (Actions →
+# "Heavy suites" → Run workflow). Scheduled runs only fire on the default
+# branch, and GitHub disables them after 60 days of repository inactivity.
 on:
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
