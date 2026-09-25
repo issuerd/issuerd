@@ -127,6 +127,10 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       # Under act: build + load locally only (no push).
       - uses: docker/build-push-action@v6
+        env:
+          # No .dockerbuild build-record artifact — download-artifact cannot
+          # fetch those, and the release job downloads artifacts by pattern.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           platforms: linux/amd64
@@ -251,6 +255,9 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        env:
+          # No .dockerbuild build-record artifact (see the amd64 job).
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: image-arm64
           platforms: linux/arm64
@@ -406,7 +413,16 @@ jobs:
       attestations: write  # build-provenance attestations
       id-token: write      # OIDC token for the attestation signing
     steps:
+      # Never download "all" artifacts here: the docker/build-push-action jobs
+      # auto-upload *.dockerbuild build-record artifacts that download-artifact
+      # cannot fetch (both v0.1.3 runs died on exactly that). Pull only what
+      # this job uses.
       - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-dist'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
       # Real runs must ship all three platforms; rehearsal (act) has no Windows job.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}

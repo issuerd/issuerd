@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **crates.io publish (v0.1.3 follow-up):** `scripts/publish.py --real` paused a fixed 30 s between crates for index propagation, but the sparse index lags the upload by a minute or more — the v0.1.3 run died at `issuerd-federation` with ``failed to select a version for the requirement `issuerd-cluster = "^0.1.3"` ``. After each upload the script now polls the sparse index until the new version is actually visible (`--index-timeout`, default 600 s) and only then proceeds; `--pause` remains as fixed rate-limit grace.
+- **crates.io publish (v0.1.3 follow-up):** `scripts/publish.py --real` paused a fixed 30 s between crates for index propagation, but the sparse index lags the upload by a minute or more — the v0.1.3 run died at `issuerd-federation` with ``failed to select a version for the requirement `issuerd-cluster = "^0.1.3"` ``. After each upload the script now polls the sparse index until the new version is actually visible (`--index-timeout`, default 600 s) and only then proceeds; `--pause` remains as fixed rate-limit grace. The resume logic also learned the newer duplicate-version wording (`crate x@y already exists on crates.io index`) so re-runs skip already-live crates instead of aborting on the first one.
+- **GitHub Release job:** the release job downloaded *all* run artifacts, including the `*.dockerbuild` build-record archives `docker/build-push-action@v6` auto-uploads — those fail to download (5 retries → job failure) in every run that reached the job. The job now downloads only the `*-dist` + `release-notes` artifacts it uses, and both docker jobs set `DOCKER_BUILD_RECORD_UPLOAD: false` ([documented opt-out](https://docs.docker.com/build/ci/github-actions/build-summary/)) so the archives are no longer uploaded.
 
 ## [0.1.3] - 2026-09-25
 

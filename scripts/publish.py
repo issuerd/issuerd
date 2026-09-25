@@ -201,8 +201,10 @@ def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict) -> bool:
         return True
     output = result.stderr + result.stdout
     # A retried run hits crates.io's duplicate-version rejection on crates that
-    # already went live — treat those as done so the run is resumable.
-    if not dry_run and "is already uploaded" in output:
+    # already went live — treat those as done so the run is resumable. The exact
+    # wording varies by cargo version ("... is already uploaded" vs the newer
+    # "crate x@y already exists on crates.io index").
+    if not dry_run and ("is already uploaded" in output or "already exists on crates.io" in output):
         print(f"skip: {name} is already on crates.io")
         return True
     # Before the first real publish (or right after a version bump), dependents
