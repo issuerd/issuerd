@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>Identity &amp; Access Management in Rust — conformance-tested OIDC/OAuth2, Keycloak-compatible, horizontally scalable, shipped as a single binary.</strong>
+  <strong>Fast, Keycloak-compatible IAM with DPoP and CIBA — conformance-tested OIDC/OAuth2 in Rust, shipped as a single binary, horizontally scalable.</strong>
 </p>
 
 <p align="center">
