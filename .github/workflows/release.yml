@@ -423,6 +423,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-notes
+          # Named artifacts extract into cwd, not a per-artifact directory —
+          # keep the release-notes/release-notes.md layout the steps expect.
+          path: release-notes
       # Real runs must ship all three platforms; rehearsal (act) has no Windows job.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}

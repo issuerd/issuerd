@@ -348,13 +348,35 @@
 
     <script>
         (function () {
+            // redirect_uri is followed by this page's own JavaScript after
+            // sign-in (and sent to the authorize/token endpoints, which
+            // validate it against the client registration). Keep it
+            // same-origin: a crafted login.html?redirect_uri=javascript:… or
+            // cross-origin URL must not turn the post-login navigation into
+            // XSS or an open redirect. Anything else falls back to the
+            // console default below.
+            function sanitizeRedirectUri(uri) {
+                if (!uri) {
+                    return null;
+                }
+                try {
+                    var u = new URL(uri, window.location.origin);
+                    if (u.origin === window.location.origin) {
+                        return u.href;
+                    }
+                } catch (e) {
+                    // fall through to null
+                }
+                return null;
+            }
+
             var params = new URLSearchParams(window.location.search);
             var executionId = params.get('execution_id');
             var code = params.get('code');
             var loggedOut = params.get('logged_out') === '1';
             var urlRealm = params.get('realm');
             var urlClientId = params.get('client_id');
-            var urlRedirectUri = params.get('redirect_uri');
+            var urlRedirectUri = sanitizeRedirectUri(params.get('redirect_uri'));
             var realm = urlRealm || 'master';
 
             var banner = document.getElementById('banner');

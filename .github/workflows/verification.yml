@@ -10,6 +10,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only jobs (checkout + run verification tools).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
