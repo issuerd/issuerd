@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-25
+
+### Fixed
+
+- **Release pipeline (v0.1.2 follow-up):** the `linux-arm64` cross-build job restricted apt sources to amd64 with a file-level guard, but runner images mix restricted and unrestricted entries within a single file — `security.ubuntu.com` stayed unrestricted and `apt-get update` 404'd on the foreign arch. The rewrite is now per line/stanza across all source files. The `crates-io` job now also installs `libkrb5-dev` so the staged `issuerd-federation` verify-build can compile `libgssapi-sys` (MIT Kerberos).
+
 ## [0.1.2] - 2026-09-25
 
 ### Added

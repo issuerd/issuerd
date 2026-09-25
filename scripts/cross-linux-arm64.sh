@@ -43,32 +43,57 @@ else
 fi
 
 # --- 2. arm64 sysroot via dpkg multiarch --------------------------------------
-# Ubuntu's default mirrors (archive.ubuntu.com / azure) carry amd64 only; arm64
-# packages live on ports.ubuntu.com. Restrict the existing sources to amd64 and
-# add ports for arm64 — apt-get update fails for the foreign arch otherwise.
+# Ubuntu's default mirrors (archive/security.ubuntu.com, azure) carry amd64
+# only; arm64 packages live on ports.ubuntu.com. Restrict EVERY existing
+# source to amd64 — per line/stanza, never per file: runner images mix
+# restricted and unrestricted entries within a single file, so a file-level
+# guard leaves leftovers that 404 the whole apt-get update on the foreign
+# arch — then add ports for arm64.
 if ! dpkg --print-foreign-architectures | grep -qx arm64; then
   echo "== enabling arm64 multiarch"
   $SUDO dpkg --add-architecture arm64
 fi
 CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-  # deb822 format (Ubuntu 24.04+)
-  if ! grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources; then
-    $SUDO sed -i 's/^URIs:/Architectures: amd64\nURIs:/' /etc/apt/sources.list.d/ubuntu.sources
-  fi
+shopt -s nullglob
+deb822=0
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+  [ -f "$f" ] || continue
+  # Active deb lines without an arch= option get [arch=amd64]: inserted into
+  # existing […] option brackets when present, prepended otherwise.
+  $SUDO sed -i -E \
+    -e '/^deb[[:space:]]/ { /arch=/! s/^deb[[:space:]]+\[/deb [arch=amd64 / }' \
+    -e '/^deb[[:space:]]/ { /arch=/! s/^deb[[:space:]]+/deb [arch=amd64] / }' \
+    "$f"
+done
+for f in /etc/apt/sources.list.d/*.sources; do
+  [ -f "$f" ] || continue
+  deb822=1
+  # deb822 (Ubuntu 24.04+): add `Architectures: amd64` to every stanza that
+  # lacks one (paragraph mode = one stanza per record, fields = lines).
+  tmp="$(mktemp)"
+  $SUDO awk '
+    BEGIN { RS = ""; FS = "\n" }
+    {
+      has_arch = 0
+      for (i = 1; i <= NF; i++) if ($i ~ /^Architectures:/) has_arch = 1
+      for (i = 1; i <= NF; i++) {
+        print $i
+        if (!has_arch && $i ~ /^URIs:/) print "Architectures: amd64"
+      }
+      print ""
+    }
+  ' "$f" > "$tmp"
+  $SUDO cp "$tmp" "$f"
+  rm -f "$tmp"
+done
+shopt -u nullglob
+if [ "$deb822" -eq 1 ]; then
   if [ ! -f /etc/apt/sources.list.d/arm64-ports.sources ]; then
     echo "== adding ports.ubuntu.com arm64 sources (deb822)"
     printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: %s %s-updates %s-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
       "$CODENAME" "$CODENAME" "$CODENAME" | $SUDO tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null
   fi
 else
-  # legacy one-line format (Ubuntu 22.04)
-  if ! grep -q 'arch=amd64' /etc/apt/sources.list; then
-    $SUDO sed -i -E 's/^deb (http)/deb [arch=amd64] \1/' /etc/apt/sources.list
-    for f in /etc/apt/sources.list.d/*.list; do
-      [ -f "$f" ] && ! grep -q 'arch=' "$f" && $SUDO sed -i -E 's/^deb (http)/deb [arch=amd64] \1/' "$f"
-    done
-  fi
   if [ ! -f /etc/apt/sources.list.d/arm64-ports.list ]; then
     echo "== adding ports.ubuntu.com arm64 sources"
     for suite in "$CODENAME" "$CODENAME-updates" "$CODENAME-security"; do
