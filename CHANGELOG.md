@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-25
+
 ### Security
 
 - **Login page redirect sanitization:** `public/login.html` took the `redirect_uri` query parameter raw and navigated to it with `window.location.href` after sign-in — a `javascript:` URL executed in the IdP origin (XSS) and any cross-origin URL was an open redirect on the login page. The parameter is now accepted only when it resolves to the page's own origin (relative URLs included); anything else falls back to the default console callback. (CodeQL `js/xss` + `js/client-side-unvalidated-url-redirection`.)
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **crates.io publish (v0.1.3 follow-up):** `scripts/publish.py --real` paused a fixed 30 s between crates for index propagation, but the sparse index lags the upload by a minute or more — the v0.1.3 run died at `issuerd-federation` with ``failed to select a version for the requirement `issuerd-cluster = "^0.1.3"` ``. After each upload the script now polls the sparse index until the new version is actually visible (`--index-timeout`, default 600 s) and only then proceeds; `--pause` remains as fixed rate-limit grace. The resume logic also learned the newer duplicate-version wording (`crate x@y already exists on crates.io index`) so re-runs skip already-live crates instead of aborting on the first one.
 - **GitHub Release job:** the release job downloaded *all* run artifacts, including the `*.dockerbuild` build-record archives `docker/build-push-action@v6` auto-uploads — those fail to download (5 retries → job failure) in every run that reached the job. The job now downloads only the `*-dist` + `release-notes` artifacts it uses (the named `release-notes` artifact with an explicit `path:`, so the notes land where the release steps expect them), and both docker jobs set `DOCKER_BUILD_RECORD_UPLOAD: false` ([documented opt-out](https://docs.docker.com/build/ci/github-actions/build-summary/)) so the archives are no longer uploaded. `verification.yml` also declares `permissions: contents: read` (code scanning `actions/missing-workflow-permissions`).
+- **Code scanning noise floor:** ~520 of the 528 open CodeQL alerts were intentional fixture secrets in test code (bulk-dismissed as *used in tests*; the 5 real ones were fixed — see Security above). `.github/codeql/codeql-config.yml` now excludes the test trees (`tests/**`, `webclientsrc/src/test/**`, `*.test.ts(x)`) from analysis via the `github-codeql-config-file` repository property ([default-setup config merge](https://github.blog/changelog/2026-08-04-customize-code-scanning-default-setup-at-scale/)) — production code keeps full coverage, and inline `#[cfg(test)]` modules (not path-excludable) remain covered with the dismissal convention.
 
 ## [0.1.3] - 2026-09-25
 

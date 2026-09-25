@@ -800,6 +800,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 6. **Audit logging** — all admin mutations and authentication events are logged immutably via `Event` / `AdminEvent`.
 7. **Key rotation** — coordinated via storage polling or Raft consensus; JWKS cached in-memory per node.
 8. **Signing keys at rest** — optional envelope encryption (`[crypto.key_encryption]`, AES-256-GCM, KEK from config/env, never the DB; see the issuerd-storage notes). Decrypted key material and retired keys are zeroized on drop (`zeroize` crate: `StoredSigningKey`, keystore `SigningKey`, transient decrypt buffers); residual copies inside `ring`/`jsonwebtoken` per sign call are documented in `key_encryption.rs`.
+9. **Code scanning** — GitHub CodeQL default setup (languages: actions, JS/TS, Python, Rust) with `.github/codeql/codeql-config.yml` merged in via the `github-codeql-config-file` repository property (org-level custom property — an org admin must define it in the org schema before the repo value sticks). The config excludes the test trees (`tests/**`, `webclientsrc/src/test/**`, `*.test.ts(x)`): they are full of intentional fixture credentials that otherwise drown the alert queue in `hard-coded-cryptographic-value` false positives. Alerts from inline `#[cfg(test)]` modules (cannot be path-excluded) are dismissed as *used in tests*; anything in production paths (`crates/`, `src/`, `webclientsrc/src`, `webclientsrc/public`) must be treated as real until proven otherwise.
 
 ---
 

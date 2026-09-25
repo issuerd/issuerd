@@ -1,0 +1,21 @@
+name: "issuerd CodeQL config"
+
+# Merged into the code scanning DEFAULT setup via the repository property
+# `github-codeql-config-file` (no workflow file needed — see
+# https://github.blog/changelog/2026-08-04-customize-code-scanning-default-setup-at-scale/).
+#
+# Test code is full of intentional fixture secrets (Password123!, TOTP seeds,
+# mock keys, loopback harness traffic) that flooded the queue with ~520
+# hard-coded-cryptographic-value / cleartext-* false positives (bulk-dismissed
+# 2026-09-25). Exclude the test trees so the signal stays usable. Production
+# code — crates/, src/, webclientsrc/src and webclientsrc/public (login.html
+# is served by the IdP origin) — keeps full coverage.
+#
+# Note: inline #[cfg(test)] modules inside crates/.../src/*.rs cannot be
+# path-excluded (they share a file with production code); occasional fixture
+# alerts there are dismissed as "used in tests".
+paths-ignore:
+  - tests/**
+  - webclientsrc/src/test/**
+  - '**/*.test.ts'
+  - '**/*.test.tsx'
