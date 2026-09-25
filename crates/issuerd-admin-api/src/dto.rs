@@ -38,6 +38,8 @@ pub struct EnumValueRepresentation {
 /// Aggregated server metadata containing all available enum lists.
 #[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
 pub struct ServerInfoRepresentation {
+    /// Server version (workspace Cargo package version, e.g. `0.1.4`).
+    pub version: String,
     /// Supported client protocols.
     pub protocols: Vec<EnumValueRepresentation>,
     /// SSL requirement levels.

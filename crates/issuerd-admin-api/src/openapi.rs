@@ -46,7 +46,7 @@ impl utoipa::Modify for SecurityAddon {
     info(
         title = "Issuerd Admin API",
         description = "RESTful Admin API for managing Issuerd IAM realms, users, clients, roles, groups, sessions, identity providers, and authentication flows. All endpoints require a valid Bearer token with appropriate realm-management roles.",
-        version = "0.1.0",
+        version = env!("CARGO_PKG_VERSION"),
         contact(name = "Issuerd", url = "https://github.com/issuerd/issuerd")
     ),
     paths(

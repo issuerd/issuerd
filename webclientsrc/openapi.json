@@ -11,7 +11,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "0.1.0"
+    "version": "0.1.4"
   },
   "paths": {
     "/admin/enums/algorithms": {
@@ -21191,6 +21191,7 @@
         "type": "object",
         "description": "Aggregated server metadata containing all available enum lists.",
         "required": [
+          "version",
           "protocols",
           "ssl_required",
           "event_types",
@@ -21472,6 +21473,10 @@
               "$ref": "#/components/schemas/EnumValueRepresentation"
             },
             "description": "Available login themes (built-in plus themes directory scan)."
+          },
+          "version": {
+            "type": "string",
+            "description": "Server version (workspace Cargo package version, e.g. `0.1.4`)."
           }
         }
       },

@@ -673,6 +673,7 @@ fn themes(names: &[String]) -> Vec<EnumValueRepresentation> {
 
 async fn build_server_info(state: &AdminApiState) -> ServerInfoRepresentation {
     ServerInfoRepresentation {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         protocols: protocols(),
         ssl_required: ssl_required(),
         event_types: event_types(),
@@ -1024,6 +1025,7 @@ mod tests {
             claims: validated.claims,
         };
         let Json(info) = get_serverinfo(State(state), Extension(auth)).await.unwrap();
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         let locale_ids: Vec<&str> = info.locales.iter().map(|v| v.id.as_str()).collect();
         assert!(locale_ids.contains(&"en") && locale_ids.contains(&"de"));
         let theme_ids: Vec<&str> = info.themes.iter().map(|v| v.id.as_str()).collect();

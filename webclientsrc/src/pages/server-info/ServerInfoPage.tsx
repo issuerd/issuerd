@@ -90,7 +90,7 @@ export default function ServerInfoPage() {
   if (!serverInfo) return <ErrorMessage message="No server information available" />
 
   const diagnostics = {
-    version: 'Issuerd 0.1.0',
+    version: `Issuerd ${serverInfo.version}`,
     rustVersion: '1.95+',
     edition: '2021',
     protocols: serverInfo.protocols?.length ?? 0,

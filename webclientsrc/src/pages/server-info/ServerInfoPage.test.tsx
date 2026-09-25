@@ -6,6 +6,7 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import ServerInfoPage from './ServerInfoPage'
 
 const mockServerInfo = {
+  version: '9.9.9-test',
   protocols: [{ id: 'openid-connect', name: 'OpenID Connect', description: 'OIDC' }],
   ssl_required: [{ id: 'external', name: 'External', description: null }],
   client_authenticator_types: [],
@@ -39,6 +40,8 @@ describe('ServerInfoPage', () => {
   it('renders overview cards', () => {
     render(<ServerInfoPage />)
     expect(screen.getByText('Version')).toBeInTheDocument()
+    // Version comes from the backend (serverinfo.version), never hardcoded.
+    expect(screen.getByText('Issuerd 9.9.9-test')).toBeInTheDocument()
     expect(screen.getByText('Rust Edition')).toBeInTheDocument()
     expect(screen.getByText('Algorithms')).toBeInTheDocument()
     expect(screen.getAllByText('1').length).toBeGreaterThanOrEqual(2)
