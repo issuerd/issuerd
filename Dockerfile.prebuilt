@@ -1,0 +1,31 @@
+# Runtime-only image variant for cross-built release binaries.
+#
+# The canonical root Dockerfile compiles inside the container (linux/amd64).
+# Cross-built platforms (linux/arm64, produced by scripts/cross-linux-arm64.sh
+# on an x86_64 host — no QEMU) are packaged with this file instead: the build
+# context carries the binary plus its shared-library dependencies, so every
+# step is a COPY and no foreign-arch code ever runs.
+#
+#   docker buildx build --platform linux/arm64 \
+#     --build-arg RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot \
+#     -f Dockerfile.prebuilt -t issuerd:arm64 <cross-out-dir>
+#
+# <cross-out-dir> layout (see cross-linux-arm64.sh):
+#   issuerd                                   the cross-compiled binary
+#   rootfs/usr/lib/<triplet>/lib*.so*         Kerberos/GSS-API runtime libs
+#                                             (distroless/cc covers glibc +
+#                                             libssl3 + ca-certificates)
+#
+# Keep ENTRYPOINT/CMD in sync with the canonical Dockerfile.
+
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+FROM ${RUNTIME_IMAGE}
+
+COPY rootfs/ /
+COPY issuerd /usr/local/bin/issuerd
+
+# The :nonroot distroless tag already runs as uid 65532.
+EXPOSE 8080
+
+ENTRYPOINT ["issuerd"]
+CMD ["daemon", "-c", "/etc/issuerd/issuerd.toml"]

@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-25
+
+### Added
+
+- **linux/arm64 release artifacts**: the tag release now ships an `issuerd_<version>_linux_arm64.tar.gz` archive (cross-compiled on the same glibc 2.35 / OpenSSL 3 baseline as the amd64 build — no QEMU) alongside the existing Linux amd64 and Windows archives, and the `issuerd/issuerd` Docker image tags (`latest`, `X.Y.Z`, `X.Y`) are now multi-arch manifest lists resolving to linux/amd64 or linux/arm64 depending on the host (per-arch tags `X.Y.Z-amd64`/`-arm64` are also published).
+
 ### Fixed
 
 - **Empty-body key rotation is deterministic on fresh deployments**: the initial EdDSA+RS256 key pair was stamped with a 1-nanosecond `created_at` gap that PostgreSQL's microsecond-resolution `timestamptz` truncates to a tie, so the rotation endpoint's "newest active key" default-algorithm selection degenerated to a kid-string coin flip and could rotate RS256 instead of the actual signing key. The RS256 MTI key is now stamped a full second older, and timestamp ties prefer the server-default algorithm (EdDSA).

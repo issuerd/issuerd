@@ -50,6 +50,8 @@ issuerd/
 │   ├── with-native-env.cmd  # Native openssl build env wrapper (Windows, see below)
 │   ├── kani.sh / flux.sh / mirai.sh # Verification tool runners (Linux/WSL, see below)
 │   ├── package-release.sh       # Release archive packaging (CI + local rehearsal, see below)
+│   ├── cross-linux-arm64.sh     # Cross-compile the linux/arm64 release binary on x86_64 Ubuntu (no QEMU)
+│   ├── publish.py               # crates.io workspace publish (staging + dry-run/real, see below)
 │   └── aggregate_cov.py / show_uncovered.py # Coverage aggregation helpers
 ├── docker-compose.yml       # Local demo stack (pulls issuerd/issuerd:latest; console on :8080)
 ├── docker-compose.from-source.yml # Override to build the demo image from local sources
@@ -184,14 +186,21 @@ Actions layout:
   parity run (`ISSUERD_TEST_TARGET=both`), and the release binary build
   (embeds the web client; release panics without `webclientsrc/dist`).
 - `.github/workflows/release.yml` (push of a `v*` tag) — the release pipeline:
-  validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, builds
-  and pushes `issuerd/issuerd` to Docker Hub (`:latest`, `:X.Y.Z`, `:X.Y`),
-  builds the Linux binary (extracted from the canonical Docker build) and the
-  Windows binary, packages both with SBOM + checksums via
-  `scripts/package-release.sh`, and creates the GitHub Release (notes
-  auto-extracted from CHANGELOG.md, build-provenance attestations).
-  Publish steps are gated on `env.ACT != 'true'` so the whole workflow can be
-  rehearsed locally with nektos/act (see "Cutting a release" below).
+  validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, then:
+  Docker Hub gets per-arch images (`issuerd/issuerd:X.Y.Z-amd64` from the
+  canonical Dockerfile; `:X.Y.Z-arm64` packed from the cross-compiled binary
+  via `Dockerfile.prebuilt`) merged by the docker-manifest job into the
+  multi-arch user tags (`:latest`, `:X.Y.Z`, `:X.Y`); Linux amd64 (extracted
+  from the canonical Docker build), Linux arm64 (cross-compiled by
+  `scripts/cross-linux-arm64.sh`, no QEMU) and Windows binaries are packaged
+  with SBOM + checksums via `scripts/package-release.sh`; the crates-io job
+  runs `scripts/publish.py --real` for the whole workspace; the release job
+  creates the GitHub Release (notes auto-extracted from CHANGELOG.md,
+  build-provenance attestations). The docker/docker-arm64/docker-manifest and
+  crates-io jobs are isolated so a registry hiccup never blocks the GitHub
+  Release. Publish steps are gated on `env.ACT != 'true'` so the whole
+  workflow can be rehearsed locally with nektos/act (see "Cutting a release"
+  below).
 - `.github/workflows/verification.yml` (push to `main` + PRs) — the extended
   tools below (flux is `continue-on-error` for now; the MIRAI job is disabled —
   hard-blocked upstream, see the tool notes).
@@ -806,7 +815,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 
 ### Publishing to crates.io
 
-All 10 crates share the workspace version and are published in dependency order with:
+All 10 crates share the workspace version and are published in dependency order. The release workflow's `crates-io` job does this automatically on every `v*` tag (real publish; dry-run under act rehearsal); locally:
 
 ```bash
 python scripts/publish.py                    # dry-run rehearsal (default, no upload)
@@ -820,26 +829,35 @@ The script stages a copy of the workspace for two reasons. First, `issuerd-core`
 
 Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on crates.io (packaged + verify-built); ahead of the first publish only `issuerd-core` can be rehearsed, because `cargo package`/`publish` strips path deps and re-resolves them against the registry — so `--real` publishes in order with a pause between crates for index propagation.
 
-### Cutting a Release (GitHub + Docker Hub)
+### Cutting a Release (GitHub + Docker Hub + crates.io)
 
 `.github/workflows/release.yml` runs on every pushed `v*` tag:
 
-1. **validate** — the tag (`v0.1.1`) must equal `[workspace.package] version` (`0.1.1`) and CHANGELOG.md must have a dated `## [0.1.1] - …` section; release notes are extracted from that section.
-2. **docker** — builds the root Dockerfile and pushes `issuerd/issuerd:latest`, `:0.1.1`, `:0.1` to Docker Hub (with SBOM + provenance attestations). Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
-3. **linux-binary** — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
-4. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
-5. **release** — `SHA256SUMS.txt`, build-provenance attestations, GitHub Release (`make_latest`).
+1. **validate** — the tag (`v0.1.2`) must equal `[workspace.package] version` (`0.1.2`) and CHANGELOG.md must have a dated `## [0.1.2] - …` section; release notes are extracted from that section.
+2. **docker** (linux/amd64) — builds the canonical root Dockerfile and pushes `issuerd/issuerd:X.Y.Z-amd64` to Docker Hub. Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
+3. **linux-binary** (amd64) — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the amd64 image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
+4. **linux-arm64** — `scripts/cross-linux-arm64.sh` cross-compiles `aarch64-unknown-linux-gnu` on the x86_64 runner (ubuntu-22.04, dpkg multiarch sysroot from ports.ubuntu.com — no ARM runner, no QEMU build), smoke-runs the binary under `qemu-aarch64-static`, and packages the tarball. The same glibc 2.35 / OpenSSL 3.0 baseline as amd64 keeps the release-notes requirements identical.
+5. **docker-arm64** — packs the exact cross-compiled binary (plus the arm64 Kerberos libs staged by the cross script) into the distroless runtime via `Dockerfile.prebuilt` — a COPY-only build, so no arm64 code executes anywhere — and pushes `issuerd/issuerd:X.Y.Z-arm64`.
+6. **docker-manifest** — merges the two per-arch images into the user-facing multi-arch manifest list (`docker buildx imagetools create`): one tag, `:latest` / `:X.Y.Z` / `:X.Y`, serves both architectures (`docker pull` resolves the host arch). Per-arch tags keep no embedded SBOM/provenance attestations — attested pushes turn a tag into an OCI index, and indexes cannot be nested into the manifest list.
+7. **crates-io** — builds the web client (publish staging embeds it) and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
+8. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
+9. **release** — `SHA256SUMS.txt`, build-provenance attestations, GitHub Release (`make_latest`).
 
-Each archive (`issuerd_0.1.1_linux_amd64.tar.gz`, `issuerd_0.1.1_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it).
+Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it).
 
-**Release procedure:** bump `[workspace.package] version` → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. crates.io publishing stays a separate manual step (`scripts/publish.py`, above).
+**Release procedure:** bump `[workspace.package] version` (and the `issuerd-*` dependency pins in the same file) → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push publishes everything: GitHub Release, the multi-arch Docker image, and the crates.io workspace.
 
 **Local rehearsal** (nothing is published; publish steps auto-skip under act via `env.ACT != 'true'`, and the `windows-binary` job — no Windows containers under act — is rehearsed natively on a Windows host):
 
 ```bash
-../.act/run-release.sh                 # act run: validate + docker build + linux packaging
+../.act/run-release.sh                 # act run: validate, docker amd64 build, linux amd64 + arm64
+                                       # cross/packaging, arm64 image build, crates.io dry-run
+../.act/rehearse-arm64.sh              # standalone arm64 path: cross-compile in an ubuntu:22.04
+                                       # container (same script as CI) + tarball + arm64 image
+../.act/rehearse-manifest.sh           # multi-arch manifest merge against a throwaway local
+                                       # registry (the exact imagetools command CI runs)
 # Windows packaging rehearsal (host): build the web client + release binary, then
-bash scripts/package-release.sh windows 0.1.1 target/release/issuerd.exe /tmp/dist
+bash scripts/package-release.sh windows 0.1.2 target/release/issuerd.exe /tmp/dist
 ```
 
 ### Key Files for Agents

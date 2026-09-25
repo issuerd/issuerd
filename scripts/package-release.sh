@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Package an issuerd release archive for one platform.
 #
-#   scripts/package-release.sh <linux|windows> <version> <binary-path> <out-dir>
+#   scripts/package-release.sh <linux|linux-arm64|windows> <version> <binary-path> <out-dir>
 #
 # Produces in <out-dir>:
-#   issuerd_<version>_<os>_amd64.tar.gz   (linux)
-#   issuerd_<version>_<os>_amd64.zip      (windows)
-#   issuerd_<version>_<os>_amd64.sbom.cyclonedx.json
+#   issuerd_<version>_<platform>.tar.gz   (linux → linux_amd64, linux-arm64 → linux_arm64)
+#   issuerd_<version>_<platform>.zip      (windows → windows_amd64)
+#   issuerd_<version>_<platform>.sbom.cyclonedx.json
 #
 # Archive contents: the binary, LICENSE, NOTICE, README.md, CHANGELOG.md,
 # example configs under examples/, and the SBOM (also shipped standalone).
@@ -15,20 +15,21 @@
 # (.act/run-release.sh), so both produce byte-comparable packaging.
 set -euo pipefail
 
-OS="${1:?usage: package-release.sh <linux|windows> <version> <binary-path> <out-dir>}"
+OS="${1:?usage: package-release.sh <linux|linux-arm64|windows> <version> <binary-path> <out-dir>}"
 VERSION="${2:?missing version (e.g. 0.1.1)}"
 BINARY="${3:?missing path to the built issuerd binary}"
 OUT_DIR="${4:?missing output directory}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 case "$OS" in
-  linux)   BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz ;;
-  windows) BIN_NAME=issuerd.exe; ARCHIVE_EXT=zip ;;
-  *) echo "error: unknown OS '$OS' (linux|windows)" >&2; exit 2 ;;
+  linux)       BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=linux_amd64 ;;
+  linux-arm64) BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=linux_arm64 ;;
+  windows)     BIN_NAME=issuerd.exe; ARCHIVE_EXT=zip;    PLATFORM=windows_amd64 ;;
+  *) echo "error: unknown OS '$OS' (linux|linux-arm64|windows)" >&2; exit 2 ;;
 esac
 [ -f "$BINARY" ] || { echo "error: binary not found: $BINARY" >&2; exit 2; }
 
-BASE="issuerd_${VERSION}_${OS}_amd64"
+BASE="issuerd_${VERSION}_${PLATFORM}"
 STAGE="$OUT_DIR/$BASE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/examples"
@@ -50,7 +51,7 @@ fi
 
 ARCHIVE="$OUT_DIR/$BASE.$ARCHIVE_EXT"
 rm -f "$ARCHIVE"
-if [ "$OS" = linux ]; then
+if [ "$ARCHIVE_EXT" = tar.gz ]; then
   tar -C "$OUT_DIR" -czf "$ARCHIVE" "$BASE"
 elif tar --version 2>/dev/null | grep -qi bsdtar; then
   # bsdtar infers zip from the suffix (GitHub runner system tar).

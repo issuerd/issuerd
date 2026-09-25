@@ -1,14 +1,26 @@
 name: Release
 
-# Tag push (v*) → GitHub Release with Linux/Windows binary archives + SBOMs +
-# checksums, and the issuerd/issuerd image on Docker Hub (:latest, :X.Y.Z,
-# :X.Y). The tag must match [workspace.package] version in Cargo.toml and have
-# a dated CHANGELOG.md section — the validate job fails fast otherwise.
+# Tag push (v*) → GitHub Release with Linux amd64/arm64 + Windows binary
+# archives (SBOMs + checksums), the multi-arch issuerd/issuerd image on Docker
+# Hub, and a crates.io publish of the whole workspace. The tag must match
+# [workspace.package] version in Cargo.toml and have a dated CHANGELOG.md
+# section — the validate job fails fast otherwise.
 #
-# Local rehearsal: .act/run-release.sh runs this workflow under nektos/act.
-# act sets ACT=true; every step that touches an external service (Docker Hub
-# login/push, release creation, attestations) is gated on `env.ACT != 'true'`
-# so the rehearsal exercises everything except the actual publishing.
+# Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images
+# (issuerd/issuerd:X.Y.Z-amd64, …-arm64), then docker-manifest assembles the
+# user-facing manifest list (:latest, :X.Y.Z, :X.Y) — one tag serving both
+# architectures (docker pull picks the host arch). Per-arch tags carry no
+# embedded SBOM/provenance attestations on purpose: attested pushes make each
+# tag an OCI index, and nesting indexes breaks manifest-list merging.
+# The arm64 image is packed from the cross-compiled binary (no QEMU builds —
+# see scripts/cross-linux-arm64.sh and Dockerfile.prebuilt).
+#
+# Local rehearsal: .act/run-release.sh runs this workflow under nektos/act
+# (plus .act/rehearse-arm64.sh / rehearse-manifest.sh for the arm64 and
+# manifest mechanics). act sets ACT=true; every step that touches an external
+# service (Docker Hub login/push, manifest push, crates.io upload, release
+# creation, attestations) is gated on `env.ACT != 'true'` so the rehearsal
+# exercises everything except the actual publishing.
 
 on:
   push:
@@ -64,16 +76,23 @@ jobs:
           ### Archives
 
           - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
+          - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, cross-compiled on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
           - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
 
           Each archive contains the binary, LICENSE + NOTICE, README + CHANGELOG, example configs, and a CycloneDX SBOM (also attached standalone). Verify downloads against \`SHA256SUMS.txt\`.
 
-          ### Docker
+          ### Docker (multi-arch: linux/amd64 + linux/arm64)
 
           \`\`\`
-          docker pull issuerd/issuerd:${VERSION}   # pinned
+          docker pull issuerd/issuerd:${VERSION}   # pinned — resolves to your host architecture
           docker pull issuerd/issuerd:latest       # latest release
           \`\`\`
+
+          Per-architecture tags are also published: \`issuerd/issuerd:${VERSION}-amd64\` and \`issuerd/issuerd:${VERSION}-arm64\`.
+
+          ### crates.io
+
+          All workspace crates are published at ${VERSION} — \`cargo install issuerd --version ${VERSION}\` or \`issuerd = "${VERSION}"\` as a dependency.
           EOF
       - uses: actions/upload-artifact@v4
         with:
@@ -81,26 +100,22 @@ jobs:
           path: release-notes.md
 
   docker:
-    name: docker image → Docker Hub
+    name: docker image (linux/amd64) → Docker Hub
     needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      # Tags/labels computed inline (not docker/metadata-action): the policy is
-      # trivial, and metadata-action calls the GitHub API, which cannot be
-      # rehearsed under act.
+      # Per-arch tag only; the docker-manifest job merges both arches into the
+      # user-facing tags. No sbom/provenance here: attested pushes turn the tag
+      # into an OCI index, which cannot be nested into the final manifest list.
       - name: Image tags and labels
         id: meta
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          {
-            echo "issuerd/issuerd:latest"
-            echo "issuerd/issuerd:$VERSION"
-            echo "issuerd/issuerd:${VERSION%.*}"
-          } | tee tags.txt
+          echo "issuerd/issuerd:$VERSION-amd64" | tee tags.txt
           {
             echo "tags<<EOF"; cat tags.txt; echo "EOF"
             echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -110,10 +125,11 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      # Under act: build + load locally only (no push, no attestations).
+      # Under act: build + load locally only (no push).
       - uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           push: ${{ env.ACT != 'true' }}
           load: ${{ env.ACT == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -126,8 +142,8 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.meta.outputs.created }}
-          sbom: ${{ env.ACT != 'true' }}
-          provenance: ${{ env.ACT != 'true' }}
+          sbom: false
+          provenance: false
           cache-from: type=gha
           cache-to: ${{ env.ACT != 'true' && 'type=gha,mode=max' || '' }}
 
@@ -160,6 +176,159 @@ jobs:
           name: linux-dist
           path: dist/
           if-no-files-found: error
+
+  linux-arm64:
+    name: linux arm64 binary (cross-compiled, no QEMU)
+    needs: validate
+    # ubuntu-22.04: glibc 2.35 / OpenSSL 3.0 — the same baseline as the
+    # canonical amd64 build, so the release-notes requirements hold for both.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-auditable
+      # Cross-compiles on x86_64 (dpkg multiarch sysroot) — identical script
+      # drives the local rehearsal (.act/rehearse-arm64.sh).
+      - name: Cross-build the arm64 binary
+        run: bash scripts/cross-linux-arm64.sh ./build/arm64
+      - name: Smoke-run the arm64 binary (qemu-user)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends qemu-user-static
+          qemu-aarch64-static ./build/arm64/issuerd --version
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_linux_amd64.tar.gz | tar -xz -C "$HOME/.local/bin" syft
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/syft" version
+      - name: Package the archive
+        run: bash scripts/package-release.sh linux-arm64 "${{ needs.validate.outputs.version }}" ./build/arm64/issuerd ./dist-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-dist
+          path: dist-arm64/
+          if-no-files-found: error
+      # The docker-arm64 job repacks this exact binary (plus its arm64
+      # Kerberos libs) into the runtime image via Dockerfile.prebuilt.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-imagectx
+          path: build/arm64/
+          if-no-files-found: error
+
+  docker-arm64:
+    name: docker image (linux/arm64) → Docker Hub
+    needs: [validate, linux-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64-imagectx
+          path: image-arm64
+      # COPY-only build (binary + libs staged in the context): no arm64 code
+      # executes on the x86_64 runner, so no QEMU is needed.
+      - name: Stage the Dockerfile into the build context
+        run: cp Dockerfile.prebuilt image-arm64/Dockerfile
+      - name: Image tag
+        id: meta
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: echo "tags=issuerd/issuerd:$VERSION-arm64" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: ${{ env.ACT != 'true' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: image-arm64
+          platforms: linux/arm64
+          push: ${{ env.ACT != 'true' }}
+          load: ${{ env.ACT == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=issuerd
+            org.opencontainers.image.description=Horizontally scalable, modular OIDC/OAuth2 IAM server (Keycloak-inspired)
+            org.opencontainers.image.source=https://github.com/issuerd/issuerd
+            org.opencontainers.image.url=https://github.com/issuerd/issuerd
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          sbom: false
+          provenance: false
+
+  docker-manifest:
+    name: multi-arch manifest (:latest, :X.Y.Z, :X.Y)
+    needs: [validate, docker, docker-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: ${{ env.ACT != 'true' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # One manifest list per user-facing tag → both architectures under a
+      # single tag; the per-arch tags stay published for pinning.
+      - name: Create and push the multi-arch manifest list
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cmd=(docker buildx imagetools create
+            -t "issuerd/issuerd:latest"
+            -t "issuerd/issuerd:$VERSION"
+            -t "issuerd/issuerd:${VERSION%.*}"
+            "issuerd/issuerd:$VERSION-amd64" "issuerd/issuerd:$VERSION-arm64")
+          if [ "${ACT:-}" = true ]; then
+            echo "::notice::act rehearsal — would run: ${cmd[*]}"
+            exit 0
+          fi
+          "${cmd[@]}"
+          docker buildx imagetools inspect "issuerd/issuerd:$VERSION"
+
+  crates-io:
+    name: crates.io publish (workspace)
+    needs: validate
+    runs-on: ubuntu-latest
+    # Isolated from the GitHub Release on purpose: a crates.io hiccup never
+    # blocks the release, and the publish is resumable (scripts/publish.py
+    # skips already-uploaded crates; --from CRATE resumes mid-list).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # scripts/publish.py stages webclientsrc/dist into issuerd-server, so a
+      # crates.io build of the packaged crate embeds the SPA.
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish the workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${ACT:-}" = true ]; then
+            python3 scripts/publish.py            # rehearsal: stage + dry-run
+          else
+            python3 scripts/publish.py --real
+          fi
 
   windows-binary:
     name: windows amd64 binary
@@ -226,7 +395,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, windows-binary]
+    needs: [validate, linux-binary, linux-arm64, windows-binary]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -234,16 +403,17 @@ jobs:
       id-token: write      # OIDC token for the attestation signing
     steps:
       - uses: actions/download-artifact@v4
-      # Real runs must ship both platforms; rehearsal (act) has no Windows job.
+      # Real runs must ship all three platforms; rehearsal (act) has no Windows job.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
+             linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json
       - name: SHA256SUMS.txt
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist windows-dist; do
+          for d in linux-dist linux-arm64-dist windows-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           cat SHA256SUMS.txt
@@ -253,6 +423,7 @@ jobs:
         with:
           subject-path: |
             linux-dist/*
+            linux-arm64-dist/*
             windows-dist/*
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
@@ -263,6 +434,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             linux-dist/*
+            linux-arm64-dist/*
             windows-dist/*
             SHA256SUMS.txt
       - name: Release contents (always logged — this is what rehearsal inspects)
