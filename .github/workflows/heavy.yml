@@ -128,7 +128,10 @@ jobs:
           tests/conformance/conformance-suite
       # run.sh builds images, runs all three plans, exports reports into
       # tests/conformance/results/, tears the stack down, and propagates the
-      # conformance-run exit code.
+      # conformance-run exit code. It exports DOCKER_HOST_UID/GID=$(id -u/g)
+      # on Linux so the runner containers can write into the bind-mounted
+      # ./pki and ./results (the ubuntu-latest user is 1001, not the compose
+      # default 1000 — without this pki-init exits 1 on Permission denied).
       - name: Run the conformance suite (hermetic stack)
         working-directory: tests/conformance
         run: ./run.sh

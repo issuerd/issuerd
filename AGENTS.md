@@ -428,7 +428,10 @@ cd tests/conformance/conformance-suite && git checkout release-v5.2.4
 
 # Run everything (builds images, generates PKI, bootstraps, runs 3 plans, exports reports)
 cd tests/conformance && docker compose up        # interactive
-./run.sh                                         # CI: exit code + teardown
+./run.sh                                         # CI: exit code + teardown; exports
+                                                 # DOCKER_HOST_UID/GID=id -u/g on Linux
+                                                 # (GH runner is 1001, not 1000) and
+                                                 # dumps stack logs on failure
 ./run-focus.sh oidcc-refresh-token               # single Basic OP module
 ```
 

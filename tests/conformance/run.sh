@@ -20,10 +20,28 @@ fi
 cd "$SCRIPT_DIR"
 mkdir -p results pki
 
+# The runner containers write to the bind-mounted ./pki and ./results as the
+# host user (compose user: ${DOCKER_HOST_UID:-1000}:${DOCKER_HOST_GID:-1000}).
+# On Linux the bind mount preserves host ownership, so pass the real ids —
+# the GitHub Actions runner is 1001, and any local user past the first one is
+# not 1000 either. Docker Desktop (Windows/macOS) maps ownership permissively;
+# there the 1000 default is the value that works.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    export DOCKER_HOST_UID="${DOCKER_HOST_UID:-$(id -u)}"
+    export DOCKER_HOST_GID="${DOCKER_HOST_GID:-$(id -g)}"
+fi
+
 cleanup() {
+    local code=$?
+    # On failure, dump the stack logs before teardown — one-shot services
+    # (pki-init, bootstrap) leave no other trace once the containers are gone.
+    if [[ $code -ne 0 ]]; then
+        echo "=== docker compose logs (tail, exit $code) ==="
+        docker compose logs --no-color --tail 300 2>/dev/null || true
+    fi
     docker compose down --volumes 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
 docker compose up -d --wait --build
 

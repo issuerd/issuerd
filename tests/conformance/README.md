@@ -15,7 +15,11 @@ docker compose up
 ```
 
 or `./run.sh` from anywhere — same thing, but it also tears the stack down
-at the end and exits non-zero on unexpected failures (CI-friendly).
+at the end and exits non-zero on unexpected failures (CI-friendly). On Linux
+it exports `DOCKER_HOST_UID`/`DOCKER_HOST_GID` from `id -u`/`id -g` so the
+runner containers can write into the bind-mounted `./pki` and `./results`
+(the compose default 1000 only matches the first local user; the GitHub
+Actions runner is 1001); on failure it dumps the stack logs before teardown.
 
 `docker compose up` builds missing images on first run (the suite JAR is
 built in-docker from `conformance-suite/` — maven downloads are cached
