@@ -860,7 +860,7 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 
 Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it).
 
-**Release procedure:** bump `[workspace.package] version` (and the `issuerd-*` dependency pins in the same file) → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push publishes everything: GitHub Release, the multi-arch Docker image, and the crates.io workspace.
+**Release procedure:** bump `[workspace.package] version` (and the `issuerd-*` dependency pins in the same file) → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → regenerate the OpenAPI spec (`cargo run --bin issuerd -- openapi -o webclientsrc/openapi.json` — `info.version` embeds the package version, so the committed spec goes stale on every bump and the `openapi-sync` CI job fails otherwise) → sync `Cargo.lock` (`cargo metadata --format-version 1 --quiet > /dev/null`) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push publishes everything: GitHub Release, the multi-arch Docker image, and the crates.io workspace.
 
 **Local rehearsal** (nothing is published; publish steps auto-skip under act via `env.ACT != 'true'`, and the `windows-binary` job — no Windows containers under act — is rehearsed natively on a Windows host):
 
