@@ -24,17 +24,24 @@ Usage:
 Auth: set CARGO_REGISTRY_TOKEN (CRATES_TOKEN is accepted as an alias) or run
 `cargo login` beforehand. Published versions are immutable — crates.io only
 allows yanking, never deleting. New-crate creation is rate-limited on fresh
-accounts, so --real pauses between crates (override with --pause SECONDS);
-interrupted runs are resumable (already-uploaded crates are skipped).
+accounts, so --real pauses between crates (override with --pause SECONDS).
+After each upload --real also polls the sparse index until the new version is
+actually visible (override the cap with --index-timeout SECONDS): the index
+lags the upload by a minute or more, and the next crate's dependency
+resolution 404s without it. Interrupted runs are resumable (already-uploaded
+crates are skipped).
 """
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -127,6 +134,61 @@ def strip_flux(root: Path) -> None:
     print(f"staged: stripped flux-rs dep + {len(lines) - len(kept)} attribute lines + 1 inline attribute from issuerd-core")
 
 
+def workspace_version(root: Path) -> str:
+    """[workspace.package] version of the staged workspace (no tomllib: the act
+    rehearsal images ship python < 3.11)."""
+    in_section = False
+    for line in (root / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("["):
+            in_section = line.strip() == "[workspace.package]"
+        elif in_section:
+            m = re.match(r'version\s*=\s*"([^"]+)"', line.strip())
+            if m:
+                return m.group(1)
+    sys.exit("error: [workspace.package] version not found in the staged Cargo.toml")
+
+
+def sparse_index_url(name: str) -> str:
+    if len(name) == 1:
+        layout = f"1/{name}"
+    elif len(name) == 2:
+        layout = f"2/{name}"
+    elif len(name) == 3:
+        layout = f"3/{name[0]}/{name}"
+    else:
+        layout = f"{name[:2]}/{name[2:4]}/{name}"
+    return f"https://index.crates.io/{layout}"
+
+
+def wait_index_visible(name: str, version: str, timeout: int, interval: int = 10) -> bool:
+    """Poll the crates.io sparse index until `version` of `name` is listed.
+
+    `cargo publish` returns as soon as the upload lands, but the sparse index —
+    what the NEXT crate's dependency resolution reads — lags behind by a minute
+    or more, so a fixed sleep is a gamble. Gate on actual visibility instead.
+    """
+    url = sparse_index_url(name)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "issuerd-publish (https://github.com/issuerd/issuerd)",
+                "Cache-Control": "no-cache",
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                for line in resp.read().decode("utf-8").splitlines():
+                    try:
+                        if json.loads(line).get("vers") == version:
+                            return True
+                    except json.JSONDecodeError:
+                        continue  # partial read — keep the complete lines
+        except OSError:
+            pass  # 404 while the crate is new to the index, or a network blip
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict) -> bool:
     """Publish (or dry-run) one crate. Returns False if deferred (see below)."""
     cmd = ["cargo", "publish", "--allow-dirty"]
@@ -158,7 +220,10 @@ def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--real", action="store_true", help="actually publish (default: dry-run)")
-    parser.add_argument("--pause", type=int, default=30, help="seconds between real publishes (index propagation)")
+    parser.add_argument("--pause", type=int, default=30,
+                        help="extra seconds between real publishes (new-crate rate-limit grace)")
+    parser.add_argument("--index-timeout", type=int, default=600, metavar="SECONDS",
+                        help="max wait for a published version to appear on the sparse index")
     parser.add_argument("--skip-root", action="store_true",
                         help="skip the root issuerd binary crate (its web-client packaging is not crates.io-ready yet)")
     parser.add_argument("--from", dest="from_crate", metavar="CRATE",
@@ -184,11 +249,22 @@ def main() -> None:
                 sys.exit(f"error: --from crate must be one of: {', '.join(names)}")
             targets = targets[names.index(args.from_crate):]
         deferred = []
+        version = workspace_version(root)
         for i, (crate_dir, name) in enumerate(targets):
             if not publish_one(crate_dir, name, dry_run=not args.real, env=env):
                 deferred.append(name)
             if args.real and i < len(targets) - 1:
-                print(f"pausing {args.pause}s for the crates.io index...")
+                # The next crate resolves its issuerd-* deps against the sparse
+                # index — gate on THIS version being visible there first (the
+                # index lags the upload; a plain sleep raced it in v0.1.3),
+                # then the fixed rate-limit grace.
+                if wait_index_visible(name, version, timeout=args.index_timeout):
+                    print(f"index: {name} {version} is visible on the sparse index")
+                else:
+                    sys.exit(f"error: {name} {version} still not visible in the crates.io index "
+                             f"after {args.index_timeout}s — check https://crates.io/crates/{name} "
+                             f"and resume with --from {name}")
+                print(f"pausing {args.pause}s (rate-limit grace)...")
                 time.sleep(args.pause)
 
     if deferred:
