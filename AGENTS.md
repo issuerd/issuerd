@@ -173,15 +173,18 @@ Actions layout:
 - `.github/workflows/ci.yml` (push to `main` + PRs) — the per-commit gates:
   `cargo fmt --all -- --check`, `check --locked --all-targets --all-features`,
   `clippy --locked --all-targets --all-features -- -D warnings`,
-  `test --locked --workspace`, `doc --locked --workspace --no-deps`, `audit`,
+  `doc --locked --workspace --no-deps`, `audit`,
   `deny check`, the web client (`npm ci` → `generate-api` → `npm run test` →
-  `npm run build`), a `coverage` job (cargo-llvm-cov `--workspace --lib` +
-  Vitest `--coverage`, both reduced to shields.io endpoint-badge JSONs by
-  `scripts/coverage_badges.py` and pushed to the `badges` branch on main —
-  self-hosted, no external coverage service; the lcov export and the web
-  client's HTML report are uploaded as workflow artifacts), and an
-  `openapi-sync` job that regenerates the spec and diffs it against the
-  committed `webclientsrc/openapi.json`.
+  `npm run build`), a `coverage` job (this IS the CI test run — there is no
+  separate `cargo test` job: cargo-llvm-cov `--locked --workspace` runs the
+  full unit + root integration suite instrumented, then
+  `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
+  stable; Vitest `--coverage` for the web client; both reduced to shields.io
+  endpoint-badge JSONs by `scripts/coverage_badges.py` and pushed to the
+  `badges` branch on main — self-hosted, no external coverage service; the
+  lcov export and the web client's HTML report are uploaded as workflow
+  artifacts), and an `openapi-sync` job that regenerates the spec and diffs
+  it against the committed `webclientsrc/openapi.json`.
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
   `CHANGELOG.md` or carries the `no-changelog` label (see "Picking Up Work").
