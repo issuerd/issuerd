@@ -16,6 +16,8 @@
   <a href="tests/conformance/README.md"><img src="https://img.shields.io/badge/OIDC%20conformance-Basic%20%C2%B7%20Form%20Post%20%C2%B7%20Config%20OP-brightgreen" alt="OIDC Conformance: Basic · Form Post · Config OP"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
+  <a href="https://crates.io/crates/issuerd"><img src="https://img.shields.io/crates/v/issuerd" alt="crates.io"></a>
+  <a href="https://hub.docker.com/r/issuerd/issuerd"><img src="https://img.shields.io/docker/pulls/issuerd/issuerd" alt="Docker pulls"></a>
 </p>
 
 > **Proof, not promises:** 3,907 conformance conditions with 0 failures and 0 warnings · 100,000-user LDAP sync in ~30 s · 2,690+ automated tests · one self-contained binary.
@@ -298,10 +300,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, the CI gate
 
 ## Security
 
-If you discover a security vulnerability in Issuerd, please report it privately.
-
-- **Email:** security@issuerd.org
-- **Process:** Please do not open public issues for security bugs. Provide a detailed description and reproduction steps, and allow reasonable time for remediation before public disclosure.
+If you discover a security vulnerability in Issuerd, please report it privately — see [SECURITY.md](SECURITY.md) for the reporting process, scope, and supported versions.
 
 ## License
 
