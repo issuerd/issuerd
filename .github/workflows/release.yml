@@ -337,10 +337,14 @@ jobs:
       - uses: actions/checkout@v4
       # Syncs the Hub repo page (Repository overview) from the committed
       # .github/dockerhub-overview.md — pushed images don't auto-sync a
-      # README, so the page stays empty without this. Hub API: exchange
-      # username+PAT for a JWT, then PATCH the repository. Isolated like the
-      # other publish jobs: nothing needs it, so a Hub API hiccup never
-      # blocks the GitHub Release.
+      # README, so the page stays empty without this. Hub API (verified live
+      # 2026-09-26): POST /v2/auth/token with identifier/secret yields a
+      # Bearer token (the legacy /v2/users/token endpoint is dead, 405), then
+      # PATCH the repository. The PAT must have the "Read, Write, Delete"
+      # permission: metadata edits need the repo:admin scope — plain
+      # "Read & Write" (repo:write) gets a 403 "insufficient scope".
+      # Isolated like the other publish jobs: nothing needs it, so a Hub API
+      # hiccup never blocks the GitHub Release.
       - name: PATCH the repository overview
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -352,11 +356,11 @@ jobs:
             exit 0
           fi
           token=$(curl -sSf -H 'Content-Type: application/json' \
-            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
-            https://hub.docker.com/v2/users/token | jq -r .token)
+            -d "{\"identifier\":\"$DOCKERHUB_USERNAME\",\"secret\":\"$DOCKERHUB_TOKEN\"}" \
+            https://hub.docker.com/v2/auth/token | jq -r .access_token)
           jq -n --arg desc "$(cat .github/dockerhub-overview.md)" '{full_description: $desc}' \
             | curl -sSf -X PATCH \
-                -H "Authorization: JWT $token" -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
                 --data @- https://hub.docker.com/v2/repositories/issuerd/issuerd/ \
             | jq '{name, description, last_updated}'
 
