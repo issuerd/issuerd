@@ -148,7 +148,9 @@ and [Human step-up approval with CIBA](../../docs/ciba-step-up.md).
   acceptance window 300 s (60 s future leeway), single-use `jti` replay
   cache, no per-client require-DPoP switch (Keycloak parity), server-provided
   nonces available but disabled by default, mTLS sender-constraining not
-  implemented.
+  implemented. Because binding is opt-in at issuance, the demo's MCP server
+  enforces the invariant at its own edge: DPoP scheme only, `cnf.jkt`
+  required in the token, proof thumbprint must match — no Bearer fallback.
 - The `mcp-server` client needs the `token.exchange.enabled=true` attribute
   before it accepts exchanges; client attributes are not expressible in
   `provision.yaml`, so the `setup` container sets it via the Admin REST API

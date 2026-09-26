@@ -3,7 +3,10 @@
 Implements the resource-server side of the MCP authorization spec against
 Issuerd-issued tokens: every POST to /mcp must carry a DPoP-bound access
 token (Authorization: DPoP <jwt>) plus a fresh single-use DPoP proof
-(RFC 9449) whose key thumbprint matches the token's cnf.jkt. Failure
+(RFC 9449) whose key thumbprint matches the token's cnf.jkt. Plain Bearer
+is not accepted at all, and a valid proof never rescues an unbound token
+(no cnf.jkt) — sender-constraining is enforced here, at the resource
+server, instead of depending on how tokens happen to be issued. Failure
 responses follow RFC 9449 section 7.1 / RFC 6750 — the exact
 WWW-Authenticate headers are part of the recorded demo.
 """
@@ -49,11 +52,15 @@ TOOL_SCOPES = {
 
 @dataclass
 class RequestAuth:
-    """Validated caller identity plus the demo security-trace lines."""
+    """Validated caller identity plus the demo security-trace lines.
+
+    ``jkt`` is the DPoP key thumbprint the caller proved possession of —
+    always present: unbound tokens never get past the middleware.
+    """
 
     sub: str
     scopes: set[str]
-    jkt: str | None
+    jkt: str
     trace: list[str] = field(default_factory=list)
 
 
@@ -169,7 +176,7 @@ async def _validate_access_token(token: str, trace: list[str]) -> dict:
 
 
 def _validate_dpop_proof(
-    proof: str, method: str, htu: str, access_token: str, token_cnf_jkt: str | None
+    proof: str, method: str, htu: str, access_token: str, token_cnf_jkt: str
 ) -> tuple[str, list[str]]:
     """Validate an RFC 9449 proof; return (jkt, trace lines)."""
 
@@ -230,12 +237,13 @@ def _validate_dpop_proof(
         raise _invalid_proof("ath does not match the presented access token")
 
     jkt = _jwk_thumbprint(jwk_dict)
-    if token_cnf_jkt is not None and jkt != token_cnf_jkt:
+    if jkt != token_cnf_jkt:
         raise _invalid_proof("proof key thumbprint does not match token cnf.jkt")
 
-    lines = ["DPoP proof: typ/htm/htu/iat/jti fresh ✓, ath matches access token ✓"]
-    if token_cnf_jkt is not None:
-        lines.append("proof jkt == token cnf.jkt — sender-constrained ✓")
+    lines = [
+        "DPoP proof: typ/htm/htu/iat/jti fresh ✓, ath matches access token ✓",
+        "proof jkt == token cnf.jkt — sender-constrained ✓",
+    ]
     return jkt, lines
 
 
@@ -340,28 +348,38 @@ class DPoPAuthMiddleware:
             raise _invalid_token("missing Authorization header")
         scheme, _, token = authz.partition(" ")
         if scheme.lower() not in ("dpop", "bearer") or not token:
-            raise _invalid_token("Authorization scheme must be DPoP or Bearer")
+            raise _invalid_token("Authorization scheme must be DPoP")
 
         token_trace: list[str] = []
         claims = await _validate_access_token(token, token_trace)
         scopes = set(claims.get("scope", "").split())
         cnf_jkt = (claims.get("cnf") or {}).get("jkt")
 
-        if scheme.lower() == "bearer" and cnf_jkt is not None:
+        # DPoP-only policy: no Bearer fallback. A bound token as Bearer is
+        # rejected per RFC 9449 section 6.1; an unbound token is rejected
+        # regardless of scheme because sender-constraining is mandatory here.
+        if scheme.lower() == "bearer":
+            if cnf_jkt is not None:
+                raise _invalid_token(
+                    "token is DPoP-bound (cnf.jkt present) but presented as Bearer; "
+                    "DPoP scheme with a proof is required"
+                )
             raise _invalid_token(
-                "token is DPoP-bound (cnf.jkt present) but presented as Bearer; "
-                "DPoP scheme with a proof is required"
+                "Bearer tokens are not accepted; a DPoP-bound access token "
+                "and a DPoP proof are required"
+            )
+        if cnf_jkt is None:
+            raise _invalid_token(
+                "access token is not DPoP-bound (no cnf.jkt); "
+                "sender-constrained tokens are required"
             )
 
-        jkt: str | None = None
-        dpop_trace: list[str] = []
-        if scheme.lower() == "dpop":
-            proof = headers.get(b"dpop", b"").decode("latin-1")
-            if not proof:
-                raise _invalid_proof("missing DPoP proof header")
-            jkt, dpop_trace = _validate_dpop_proof(
-                proof, method, _request_htu(scope, headers), token, cnf_jkt
-            )
+        proof = headers.get(b"dpop", b"").decode("latin-1")
+        if not proof:
+            raise _invalid_proof("missing DPoP proof header")
+        jkt, dpop_trace = _validate_dpop_proof(
+            proof, method, _request_htu(scope, headers), token, cnf_jkt
+        )
 
         # Scope enforcement needs the tool name: peek at the JSON-RPC body.
         body = await _read_body(receive)
