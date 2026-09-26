@@ -175,15 +175,21 @@ Actions layout:
   `clippy --locked --all-targets --all-features -- -D warnings`,
   `doc --locked --workspace --no-deps`, `audit`,
   `deny check`, the web client (`npm ci` → `generate-api` → `npm run test` →
-  `npm run build`), a `coverage` job (this IS the CI test run — there is no
-  separate `cargo test` job: cargo-llvm-cov `--locked --workspace` runs the
+  `npm run build`), a `coverage` job (this is the Linux CI test run:
+  cargo-llvm-cov `--locked --workspace` runs the
   full unit + root integration suite instrumented, then
   `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
   stable; Vitest `--coverage` for the web client; both reduced to shields.io
   endpoint-badge JSONs by `scripts/coverage_badges.py` and pushed to the
   `badges` branch on main — self-hosted, no external coverage service; the
   lcov export and the web client's HTML report are uploaded as workflow
-  artifacts), and an `openapi-sync` job that regenerates the spec and diffs
+  artifacts), a `macos` job (`macos-15` Apple Silicon runner — native
+  `cargo build --locked --release --bin issuerd` + `--version` smoke +
+  full `cargo test --locked --workspace`, binary uploaded as the
+  `macos-arm64-binary` artifact; OpenSSL from Homebrew `openssl@3`,
+  Kerberos from the system GSS.framework, libclang for bindgen from the
+  preinstalled Xcode toolchain — no cross toolchain), and an
+  `openapi-sync` job that regenerates the spec and diffs
   it against the committed `webclientsrc/openapi.json`.
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
