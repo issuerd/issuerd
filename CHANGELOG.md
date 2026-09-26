@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **macOS arm64 release binary.** GitHub Releases now ship `issuerd_X.Y.Z_macos_arm64.tar.gz` alongside the Linux and Windows archives: a natively built Apple Silicon binary (`MACOSX_DEPLOYMENT_TARGET=11.0`) with the usual archive contents (LICENSE/NOTICE, README, CHANGELOG, example configs) plus a CycloneDX SBOM, covered by `SHA256SUMS.txt` and the build-provenance attestation. The `macos-binary` release job packages it via `scripts/package-release.sh` after its native build + full workspace test run; the raw `macos-arm64-binary` workflow artifact is gone (the archive replaces it).
+
 ## [0.1.7] - 2026-09-27
 
 ### Added

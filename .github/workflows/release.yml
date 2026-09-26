@@ -494,14 +494,14 @@ jobs:
           if-no-files-found: error
 
   macos-binary:
-    name: macOS arm64 binary (build + test)
+    name: macOS arm64 binary (build + test + package)
     needs: validate
-    # Release-time platform validation only: native build + full workspace
-    # tests on an Apple Silicon runner (macos-13 is Intel — avoid). The
-    # binary is NOT shipped (no archive/SBOM) — the job exists so every tag
-    # proves macOS arm64 stays buildable and green. Not part of per-commit
-    # CI. Skipped under act like the heavy call (no macOS runners there;
-    # vars.ACT because job-level `if` has no env context).
+    # Native build + full workspace tests on an Apple Silicon runner (macos-13
+    # is Intel — avoid), then packages the shipped macOS arm64 archive like the
+    # other platform jobs. Not part of per-commit CI. Skipped under act like
+    # the heavy call (no macOS runners there; vars.ACT because job-level `if`
+    # has no env context) — the release job tolerates the missing macos-dist
+    # artifact in rehearsal.
     if: ${{ vars.ACT != 'true' }}
     runs-on: macos-15
     env:
@@ -522,6 +522,9 @@ jobs:
         run: npm ci && npm run generate-api && npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary (same as the
+      # Dockerfile) so the SBOM scan sees every crate.
+      - uses: taiki-e/install-action@cargo-auditable
       # Native build, no cross tooling: openssl-sys probes
       # /opt/homebrew/opt/openssl@3 (preinstalled on the image; brew install
       # is idempotent), Kerberos comes from the system GSS.framework
@@ -530,7 +533,7 @@ jobs:
       - name: System dependencies (OpenSSL)
         run: brew install openssl@3
       - name: Build the release binary
-        run: cargo build --locked --release --bin issuerd
+        run: cargo auditable build --locked --release --bin issuerd
       - name: Smoke-run the binary
         run: ./target/release/issuerd --version
       # Full workspace suite, not just --lib: Docker-dependent suites
@@ -539,14 +542,18 @@ jobs:
       # E2E tests run for real.
       - name: cargo test
         run: cargo test --locked --workspace
-      # Kept downloadable for manual on-device verification; never attached
-      # to the GitHub Release.
-      - name: Upload the binary
-        uses: actions/upload-artifact@v4
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_darwin_arm64.tar.gz | tar -xz -C "$HOME/bin" syft
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Package the archive
+        run: bash scripts/package-release.sh macos "${{ needs.validate.outputs.version }}" target/release/issuerd ./dist
+      - uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64-binary
-          path: target/release/issuerd
-          retention-days: 14
+          name: macos-dist
+          path: dist/
+          if-no-files-found: error
 
   release:
     name: GitHub Release
@@ -581,20 +588,22 @@ jobs:
         with:
           name: conformance-evidence
           path: conformance-evidence
-      # Real runs must ship all three platforms; rehearsal (act) has no Windows job.
+      # Real runs must ship all four platforms; rehearsal (act) has no macOS
+      # job, so macos-dist is only required by this check, never under act.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
              linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
+             macos-dist/*.tar.gz macos-dist/*.sbom.cyclonedx.json \
              conformance-evidence/conformance-evidence.tar.gz
       - name: SHA256SUMS.txt
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist linux-arm64-dist windows-dist; do
+          for d in linux-dist linux-arm64-dist windows-dist macos-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           # Standalone conformance evidence asset (absent under act).
@@ -612,6 +621,7 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            macos-dist/*
             issuerd_*_conformance-evidence.tar.gz
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
@@ -624,6 +634,7 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            macos-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
       - name: Release contents (always logged — this is what rehearsal inspects)
