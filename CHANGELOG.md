@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`examples/agentic-mcp` demo stack: bumped vulnerable Python pins + fixed a regex DoS.** ChatApp requirements moved to PyJWT 2.14.0, cryptography 50.0.1, python-multipart 0.0.31, clearing 17 Dependabot alerts (HS256 public-key confusion forgery, PKCS#7 Bleichenbacher oracle, multipart header DoS / arbitrary file write, and others). Demo code only — the issuerd server is Rust and has none of these in its dependency tree. Also rewrote the ChatApp intent parser's order-id regex, which had a polynomial-backtracking DoS on long whitespace runs (CodeQL `py/polynomial-redos`); matching behavior is unchanged (verified against the old pattern plus the app's smoke suite).
+
 ### Added
 
 - **macOS arm64 release binary.** GitHub Releases now ship `issuerd_X.Y.Z_macos_arm64.tar.gz` alongside the Linux and Windows archives: a natively built Apple Silicon binary (`MACOSX_DEPLOYMENT_TARGET=11.0`) with the usual archive contents (LICENSE/NOTICE, README, CHANGELOG, example configs) plus a CycloneDX SBOM, covered by `SHA256SUMS.txt` and the build-provenance attestation. The `macos-binary` release job packages it via `scripts/package-release.sh` after its native build + full workspace test run; the raw `macos-arm64-binary` workflow artifact is gone (the archive replaces it).

@@ -22,7 +22,10 @@ ORDERS_VERB_RE = re.compile(r"(show|list|my|recent|all|customers|everyone)", re.
 INJECTION_RE = re.compile(r"ignore|all customers|everyone", re.IGNORECASE)
 REFUND_RE = re.compile(r"refund", re.IGNORECASE)
 # Order id must follow the word "order" or a "#" — a bare number is the amount.
-ORDER_ID_RE = re.compile(r"(?:\border\s*#?|#)\s*(\d+)", re.IGNORECASE)
+# The second whitespace run is gated behind a literal "#": two bare \s* in a
+# row would give the engine quadratically many ways to split a long run of
+# spaces (CodeQL py/polynomial-redos).
+ORDER_ID_RE = re.compile(r"(?:\border\s*(?:#\s*)?|#\s*)(\d+)", re.IGNORECASE)
 AMOUNT_RE = re.compile(r"\$?\s*(\d+(?:\.\d+)?)")
 
 
