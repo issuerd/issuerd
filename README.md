@@ -66,7 +66,7 @@ Issuerd deliberately mirrors Keycloak's domain model and API surface — it is n
 | Runtime | Single Rust binary | JVM (Quarkus) distribution |
 | Cluster state | PostgreSQL + Redis | Embedded Infinispan grid |
 | Protocol parity | Continuously diff-tested against Keycloak 24.0 | Reference |
-| Conformance evidence | Suite results checked into the repo | Vendor certification program |
+| Conformance evidence | Suite results checked into the repo; full report bundle attached to every release | Vendor certification program |
 | SAML, UMA, FGAP, Organizations | Not implemented (see [scope](#project-scope)) | Implemented |
 
 If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model, Issuerd is a drop-in alternative with a Rust operational footprint.
@@ -144,6 +144,8 @@ Tested against the [OpenID Foundation Conformance Suite](https://gitlab.com/open
 | Form Post OP | **PASSED** — 36 modules, 2,010 conditions, 0 failures, 0 warnings |
 
 Setup and per-module results: `tests/conformance/README.md`, `tests/conformance/COVERAGE.md`; logs are written to the (gitignored) `tests/conformance/results/` directory when the suite runs.
+
+Every [GitHub Release](https://github.com/issuerd/issuerd/releases) re-runs the suite — together with the rest of the heavy test suites — against the exact tagged commit and attaches the complete report bundle as a standalone release asset: `issuerd_<version>_conformance-evidence.tar.gz`, containing the HTML reports, JSON exports, and runner logs, covered by `SHA256SUMS.txt` and a build-provenance attestation.
 
 ```bash
 # Re-run the full conformance suite (requires Docker)
