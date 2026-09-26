@@ -28,8 +28,11 @@ accounts, so --real pauses between crates (override with --pause SECONDS).
 After each upload --real also polls the sparse index until the new version is
 actually visible (override the cap with --index-timeout SECONDS): the index
 lags the upload by a minute or more, and the next crate's dependency
-resolution 404s without it. Interrupted runs are resumable (already-uploaded
-crates are skipped).
+resolution 404s without it. Even after the gate passes, cargo's conditional
+index revalidation can still resolve a stale version list (its on-disk .cache
+entry revalidated against a lagging index edge), so --real retries that
+resolver race after evicting cargo's local sparse-index cache entries.
+Interrupted runs are resumable (already-uploaded crates are skipped).
 """
 
 import argparse
@@ -148,16 +151,40 @@ def workspace_version(root: Path) -> str:
     sys.exit("error: [workspace.package] version not found in the staged Cargo.toml")
 
 
-def sparse_index_url(name: str) -> str:
+def index_cache_layout(name: str) -> str:
     if len(name) == 1:
-        layout = f"1/{name}"
-    elif len(name) == 2:
-        layout = f"2/{name}"
-    elif len(name) == 3:
-        layout = f"3/{name[0]}/{name}"
-    else:
-        layout = f"{name[:2]}/{name[2:4]}/{name}"
-    return f"https://index.crates.io/{layout}"
+        return f"1/{name}"
+    if len(name) == 2:
+        return f"2/{name}"
+    if len(name) == 3:
+        return f"3/{name[0]}/{name}"
+    return f"{name[:2]}/{name[2:4]}/{name}"
+
+
+def sparse_index_url(name: str) -> str:
+    return f"https://index.crates.io/{index_cache_layout(name)}"
+
+
+# Markers of the sparse-index propagation race: the no-cache gate fetch already
+# saw the freshly published issuerd-* dependency, but cargo's resolver still got
+# a stale version list (its on-disk .cache entry, revalidated against a lagging
+# index edge — this killed the v0.1.7 crates-io job on issuerd-auth-flow).
+RESOLVER_RACE_MARKERS = (
+    "failed to select a version for the requirement `issuerd-",
+    "no matching package named `issuerd-",
+)
+
+
+def evict_index_cache(name: str) -> None:
+    """Drop cargo's on-disk sparse-index cache entry for `name` so the next
+    resolution does a full refetch instead of revalidating a stale copy."""
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    for entry in cargo_home.glob(f"registry/index/*/.cache/{index_cache_layout(name)}"):
+        try:
+            entry.unlink()
+            print(f"evicted local index cache entry: {entry}")
+        except OSError:
+            pass
 
 
 def wait_index_visible(name: str, version: str, timeout: int, interval: int = 10) -> bool:
@@ -189,34 +216,48 @@ def wait_index_visible(name: str, version: str, timeout: int, interval: int = 10
         time.sleep(interval)
 
 
-def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict) -> bool:
+def publish_one(crate_dir: Path, name: str, dry_run: bool, env: dict,
+                retries: int = 8, retry_wait: int = 45) -> bool:
     """Publish (or dry-run) one crate. Returns False if deferred (see below)."""
     cmd = ["cargo", "publish", "--allow-dirty"]
     if dry_run:
         cmd.append("--dry-run")
     print(f"\n=== {'dry-run' if dry_run else 'PUBLISH'} {name} ===")
-    result = subprocess.run(cmd, cwd=crate_dir, env=env, capture_output=True, text=True)
-    print(result.stderr or result.stdout)
-    if result.returncode == 0:
-        return True
-    output = result.stderr + result.stdout
-    # A retried run hits crates.io's duplicate-version rejection on crates that
-    # already went live — treat those as done so the run is resumable. The exact
-    # wording varies by cargo version ("... is already uploaded" vs the newer
-    # "crate x@y already exists on crates.io index").
-    if not dry_run and ("is already uploaded" in output or "already exists on crates.io" in output):
-        print(f"skip: {name} is already on crates.io")
-        return True
-    # Before the first real publish (or right after a version bump), dependents
-    # cannot even be packaged: cargo strips path deps and resolves issuerd-*
-    # against crates.io, where the crate or the new version does not exist yet.
-    # Their own manifest metadata was already validated by the time resolution
-    # fails, so treat exactly these failures as deferred.
-    if dry_run and ("no matching package named `issuerd-" in output
-                    or "failed to select a version for the requirement `issuerd-" in output):
-        print(f"deferred: {name} can only be packaged once its issuerd-* deps are live on crates.io")
-        return False
-    sys.exit(f"error: {'dry-run' if dry_run else 'publish'} failed for {name}")
+    attempt = 0
+    while True:
+        attempt += 1
+        result = subprocess.run(cmd, cwd=crate_dir, env=env, capture_output=True, text=True)
+        print(result.stderr or result.stdout)
+        if result.returncode == 0:
+            return True
+        output = result.stderr + result.stdout
+        # A retried run hits crates.io's duplicate-version rejection on crates that
+        # already went live — treat those as done so the run is resumable. The exact
+        # wording varies by cargo version ("... is already uploaded" vs the newer
+        # "crate x@y already exists on crates.io index").
+        if not dry_run and ("is already uploaded" in output or "already exists on crates.io" in output):
+            print(f"skip: {name} is already on crates.io")
+            return True
+        raced = any(marker in output for marker in RESOLVER_RACE_MARKERS)
+        # Before the first real publish (or right after a version bump), dependents
+        # cannot even be packaged: cargo strips path deps and resolves issuerd-*
+        # against crates.io, where the crate or the new version does not exist yet.
+        # Their own manifest metadata was already validated by the time resolution
+        # fails, so treat exactly these failures as deferred.
+        if dry_run and raced:
+            print(f"deferred: {name} can only be packaged once their issuerd-* deps are live on crates.io")
+            return False
+        # Real run with the same markers: the dependency IS live (the no-cache
+        # gate saw it) but cargo resolved a stale version list — evict the local
+        # index cache entries and retry instead of dying on CDN propagation lag.
+        if not dry_run and raced and attempt <= retries:
+            for cached in [*CRATES, "issuerd"]:
+                evict_index_cache(cached)
+            print(f"resolver race: local index cache evicted; "
+                  f"retry {attempt}/{retries} in {retry_wait}s...")
+            time.sleep(retry_wait)
+            continue
+        sys.exit(f"error: {'dry-run' if dry_run else 'publish'} failed for {name}")
 
 
 def main() -> None:
@@ -262,6 +303,11 @@ def main() -> None:
                 # then the fixed rate-limit grace.
                 if wait_index_visible(name, version, timeout=args.index_timeout):
                     print(f"index: {name} {version} is visible on the sparse index")
+                    # The gate fetched origin-fresh (no-cache), but cargo's own
+                    # post-publish poll may have left a stale .cache entry that
+                    # the next crate's resolution would revalidate against a
+                    # lagging edge — drop it before publishing the dependent.
+                    evict_index_cache(name)
                 else:
                     sys.exit(f"error: {name} {version} still not visible in the crates.io index "
                              f"after {args.index_timeout}s — check https://crates.io/crates/{name} "
