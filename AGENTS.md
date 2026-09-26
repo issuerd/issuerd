@@ -175,21 +175,15 @@ Actions layout:
   `clippy --locked --all-targets --all-features -- -D warnings`,
   `doc --locked --workspace --no-deps`, `audit`,
   `deny check`, the web client (`npm ci` → `generate-api` → `npm run test` →
-  `npm run build`), a `coverage` job (this is the Linux CI test run:
-  cargo-llvm-cov `--locked --workspace` runs the
+  `npm run build`), a `coverage` job (this IS the CI test run — there is no
+  separate `cargo test` job: cargo-llvm-cov `--locked --workspace` runs the
   full unit + root integration suite instrumented, then
   `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
   stable; Vitest `--coverage` for the web client; both reduced to shields.io
   endpoint-badge JSONs by `scripts/coverage_badges.py` and pushed to the
   `badges` branch on main — self-hosted, no external coverage service; the
   lcov export and the web client's HTML report are uploaded as workflow
-  artifacts), a `macos` job (`macos-15` Apple Silicon runner — native
-  `cargo build --locked --release --bin issuerd` + `--version` smoke +
-  full `cargo test --locked --workspace`, binary uploaded as the
-  `macos-arm64-binary` artifact; OpenSSL from Homebrew `openssl@3`,
-  Kerberos from the system GSS.framework, libclang for bindgen from the
-  preinstalled Xcode toolchain — no cross toolchain), and an
-  `openapi-sync` job that regenerates the spec and diffs
+  artifacts), and an `openapi-sync` job that regenerates the spec and diffs
   it against the committed `webclientsrc/openapi.json`.
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
@@ -206,13 +200,17 @@ Actions layout:
 - `.github/workflows/release.yml` (push of a `v*` tag) — the release pipeline:
   validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, then:
   Docker Hub gets per-arch images (`issuerd/issuerd:X.Y.Z-amd64` from the
-  canonical Dockerfile; `:X.Y.Z-arm64` packed from the cross-compiled binary
-  via `Dockerfile.prebuilt`) merged by the docker-manifest job into the
+  canonical Dockerfile; `:X.Y.Z-arm64` packed from the natively built
+  linux-arm64 binary via `Dockerfile.prebuilt`) merged by the docker-manifest
+  job into the
   multi-arch user tags (`:latest`, `:X.Y.Z`, `:X.Y`); Linux amd64 (extracted
   from the canonical Docker build), Linux arm64 (built natively on an
   `ubuntu-22.04-arm` runner — the unit suite runs there with cargo-llvm-cov
   coverage) and Windows binaries are packaged
-  with SBOM + checksums via `scripts/package-release.sh`; the crates-io job
+  with SBOM + checksums via `scripts/package-release.sh`; a `macos-binary`
+  job builds + runs the full workspace suite natively on a `macos-15` Apple
+  Silicon runner as release-time validation (the macOS binary is NOT
+  shipped); the crates-io job
   runs `scripts/publish.py --real` for the whole workspace; the release job
   creates the GitHub Release (notes auto-extracted from CHANGELOG.md,
   build-provenance attestations). The docker/docker-arm64/docker-manifest,
@@ -865,8 +863,9 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 7. **docker-manifest** — merges the two per-arch images into the user-facing multi-arch manifest list (`docker buildx imagetools create`): one tag, `:latest` / `:X.Y.Z` / `:X.Y`, serves both architectures (`docker pull` resolves the host arch). Per-arch tags keep no embedded SBOM/provenance attestations — attested pushes turn a tag into an OCI index, and indexes cannot be nested into the manifest list.
 8. **crates-io** — builds the web client (publish staging embeds it), installs `libkrb5-dev` (the staged `issuerd-federation` verify-build compiles `libgssapi-sys`, whose build script needs the MIT Kerberos dev package), and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
 9. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
-10. **release** — needs the packaging jobs AND `heavy` green (skipped only under act); downloads only the `*-dist` + `release-notes` + `conformance-evidence` artifacts (never "all": docker/build-push-action auto-uploads `*.dockerbuild` build-record artifacts that download-artifact cannot fetch — suppressed at the source via `DOCKER_BUILD_RECORD_UPLOAD: false` on both docker jobs), renames the evidence tarball to `issuerd_X.Y.Z_conformance-evidence.tar.gz`, `SHA256SUMS.txt` (covers the evidence bundle too), build-provenance attestations, GitHub Release (`make_latest`).
-11. **dockerhub-overview** — runs after `docker-manifest` and PATCHes the Docker Hub repository overview from `.github/dockerhub-overview.md` via the Hub API (`POST /v2/auth/token` with identifier/secret → Bearer token → `PATCH /v2/repositories/issuerd/issuerd/`; the legacy `/v2/users/token` endpoint is dead — 405), reusing the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets — pushed images don't auto-sync a README, so without this the Hub page stays empty. The PAT needs the **Read, Write, Delete** permission: metadata edits require the `repo:admin` scope, plain Read & Write (`repo:write`) gets a 403 "insufficient scope". Isolated: nothing needs it, so a Hub API hiccup never blocks the GitHub Release; prints a notice under act like the other publish steps.
+10. **macos-binary** — `macos-15` Apple Silicon runner (web client first, Homebrew `openssl@3`, `MACOSX_DEPLOYMENT_TARGET=11.0`): native release build + `--version` smoke + full `cargo test --locked --workspace`. Release-time platform validation only — the macOS binary is NOT packaged or shipped (uploaded as a workflow artifact for manual on-device checks). Skipped under act (`vars.ACT`, no macOS runners there), tolerated by the release gate.
+11. **release** — needs the packaging jobs AND `heavy` green (`heavy` and `macos-binary` are skipped under act; skips are tolerated, failures are not); downloads only the `*-dist` + `release-notes` + `conformance-evidence` artifacts (never "all": docker/build-push-action auto-uploads `*.dockerbuild` build-record artifacts that download-artifact cannot fetch — suppressed at the source via `DOCKER_BUILD_RECORD_UPLOAD: false` on both docker jobs), renames the evidence tarball to `issuerd_X.Y.Z_conformance-evidence.tar.gz`, `SHA256SUMS.txt` (covers the evidence bundle too), build-provenance attestations, GitHub Release (`make_latest`).
+12. **dockerhub-overview** — runs after `docker-manifest` and PATCHes the Docker Hub repository overview from `.github/dockerhub-overview.md` via the Hub API (`POST /v2/auth/token` with identifier/secret → Bearer token → `PATCH /v2/repositories/issuerd/issuerd/`; the legacy `/v2/users/token` endpoint is dead — 405), reusing the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets — pushed images don't auto-sync a README, so without this the Hub page stays empty. The PAT needs the **Read, Write, Delete** permission: metadata edits require the `repo:admin` scope, plain Read & Write (`repo:write`) gets a 403 "insufficient scope". Isolated: nothing needs it, so a Hub API hiccup never blocks the GitHub Release; prints a notice under act like the other publish steps.
 
 Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it). The conformance evidence bundle is NOT part of any archive: like the standalone SBOMs, it is attached to the GitHub Release as one separate asset (`issuerd_X.Y.Z_conformance-evidence.tar.gz`).
 

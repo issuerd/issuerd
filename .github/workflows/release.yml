@@ -493,11 +493,67 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  macos-binary:
+    name: macOS arm64 binary (build + test)
+    needs: validate
+    # Release-time platform validation only: native build + full workspace
+    # tests on an Apple Silicon runner (macos-13 is Intel — avoid). The
+    # binary is NOT shipped (no archive/SBOM) — the job exists so every tag
+    # proves macOS arm64 stays buildable and green. Not part of per-commit
+    # CI. Skipped under act like the heavy call (no macOS runners there;
+    # vars.ACT because job-level `if` has no env context).
+    if: ${{ vars.ACT != 'true' }}
+    runs-on: macos-15
+    env:
+      # Pin the deployment target to the aarch64-apple-darwin std minimum
+      # instead of letting the host SDK raise the floor to the runner's macOS.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs panics
+      # without webclientsrc/dist).
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Native build, no cross tooling: openssl-sys probes
+      # /opt/homebrew/opt/openssl@3 (preinstalled on the image; brew install
+      # is idempotent), Kerberos comes from the system GSS.framework
+      # (libgssapi-sys auto-detects the Apple impl), and bindgen's libclang
+      # from the preinstalled Xcode toolchain.
+      - name: System dependencies (OpenSSL)
+        run: brew install openssl@3
+      - name: Build the release binary
+        run: cargo build --locked --release --bin issuerd
+      - name: Smoke-run the binary
+        run: ./target/release/issuerd --version
+      # Full workspace suite, not just --lib: Docker-dependent suites
+      # (testcontainers, Keycloak/federation targets) probe availability and
+      # skip gracefully — macOS runners have no Docker — while the in-process
+      # E2E tests run for real.
+      - name: cargo test
+        run: cargo test --locked --workspace
+      # Kept downloadable for manual on-device verification; never attached
+      # to the GitHub Release.
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-binary
+          path: target/release/issuerd
+          retention-days: 14
+
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, linux-arm64, windows-binary, heavy]
+    needs: [validate, linux-binary, linux-arm64, windows-binary, macos-binary, heavy]
     # Gate on every need, tolerating ONLY skips (act leaves out the heavy
-    # call): a failed suite or packaging job means no GitHub Release.
+    # call and the macos-binary job): a failed suite or packaging job means
+    # no GitHub Release.
     if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
