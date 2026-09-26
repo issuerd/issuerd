@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-26
+
+### Added
+
+- **Conformance evidence shipped with releases:** the release pipeline now runs the full heavy test suites (LDAP/AD federation, two-node cluster E2E, Keycloak dual-target parity, and the OIDF conformance suite) against the exact tagged commit before cutting the GitHub Release, and attaches the packed conformance report bundle `issuerd_X.Y.Z_conformance-evidence.tar.gz` as a standalone release asset (checksum-covered and attested, alongside the SBOMs — not part of the binary archives).
+
 ## [0.1.5] - 2026-09-26
 
 ### Fixed

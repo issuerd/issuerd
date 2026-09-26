@@ -84,7 +84,7 @@ jsonwebtoken = { workspace = true }
 testcontainers = { workspace = true }
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/issuerd/issuerd"
@@ -209,15 +209,15 @@ openssl = { version = "0.10", features = ["vendored"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 
 # Internal crates (version pinned to workspace; version required for crates.io publish)
-issuerd-core = { path = "crates/issuerd-core", version = "0.1.5" }
-issuerd-protocol = { path = "crates/issuerd-protocol", version = "0.1.5" }
-issuerd-auth-flow = { path = "crates/issuerd-auth-flow", version = "0.1.5" }
-issuerd-token = { path = "crates/issuerd-token", version = "0.1.5" }
-issuerd-storage = { path = "crates/issuerd-storage", version = "0.1.5" }
-issuerd-federation = { path = "crates/issuerd-federation", version = "0.1.5" }
-issuerd-admin-api = { path = "crates/issuerd-admin-api", version = "0.1.5" }
-issuerd-cluster = { path = "crates/issuerd-cluster", version = "0.1.5" }
-issuerd-server = { path = "crates/issuerd-server", version = "0.1.5" }
+issuerd-core = { path = "crates/issuerd-core", version = "0.1.6" }
+issuerd-protocol = { path = "crates/issuerd-protocol", version = "0.1.6" }
+issuerd-auth-flow = { path = "crates/issuerd-auth-flow", version = "0.1.6" }
+issuerd-token = { path = "crates/issuerd-token", version = "0.1.6" }
+issuerd-storage = { path = "crates/issuerd-storage", version = "0.1.6" }
+issuerd-federation = { path = "crates/issuerd-federation", version = "0.1.6" }
+issuerd-admin-api = { path = "crates/issuerd-admin-api", version = "0.1.6" }
+issuerd-cluster = { path = "crates/issuerd-cluster", version = "0.1.6" }
+issuerd-server = { path = "crates/issuerd-server", version = "0.1.6" }
 
 [profile.release]
 # Strip the symbol table from the release binary: production images ship
