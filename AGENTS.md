@@ -208,11 +208,11 @@ Actions layout:
   with SBOM + checksums via `scripts/package-release.sh`; the crates-io job
   runs `scripts/publish.py --real` for the whole workspace; the release job
   creates the GitHub Release (notes auto-extracted from CHANGELOG.md,
-  build-provenance attestations). The docker/docker-arm64/docker-manifest and
-  crates-io jobs are isolated so a registry hiccup never blocks the GitHub
-  Release. Publish steps are gated on `env.ACT != 'true'` so the whole
-  workflow can be rehearsed locally with nektos/act (see "Cutting a release"
-  below).
+  build-provenance attestations). The docker/docker-arm64/docker-manifest,
+  dockerhub-overview, and crates-io jobs are isolated so a registry hiccup
+  never blocks the GitHub Release. Publish steps are gated on `env.ACT !=
+  'true'` so the whole workflow can be rehearsed locally with nektos/act (see
+  "Cutting a release" below).
 - `.github/workflows/verification.yml` (push to `main` + PRs) — the extended
   tools below (flux is `continue-on-error` for now; the MIRAI job is disabled —
   hard-blocked upstream, see the tool notes).
@@ -859,6 +859,7 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 8. **crates-io** — builds the web client (publish staging embeds it), installs `libkrb5-dev` (the staged `issuerd-federation` verify-build compiles `libgssapi-sys`, whose build script needs the MIT Kerberos dev package), and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
 9. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
 10. **release** — needs the packaging jobs AND `heavy` green (skipped only under act); downloads only the `*-dist` + `release-notes` + `conformance-evidence` artifacts (never "all": docker/build-push-action auto-uploads `*.dockerbuild` build-record artifacts that download-artifact cannot fetch — suppressed at the source via `DOCKER_BUILD_RECORD_UPLOAD: false` on both docker jobs), renames the evidence tarball to `issuerd_X.Y.Z_conformance-evidence.tar.gz`, `SHA256SUMS.txt` (covers the evidence bundle too), build-provenance attestations, GitHub Release (`make_latest`).
+11. **dockerhub-overview** — runs after `docker-manifest` and PATCHes the Docker Hub repository overview from `.github/dockerhub-overview.md` via the Hub API (JWT from `/v2/users/token`, then `PATCH /v2/repositories/issuerd/issuerd/`), reusing the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets — pushed images don't auto-sync a README, so without this the Hub page stays empty. Isolated: nothing needs it, so a Hub API hiccup never blocks the GitHub Release; prints a notice under act like the other publish steps.
 
 Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it). The conformance evidence bundle is NOT part of any archive: like the standalone SBOMs, it is attached to the GitHub Release as one separate asset (`issuerd_X.Y.Z_conformance-evidence.tar.gz`).
 

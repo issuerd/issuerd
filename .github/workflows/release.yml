@@ -28,9 +28,9 @@ name: Release
 # Local rehearsal: .act/run-release.sh runs this workflow under nektos/act
 # (plus .act/rehearse-arm64.sh / rehearse-manifest.sh for the arm64 and
 # manifest mechanics). act sets ACT=true; every step that touches an external
-# service (Docker Hub login/push, manifest push, crates.io upload, release
-# creation, attestations) is gated on `env.ACT != 'true'` so the rehearsal
-# exercises everything except the actual publishing.
+# service (Docker Hub login/push, manifest push, Hub overview PATCH, crates.io
+# upload, release creation, attestations) is gated on `env.ACT != 'true'` so
+# the rehearsal exercises everything except the actual publishing.
 
 on:
   push:
@@ -328,6 +328,37 @@ jobs:
           fi
           "${cmd[@]}"
           docker buildx imagetools inspect "issuerd/issuerd:$VERSION"
+
+  dockerhub-overview:
+    name: Docker Hub repo overview
+    needs: [validate, docker-manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Syncs the Hub repo page (Repository overview) from the committed
+      # .github/dockerhub-overview.md — pushed images don't auto-sync a
+      # README, so the page stays empty without this. Hub API: exchange
+      # username+PAT for a JWT, then PATCH the repository. Isolated like the
+      # other publish jobs: nothing needs it, so a Hub API hiccup never
+      # blocks the GitHub Release.
+      - name: PATCH the repository overview
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${ACT:-}" = true ]; then
+            echo "::notice::act rehearsal — would PATCH hub.docker.com/v2/repositories/issuerd/issuerd/ with .github/dockerhub-overview.md"
+            exit 0
+          fi
+          token=$(curl -sSf -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
+            https://hub.docker.com/v2/users/token | jq -r .token)
+          jq -n --arg desc "$(cat .github/dockerhub-overview.md)" '{full_description: $desc}' \
+            | curl -sSf -X PATCH \
+                -H "Authorization: JWT $token" -H 'Content-Type: application/json' \
+                --data @- https://hub.docker.com/v2/repositories/issuerd/issuerd/ \
+            | jq '{name, description, last_updated}'
 
   crates-io:
     name: crates.io publish (workspace)
