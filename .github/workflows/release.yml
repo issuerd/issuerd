@@ -22,8 +22,8 @@ name: Release
 # architectures (docker pull picks the host arch). Per-arch tags carry no
 # embedded SBOM/provenance attestations on purpose: attested pushes make each
 # tag an OCI index, and nesting indexes breaks manifest-list merging.
-# The arm64 image is packed from the cross-compiled binary (no QEMU builds —
-# see scripts/cross-linux-arm64.sh and Dockerfile.prebuilt).
+# The arm64 image is packed from the natively built binary (ubuntu-22.04-arm
+# runner — see the linux-arm64 job and Dockerfile.prebuilt).
 #
 # Local rehearsal: .act/run-release.sh runs this workflow under nektos/act
 # (plus .act/rehearse-arm64.sh / rehearse-manifest.sh for the arm64 and
@@ -86,7 +86,7 @@ jobs:
           ### Archives
 
           - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
-          - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, cross-compiled on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
+          - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, built natively (ubuntu-22.04-arm runner) on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
           - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
           - \`issuerd_${VERSION}_conformance-evidence.tar.gz\` — OIDF conformance suite evidence from this tag's run (HTML reports, JSON exports, runner logs; informational — not needed to run issuerd)
 
@@ -206,11 +206,15 @@ jobs:
           if-no-files-found: error
 
   linux-arm64:
-    name: linux arm64 binary (cross-compiled, no QEMU)
+    name: linux arm64 binary (native build + unit tests)
     needs: validate
-    # ubuntu-22.04: glibc 2.35 / OpenSSL 3.0 — the same baseline as the
-    # canonical amd64 build, so the release-notes requirements hold for both.
-    runs-on: ubuntu-22.04
+    # ubuntu-22.04-arm: native aarch64 GitHub runner on the same glibc 2.35 /
+    # OpenSSL 3.0 baseline as the canonical amd64 build, so the release-notes
+    # requirements hold for both. Native means no dpkg-multiarch sysroot and
+    # no QEMU: the unit suite actually runs (instrumented, with coverage) and
+    # the smoke run is a real execution. (The x86_64 cross route survives as
+    # scripts/cross-linux-arm64.sh for local/rehearsal builds.)
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -218,24 +222,50 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs).
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.95.0
-          targets: aarch64-unknown-linux-gnu
+          toolchain: 1.95.0   # pinned, same as the canonical Dockerfile
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-auditable
-      # Cross-compiles on x86_64 (dpkg multiarch sysroot) — identical script
-      # drives the local rehearsal (.act/rehearse-arm64.sh).
-      - name: Cross-build the arm64 binary
-        run: bash scripts/cross-linux-arm64.sh ./build/arm64
-      - name: Smoke-run the arm64 binary (qemu-user)
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Native arch — plain apt, no multiarch/ports.ubuntu.com setup.
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      # Unit tests on the real target architecture, instrumented; the lcov
+      # export is kept as an artifact. --lib keeps this Docker-free: the
+      # Docker-dependent suites live in the integration targets.
+      - name: Unit tests + coverage
+        run: cargo llvm-cov --locked --workspace --lib --lcov --output-path arm64-lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-coverage
+          path: arm64-lcov.info
+          if-no-files-found: error
+      # cargo-auditable embeds the dependency tree (same as the Dockerfile).
+      - name: Build the release binary
+        run: cargo auditable build --locked --release --bin issuerd
+      - name: Smoke-run the binary (native — no QEMU)
+        run: ./target/release/issuerd --version
+      # Stage the Dockerfile.prebuilt context: binary + the Kerberos/GSS-API
+      # runtime libs it links (distroless/cc supplies glibc + libssl3 +
+      # ca-certificates).
+      - name: Stage the arm64 image build context
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends qemu-user-static
-          qemu-aarch64-static ./build/arm64/issuerd --version
+          set -euo pipefail
+          mkdir -p build/arm64/rootfs/usr/lib/aarch64-linux-gnu
+          cp target/release/issuerd build/arm64/issuerd
+          for lib in libgssapi_krb5.so.2 libkrb5.so.3 libk5crypto.so.3 libcom_err.so.2 libkrb5support.so.0 libkeyutils.so.1; do
+            cp -L "/usr/lib/aarch64-linux-gnu/$lib"* build/arm64/rootfs/usr/lib/aarch64-linux-gnu/
+          done
       - name: Install syft (SBOM)
         run: |
           mkdir -p "$HOME/.local/bin"
-          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_linux_amd64.tar.gz | tar -xz -C "$HOME/.local/bin" syft
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_linux_arm64.tar.gz | tar -xz -C "$HOME/.local/bin" syft
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/syft" version
       - name: Package the archive

@@ -50,7 +50,7 @@ issuerd/
 │   ├── with-native-env.cmd  # Native openssl build env wrapper (Windows, see below)
 │   ├── kani.sh / flux.sh / mirai.sh # Verification tool runners (Linux/WSL, see below)
 │   ├── package-release.sh       # Release archive packaging (CI + local rehearsal, see below)
-│   ├── cross-linux-arm64.sh     # Cross-compile the linux/arm64 release binary on x86_64 Ubuntu (no QEMU)
+│   ├── cross-linux-arm64.sh     # Cross-compile linux/arm64 on x86_64 Ubuntu — local/rehearsal only; CI builds natively on ubuntu-22.04-arm
 │   ├── publish.py               # crates.io workspace publish (staging + dry-run/real, see below)
 │   └── aggregate_cov.py / show_uncovered.py # Coverage aggregation helpers
 ├── docker-compose.yml       # Local demo stack (pulls issuerd/issuerd:latest; console on :8080)
@@ -209,8 +209,9 @@ Actions layout:
   canonical Dockerfile; `:X.Y.Z-arm64` packed from the cross-compiled binary
   via `Dockerfile.prebuilt`) merged by the docker-manifest job into the
   multi-arch user tags (`:latest`, `:X.Y.Z`, `:X.Y`); Linux amd64 (extracted
-  from the canonical Docker build), Linux arm64 (cross-compiled by
-  `scripts/cross-linux-arm64.sh`, no QEMU) and Windows binaries are packaged
+  from the canonical Docker build), Linux arm64 (built natively on an
+  `ubuntu-22.04-arm` runner — the unit suite runs there with cargo-llvm-cov
+  coverage) and Windows binaries are packaged
   with SBOM + checksums via `scripts/package-release.sh`; the crates-io job
   runs `scripts/publish.py --real` for the whole workspace; the release job
   creates the GitHub Release (notes auto-extracted from CHANGELOG.md,
@@ -859,8 +860,8 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 2. **heavy** — calls `heavy.yml` as a reusable workflow (`workflow_call`): the full heavy suites (federation, cluster E2E, Keycloak parity, OIDF conformance) run inside the release run against the exact tagged commit. The GitHub Release job waits for it; the Docker/crates.io publish jobs deliberately do not (isolation — the nightly heavy runs are the early warning, and crates.io uploads are irreversible either way).
 3. **docker** (linux/amd64) — builds the canonical root Dockerfile and pushes `issuerd/issuerd:X.Y.Z-amd64` to Docker Hub. Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
 4. **linux-binary** (amd64) — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the amd64 image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
-5. **linux-arm64** — `scripts/cross-linux-arm64.sh` cross-compiles `aarch64-unknown-linux-gnu` on the x86_64 runner (ubuntu-22.04, dpkg multiarch sysroot from ports.ubuntu.com — no ARM runner, no QEMU build), smoke-runs the binary under `qemu-aarch64-static`, and packages the tarball. The same glibc 2.35 / OpenSSL 3.0 baseline as amd64 keeps the release-notes requirements identical.
-6. **docker-arm64** — packs the exact cross-compiled binary (plus the arm64 Kerberos libs staged by the cross script) into the distroless runtime via `Dockerfile.prebuilt` — a COPY-only build, so no arm64 code executes anywhere — and pushes `issuerd/issuerd:X.Y.Z-arm64`.
+5. **linux-arm64** — built **natively** on an `ubuntu-22.04-arm` runner (same glibc 2.35 / OpenSSL 3.0 baseline as amd64, so the release-notes requirements hold): the unit suite runs instrumented under cargo-llvm-cov (`--lib`, lcov kept as the `linux-arm64-coverage` artifact), the release binary is smoke-run natively (no QEMU), the Kerberos runtime libs are staged for `Dockerfile.prebuilt`, and the tarball is packaged. (`scripts/cross-linux-arm64.sh` remains for local x86_64 builds/rehearsals.)
+6. **docker-arm64** — packs the exact linux-arm64 binary (plus the arm64 Kerberos libs staged by the linux-arm64 job) into the distroless runtime via `Dockerfile.prebuilt` — a COPY-only build, so no arm64 code executes anywhere — and pushes `issuerd/issuerd:X.Y.Z-arm64`.
 7. **docker-manifest** — merges the two per-arch images into the user-facing multi-arch manifest list (`docker buildx imagetools create`): one tag, `:latest` / `:X.Y.Z` / `:X.Y`, serves both architectures (`docker pull` resolves the host arch). Per-arch tags keep no embedded SBOM/provenance attestations — attested pushes turn a tag into an OCI index, and indexes cannot be nested into the manifest list.
 8. **crates-io** — builds the web client (publish staging embeds it), installs `libkrb5-dev` (the staged `issuerd-federation` verify-build compiles `libgssapi-sys`, whose build script needs the MIT Kerberos dev package), and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
 9. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
@@ -876,8 +877,10 @@ Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar
 ```bash
 ../.act/run-release.sh                 # act run: validate, docker amd64 build, linux amd64 + arm64
                                        # cross/packaging, arm64 image build, crates.io dry-run
-../.act/rehearse-arm64.sh              # standalone arm64 path: cross-compile in an ubuntu:22.04
-                                       # container (same script as CI) + tarball + arm64 image
+../.act/rehearse-arm64.sh              # standalone arm64 path on x86_64: cross-compile in an
+                                       # ubuntu:22.04 container via scripts/cross-linux-arm64.sh
+                                       # (the local stand-in — CI itself builds natively on
+                                       # ubuntu-22.04-arm) + tarball + arm64 image
 ../.act/rehearse-manifest.sh           # multi-arch manifest merge against a throwaway local
                                        # registry (the exact imagetools command CI runs)
 # Windows packaging rehearsal (host): build the web client + release binary, then

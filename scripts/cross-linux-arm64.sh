@@ -9,10 +9,11 @@
 #   rootfs/usr/lib/aarch64-linux-gnu/…       the Kerberos/GSS-API shared libs the
 #                                            binary links (for Dockerfile.prebuilt)
 #
-# The same script runs in the release workflow (ubuntu-22.04 runner), under
-# act, and in a local Ubuntu 22.04 container (.act/rehearse-arm64.sh), so the
-# arm64 artifact is reproducible everywhere. ubuntu-22.04 gives glibc 2.35 /
-# OpenSSL 3.0 — the same baseline as the canonical amd64 Docker build.
+# The release workflow builds linux/arm64 NATIVELY on an ubuntu-22.04-arm
+# GitHub runner (and runs the unit suite there with coverage); this script
+# remains for local builds and release rehearsals on x86_64 hosts
+# (.act/rehearse-arm64.sh). ubuntu-22.04 gives glibc 2.35 / OpenSSL 3.0 —
+# the same baseline as the canonical amd64 Docker build.
 #
 # Idempotent: safe to re-run in a persistent container/VM (installs are skipped
 # when already present).
