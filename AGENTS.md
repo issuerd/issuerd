@@ -189,13 +189,14 @@ Actions layout:
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
   `CHANGELOG.md` or carries the `no-changelog` label (see "Picking Up Work").
 - `.github/workflows/heavy.yml` (nightly at 03:17 UTC + manual
-  `workflow_dispatch`) — the heavy Docker suites: federation vs
-  Samba AD DC + OpenLDAP, the two-node cluster E2E, the Keycloak dual-target
-  parity run (`ISSUERD_TEST_TARGET=both`), the OIDF conformance suite
-  (`tests/conformance/run.sh`; clones the pinned suite tag itself and uploads
-  `tests/conformance/results/` as the `conformance-evidence` artifact even on
-  failure), and the release binary build (embeds the web client; release
-  panics without `webclientsrc/dist`).
+  `workflow_dispatch` + `workflow_call` from release.yml on `v*` tags) — the
+  heavy Docker suites: federation vs Samba AD DC + OpenLDAP, the two-node
+  cluster E2E, the Keycloak dual-target parity run
+  (`ISSUERD_TEST_TARGET=both`), the OIDF conformance suite
+  (`tests/conformance/run.sh`; clones the pinned suite tag itself, packs
+  `tests/conformance/results/` into one tarball and uploads it as the
+  `conformance-evidence` artifact even on failure), and the release binary
+  build (embeds the web client; release panics without `webclientsrc/dist`).
 - `.github/workflows/release.yml` (push of a `v*` tag) — the release pipeline:
   validates tag ↔ `[workspace.package] version` ↔ CHANGELOG section, then:
   Docker Hub gets per-arch images (`issuerd/issuerd:X.Y.Z-amd64` from the
@@ -849,20 +850,21 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 `.github/workflows/release.yml` runs on every pushed `v*` tag:
 
 1. **validate** — the tag (`v0.1.2`) must equal `[workspace.package] version` (`0.1.2`) and CHANGELOG.md must have a dated `## [0.1.2] - …` section; release notes are extracted from that section.
-2. **docker** (linux/amd64) — builds the canonical root Dockerfile and pushes `issuerd/issuerd:X.Y.Z-amd64` to Docker Hub. Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
-3. **linux-binary** (amd64) — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the amd64 image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
-4. **linux-arm64** — `scripts/cross-linux-arm64.sh` cross-compiles `aarch64-unknown-linux-gnu` on the x86_64 runner (ubuntu-22.04, dpkg multiarch sysroot from ports.ubuntu.com — no ARM runner, no QEMU build), smoke-runs the binary under `qemu-aarch64-static`, and packages the tarball. The same glibc 2.35 / OpenSSL 3.0 baseline as amd64 keeps the release-notes requirements identical.
-5. **docker-arm64** — packs the exact cross-compiled binary (plus the arm64 Kerberos libs staged by the cross script) into the distroless runtime via `Dockerfile.prebuilt` — a COPY-only build, so no arm64 code executes anywhere — and pushes `issuerd/issuerd:X.Y.Z-arm64`.
-6. **docker-manifest** — merges the two per-arch images into the user-facing multi-arch manifest list (`docker buildx imagetools create`): one tag, `:latest` / `:X.Y.Z` / `:X.Y`, serves both architectures (`docker pull` resolves the host arch). Per-arch tags keep no embedded SBOM/provenance attestations — attested pushes turn a tag into an OCI index, and indexes cannot be nested into the manifest list.
-7. **crates-io** — builds the web client (publish staging embeds it), installs `libkrb5-dev` (the staged `issuerd-federation` verify-build compiles `libgssapi-sys`, whose build script needs the MIT Kerberos dev package), and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
-8. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
-9. **release** — downloads only the `*-dist` + `release-notes` artifacts (never "all": docker/build-push-action auto-uploads `*.dockerbuild` build-record artifacts that download-artifact cannot fetch — suppressed at the source via `DOCKER_BUILD_RECORD_UPLOAD: false` on both docker jobs), `SHA256SUMS.txt`, build-provenance attestations, GitHub Release (`make_latest`).
+2. **heavy** — calls `heavy.yml` as a reusable workflow (`workflow_call`): the full heavy suites (federation, cluster E2E, Keycloak parity, OIDF conformance) run inside the release run against the exact tagged commit. The GitHub Release job waits for it; the Docker/crates.io publish jobs deliberately do not (isolation — the nightly heavy runs are the early warning, and crates.io uploads are irreversible either way).
+3. **docker** (linux/amd64) — builds the canonical root Dockerfile and pushes `issuerd/issuerd:X.Y.Z-amd64` to Docker Hub. Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`; this job is isolated so a missing secret never blocks the GitHub Release.
+4. **linux-binary** (amd64) — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the amd64 image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
+5. **linux-arm64** — `scripts/cross-linux-arm64.sh` cross-compiles `aarch64-unknown-linux-gnu` on the x86_64 runner (ubuntu-22.04, dpkg multiarch sysroot from ports.ubuntu.com — no ARM runner, no QEMU build), smoke-runs the binary under `qemu-aarch64-static`, and packages the tarball. The same glibc 2.35 / OpenSSL 3.0 baseline as amd64 keeps the release-notes requirements identical.
+6. **docker-arm64** — packs the exact cross-compiled binary (plus the arm64 Kerberos libs staged by the cross script) into the distroless runtime via `Dockerfile.prebuilt` — a COPY-only build, so no arm64 code executes anywhere — and pushes `issuerd/issuerd:X.Y.Z-arm64`.
+7. **docker-manifest** — merges the two per-arch images into the user-facing multi-arch manifest list (`docker buildx imagetools create`): one tag, `:latest` / `:X.Y.Z` / `:X.Y`, serves both architectures (`docker pull` resolves the host arch). Per-arch tags keep no embedded SBOM/provenance attestations — attested pushes turn a tag into an OCI index, and indexes cannot be nested into the manifest list.
+8. **crates-io** — builds the web client (publish staging embeds it), installs `libkrb5-dev` (the staged `issuerd-federation` verify-build compiles `libgssapi-sys`, whose build script needs the MIT Kerberos dev package), and runs `scripts/publish.py --real` (needs the `CARGO_REGISTRY_TOKEN` repo secret; isolated, resumable via `--from`).
+9. **windows-binary** — `windows-latest` runner (Strawberry Perl for the vendored openssl build, web client first), self-contained zip.
+10. **release** — needs the packaging jobs AND `heavy` green (skipped only under act); downloads only the `*-dist` + `release-notes` + `conformance-evidence` artifacts (never "all": docker/build-push-action auto-uploads `*.dockerbuild` build-record artifacts that download-artifact cannot fetch — suppressed at the source via `DOCKER_BUILD_RECORD_UPLOAD: false` on both docker jobs), renames the evidence tarball to `issuerd_X.Y.Z_conformance-evidence.tar.gz`, `SHA256SUMS.txt` (covers the evidence bundle too), build-provenance attestations, GitHub Release (`make_latest`).
 
-Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it).
+Each archive (`issuerd_0.1.2_linux_amd64.tar.gz`, `issuerd_0.1.2_linux_arm64.tar.gz`, `issuerd_0.1.2_windows_amd64.zip`) contains the binary, LICENSE + NOTICE, README + CHANGELOG, `examples/` starter configs, and a CycloneDX SBOM (also attached standalone) — assembled by `scripts/package-release.sh`, which is the single source of truth for packaging (CI and local rehearsal both call it). The conformance evidence bundle is NOT part of any archive: like the standalone SBOMs, it is attached to the GitHub Release as one separate asset (`issuerd_X.Y.Z_conformance-evidence.tar.gz`).
 
-**Release procedure:** bump `[workspace.package] version` (and the `issuerd-*` dependency pins in the same file) → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → regenerate the OpenAPI spec (`cargo run --bin issuerd -- openapi -o webclientsrc/openapi.json` — `info.version` embeds the package version, so the committed spec goes stale on every bump and the `openapi-sync` CI job fails otherwise) → sync `Cargo.lock` (`cargo metadata --format-version 1 --quiet > /dev/null`) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push publishes everything: GitHub Release, the multi-arch Docker image, and the crates.io workspace.
+**Release procedure:** bump `[workspace.package] version` (and the `issuerd-*` dependency pins in the same file) → rename `## [Unreleased]` to `## [X.Y.Z] - <date>` in CHANGELOG.md (fresh empty `Unreleased` above) → regenerate the OpenAPI spec (`cargo run --bin issuerd -- openapi -o webclientsrc/openapi.json` — `info.version` embeds the package version, so the committed spec goes stale on every bump and the `openapi-sync` CI job fails otherwise) → sync `Cargo.lock` (`cargo metadata --format-version 1 --quiet > /dev/null`) → commit → `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push publishes everything: GitHub Release, the multi-arch Docker image, and the crates.io workspace. It also runs the full heavy suites (`heavy.yml` via `workflow_call`) — expect the run to take as long as the conformance suite (~1–2 h); the GitHub Release waits for them and attaches the packed conformance evidence, while the Docker/crates.io publishes proceed in parallel without waiting.
 
-**Local rehearsal** (nothing is published; publish steps auto-skip under act via `env.ACT != 'true'`, and the `windows-binary` job — no Windows containers under act — is rehearsed natively on a Windows host):
+**Local rehearsal** (nothing is published; publish steps auto-skip under act via `env.ACT != 'true'`, the `heavy` reusable-workflow call is skipped via `vars.ACT` — job-level `if` has no `env` context on GitHub, so `.act/run-release.sh` passes `--var ACT=true` — and the `windows-binary` job, with no Windows containers under act, is rehearsed natively on a Windows host):
 
 ```bash
 ../.act/run-release.sh                 # act run: validate, docker amd64 build, linux amd64 + arm64

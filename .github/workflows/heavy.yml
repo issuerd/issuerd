@@ -5,13 +5,17 @@ name: Heavy suites
 # two-node cluster E2E, the Keycloak dual-target parity run, the OIDF
 # conformance suite (with the run reports uploaded as evidence artifacts),
 # and the release binary build (which embeds the web client). Runs nightly
-# at 03:17 UTC (off the top-of-hour herd) and on manual trigger (Actions →
-# "Heavy suites" → Run workflow). Scheduled runs only fire on the default
+# at 03:17 UTC (off the top-of-hour herd), on manual trigger (Actions →
+# "Heavy suites" → Run workflow), and as a reusable workflow called by
+# release.yml on v* tag pushes — in that mode the jobs run inside the release
+# run, so the conformance evidence artifact lands where the release job can
+# attach it to the GitHub Release. Scheduled runs only fire on the default
 # branch, and GitHub disables them after 60 days of repository inactivity.
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -138,12 +142,27 @@ jobs:
         working-directory: tests/conformance
         run: ./run.sh
       # Evidence: html-reports-*/index.html, export-json/, exports/ zips and
-      # the oidcc-*-output.log runner logs. Uploaded on failure too — a red
-      # run is exactly when the evidence matters.
+      # the oidcc-*-output.log runner logs, packed as ONE tarball. release.yml
+      # attaches that file to the GitHub Release as a standalone asset (like
+      # the SBOMs — not part of the binary distros). Uploaded on failure too —
+      # a red run is exactly when the evidence matters.
+      - name: Pack the evidence bundle
+        if: always()
+        working-directory: tests/conformance
+        run: |
+          set -euo pipefail
+          if [ -d results ]; then
+            tar -czf conformance-evidence.tar.gz -C results .
+          else
+            echo "conformance run died before producing results/" > MISSING.txt
+            tar -czf conformance-evidence.tar.gz MISSING.txt
+          fi
+          ls -lh conformance-evidence.tar.gz
       - name: Upload evidence artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-evidence
-          path: tests/conformance/results/
+          path: tests/conformance/conformance-evidence.tar.gz
           retention-days: 30
+          if-no-files-found: error

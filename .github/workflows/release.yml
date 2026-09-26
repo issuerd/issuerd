@@ -6,6 +6,16 @@ name: Release
 # [workspace.package] version in Cargo.toml and have a dated CHANGELOG.md
 # section — the validate job fails fast otherwise.
 #
+# Heavy suites: the tag run also executes heavy.yml (federation, cluster E2E,
+# Keycloak parity, OIDF conformance) as a reusable-workflow call — the final
+# verification of the exact released commit. The GitHub Release job waits for
+# it and attaches the packed conformance evidence bundle as a standalone
+# release asset (not inside the binary distros — one copy alongside the
+# SBOMs). The publish jobs (Docker Hub, crates.io) deliberately do NOT wait
+# on the heavy suites: they stay isolated so a flaky directory container
+# never holds back an already-validated publish, and the nightly heavy runs
+# are the early warning (crates.io uploads are irreversible either way).
+#
 # Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images
 # (issuerd/issuerd:X.Y.Z-amd64, …-arm64), then docker-manifest assembles the
 # user-facing manifest list (:latest, :X.Y.Z, :X.Y) — one tag serving both
@@ -78,6 +88,7 @@ jobs:
           - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
           - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, cross-compiled on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
           - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
+          - \`issuerd_${VERSION}_conformance-evidence.tar.gz\` — OIDF conformance suite evidence from this tag's run (HTML reports, JSON exports, runner logs; informational — not needed to run issuerd)
 
           Each archive contains the binary, LICENSE + NOTICE, README + CHANGELOG, example configs, and a CycloneDX SBOM (also attached standalone). Verify downloads against \`SHA256SUMS.txt\`.
 
@@ -98,6 +109,19 @@ jobs:
         with:
           name: release-notes
           path: release-notes.md
+
+  heavy:
+    name: heavy suites (federation, cluster E2E, parity, conformance)
+    needs: validate
+    # Reusable-workflow call — the heavy jobs run inside THIS run, so the
+    # conformance-evidence artifact is downloadable by the release job below.
+    # Skipped under act (rehearsing hours of Docker suites locally is
+    # pointless); the release job tolerates that skip via its `if`. Gate uses
+    # vars.ACT — job-level `if` has NO `env` context (GitHub rejects it, as
+    # does act), so .act/run-release.sh passes `--var ACT=true` instead of
+    # relying on act's automatic ACT env var.
+    if: ${{ vars.ACT != 'true' }}
+    uses: ./.github/workflows/heavy.yml
 
   docker:
     name: docker image (linux/amd64) → Docker Hub
@@ -406,7 +430,10 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, linux-arm64, windows-binary]
+    needs: [validate, linux-binary, linux-arm64, windows-binary, heavy]
+    # Gate on every need, tolerating ONLY skips (act leaves out the heavy
+    # call): a failed suite or packaging job means no GitHub Release.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -426,19 +453,35 @@ jobs:
           # Named artifacts extract into cwd, not a per-artifact directory —
           # keep the release-notes/release-notes.md layout the steps expect.
           path: release-notes
+      # Packed by heavy.yml's conformance job (single tarball). Absent under
+      # act — the heavy call is skipped there.
+      - uses: actions/download-artifact@v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          name: conformance-evidence
+          path: conformance-evidence
       # Real runs must ship all three platforms; rehearsal (act) has no Windows job.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
              linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
-             windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json
+             windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
+             conformance-evidence/conformance-evidence.tar.gz
       - name: SHA256SUMS.txt
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
           for d in linux-dist linux-arm64-dist windows-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
+          # Standalone conformance evidence asset (absent under act).
+          if [ -f conformance-evidence/conformance-evidence.tar.gz ]; then
+            mv conformance-evidence/conformance-evidence.tar.gz \
+               "issuerd_${VERSION}_conformance-evidence.tar.gz"
+            sha256sum "issuerd_${VERSION}_conformance-evidence.tar.gz" >> SHA256SUMS.txt
+          fi
           cat SHA256SUMS.txt
       - name: Build-provenance attestation
         if: ${{ env.ACT != 'true' }}
@@ -448,6 +491,7 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            issuerd_*_conformance-evidence.tar.gz
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
         uses: softprops/action-gh-release@v2
@@ -459,9 +503,12 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
       - name: Release contents (always logged — this is what rehearsal inspects)
         run: |
           ls -l *-dist/
+          ls -l issuerd_*_conformance-evidence.tar.gz 2>/dev/null \
+            || echo "(no conformance evidence — act rehearsal)"
           echo '--- release notes ---'
           cat release-notes/release-notes.md
