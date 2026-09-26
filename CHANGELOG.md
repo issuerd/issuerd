@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Token exchange: the requester-in-audience check is now mandatory** (RFC 8693 hardening, security-review remediation). The client authenticated at the token endpoint must always appear in the subject token's `aud` claim (string or array form), in both internal and impersonation modes, or the exchange fails with `invalid_grant` — Keycloak's semantics, now unconditional. Previously this was the opt-in `require_requester_in_subject_aud` realm/client attribute (default off), which let a client re-scope any valid token of the realm it had been handed. The attribute is removed; leftover occurrences in stored realms/clients are inert. **Migration:** if a client legitimately exchanges tokens issued to a different client, make the issuing client add the requester to the token audience — e.g. an `oidc-audience-mapper` protocol mapper with `included.client.audience` set to the requesting client. See `docs/client-integration.md` — "Token exchange and impersonation".
+
 ## [0.1.6] - 2026-09-26
 
 ### Added

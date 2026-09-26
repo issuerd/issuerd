@@ -18,12 +18,12 @@
 //!   the `impersonator` claim and the same audit treatment applies (admin
 //!   event + gate-bypassing login event).
 //!
-//! The subject token's `aud` is **not** checked by default: any valid access
-//! token of the realm may be presented (see `token_exchange_grant`). The
-//! opt-in `require_requester_in_subject_aud` policy (realm attribute, or
-//! requesting-client attribute override) switches to Keycloak's stricter
-//! semantics — the requesting client must appear in the subject token's
-//! audience — and applies to both modes.
+//! The subject token's `aud` MUST contain the requesting client (Keycloak's
+//! semantics, unconditional since the security-review remediation): a client
+//! may only exchange a token that was issued for it, in both modes — see
+//! `token_exchange_grant`. (The former opt-in
+//! `require_requester_in_subject_aud` realm/client attribute was removed;
+//! leftover attributes in stored realms/clients are inert.)
 //!
 //! Out of scope (rejected at protocol validation): delegation
 //! (`actor_token`), non-access-token subject/requested token types.
@@ -51,20 +51,6 @@ use crate::state::ServerState;
 /// Client attribute gating internal token exchange to this client as the
 /// target audience.
 pub(crate) const CLIENT_TOKEN_EXCHANGE_ATTRIBUTE: &str = "token.exchange.enabled";
-
-/// Opt-in strict audience policy for token exchange (RFC 8693): when
-/// enabled, the requesting client must appear in the subject token's `aud`
-/// claim — Keycloak's always-on semantics, off here by default for backward
-/// compatibility.
-///
-/// Read as a **realm attribute** (the realm-wide default) with a
-/// **requesting-client attribute override**: a client attribute value of
-/// `"true"`/`"false"` wins over the realm setting in either direction, so a
-/// realm can enforce the policy globally while exempting individual clients
-/// (or enforce it only for selected clients). Applies to internal and
-/// impersonation exchanges alike.
-pub(crate) const REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE: &str =
-    "require_requester_in_subject_aud";
 
 /// Realm role the subject-token owner must hold to run an impersonation
 /// exchange — the same role the admin impersonation endpoint checks.
@@ -95,9 +81,9 @@ pub(crate) async fn token_exchange_grant(
         return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
     }
 
-    // Stateless validation: signature, expiry, issuer family. `aud` is
-    // deliberately not checked — the subject token only needs to be a valid
-    // token of this realm, regardless of which client it was minted for.
+    // Stateless validation: signature, expiry, issuer family. `aud` is not
+    // checked here — the mandatory requester-in-audience check below handles
+    // it against the raw claim (the typed claims keep only its first entry).
     let subject_claims = match state.token_service.validate_access_token(subject_token) {
         Ok(v) => v.claims,
         Err(e) => {
@@ -139,16 +125,13 @@ pub(crate) async fn token_exchange_grant(
         }
     };
 
-    // Opt-in strict audience policy (Keycloak's default semantics): the
-    // requesting client must be an audience of the subject token. Without the
-    // flag any valid token of the realm may be presented (the historical
-    // behavior), which lets a client that was handed a token addressed to
-    // someone else re-scope it. The raw `aud` claim is inspected because the
-    // typed claims keep only its first entry.
-    if require_requester_in_subject_aud(realm, client)
-        && !subject_token_audience_contains(subject_token, client.client_id.as_ref())
-    {
-        warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: requesting client not in the subject token's audience (require_requester_in_subject_aud)");
+    // Mandatory audience check (Keycloak's semantics; security review
+    // remediation): the requesting client must be an audience of the subject
+    // token. Without it, a client that was handed a token addressed to
+    // someone else could re-scope it. The raw `aud` claim is inspected
+    // because the typed claims keep only its first entry.
+    if !subject_token_audience_contains(subject_token, client.client_id.as_ref()) {
+        warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: requesting client not in the subject token's audience");
         return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
     }
 
@@ -552,18 +535,6 @@ async fn impersonation_exchange(
     })
 }
 
-/// Effective `require_requester_in_subject_aud` policy for one exchange: the
-/// requesting client's attribute overrides the realm's in either direction;
-/// absent both, the lenient default (`false`) preserves the pre-policy
-/// behavior.
-fn require_requester_in_subject_aud(realm: &Realm, client: &Client) -> bool {
-    client
-        .attributes
-        .get(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE)
-        .or_else(|| realm.attributes.get(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE))
-        .is_some_and(|v| v == "true")
-}
-
 /// Whether the subject token's raw `aud` claim lists `client_id`, tolerating
 /// both JWT forms (`"aud": "a"` and `"aud": ["a", "b"]`). The payload is
 /// decoded WITHOUT re-verifying the signature — trust comes from
@@ -658,53 +629,6 @@ async fn exchange_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use issuerd_core::{ClientProtocol, Scope};
-
-    fn realm_with_policy(value: Option<&str>) -> Realm {
-        let mut realm = Realm {
-            id: RealmId::new("test").unwrap(),
-            name: issuerd_core::RealmName::new("test").unwrap(),
-            ..Default::default()
-        };
-        if let Some(v) = value {
-            realm
-                .attributes
-                .insert(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE.to_string(), v.to_string());
-        }
-        realm
-    }
-
-    fn client_with_policy(value: Option<&str>) -> Client {
-        let mut client = Client {
-            id: issuerd_core::ClientId::new("client-uuid-1").unwrap(),
-            realm_id: RealmId::new("test").unwrap(),
-            client_id: ClientIdentifier::new("requester").unwrap(),
-            name: None,
-            description: None,
-            enabled: true,
-            protocol: ClientProtocol::OpenIdConnect,
-            public_client: false,
-            bearer_only: false,
-            client_authenticator_type: issuerd_core::ClientAuthenticatorType::ClientSecret,
-            secret: None,
-            redirect_uris: vec![],
-            web_origins: vec![],
-            default_scopes: Scope::empty(),
-            optional_scopes: Scope::empty(),
-            consent_required: false,
-            full_scope_allowed: true,
-            service_accounts_enabled: false,
-            protocol_mappers: Vec::new(),
-            scope_mappings: Default::default(),
-            attributes: HashMap::new(),
-        };
-        if let Some(v) = value {
-            client
-                .attributes
-                .insert(REQUIRE_REQUESTER_IN_SUBJECT_AUD_ATTRIBUTE.to_string(), v.to_string());
-        }
-        client
-    }
 
     /// Mint an unsigned-shaped JWT carrying `aud` for the audience helper
     /// (the helper never verifies the signature — the exchange validated the
@@ -719,49 +643,6 @@ mod tests {
             b64(serde_json::json!({"alg": "none"})),
             b64(serde_json::json!({"sub": "user-1", "aud": aud}))
         )
-    }
-
-    #[test]
-    fn policy_defaults_off_without_attributes() {
-        assert!(!require_requester_in_subject_aud(
-            &realm_with_policy(None),
-            &client_with_policy(None)
-        ));
-    }
-
-    #[test]
-    fn policy_realm_attribute_enables() {
-        assert!(require_requester_in_subject_aud(
-            &realm_with_policy(Some("true")),
-            &client_with_policy(None)
-        ));
-        // Any value other than exactly "true" keeps the policy off.
-        assert!(!require_requester_in_subject_aud(
-            &realm_with_policy(Some("false")),
-            &client_with_policy(None)
-        ));
-        assert!(!require_requester_in_subject_aud(
-            &realm_with_policy(Some("1")),
-            &client_with_policy(None)
-        ));
-    }
-
-    #[test]
-    fn policy_client_attribute_overrides_realm_in_both_directions() {
-        // Client opt-in with the realm default off.
-        assert!(require_requester_in_subject_aud(
-            &realm_with_policy(None),
-            &client_with_policy(Some("true"))
-        ));
-        assert!(require_requester_in_subject_aud(
-            &realm_with_policy(Some("false")),
-            &client_with_policy(Some("true"))
-        ));
-        // Client exemption with the realm enforcing.
-        assert!(!require_requester_in_subject_aud(
-            &realm_with_policy(Some("true")),
-            &client_with_policy(Some("false"))
-        ));
     }
 
     #[test]
