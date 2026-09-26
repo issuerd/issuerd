@@ -1,0 +1,8 @@
+{# Renders `entries` (a list of TraceEntry). Used for the initial page render
+   and, with hx-swap-oob="beforeend" on the wrapper, for appended entries. #}
+{% for e in entries %}
+<details class="trace-entry kind-{{ e.kind }} {{ 'ok' if e.ok else 'fail' }}"{% if loop.last %} open{% endif %}>
+  <summary><span class="dot"></span><span class="trace-kind">{{ e.kind }}</span><span class="trace-title">{{ e.title }}</span></summary>
+  {% if e.detail %}<pre class="trace-detail">{{ e.detail }}</pre>{% endif %}
+</details>
+{% endfor %}

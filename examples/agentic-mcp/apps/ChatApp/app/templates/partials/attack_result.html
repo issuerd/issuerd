@@ -1,0 +1,14 @@
+<div class="msg attack"><div class="bubble">
+  <div class="attack-title">⚔ {{ attack.title }}</div>
+  <div class="attack-label2">what an attacker would run:</div>
+  <pre class="attack-cmd">{{ attack.command }}</pre>
+  <div class="attack-label2">the real response from the MCP server:</div>
+  <div class="attack-status">
+    <span class="status-badge {{ 'held' if attack.status in (401, 403) else 'bad' }}">HTTP {{ attack.status }}</span>
+    {% if attack.www_authenticate %}<code class="www-auth">{{ attack.www_authenticate }}</code>{% endif %}
+  </div>
+  <pre class="attack-body">{{ attack.body }}</pre>
+  <div class="attack-explain">{{ attack.explanation }}</div>
+</div></div>
+{# Trace entry for this attack. #}
+<div id="trace-list" hx-swap-oob="beforeend">{% include "partials/trace_entries.html" %}</div>

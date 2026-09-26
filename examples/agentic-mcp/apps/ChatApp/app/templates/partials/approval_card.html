@@ -1,0 +1,57 @@
+{# CIBA approval card. Pending variant polls /chat/ciba-status every 5.5 s and
+   swaps itself out (outerHTML) when the server observes the user's decision.
+   Resolved variants render the outcome and stop polling. #}
+{% if not resolved %}
+<div class="approval-card pending" id="ciba-card"
+     hx-get="/chat/ciba-status?auth_req_id={{ pending.auth_req_id }}"
+     hx-trigger="every 5.5s" hx-swap="outerHTML">
+  <div class="card-title">Human step-up required <span class="badge-ciba">CIBA</span></div>
+  <div class="card-body">The agent requests your approval:
+    <strong>{{ pending.binding_message }}</strong></div>
+  {# Cross-origin form POST into the hidden iframe: the user's SSO cookie flows
+     (same-site subdomains), no CORS, the chat page never navigates. #}
+  <form class="card-actions" method="post"
+        action="{{ settings.ciba_approve_url_public }}" target="ciba_iframe">
+    <input type="hidden" name="auth_req_id" value="{{ pending.auth_req_id }}">
+    <button type="submit" name="action" value="approve" class="btn-approve"
+            onclick="cibaSubmitted(this.closest('.approval-card'))">Approve</button>
+    <button type="submit" name="action" value="deny" class="btn-deny"
+            onclick="cibaSubmitted(this.closest('.approval-card'))">Deny</button>
+    <span class="decision-hint">expires in <span data-expires="{{ pending.expires_at | int }}">120s</span></span>
+  </form>
+</div>
+{% else %}
+<div class="approval-card resolved {{ resolved }}" id="ciba-card">
+  {% if resolved == "approved" %}
+    <div class="card-title">✓ Approved — refund executed</div>
+    <div class="card-body">You approved <strong>{{ pending.binding_message }}</strong>.
+      The agent received a 120-second step-up token with scope <code>refunds:execute</code>,
+      exchanged it for <code>aud=mcp-server</code>, and the MCP server applied the refund.</div>
+    {% if order_json %}<pre class="card-json">{{ order_json }}</pre>{% endif %}
+  {% elif resolved == "denied" %}
+    <div class="card-title">✗ Refund cancelled by user</div>
+    <div class="card-body">You denied <strong>{{ pending.binding_message }}</strong>.
+      No step-up token was issued and the agent cannot retry without a new request.</div>
+  {% elif resolved == "expired" %}
+    <div class="card-title">⏱ Approval request expired</div>
+    <div class="card-body">The request <strong>{{ pending.binding_message }}</strong> ran out of
+      its 120-second window. Ask again to start a fresh approval.</div>
+  {% elif resolved == "missing" %}
+    <div class="card-title">Approval request not found</div>
+    <div class="card-body">This request was already resolved or has expired.</div>
+  {% else %}
+    <div class="card-title">✗ Step-up failed</div>
+    <div class="card-body">{{ error }}</div>
+  {% endif %}
+</div>
+{% if resolved == "approved" and order %}
+<div id="transcript" hx-swap-oob="beforeend"><div class="msg agent"><div class="bubble">Refund processed:
+  order <strong>#{{ order.id }}</strong> — ${{ order.amount }} → status
+  <code>{{ order.status }}</code>. The step-up token is already useless for anything else:
+  it expired in 120&nbsp;s and only ever worked for <code>refunds:execute</code> on
+  <code>mcp-server</code>.</div></div></div>
+{% endif %}
+{% endif %}
+{# Trace entries produced by the poll / the refund call (resolved renders only —
+   the messages partial appends its own entries for the pending render). #}
+{% if resolved and entries %}<div id="trace-list" hx-swap-oob="beforeend">{% include "partials/trace_entries.html" %}</div>{% endif %}

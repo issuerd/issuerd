@@ -1,0 +1,16 @@
+<div class="msg user"><div class="bubble">{{ message }}</div></div>
+{% for ev in events %}
+  {% if ev.kind == "orders" %}
+  <div class="msg agent"><div class="bubble">
+    {% include "partials/orders.html" %}
+  </div></div>
+  {% elif ev.kind == "approval" %}
+    {% set pending = ev.pending %}
+    {% set resolved = none %}
+    {% include "partials/approval_card.html" %}
+  {% elif ev.text %}
+  <div class="msg agent"><div class="bubble">{{ ev.text }}</div></div>
+  {% endif %}
+{% endfor %}
+{# Append the trace entries produced while handling this message. #}
+<div id="trace-list" hx-swap-oob="beforeend">{% include "partials/trace_entries.html" %}</div>

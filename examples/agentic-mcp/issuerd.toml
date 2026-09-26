@@ -1,0 +1,35 @@
+# Issuerd configuration for the agentic MCP example (docker-compose.yml in
+# this directory). Single node: PostgreSQL for persistence (so the demo users
+# and their UUID subs survive restarts — the shop.orders rows are keyed by
+# them), in-memory cache for transient state (DPoP jti replay cache, pending
+# CIBA requests), plain HTTP on :8080.
+
+bind = "0.0.0.0"
+port = 8080
+
+# Public base URL as reached by browsers; baked into the `iss` claim and the
+# discovery document, so it must match how clients access the container. The
+# apps reach the same server internally as http://issuerd:8080 — DPoP `htu`
+# validation always compares against this public spelling.
+issuer_url = "http://localhost:8080"
+
+# Realm content (master with admin/admin, demo with alice/bob, the chat-app
+# and mcp-server clients), applied exactly once at first startup against an
+# empty database.
+provision = "/etc/issuerd/provision.yaml"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@postgres:5432/issuerd"
+
+[logging]
+format = "pretty"
+level = "info"
+
+[web_ui]
+enabled = true
+
+# The ChatApp UI (http://localhost:5108) — the CIBA approval rides a plain
+# cross-origin form POST into a hidden iframe (no CORS involved); listing the
+# origin here is belt-and-braces for any future fetch-based calls.
+[cors]
+allowed_origins = ["http://localhost:5108"]

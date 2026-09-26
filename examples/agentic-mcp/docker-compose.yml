@@ -1,0 +1,144 @@
+# Agentic MCP example — a complete, self-contained agentic-IAM demo:
+#
+#   docker compose up -d
+#
+# then open http://localhost:5108 and sign in as alice / changeme.
+#
+# The stack: Issuerd (OIDC IdP, pulled from Docker Hub — no Rust toolchain
+# needed) + the ChatApp (FastAPI/HTMX support-chat UI) + the McpServer
+# (FastMCP resource server, internal only) + PostgreSQL (Issuerd storage AND
+# the RLS-protected `shop` database). A one-shot `setup` container applies the
+# two things declarative provisioning cannot express: the
+# `token.exchange.enabled` attribute on the mcp-server client, and the
+# shop.orders seed rows keyed by the real user UUIDs.
+#
+# Ports: issuerd on localhost:8080, ChatApp on localhost:5108. Only one
+# issuerd stack can hold :8080 at a time — stop the root demo stack
+# (../../docker-compose.yml) first if it is running.
+#
+# Contributors: build issuerd from local sources instead of pulling:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.from-source.yml up -d --build
+#
+# Stop with `docker compose down`; wipe all state with `docker compose down -v`.
+
+name: issuerd-agentic-mcp
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # shop demo schema: creates the `shop` database, orders table + RLS
+      # policy and the non-owner mcp_user role on a FRESH volume only
+      # (docker-entrypoint-initdb.d semantics). Row seeding with real user
+      # subs happens in the setup service.
+      - ./apps/McpServer/db-init:/docker-entrypoint-initdb.d:ro
+    # No host port published: the demo is self-contained.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  issuerd:
+    image: issuerd/issuerd:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./issuerd.toml:/etc/issuerd/issuerd.toml:ro
+      - ./provision.yaml:/etc/issuerd/provision.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The runtime image ships no curl/shell — use the binary's own probe.
+      test: ["CMD", "issuerd", "healthcheck", "--url", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  mcpserver:
+    build:
+      context: ./apps/McpServer
+    restart: unless-stopped
+    environment:
+      # Public issuer spelling: the `iss` claim the JWT validator expects.
+      ISSUER: http://localhost:8080
+      REALM: demo
+      # JWKS pulled over the compose network — same keys, internal address.
+      JWKS_URL: http://issuerd:8080/realms/demo/protocol/openid-connect/certs
+      AUDIENCE: mcp-server
+      DATABASE_URL: postgres://mcp_user:RJUT-vefyAjQ5sL9Ia8sjwCs@postgres:5432/shop
+      PORT: "8000"
+    # Deliberately no published port: the resource server is reachable only
+    # from inside the compose network, never directly from the host.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  setup:
+    build:
+      context: ./setup
+    restart: "no"
+    environment:
+      IDP_BASE_URL: http://issuerd:8080
+      REALM: demo
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: admin
+      MCP_CLIENT_ID: mcp-server
+      SHOP_ADMIN_DSN: postgres://issuerd:issuerd_secret@postgres:5432/shop
+      SHOP_RLS_DSN: postgres://mcp_user:RJUT-vefyAjQ5sL9Ia8sjwCs@postgres:5432/shop
+      # verify.py: the public issuer spelling (as baked into `iss` and
+      # browser redirects) and the in-network spellings verify rewrites to.
+      IDP_PUBLIC: http://localhost:8080
+      IDP_INTERNAL: http://issuerd:8080
+      CHAT_BASE: http://chatapp:8000
+    depends_on:
+      issuerd:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  chatapp:
+    build:
+      context: ./apps/ChatApp
+    restart: unless-stopped
+    ports:
+      - "5108:8000"
+    environment:
+      # Public issuer spelling: browser redirects and DPoP `htu` claims.
+      ISSUER: http://localhost:8080
+      # Server-side IdP calls (token, exchange, CIBA) go over the compose
+      # network; Issuerd validates DPoP `htu` against the public spelling.
+      IDP_INTERNAL_BASE: http://issuerd:8080
+      REALM: demo
+      CLIENT_ID: chat-app
+      CLIENT_SECRET: f7ae7e19-3850-43d7-b27e-97c0020a84a4
+      PUBLIC_BASE: http://localhost:5108
+      MCP_URL: http://mcpserver:8000/mcp
+      DEMO_MODE: scripted
+      DPOP_KEY_PATH: /srv/chatapp/data/dpop_key.pem
+      SESSION_SECRET: l6aEU5UpQCagmtHEj5o3JPwZT4cf7ELXkPc1bUTJ0fo
+      PORT: "8000"
+    volumes:
+      # The ES256 DPoP key survives restarts (issued tokens stay bound to it).
+      - chatapp-data:/srv/chatapp/data
+    depends_on:
+      mcpserver:
+        condition: service_started
+      setup:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+    driver: local
+  chatapp-data:
+    driver: local

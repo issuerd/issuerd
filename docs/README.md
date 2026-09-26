@@ -28,7 +28,7 @@ Depending on your role, you will typically read the set in this order:
 | Connecting a user directory | [User federation](user-federation.md) → [LDAP group mapping and token claims](ldap-group-mapping.md) → [Provisioning](provisioning.md) → [Troubleshooting](troubleshooting.md) |
 | Connecting external identity providers | [Identity brokering](identity-brokering.md) → [Security](security.md) |
 | Application developer | [Client integration](client-integration.md) → [Configuration](configuration.md) (CORS, issuer) |
-| Building an AI agent or MCP server | [Agentic IAM: MCP tool calls](agentic-iam-mcp.md) → [Human step-up approval with CIBA](ciba-step-up.md) → [Client integration](client-integration.md) |
+| Building an AI agent or MCP server | [Agentic IAM: MCP tool calls](agentic-iam-mcp.md) → [Human step-up approval with CIBA](ciba-step-up.md) → [Client integration](client-integration.md) → [runnable demo](../examples/agentic-mcp/) |
 
 ## Documents
 
@@ -61,6 +61,7 @@ Depending on your role, you will typically read the set in this order:
 |---|---|
 | [Agentic IAM: MCP tool calls with DPoP and token exchange](agentic-iam-mcp.md) | Securing AI-agent tool calls end to end: DPoP sender-constraining (`cnf.jkt`, single-use `jti` replay cache), RFC 8693 audience/scope attenuation per call, the resource-server enforcement checklist, a live failure matrix, and the recorded MCP demo. |
 | [Human step-up approval with CIBA](ciba-step-up.md) | Client-Initiated Backchannel Authentication (poll mode) as the human-in-the-loop for privileged agent actions: endpoints and parameters, binding messages, DPoP-bound step-up tokens, the step-up configuration pattern, and the recorded refund-approval demo. |
+| [Runnable example: `examples/agentic-mcp/`](../examples/agentic-mcp/) | The same scenario as a self-contained docker compose stack (chat agent + MCP server + PostgreSQL RLS): `docker compose up -d`, sign in as alice/changeme, and watch every protocol step in the security-trace panel. |
 
 ### Identity sources
 

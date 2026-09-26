@@ -59,7 +59,7 @@ issuerd/
 ├── docker-compose.cluster.yml # Two-node cluster demo (nginx LB + Postgres + Redis)
 ├── cluster/                 # Cluster demo stack config (issuerd.toml, nginx.conf, provision.yaml)
 ├── dns/bind9/               # Bind9 zone config for the integration stack
-├── examples/                # Example server/provision configs (regenerable via `issuerd example`) + local demo stack config (*.demo.*)
+├── examples/                # Example server/provision configs (regenerable via `issuerd example`) + local demo stack config (*.demo.*) + runnable examples (agentic-mcp/ — dockerized agentic IAM demo: DPoP + RFC 8693 + CIBA)
 ├── docs/                    # Operations documentation set (index: docs/README.md) + CLUSTERING.md, PERFORMANCE.md, crate graph
 ├── themes/                  # Login theme(s) served at /realms/{realm}/theme/{*path}
 └── webclientsrc/            # Embedded React/Vite admin + account SPA (optional)

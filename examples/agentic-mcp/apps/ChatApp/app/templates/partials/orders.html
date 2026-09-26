@@ -1,0 +1,17 @@
+{% if ev.orders %}
+<table class="orders">
+  <thead><tr><th>id</th><th>item</th><th>amount</th><th>status</th></tr></thead>
+  <tbody>
+    {% for o in ev.orders %}
+    <tr>
+      <td>#{{ o.id }}</td>
+      <td>{{ o.item }}</td>
+      <td>${{ o.amount }}</td>
+      <td><span class="status-pill status-{{ o.status }}">{{ o.status }}</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty-orders"><em>No orders found for your account.</em></p>
+{% endif %}

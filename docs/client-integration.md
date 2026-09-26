@@ -349,6 +349,8 @@ One paragraph each on the advanced OAuth surface; all are implemented and advert
 
 **CIBA (Client-Initiated Backchannel Authentication), poll mode.** Confidential clients start an out-of-band authentication with `POST {issuer}/protocol/openid-connect/ext/ciba/auth` carrying a user hint and receive an `auth_req_id`. The parser accepts `login_hint`, `login_hint_token`, and `id_token_hint`, but the handler currently resolves the user from `login_hint` (a plain username) only — a request carrying only one of the other two hints fails with `400` `unknown_user_id`. After the user approves on their second device, the client polls the token endpoint with `grant_type=urn:openid:params:grant-type:ciba`. Ping and push delivery modes are out of scope. The agent step-up pattern — binding messages, DPoP-bound step-up tokens, and the recorded approval demo — is covered in [Human step-up approval for agent actions: CIBA](ciba-step-up.md).
 
+**Runnable example.** The three capabilities above (DPoP, token exchange, CIBA) come together in [`examples/agentic-mcp/`](../examples/agentic-mcp/): a self-contained docker compose stack (Issuerd + chat agent + MCP server + PostgreSQL RLS) that runs the full agentic scenario in a browser — `docker compose up -d`, sign in as alice/changeme, watch the security trace.
+
 ## Realm token and session settings
 
 Token and session lifetimes are realm settings; admins change them in the admin console (realm settings), in provision YAML (`examples/provision.example.yaml`), or through the Admin API realm update. Details in [administration.md](administration.md). Defaults:
