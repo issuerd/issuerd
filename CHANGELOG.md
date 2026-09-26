@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-27
+
 ### Added
 
 - **Runnable agentic IAM example: `examples/agentic-mcp/`**. A self-contained docker compose stack — Issuerd + a FastAPI/HTMX support-chat agent + a FastMCP resource server + PostgreSQL with row-level security — demonstrating the full agentic scenario in a browser: OIDC login with DPoP-bound tokens, RFC 8693 audience/scope attenuation per tool call, CIBA human step-up for refunds (DPoP-bound step-up token), prompt-injection containment via RLS, and live attack buttons (stolen-token replay, missing scope, refund without step-up) with a security-trace panel narrating every protocol step. `cd examples/agentic-mcp && docker compose up -d`, then http://localhost:5108 (alice/changeme); a headless self-check (`docker compose run --rm setup python verify.py`) asserts the whole flow. Indexed from the new `examples/README.md` and linked from `docs/client-integration.md` / `docs/README.md`.
