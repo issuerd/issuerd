@@ -292,11 +292,7 @@ All OIDC-parity feature areas are implemented. Deliberately out of scope for now
 
 ## Contributing
 
-1. Review the conventions in `AGENTS.md`
-2. Create a feature branch: `git checkout -b feat/<feature-name>`
-3. Implement with tests first (TDD encouraged)
-4. Ensure `cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo fmt --check` pass
-5. Respect the backward-compatibility policy, keep the discovery document truthful, and keep the admin SPA dynamic (see the enum rule in `AGENTS.md`)
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, the CI gates, and the standing rules (backward compatibility, truthful discovery, dynamic admin SPA). The deep engineering conventions live in [AGENTS.md](AGENTS.md); participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 

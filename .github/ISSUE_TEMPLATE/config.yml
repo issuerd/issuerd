@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/issuerd/issuerd/blob/main/docs/security.md#vulnerability-reporting
+    about: Do NOT open a public issue — report privately to security@issuerd.org.
+  - name: Documentation
+    url: https://github.com/issuerd/issuerd/blob/main/docs/README.md
+    about: Operations guides — deployment, configuration, administration, troubleshooting.

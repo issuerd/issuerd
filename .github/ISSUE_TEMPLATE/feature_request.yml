@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Scope note:** SAML 2.0, UMA/Authorization Services, fine-grained
+        admin permissions (FGAP), Organizations, FAPI 2.0 message signing, and
+        CIBA ping/push modes are deliberately out of scope for now (see the
+        [project scope](https://github.com/issuerd/issuerd#project-scope)).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: The use case or limitation you ran into.
+      placeholder: When I try to …, I cannot …
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should Issuerd do? Sketches of API surface, config keys, or protocol behavior are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other designs you weighed.
+  - type: input
+    id: spec
+    attributes:
+      label: Spec or reference implementation
+      description: RFC / OIDC spec clause, or how Keycloak handles this, if relevant.
+      placeholder: e.g. RFC 9396 (RAR), Keycloak 26 docs

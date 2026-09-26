@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a defect in Issuerd
+labels: ["bug"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected to happen instead.
+      placeholder: |
+        Steps to reproduce, observed behavior, expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Issuerd version
+      description: The release tag, image tag, or commit you are running.
+      placeholder: v0.1.6
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running Issuerd?
+      options:
+        - Docker Hub image (issuerd/issuerd)
+        - Docker Compose demo stack
+        - Release binary
+        - Built from source
+        - crates.io (cargo install)
+    validations:
+      required: true
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage backend
+      options:
+        - PostgreSQL
+        - In-memory
+        - JSON file
+        - Not sure / not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Paste the relevant log lines. Logs must never contain secrets — redact
+        tokens, passwords, client secrets, cookies, and connection URLs
+        before pasting.
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Config snippets (redacted), realm setup, related issues.
