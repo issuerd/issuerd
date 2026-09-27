@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-27
+
+### Fixed
+
+- **Docker linux/arm64 image failed to start.** The 0.1.8 (and earlier) `issuerd/issuerd` arm64 image shipped `/usr/local/bin/issuerd` without the executable bit: the release workflow hands the natively built binary to the image-packaging job through a workflow artifact, which drops Unix mode bits, and the plain `COPY` in `Dockerfile.prebuilt` baked `0644` into the image. On ARM hosts (Apple Silicon, ARM Linux) any container run from the multi-arch tags (`latest`, `0.1.8`, `0.1`) died immediately with `exec: "issuerd": executable file not found in $PATH`. The packaging Dockerfile now uses `COPY --chmod=0755` so the mode no longer depends on how the build context was transported. Only the arm64 Docker image was affected — the amd64 image (compiled inside the container), the arm64 release tarball (tar preserves modes), and the crates.io crates are all fine. **Action for ARM users on 0.1.8:** pull `issuerd/issuerd:0.1.9` (or `latest`); alternatively force the amd64 image with `--platform linux/amd64`.
+
 ## [0.1.8] - 2026-09-27
 
 ### Security
