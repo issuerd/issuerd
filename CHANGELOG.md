@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-27
+
 ### Security
 
 - **`examples/agentic-mcp` demo stack: bumped vulnerable Python pins + fixed a regex DoS.** ChatApp requirements moved to PyJWT 2.14.0, cryptography 50.0.1, python-multipart 0.0.31, clearing 17 Dependabot alerts (HS256 public-key confusion forgery, PKCS#7 Bleichenbacher oracle, multipart header DoS / arbitrary file write, and others). Demo code only — the issuerd server is Rust and has none of these in its dependency tree. Also rewrote the ChatApp intent parser's order-id regex, which had a polynomial-backtracking DoS on long whitespace runs (CodeQL `py/polynomial-redos`); matching behavior is unchanged (verified against the old pattern plus the app's smoke suite).
