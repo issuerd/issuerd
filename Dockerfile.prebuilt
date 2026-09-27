@@ -25,7 +25,9 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 FROM ${RUNTIME_IMAGE}
 
 COPY rootfs/ /
-COPY issuerd /usr/local/bin/issuerd
+# --chmod is mandatory: the release workflow stages this build context through
+# actions/upload-artifact + download-artifact, which drop the executable bit.
+COPY --chmod=0755 issuerd /usr/local/bin/issuerd
 
 # The :nonroot distroless tag already runs as uid 65532.
 EXPOSE 8080
