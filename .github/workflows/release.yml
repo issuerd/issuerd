@@ -88,6 +88,7 @@ jobs:
           - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
           - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, built natively (ubuntu-22.04-arm runner) on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
           - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
+          - \`issuerd_${VERSION}_macos_arm64.tar.gz\` — macOS Apple Silicon (arm64), natively built (macos-15 runner, deployment target macOS 11.0)
           - \`issuerd_${VERSION}_conformance-evidence.tar.gz\` — OIDF conformance suite evidence from this tag's run (HTML reports, JSON exports, runner logs; informational — not needed to run issuerd)
 
           Each archive contains the binary, LICENSE + NOTICE, README + CHANGELOG, example configs, and a CycloneDX SBOM (also attached standalone). Verify downloads against \`SHA256SUMS.txt\`.
