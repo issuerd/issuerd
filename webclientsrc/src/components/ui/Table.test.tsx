@@ -29,7 +29,15 @@ describe('Table components', () => {
   })
 
   it('applies Table className', () => {
-    const { container } = render(<Table className="my-table">x</Table>)
+    const { container } = render(
+      <Table className="my-table">
+        <Tbody>
+          <Tr>
+            <Td>x</Td>
+          </Tr>
+        </Tbody>
+      </Table>
+    )
     expect(container.firstChild).toHaveClass('my-table')
   })
 })
