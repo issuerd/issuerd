@@ -504,6 +504,7 @@ enum StageOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2862,5 +2863,500 @@ mod tests {
         let outcome = executor.execute(&config, &mut ctx).await.unwrap();
         let result = assert_success(outcome);
         assert!(result.required_actions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume-point arithmetic: the stage named by execution_id must run
+    // exactly once (regression tests for `idx + 1` slicing in continue_flow)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn continue_flow_success_does_not_reexecute_resume_stage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let auth = TestAuthenticator::new("auth", move |ctx| {
+            // A second invocation would fail the flow: the resume stage must
+            // not be executed twice.
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ctx.user_id = Some(UserId::new("alice").unwrap());
+                AuthStepResult::Success
+            } else {
+                AuthStepResult::Failure(IssuerdError::InvalidGrant)
+            }
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Required, "auth", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor
+            .continue_flow(&config, &FlowStageId::new("s1").unwrap(), &mut ctx)
+            .await
+            .unwrap();
+        assert_success(outcome);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "resume stage ran twice");
+    }
+
+    #[tokio::test]
+    async fn continue_flow_optional_failure_does_not_reexecute_resume_stage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let auth = TestAuthenticator::new("auth", move |_ctx| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            AuthStepResult::Failure(IssuerdError::InvalidGrant)
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Optional, "auth", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor
+            .continue_flow(&config, &FlowStageId::new("s1").unwrap(), &mut ctx)
+            .await
+            .unwrap();
+        let err = assert_failure(outcome);
+        assert_eq!(err, IssuerdError::AccessDenied);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "failed optional stage ran twice");
+    }
+
+    #[tokio::test]
+    async fn continue_flow_optional_attempted_does_not_reexecute_resume_stage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let auth = TestAuthenticator::new("auth", move |_ctx| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            AuthStepResult::Attempted
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Optional, "auth", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor
+            .continue_flow(&config, &FlowStageId::new("s1").unwrap(), &mut ctx)
+            .await
+            .unwrap();
+        let err = assert_failure(outcome);
+        assert_eq!(err, IssuerdError::AccessDenied);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "attempted optional stage ran twice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional scope skipping
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn conditional_stage_runs_when_no_prior_failure() {
+        // Without a preceding conditional failure the stage must be
+        // evaluated: skipping it unconditionally would drop the only
+        // user-binding stage of the flow.
+        let auth = TestAuthenticator::new("auth-cond", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-cond"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Conditional, "auth-cond", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        let result = assert_success(outcome);
+        assert_eq!(result.user_id, UserId::new("alice").unwrap());
+    }
+
+    #[tokio::test]
+    async fn conditional_attempted_skips_following_conditional_stage() {
+        let auth1 = TestAuthenticator::new("auth1", |_| AuthStepResult::Attempted);
+        let auth2 = TestAuthenticator::new("auth2", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth1"))
+            .returning(move |_| Ok(Some(Arc::new(auth1.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth2"))
+            .returning(move |_| Ok(Some(Arc::new(auth2.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                stage("s1", Requirement::Conditional, "auth1", 1),
+                stage("s2", Requirement::Conditional, "auth2", 2),
+            ],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        // s1 attempted conditional -> s2 (same scope) skipped -> no user.
+        let err = assert_failure(outcome);
+        assert_eq!(err, IssuerdError::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn conditional_subflow_failure_skips_scope_and_runs_subflow_once() {
+        let fail_calls = Arc::new(AtomicUsize::new(0));
+        let fail_counter = fail_calls.clone();
+        let failing = TestAuthenticator::new("auth-fail", move |_ctx| {
+            fail_counter.fetch_add(1, Ordering::SeqCst);
+            AuthStepResult::Failure(IssuerdError::InvalidGrant)
+        });
+        let cond_calls = Arc::new(AtomicUsize::new(0));
+        let cond_counter = cond_calls.clone();
+        let cond = TestAuthenticator::new("auth-cond", move |ctx| {
+            cond_counter.fetch_add(1, Ordering::SeqCst);
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-fail"))
+            .returning(move |_| Ok(Some(Arc::new(failing.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-cond"))
+            .returning(move |_| Ok(Some(Arc::new(cond.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let sub = FlowConfig {
+            alias: Alias::new("sub").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: false,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Required, "auth-fail", 1)],
+        };
+        let top = FlowConfig {
+            alias: Alias::new("top").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                FlowStage {
+                    id: FlowStageId::new("s-top1").unwrap(),
+                    requirement: Requirement::Conditional,
+                    authenticator: Alias::new("sub-flow").unwrap(),
+                    priority: 1,
+                    sub_flow_alias: Some(Alias::new("sub").unwrap()),
+                    authenticator_config: None,
+                },
+                stage("s-top2", Requirement::Conditional, "auth-cond", 2),
+            ],
+        };
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[sub]);
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&top, &mut ctx).await.unwrap();
+        // The failing conditional sub-flow skips the rest of its scope, so
+        // the flow ends without a user.
+        let err = assert_failure(outcome);
+        assert_eq!(err, IssuerdError::AccessDenied);
+        assert_eq!(fail_calls.load(Ordering::SeqCst), 1, "sub-flow executed twice");
+        assert_eq!(cond_calls.load(Ordering::SeqCst), 0, "scoped stage must be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Attempted handling on Required stages
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn required_attempted_aborts_flow_before_later_stages() {
+        let auth1 = TestAuthenticator::new("auth1", |_| AuthStepResult::Attempted);
+        let auth2 = TestAuthenticator::new("auth2", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth1"))
+            .returning(move |_| Ok(Some(Arc::new(auth1.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth2"))
+            .returning(move |_| Ok(Some(Arc::new(auth2.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                stage("s1", Requirement::Required, "auth1", 1),
+                stage("s2", Requirement::Required, "auth2", 2),
+            ],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        // Attempted on a Required stage is an immediate failure; the later
+        // stage must not get a chance to bind a user.
+        let err = assert_failure(outcome);
+        assert_eq!(err, IssuerdError::AccessDenied);
+    }
+
+    // -----------------------------------------------------------------------
+    // Recursion depth guard
+    // -----------------------------------------------------------------------
+
+    fn subflow_ref_stage(id: &str, req: Requirement, target: &str) -> FlowStage {
+        FlowStage {
+            id: FlowStageId::new(id).unwrap(),
+            requirement: req,
+            authenticator: Alias::new("sub-flow").unwrap(),
+            priority: 0,
+            sub_flow_alias: Some(Alias::new(target).unwrap()),
+            authenticator_config: None,
+        }
+    }
+
+    fn chain_flow(name: &str, stage: FlowStage) -> FlowConfig {
+        FlowConfig {
+            alias: Alias::new(name).unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: false,
+            built_in: true,
+            stages: vec![stage],
+        }
+    }
+
+    fn leaf_registry() -> MockPluginRegistry {
+        let leaf = TestAuthenticator::new("auth-leaf", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-leaf"))
+            .returning(move |_| Ok(Some(Arc::new(leaf.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+        reg
+    }
+
+    #[tokio::test]
+    async fn depth_ten_nested_subflows_still_execute() {
+        // Chain f0 -> f1 -> ... -> f10 (f10 holds the leaf stage). f10's
+        // stages execute at recursion depth 10; the guard only trips ABOVE
+        // depth 10, so this chain must still succeed.
+        let mut configs: Vec<FlowConfig> = (0..=10)
+            .map(|n| {
+                if n == 10 {
+                    chain_flow("f10", stage("s10", Requirement::Required, "auth-leaf", 1))
+                } else {
+                    chain_flow(
+                        &format!("f{n}"),
+                        subflow_ref_stage(
+                            &format!("s{n}"),
+                            Requirement::Required,
+                            &format!("f{}", n + 1),
+                        ),
+                    )
+                }
+            })
+            .collect();
+        let top = configs.remove(0);
+
+        let executor = FlowExecutor::new(Arc::new(leaf_registry()), &configs);
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&top, &mut ctx).await.unwrap();
+        let result = assert_success(outcome);
+        assert_eq!(result.user_id, UserId::new("alice").unwrap());
+    }
+
+    #[tokio::test]
+    async fn alternative_group_subflows_count_toward_depth_limit() {
+        // Each chain level is an alternative group whose FIRST member is a
+        // plain (failing) authenticator and whose SECOND member is the
+        // sub-flow reference: only then does nesting go through the
+        // alternative-group sub-flow path (a group-leading sub-flow stage is
+        // intercepted by the plain sub-flow handling above it).
+        let failing = TestAuthenticator::new("auth-fail", |_| {
+            AuthStepResult::Failure(IssuerdError::InvalidGrant)
+        });
+        let leaf = TestAuthenticator::new("auth-leaf", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-fail"))
+            .returning(move |_| Ok(Some(Arc::new(failing.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-leaf"))
+            .returning(move |_| Ok(Some(Arc::new(leaf.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let mut configs: Vec<FlowConfig> = (0..=11)
+            .map(|n| {
+                if n == 11 {
+                    chain_flow("f11", stage("s11", Requirement::Required, "auth-leaf", 1))
+                } else {
+                    let mut flow = chain_flow(
+                        &format!("f{n}"),
+                        stage(&format!("s{n}a"), Requirement::Alternative, "auth-fail", 1),
+                    );
+                    flow.stages.push(subflow_ref_stage(
+                        &format!("s{n}b"),
+                        Requirement::Alternative,
+                        &format!("f{}", n + 1),
+                    ));
+                    flow
+                }
+            })
+            .collect();
+        let top = configs.remove(0);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &configs);
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&top, &mut ctx).await.unwrap();
+        // Depth must increment per alternative-group sub-flow nesting level,
+        // so the 11th nesting trips the guard instead of recursing unbounded.
+        assert_server_error(outcome);
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional/not-configured short-circuit in execute_stage
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct GateableAuthenticator {
+        configured: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl issuerd_core::Authenticator for GateableAuthenticator {
+        fn id(&self) -> &str {
+            "gateable"
+        }
+        fn display_name(&self) -> &str {
+            "Gateable"
+        }
+        fn requires_user(&self) -> bool {
+            false
+        }
+        fn configured_for(&self, _ctx: &AuthContext) -> bool {
+            self.configured
+        }
+        async fn authenticate(&self, ctx: &mut AuthContext) -> AuthStepResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        }
+    }
+
+    fn gateable_registry(auth: GateableAuthenticator) -> (MockPluginRegistry, Arc<AtomicUsize>) {
+        let calls = auth.calls.clone();
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("gateable"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+        (reg, calls)
+    }
+
+    #[tokio::test]
+    async fn required_stage_executes_even_when_not_configured() {
+        // The not-configured short-circuit applies to Optional stages only:
+        // a Required stage must run its authenticator regardless.
+        let (reg, calls) = gateable_registry(GateableAuthenticator {
+            configured: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Required, "gateable", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        assert_success(outcome);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn optional_configured_stage_executes_authenticator() {
+        // An Optional stage whose authenticator IS configured must run, not
+        // be short-circuited to Attempted.
+        let (reg, calls) = gateable_registry(GateableAuthenticator {
+            configured: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Optional, "gateable", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        assert_success(outcome);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

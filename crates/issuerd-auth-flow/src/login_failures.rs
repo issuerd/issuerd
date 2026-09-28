@@ -490,4 +490,114 @@ mod tests {
             .await
             .unwrap());
     }
+
+    #[test]
+    fn cache_keys_follow_the_documented_schema() {
+        let realm = RealmId::new("realm-1").unwrap();
+        assert_eq!(
+            failure_count_key(&realm, "alice", "127.0.0.1"),
+            "login-failure:realm-1:alice:127.0.0.1"
+        );
+        assert_eq!(
+            lockout_key(&realm, "alice", "127.0.0.1"),
+            "login-lockout:realm-1:alice:127.0.0.1"
+        );
+
+        // Keys must not collapse across realms, identifiers, IPs, or the two
+        // key kinds: a constant key would merge counters of unrelated
+        // user+IP pairs (cross-account lockouts) and make reset delete the
+        // wrong entries.
+        let other_realm = RealmId::new("realm-2").unwrap();
+        let base_count = failure_count_key(&realm, "alice", "127.0.0.1");
+        assert_ne!(base_count, failure_count_key(&other_realm, "alice", "127.0.0.1"));
+        assert_ne!(base_count, failure_count_key(&realm, "bob", "127.0.0.1"));
+        assert_ne!(base_count, failure_count_key(&realm, "alice", "10.0.0.1"));
+        assert_ne!(base_count, lockout_key(&realm, "alice", "127.0.0.1"));
+        let base_lock = lockout_key(&realm, "alice", "127.0.0.1");
+        assert_ne!(base_lock, lockout_key(&other_realm, "alice", "127.0.0.1"));
+        assert_ne!(base_lock, lockout_key(&realm, "bob", "127.0.0.1"));
+        assert_ne!(base_lock, lockout_key(&realm, "alice", "10.0.0.1"));
+    }
+
+    /// Records every `set` call so tests can assert a marker was (not)
+    /// written; other operations delegate to the in-memory cache.
+    struct RecordingCache {
+        inner: InMemoryCache,
+        sets: std::sync::Mutex<Vec<(String, Vec<u8>, Option<Duration>)>>,
+    }
+
+    impl RecordingCache {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryCache::new(),
+                sets: std::sync::Mutex::new(vec![]),
+            }
+        }
+
+        fn recorded_sets(&self) -> Vec<(String, Vec<u8>, Option<Duration>)> {
+            self.sets.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for RecordingCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.sets.lock().unwrap().push((key.to_string(), value.clone(), ttl));
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn increment(&self, key: &str, ttl: Option<Duration>) -> Result<u64, IssuerdError> {
+            self.inner.increment(key, ttl).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_wait_lockout_writes_no_marker() {
+        // Threshold reached but the computed lockout wait is zero: the
+        // lockout marker must NOT be written at all (writing it, even with a
+        // zero TTL, is a bug — the guard is `wait > 0`).
+        let tracker = LoginFailureTracker::new();
+        let config = fixed_config(1, 0); // max_failures = 1, lockout_duration = 0
+        let cache = RecordingCache::new();
+        let realm = RealmId::new("realm-1").unwrap();
+
+        tracker
+            .record_failure(&realm, "alice", "127.0.0.1", &cache, &config)
+            .await
+            .unwrap();
+
+        assert!(
+            cache.recorded_sets().is_empty(),
+            "no lockout marker may be written for a zero wait: {:?}",
+            cache.recorded_sets()
+        );
+    }
 }

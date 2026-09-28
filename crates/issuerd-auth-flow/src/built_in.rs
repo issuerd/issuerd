@@ -5073,4 +5073,230 @@ mod tests {
         let result = auth.authenticate(&mut ctx).await;
         assert_auth_server_error(result);
     }
+
+    #[tokio::test]
+    async fn password_authenticator_success_resets_failure_counter() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut realm = test_realm();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = 3;
+        realm.wait_increment_secs = 0;
+        realm.lockout_duration_secs = 900;
+        storage.create_realm(&realm).await.unwrap();
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let cred = Credential {
+            id: CredentialId::new("cred-1").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data: hash_password("password").into_bytes(),
+            credential_data: json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let tracker = Arc::new(LoginFailureTracker::new());
+        let auth = UsernamePasswordAuthenticator::with_tracker(storage, tracker, cache.clone());
+        let count_key = crate::login_failures::failure_count_key(
+            &RealmId::new("realm-1").unwrap(),
+            "alice",
+            "0.0.0.0",
+        );
+        let lock_key = crate::login_failures::lockout_key(
+            &RealmId::new("realm-1").unwrap(),
+            "alice",
+            "0.0.0.0",
+        );
+
+        // One failed attempt leaves a counter entry (below the lockout
+        // threshold).
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["wrong".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert!(cache.get(&count_key).await.unwrap().is_some(), "failure must be counted");
+
+        // A successful login clears the counter: a stale entry would
+        // otherwise accumulate towards a lockout across later failures.
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_success(result);
+        assert!(
+            cache.get(&count_key).await.unwrap().is_none(),
+            "successful login must reset the failure counter"
+        );
+        assert!(cache.get(&lock_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spnego_non_negotiate_authorization_header_is_not_consumed() {
+        // A non-Negotiate Authorization header (e.g. Basic) must be left for
+        // other authenticators: the SPNEGO stage passes through without
+        // consulting any Kerberos provider.
+        let provider = Arc::new(MockFedProvider {
+            id: "krb-test".to_string(),
+            validate_result: std::sync::Mutex::new(Ok(true)),
+            spnego_result: std::sync::Mutex::new(Ok(issuerd_core::SpnegoAuthResult {
+                principal: Some("alice@TEST.LOCAL".to_string()),
+                response_token: None,
+                status: issuerd_core::SpnegoStatus::Authenticated,
+            })),
+        });
+        let fed_user = issuerd_core::FederatedUser {
+            username: "alice".to_string(),
+            federation_link: "krb-test".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        let fm = Arc::new(MockFedManager {
+            providers: vec![provider.clone()],
+            find_user_result: std::sync::Mutex::new(Ok(Some((provider, fed_user)))),
+        });
+        let auth = SpnegoFlowAuthenticator::new(fm);
+        let mut ctx = test_context();
+        ctx.attributes
+            .insert("Authorization".to_string(), "Basic dXNlcjpwYXNz".to_string());
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_attempted(result);
+        assert!(ctx.user_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn idp_redirect_hint_matches_alias_distinct_from_provider_id() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let idp = IdentityProviderConfig {
+            id: IdentityProviderId::new("idp-1").unwrap(),
+            alias: issuerd_core::Alias::new("corporate").unwrap(),
+            provider_id: issuerd_core::ProviderId::new("oidc"),
+            enabled: true,
+            config: HashMap::new(),
+        };
+        storage
+            .create_identity_provider(&RealmId::new("realm-1").unwrap(), &idp)
+            .await
+            .unwrap();
+
+        let auth = IdentityProviderRedirectAuthenticator::new(storage);
+        let mut ctx = test_context();
+        // The hint matches the alias but NOT the provider id; the alias
+        // comparison alone must select the IdP.
+        ctx.attributes
+            .insert("identity_provider_hint".to_string(), "corporate".to_string());
+        let result = auth.authenticate(&mut ctx).await;
+        let url = assert_auth_challenge_redirect(result);
+        assert_eq!(url, "/broker/corporate/login");
+    }
+
+    #[tokio::test]
+    async fn set_user_password_history_disabled_allows_reuse() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let cred = Credential {
+            id: CredentialId::new("cred-1").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data: hash_password("hunter2").into_bytes(),
+            credential_data: json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+
+        // With history_size == 0 the reuse check is disabled: setting the
+        // same password again must succeed.
+        let result =
+            set_user_password(storage.as_ref(), &user.realm_id, &user.id, "hunter2", 0, false)
+                .await;
+        assert!(result.is_ok(), "history-disabled reuse must succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn set_user_password_history_disabled_drops_old_credential() {
+        // With history_size == 0 the superseded credential must be deleted
+        // outright. The observable contract is the write pattern: exactly
+        // one delete (the old credential) and one create (the new one).
+        // Converting the old credential into a password-history entry would
+        // show up as a second create+delete pair (the entry is created and
+        // then pruned by the zero-size retention).
+        let old_cred = Credential {
+            id: CredentialId::new("cred-1").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data: hash_password("oldpass").into_bytes(),
+            credential_data: json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        let returned = old_cred.clone();
+        let mut mock = issuerd_core::MockStorage::new();
+        mock.expect_get_credentials().returning(move |_, _, t| {
+            if t == CredentialType::Password {
+                Ok(vec![returned.clone()])
+            } else {
+                Ok(vec![])
+            }
+        });
+        mock.expect_delete_credential().times(1).returning(|_, _, _| Ok(()));
+        mock.expect_create_credential().times(1).returning(|_, _, _| Ok(()));
+
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let user_id = UserId::new("alice").unwrap();
+        set_user_password(&mock, &realm_id, &user_id, "newpass", 0, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_profile_single_field_submission_is_processed() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+
+        let action = UpdateProfileRequiredAction::new(storage.clone());
+        let mut ctx = test_context();
+        ctx.user_id = Some(UserId::new("alice").unwrap());
+        // Submitting only the first name still counts as a form submission:
+        // the action must process it, not re-issue the form challenge.
+        ctx.parameters.insert("first_name".to_string(), vec!["Alice".to_string()]);
+        let result = action.process(&mut ctx).await;
+        assert_action_success(result);
+
+        let stored = storage
+            .get_user(&RealmId::new("realm-1").unwrap(), &UserId::new("alice").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.first_name.as_ref().unwrap().as_ref(), "Alice");
+    }
+
+    #[tokio::test]
+    async fn update_profile_cleared_email_resets_verification() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut user = test_user();
+        user.email_verified = true;
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+
+        let action = UpdateProfileRequiredAction::new(storage.clone());
+        let mut ctx = test_context();
+        ctx.user_id = Some(UserId::new("alice").unwrap());
+        // Clearing a previously verified address is a change: verification
+        // must not survive it.
+        ctx.parameters.insert("email".to_string(), vec![String::new()]);
+        let result = action.process(&mut ctx).await;
+        assert_action_success(result);
+
+        let stored = storage
+            .get_user(&RealmId::new("realm-1").unwrap(), &UserId::new("alice").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.email.is_none());
+        assert!(!stored.email_verified, "cleared email must reset verification");
+    }
 }

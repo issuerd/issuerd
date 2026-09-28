@@ -751,4 +751,43 @@ mod tests {
         // re-challenges instead of succeeding twice.
         assert_challenge_options(auth.authenticate(&mut ctx).await);
     }
+
+    #[test]
+    fn auth_ceremony_key_is_scoped_per_realm_and_user() {
+        let realm = RealmId::new("realm-1").unwrap();
+        let other_realm = RealmId::new("realm-2").unwrap();
+        let user = UserId::new("u-1").unwrap();
+        let other_user = UserId::new("u-2").unwrap();
+
+        assert_eq!(auth_ceremony_key(&realm, &user), "webauthn-auth:realm-1:u-1");
+        // Keys must not collide across realms or users: a constant key would
+        // let one user's ceremony state be consumed by another.
+        assert_ne!(auth_ceremony_key(&realm, &user), auth_ceremony_key(&other_realm, &user));
+        assert_ne!(auth_ceremony_key(&realm, &user), auth_ceremony_key(&realm, &other_user));
+    }
+
+    #[test]
+    fn rp_name_prefers_display_name_then_realm_name() {
+        let mut realm = test_realm();
+        // No display name: the realm name is the RP label.
+        assert_eq!(rp_name(&realm), "realm-1");
+        realm.display_name = Some(issuerd_core::DisplayName::new("My Realm").unwrap());
+        assert_eq!(rp_name(&realm), "My Realm");
+    }
+
+    #[test]
+    fn authenticator_trait_metadata() {
+        let auth = authenticator(Arc::new(issuerd_storage::InMemoryStorage::new()));
+        assert_eq!(auth.id(), "auth-webauthn");
+        assert_eq!(auth.display_name(), "WebAuthn Authenticator");
+        // Second-factor stage: it operates on an already identified user.
+        assert!(auth.requires_user());
+    }
+
+    #[test]
+    fn configured_for_reflects_user_presence() {
+        let auth = authenticator(Arc::new(issuerd_storage::InMemoryStorage::new()));
+        assert!(auth.configured_for(&test_context(Some("alice"))));
+        assert!(!auth.configured_for(&test_context(None)));
+    }
 }

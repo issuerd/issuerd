@@ -835,4 +835,70 @@ mod tests {
             assert!(code.chars().all(|c| c.is_ascii_digit()));
         }
     }
+
+    #[test]
+    fn entry_key_is_scoped_per_realm_and_user() {
+        let realm = RealmId::new("realm-1").unwrap();
+        let other_realm = RealmId::new("realm-2").unwrap();
+        let user = UserId::new("u-1").unwrap();
+        let other_user = UserId::new("u-2").unwrap();
+
+        assert_eq!(entry_key(&realm, &user), "email-code:realm-1:u-1");
+        // Keys must not collide across realms or users: a constant key would
+        // let one user's minted code overwrite another's.
+        assert_ne!(entry_key(&realm, &user), entry_key(&other_realm, &user));
+        assert_ne!(entry_key(&realm, &user), entry_key(&realm, &other_user));
+    }
+
+    #[test]
+    fn ttl_secs_rejects_zero_and_falls_back_to_default() {
+        let mut realm = test_realm();
+        realm.attributes.insert(REALM_ATTR_TTL_SECS.to_string(), "0".to_string());
+        // A zero TTL would burn the entry instantly; it falls back to the
+        // default like any other invalid value.
+        assert_eq!(ttl_secs(&realm), DEFAULT_TTL_SECS);
+
+        let mut realm = test_realm();
+        realm.attributes.insert(REALM_ATTR_TTL_SECS.to_string(), "120".to_string());
+        assert_eq!(ttl_secs(&realm), 120);
+    }
+
+    #[test]
+    fn generated_code_uses_the_full_digit_alphabet() {
+        // Rejection sampling accepts bytes 0..250, so every digit 0-9 must
+        // be reachable. Over 512 digits the original produces a digit >= 6
+        // with probability 1 - 0.6^512; a sampler rejecting the wrong byte
+        // range (only 250..=255 accepted) can only emit digits 0-5.
+        let code = generate_code(512).unwrap();
+        assert_eq!(code.len(), 512);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        assert!(
+            code.chars().any(|c| c >= '6'),
+            "512 samples without a digit >= 6: the acceptance range is wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn codes_are_scoped_per_user() {
+        let f = fixture().await;
+        let alice = test_user("u-20", "alice", Some("alice@example.com"));
+        let bob = test_user("u-21", "bob", Some("bob@example.com"));
+        f.storage.create_user(&alice.realm_id, &alice).await.unwrap();
+        f.storage.create_user(&bob.realm_id, &bob).await.unwrap();
+
+        // Mint codes for both users; alice's entry must survive bob's mint.
+        let mut ctx = with_param(context(), "username", "alice@example.com");
+        assert_otp_challenge(f.authenticator.authenticate(&mut ctx).await);
+        let mut ctx = with_param(context(), "username", "bob@example.com");
+        assert_otp_challenge(f.authenticator.authenticate(&mut ctx).await);
+        let sent = f.mailer.sent();
+        assert_eq!(sent.len(), 2);
+        let alice_code = sent[0].1.clone();
+
+        let (result, _) = submit_otp(&f, Some("u-20"), &alice_code).await;
+        assert!(
+            matches!(result, AuthStepResult::Success),
+            "alice's code must verify after bob's mint: {result:?}"
+        );
+    }
 }
