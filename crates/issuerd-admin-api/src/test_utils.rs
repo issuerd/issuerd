@@ -115,6 +115,24 @@ pub mod tests {
         storage: Arc<dyn issuerd_core::Storage>,
         roles: Vec<issuerd_core::RoleName>,
     ) -> Arc<AdminApiState> {
+        test_state_with_components(storage, roles, Arc::new(issuerd_core::MockBrokerClient::new()))
+    }
+
+    /// Same as [`test_state`] but with a caller-supplied broker client, so
+    /// tests can prime the discovery fetch behind the IdP test-connection
+    /// endpoint.
+    pub fn test_state_with_broker_client(
+        roles: Vec<issuerd_core::RoleName>,
+        broker_client: Arc<dyn issuerd_core::BrokerClient>,
+    ) -> Arc<AdminApiState> {
+        test_state_with_components(storage_with_master_realm(), roles, broker_client)
+    }
+
+    fn test_state_with_components(
+        storage: Arc<dyn issuerd_core::Storage>,
+        roles: Vec<issuerd_core::RoleName>,
+        broker_client: Arc<dyn issuerd_core::BrokerClient>,
+    ) -> Arc<AdminApiState> {
         let mut mock = issuerd_core::MockCryptoProvider::new();
         mock.expect_get_public_keys()
             .returning(|| Ok(issuerd_core::JwkSet { keys: vec![] }));
@@ -126,7 +144,7 @@ pub mod tests {
             plugin_registry: Arc::new(stub_plugin_registry()),
             cache: Arc::new(issuerd_cluster::InMemoryCache::new()),
             email_sender: Arc::new(issuerd_core::MockEmailSender::new()),
-            broker_client: Arc::new(issuerd_core::MockBrokerClient::new()),
+            broker_client,
             logout_notifier: Arc::new(issuerd_core::NoOpSessionLogoutNotifier),
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(StubTokenIssuer::new()),

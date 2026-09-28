@@ -2024,4 +2024,41 @@ mod tests {
         assert_eq!(stored.parent_id, Some(issuerd_core::GroupId::new("g-a").unwrap()));
         assert_eq!(stored.path, issuerd_core::GroupPath::new("/a/b").unwrap());
     }
+
+    #[tokio::test]
+    async fn create_group_with_sub_groups_rejected() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let realm = realm_fixture();
+        state.storage.create_realm(&realm).await.unwrap();
+
+        // Nested groups are created through the children endpoint, not the
+        // create body.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/realms/test/groups")
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"admins","path":"/admins","sub_groups":[{"name":"nested"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Nothing was created.
+        let groups = state
+            .storage
+            .list_groups(&issuerd_core::RealmId::new("realm-1").unwrap(), &Pagination::default())
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+    }
 }

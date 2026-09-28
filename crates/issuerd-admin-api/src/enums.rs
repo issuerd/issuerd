@@ -1176,4 +1176,274 @@ mod tests {
             assert!(item.description.as_ref().is_some_and(|d| !d.is_empty()));
         }
     }
+
+    fn auth_with_role(role: &str) -> AdminAuth {
+        let role = issuerd_core::RoleName::new(role).unwrap();
+        let token_service = crate::test_utils::tests::MockTokenService { roles: vec![role] };
+        let validated =
+            issuerd_core::TokenService::validate_access_token(&token_service, "tok").unwrap();
+        AdminAuth {
+            claims: validated.claims,
+        }
+    }
+
+    type EnumListFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                Output = Result<Json<Vec<EnumValueRepresentation>>, AdminApiError>,
+            >,
+        >,
+    >;
+    type EnumListHandler = fn(Extension<AdminAuth>) -> EnumListFuture;
+
+    fn assert_enum_list(endpoint: &str, list: &[EnumValueRepresentation], expected_ids: &[&str]) {
+        assert!(!list.is_empty(), "{endpoint} returned an empty list");
+        let ids: Vec<&str> = list.iter().map(|v| v.id.as_str()).collect();
+        for want in expected_ids {
+            assert!(ids.contains(want), "{endpoint} is missing {want}");
+        }
+        for item in list {
+            assert!(!item.name.is_empty(), "{endpoint}: {} has an empty name", item.id);
+            // Descriptions are part of the API contract: the SPA surfaces
+            // them in dropdowns and tooltips, so they must never be dropped.
+            assert!(
+                item.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "{endpoint}: {} must carry a description",
+                item.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enum_endpoints_return_known_ids_with_descriptions() {
+        let auth = auth_with_role("view-realm");
+        let cases: &[(&str, EnumListHandler, &[&str])] = &[
+            (
+                "/admin/enums/protocols",
+                |a| Box::pin(list_protocols(a)),
+                &["openid-connect", "saml"],
+            ),
+            (
+                "/admin/enums/ssl-required",
+                |a| Box::pin(list_ssl_required(a)),
+                &["none", "external", "all"],
+            ),
+            (
+                "/admin/enums/event-types",
+                |a| Box::pin(list_event_types(a)),
+                &["login", "login_error", "ciba_approve", "invalid_signature"],
+            ),
+            (
+                "/admin/enums/event-listeners",
+                |a| Box::pin(list_event_listeners(a)),
+                &["logging"],
+            ),
+            (
+                "/admin/enums/credential-types",
+                |a| Box::pin(list_credential_types(a)),
+                &[
+                    "password",
+                    "totp",
+                    "web_authn_passwordless",
+                    "ssh_public_key",
+                ],
+            ),
+            (
+                "/admin/enums/algorithms",
+                |a| Box::pin(list_algorithms(a)),
+                &["RS256", "ES512", "EdDSA"],
+            ),
+            (
+                "/admin/enums/grant-types",
+                |a| Box::pin(list_grant_types(a)),
+                &[
+                    "authorization_code",
+                    "client_credentials",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "urn:openid:params:grant-type:ciba",
+                ],
+            ),
+            (
+                "/admin/enums/response-types",
+                |a| Box::pin(list_response_types(a)),
+                &["code", "id_token", "code id_token token"],
+            ),
+            (
+                "/admin/enums/response-modes",
+                |a| Box::pin(list_response_modes(a)),
+                &["query", "form_post", "form_post.jwt"],
+            ),
+            (
+                "/admin/enums/requirements",
+                |a| Box::pin(list_requirements(a)),
+                &["required", "conditional"],
+            ),
+            (
+                "/admin/enums/provider-ids",
+                |a| Box::pin(list_provider_ids(a)),
+                &["ldap", "oidc", "github"],
+            ),
+            (
+                "/admin/enums/client-authenticator-types",
+                |a| Box::pin(list_client_authenticator_types(a)),
+                &["client-secret", "client-x509"],
+            ),
+            (
+                "/admin/enums/operation-types",
+                |a| Box::pin(list_operation_types(a)),
+                &["CREATE", "ACTION"],
+            ),
+            (
+                "/admin/enums/prompts",
+                |a| Box::pin(list_prompts(a)),
+                &["none", "select_account"],
+            ),
+            (
+                "/admin/enums/resource-types",
+                |a| Box::pin(list_resource_types(a)),
+                &["REALM", "CLIENT_SCOPE", "INITIAL_ACCESS_TOKEN"],
+            ),
+            (
+                "/admin/enums/hash-algorithms",
+                |a| Box::pin(list_hash_algorithms(a)),
+                &["argon2id", "pbkdf2"],
+            ),
+            (
+                "/admin/enums/auth-methods",
+                |a| Box::pin(list_auth_methods(a)),
+                &["password", "spnego", "ciba"],
+            ),
+            (
+                "/admin/enums/pkce-code-challenge-methods",
+                |a| Box::pin(list_pkce_code_challenge_methods(a)),
+                &["S256", "plain"],
+            ),
+            ("/admin/enums/jwk-use", |a| Box::pin(list_jwk_use(a)), &["sig", "enc"]),
+            (
+                "/admin/enums/jwk-key-types",
+                |a| Box::pin(list_jwk_key_types(a)),
+                &["RSA", "EC", "oct", "OKP"],
+            ),
+            (
+                "/admin/enums/ldap-vendors",
+                |a| Box::pin(list_ldap_vendors(a)),
+                &["GENERIC", "ACTIVE_DIRECTORY", "SAMBA"],
+            ),
+            (
+                "/admin/enums/ldap-search-scopes",
+                |a| Box::pin(list_ldap_search_scopes(a)),
+                &["SUBTREE", "ONELEVEL", "BASE"],
+            ),
+            (
+                "/admin/enums/edit-modes",
+                |a| Box::pin(list_edit_modes(a)),
+                &["READONLY", "WRITABLE", "UNSYNCED"],
+            ),
+            (
+                "/admin/enums/required-actions",
+                |a| Box::pin(list_required_actions(a)),
+                &["VERIFY_EMAIL", "TERMS_AND_CONDITIONS"],
+            ),
+            (
+                "/admin/enums/otp-algorithms",
+                |a| Box::pin(list_otp_algorithms(a)),
+                &["HmacSHA1", "HmacSHA512"],
+            ),
+            (
+                "/admin/enums/broker-sync-modes",
+                |a| Box::pin(list_broker_sync_modes(a)),
+                &["import", "force"],
+            ),
+            (
+                "/admin/enums/broker-client-auth-methods",
+                |a| Box::pin(list_broker_client_auth_methods(a)),
+                &["client_secret_basic", "client_secret_post"],
+            ),
+            (
+                "/admin/enums/idp-mapper-types",
+                |a| Box::pin(list_idp_mapper_types(a)),
+                &["attribute", "role", "username_template"],
+            ),
+            (
+                "/admin/enums/mapper-types",
+                |a| Box::pin(list_mapper_types(a)),
+                &[
+                    "oidc-usermodel-attribute-mapper",
+                    "oidc-group-membership-mapper",
+                    "oidc-allowed-origins-mapper",
+                ],
+            ),
+            ("/admin/enums/locales", |a| Box::pin(list_locales(a)), &["en", "de"]),
+            (
+                "/admin/enums/subject-types",
+                |a| Box::pin(list_subject_types(a)),
+                &["public", "pairwise"],
+            ),
+        ];
+        for (endpoint, handler, expected) in cases {
+            let Json(list) = handler(Extension(auth.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("{endpoint} failed: {e:?}"));
+            assert_enum_list(endpoint, &list, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn state_backed_enum_endpoints_return_known_ids() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-realm").unwrap()
+            ]);
+        let auth = auth_with_role("view-realm");
+
+        let Json(list) = list_themes(State(state.clone()), Extension(auth.clone())).await.unwrap();
+        // test_state exposes the built-in `issuerd` theme.
+        assert_enum_list("/admin/enums/themes", &list, &["issuerd"]);
+
+        let Json(list) = list_authenticators(State(state), Extension(auth)).await.unwrap();
+        // Ids come from the state's plugin registry; the stub mirrors the
+        // issuerd-auth-flow built-ins.
+        assert_enum_list(
+            "/admin/enums/authenticators",
+            &list,
+            &[
+                "auth-cookie",
+                "auth-username-password",
+                "auth-otp-form",
+                "auth-webauthn",
+                "auth-registration",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn client_installations_and_presets_endpoints_return_known_ids() {
+        let auth = auth_with_role("view-realm");
+
+        let Json(list) = list_client_installations(Extension(auth.clone())).await.unwrap();
+        let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
+        assert!(ids.contains(&"keycloak-oidc-keycloak-json"));
+        assert!(ids.contains(&"generic-oidc-json"));
+        for provider in &list {
+            assert!(!provider.display_type.is_empty());
+            assert!(!provider.help_text.is_empty());
+        }
+
+        let Json(list) = list_identity_provider_presets(Extension(auth)).await.unwrap();
+        let ids: Vec<&str> = list.iter().map(|p| p.provider_id.as_str()).collect();
+        for expected in ["oidc", "google", "microsoft", "github", "facebook"] {
+            assert!(ids.contains(&expected), "presets missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn enum_endpoints_require_view_or_manage_realm() {
+        // manage-realm passes the guard as well (either role is accepted).
+        let Json(list) = list_protocols(Extension(auth_with_role("manage-realm"))).await.unwrap();
+        assert!(!list.is_empty());
+
+        // A token with no realm-view role is rejected.
+        let result = list_protocols(Extension(auth_with_role("manage-clients"))).await;
+        assert!(matches!(result, Err(AdminApiError::Forbidden)));
+    }
 }

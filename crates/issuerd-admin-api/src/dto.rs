@@ -3190,4 +3190,201 @@ mod tests {
         assert_eq!(json["realm_mappings"][0]["name"], "admin");
         assert!(json.get("client_mappings").is_none());
     }
+
+    /// Minimal realm representation: every optional field omitted so tests can
+    /// pin a single field with struct-update syntax.
+    fn base_realm_rep() -> RealmRepresentation {
+        RealmRepresentation {
+            id: None,
+            realm: "test".to_string(),
+            display_name: None,
+            enabled: None,
+            ssl_required: None,
+            password_policy: None,
+            access_token_lifespan: None,
+            refresh_token_lifespan: None,
+            sso_session_idle_timeout: None,
+            sso_session_max_lifespan: None,
+            offline_session_idle_timeout: None,
+            login_theme: None,
+            email_theme: None,
+            admin_theme: None,
+            internationalization_enabled: None,
+            supported_locales: None,
+            default_locale: None,
+            default_role: None,
+            attributes: None,
+            brute_force_protected: None,
+            max_login_failures: None,
+            wait_increment_secs: None,
+            max_failure_wait_secs: None,
+            lockout_duration_secs: None,
+            registration_enabled: None,
+            reset_password_allowed: None,
+            remember_me_enabled: None,
+            verify_email_enabled: None,
+            login_with_email_allowed: None,
+            duplicate_emails_allowed: None,
+            edit_username_allowed: None,
+            remember_me_session_idle_secs: None,
+            otp_policy_algorithm: None,
+            otp_policy_digits: None,
+            otp_policy_period: None,
+            otp_policy_look_ahead_window: None,
+            events_enabled: None,
+            events_expiration_secs: None,
+            admin_events_enabled: None,
+            include_representations: None,
+            events_listeners: None,
+            not_before: None,
+            default_groups: None,
+            browser_flow: None,
+            direct_grant_flow: None,
+            reset_credentials_flow: None,
+            first_broker_login_flow: None,
+            registration_flow: None,
+        }
+    }
+
+    #[test]
+    fn otp_policy_from_rep_applies_present_fields() {
+        let rep = RealmRepresentation {
+            otp_policy_algorithm: Some("HmacSHA256".to_string()),
+            otp_policy_digits: Some(8),
+            otp_policy_period: Some(60),
+            otp_policy_look_ahead_window: Some(3),
+            ..base_realm_rep()
+        };
+        let policy = otp_policy_from_rep(&rep, &OtpPolicy::default()).unwrap();
+        // None of these values coincides with the model defaults
+        // (HmacSHA1 / 6 digits / 30 s / 1 step).
+        assert_eq!(policy.algorithm, OtpHashAlgorithm::HmacSha256);
+        assert_eq!(policy.digits, 8);
+        assert_eq!(policy.period_secs, 60);
+        assert_eq!(policy.look_ahead_window, 3);
+    }
+
+    #[test]
+    fn otp_policy_from_rep_omitted_fields_use_defaults() {
+        let policy = otp_policy_from_rep(&base_realm_rep(), &OtpPolicy::default()).unwrap();
+        assert_eq!(policy, OtpPolicy::default());
+    }
+
+    #[test]
+    fn otp_policy_digits_accepts_only_six_and_eight() {
+        for (digits, accepted) in [(6, true), (8, true), (5, false), (7, false), (9, false)] {
+            let rep = RealmRepresentation {
+                otp_policy_digits: Some(digits),
+                ..base_realm_rep()
+            };
+            let result = otp_policy_from_rep(&rep, &OtpPolicy::default());
+            assert_eq!(result.is_ok(), accepted, "digits={digits}");
+            if let Ok(policy) = result {
+                assert_eq!(policy.digits, digits as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn otp_policy_period_must_be_at_least_one() {
+        for (period, accepted) in [(-1, false), (0, false), (1, true), (30, true)] {
+            let rep = RealmRepresentation {
+                otp_policy_period: Some(period),
+                ..base_realm_rep()
+            };
+            let result = otp_policy_from_rep(&rep, &OtpPolicy::default());
+            assert_eq!(result.is_ok(), accepted, "period={period}");
+            if let Ok(policy) = result {
+                assert_eq!(policy.period_secs, period as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn otp_policy_look_ahead_window_bounded_zero_to_five() {
+        for (window, accepted) in [(-1, false), (0, true), (5, true), (6, false)] {
+            let rep = RealmRepresentation {
+                otp_policy_look_ahead_window: Some(window),
+                ..base_realm_rep()
+            };
+            let result = otp_policy_from_rep(&rep, &OtpPolicy::default());
+            assert_eq!(result.is_ok(), accepted, "look_ahead_window={window}");
+            if let Ok(policy) = result {
+                assert_eq!(policy.look_ahead_window, window as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn pagination_query_params_max_defaults_to_twenty() {
+        let params: PaginationQueryParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params.first, 0);
+        assert_eq!(params.max, 20);
+
+        // An explicit value always wins over the serde default.
+        let params: PaginationQueryParams =
+            serde_json::from_str(r#"{"first":5,"max":50}"#).unwrap();
+        assert_eq!(params.first, 5);
+        assert_eq!(params.max, 50);
+    }
+
+    #[test]
+    fn realm_try_from_applies_explicit_lifespans() {
+        let rep = RealmRepresentation {
+            access_token_lifespan: Some(42),
+            refresh_token_lifespan: Some(84),
+            sso_session_idle_timeout: Some(100),
+            sso_session_max_lifespan: Some(200),
+            offline_session_idle_timeout: Some(300),
+            remember_me_session_idle_secs: Some(400),
+            ..base_realm_rep()
+        };
+        let realm: Realm = rep.try_into().unwrap();
+        assert_eq!(realm.access_token_lifespan.get(), 42);
+        assert_eq!(realm.refresh_token_lifespan.get(), 84);
+        assert_eq!(realm.sso_session_idle_timeout.get(), 100);
+        assert_eq!(realm.sso_session_max_lifespan.get(), 200);
+        assert_eq!(realm.offline_session_idle_timeout.get(), 300);
+        assert_eq!(realm.remember_me_session_idle_secs.get(), 400);
+    }
+
+    #[test]
+    fn realm_try_from_omitted_lifespans_use_defaults() {
+        let realm: Realm = base_realm_rep().try_into().unwrap();
+        assert_eq!(realm.access_token_lifespan.get(), 300);
+        assert_eq!(realm.refresh_token_lifespan.get(), 1800);
+        assert_eq!(realm.sso_session_idle_timeout.get(), 1800);
+        assert_eq!(realm.sso_session_max_lifespan.get(), 36000);
+        assert_eq!(realm.offline_session_idle_timeout.get(), 2592000);
+        assert_eq!(realm.remember_me_session_idle_secs.get(), 604800);
+    }
+
+    #[test]
+    fn realm_try_from_rejects_non_positive_lifespans() {
+        let fields: [(&str, fn(&mut RealmRepresentation, i64)); 6] = [
+            ("access_token_lifespan", |rep, v| rep.access_token_lifespan = Some(v)),
+            ("refresh_token_lifespan", |rep, v| rep.refresh_token_lifespan = Some(v)),
+            ("sso_session_idle_timeout", |rep, v| rep.sso_session_idle_timeout = Some(v)),
+            ("sso_session_max_lifespan", |rep, v| rep.sso_session_max_lifespan = Some(v)),
+            ("offline_session_idle_timeout", |rep, v| {
+                rep.offline_session_idle_timeout = Some(v)
+            }),
+            ("remember_me_session_idle_secs", |rep, v| {
+                rep.remember_me_session_idle_secs = Some(v)
+            }),
+        ];
+        for (name, set) in fields {
+            for value in [0, -1] {
+                let mut rep = base_realm_rep();
+                set(&mut rep, value);
+                let result: Result<Realm, _> = rep.try_into();
+                match result {
+                    Err(issuerd_core::IssuerdError::InvalidRequest(msg)) => {
+                        assert!(msg.contains(name), "error should name {name}: {msg}");
+                    }
+                    other => panic!("{name}={value} must be rejected, got {other:?}"),
+                }
+            }
+        }
+    }
 }

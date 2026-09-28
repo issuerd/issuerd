@@ -1418,6 +1418,7 @@ mod tests {
     fn user_routes(state: Arc<AdminApiState>) -> Router {
         Router::new()
             .route("/admin/realms/{realm}/users", get(list_users).post(create_user))
+            .route("/admin/realms/{realm}/users/count", get(count_users))
             .route(
                 "/admin/realms/{realm}/users/{id}",
                 get(get_user).put(update_user).delete(delete_user),
@@ -2973,5 +2974,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn get_user_count(app: &Router, realm_name: &str) -> i64 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users/count"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rep: CountRepresentation = serde_json::from_slice(&body).unwrap();
+        rep.count
+    }
+
+    #[tokio::test]
+    async fn count_users_tracks_creates_and_deletes() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+
+        // The seeded fixture user is counted and listed.
+        assert_eq!(get_user_count(&app, &realm_name).await, 1);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let users: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "alice");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/users"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"username":"bob"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(get_user_count(&app, &realm_name).await, 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/realms/{realm_name}/users/{user_id}"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(get_user_count(&app, &realm_name).await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_user_with_client_roles_rejected() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let realm = issuerd_core::Realm {
+            id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/realms/test/users")
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"username":"bob","client_roles":{"my-app":["admin"]}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The rejected request must not have created the user.
+        let stored = state
+            .storage
+            .get_user_by_username(&issuerd_core::RealmId::new("realm-1").unwrap(), "bob")
+            .await
+            .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_user_rename_onto_existing_username_conflicts() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let bob = issuerd_core::User {
+            id: issuerd_core::UserId::new("user-2").unwrap(),
+            realm_id: realm_id.clone(),
+            username: issuerd_core::Username::new("bob").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        state.storage.create_user(&realm_id, &bob).await.unwrap();
+
+        // Renaming bob onto the already-taken username "alice" conflicts.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/admin/realms/{realm_name}/users/user-2"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"username":"alice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // The conflicting rename was not persisted.
+        let stored = state
+            .storage
+            .get_user(&realm_id, &issuerd_core::UserId::new("user-2").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.username, issuerd_core::Username::new("bob").unwrap());
     }
 }

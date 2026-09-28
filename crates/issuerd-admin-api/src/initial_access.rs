@@ -308,9 +308,59 @@ pub async fn delete_initial_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::Request,
+        routing::{delete, get},
+        Router,
+    };
+    use tower::ServiceExt;
 
     fn realm_id() -> RealmId {
         RealmId::new("realm-1").unwrap()
+    }
+
+    /// Router mirroring the `clients-initial-access` registrations in
+    /// `routes.rs`, behind the real admin auth middleware.
+    fn initial_access_routes(state: Arc<AdminApiState>) -> Router {
+        Router::new()
+            .route(
+                "/admin/realms/{realm}/clients-initial-access",
+                get(list_initial_access_tokens).post(create_initial_access_token),
+            )
+            .route(
+                "/admin/realms/{realm}/clients-initial-access/{id}",
+                delete(delete_initial_access_token),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::admin_auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn seed_test_realm(state: &AdminApiState) {
+        let realm = issuerd_core::Realm {
+            id: realm_id(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+    }
+
+    fn request(method: &str, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer valid-token")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[test]
@@ -388,5 +438,247 @@ mod tests {
         assert!(!verify_and_consume_initial_access_token(&cache, &realm_id(), &token)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_list_consume_list_roundtrip_handler() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = initial_access_routes(state.clone());
+        seed_test_realm(&state).await;
+
+        // Mint via the admin endpoint: the raw token is returned exactly once.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/realms/test/clients-initial-access",
+                Body::from(r#"{"expiration":3600,"count":2}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: InitialAccessTokenRepresentation = json_body(response).await;
+        assert!(!created.id.is_empty());
+        let raw = created.token.clone().expect("mint response carries the raw token");
+        assert!(raw.starts_with(&format!("{}.", created.id)));
+        assert_eq!(created.expiration, 3600);
+        assert_eq!(created.count, 2);
+        assert_eq!(created.remaining_count, 2);
+
+        // The list shows the token without token material.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed: Vec<InitialAccessTokenRepresentation> = json_body(response).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+        assert!(listed[0].token.is_none());
+        assert_eq!(listed[0].expiration, 3600);
+        assert_eq!(listed[0].count, 2);
+        assert_eq!(listed[0].remaining_count, 2);
+
+        // Consuming a use via the registration-side verifier decrements the
+        // remaining count reported by the list handler.
+        assert!(verify_and_consume_initial_access_token(&state.cache, &realm_id(), &raw)
+            .await
+            .unwrap());
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        let listed: Vec<InitialAccessTokenRepresentation> = json_body(response).await;
+        assert_eq!(listed[0].remaining_count, 1);
+
+        assert!(verify_and_consume_initial_access_token(&state.cache, &realm_id(), &raw)
+            .await
+            .unwrap());
+        let response = app
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        let listed: Vec<InitialAccessTokenRepresentation> = json_body(response).await;
+        assert_eq!(listed[0].remaining_count, 0);
+        assert!(!verify_and_consume_initial_access_token(&state.cache, &realm_id(), &raw)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_defaults_to_unlimited_and_delete_revokes_idempotently() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = initial_access_routes(state.clone());
+        seed_test_realm(&state).await;
+
+        // Omitted expiration/count default to 0: never expires, unlimited uses.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/realms/test/clients-initial-access", Body::from("{}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: InitialAccessTokenRepresentation = json_body(response).await;
+        assert_eq!(created.expiration, 0);
+        assert_eq!(created.count, 0);
+        assert_eq!(created.remaining_count, 0);
+        let raw = created.token.clone().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "DELETE",
+                &format!("/admin/realms/test/clients-initial-access/{}", created.id),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Revoked: gone from the list and no longer verifiable.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        let listed: Vec<InitialAccessTokenRepresentation> = json_body(response).await;
+        assert!(listed.is_empty());
+        assert!(!verify_and_consume_initial_access_token(&state.cache, &realm_id(), &raw)
+            .await
+            .unwrap());
+
+        // Revocation is deliberately idempotent (unlike Keycloak's 404):
+        // re-deleting an unknown id still returns 204.
+        let response = app
+            .oneshot(request(
+                "DELETE",
+                &format!("/admin/realms/test/clients-initial-access/{}", created.id),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn handlers_return_404_for_unknown_realm() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = initial_access_routes(state);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/realms/ghost/clients-initial-access",
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/ghost/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(request(
+                "DELETE",
+                "/admin/realms/ghost/clients-initial-access/some-id",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handlers_enforce_client_role_guards() {
+        // view-clients may list but not mint or revoke.
+        let viewer =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-clients").unwrap()
+            ]);
+        let app = initial_access_routes(viewer.clone());
+        seed_test_realm(&viewer).await;
+
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/realms/test/clients-initial-access", Body::from("{}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request(
+                "DELETE",
+                "/admin/realms/test/clients-initial-access/some-id",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // An unrelated admin role (manage-realm) grants no client access.
+        let other =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = initial_access_routes(other.clone());
+        seed_test_realm(&other).await;
+
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/realms/test/clients-initial-access", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request("POST", "/admin/realms/test/clients-initial-access", Body::from("{}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn handlers_require_authentication() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = initial_access_routes(state.clone());
+        seed_test_realm(&state).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/realms/test/clients-initial-access")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

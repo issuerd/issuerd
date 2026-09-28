@@ -567,7 +567,7 @@ mod tests {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
-        routing::get,
+        routing::{get, post, put},
         Router,
     };
     use std::sync::Arc;
@@ -582,6 +582,18 @@ mod tests {
             .route(
                 "/admin/realms/{realm}/identity-provider/instances/{alias}",
                 get(get_idp).put(update_idp).delete(delete_idp),
+            )
+            .route(
+                "/admin/realms/{realm}/identity-provider/instances/{alias}/mappers",
+                get(list_idp_mappers).post(create_idp_mapper),
+            )
+            .route(
+                "/admin/realms/{realm}/identity-provider/instances/{alias}/mappers/{name}",
+                put(update_idp_mapper).delete(delete_idp_mapper),
+            )
+            .route(
+                "/admin/realms/{realm}/identity-provider/instances/{alias}/test-connection",
+                post(test_idp_connection),
             )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -724,5 +736,504 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    // ------------------------------------------------------------------
+    // IdP mapper sub-resources + test-connection
+    // ------------------------------------------------------------------
+
+    const MAPPERS_URI: &str = "/admin/realms/test/identity-provider/instances/corpidp/mappers";
+    const TEST_CONNECTION_URI: &str =
+        "/admin/realms/test/identity-provider/instances/corpidp/test-connection";
+
+    fn manage_realm_state() -> Arc<AdminApiState> {
+        crate::test_utils::tests::test_state(vec![
+            issuerd_core::RoleName::new("manage-realm").unwrap()
+        ])
+    }
+
+    async fn seed_realm(state: &Arc<AdminApiState>) -> issuerd_core::RealmId {
+        let realm = issuerd_core::Realm {
+            id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+        realm.id
+    }
+
+    async fn seed_idp(
+        state: &Arc<AdminApiState>,
+        realm_id: &issuerd_core::RealmId,
+        provider_id: &str,
+        config: std::collections::HashMap<String, String>,
+    ) {
+        let idp = issuerd_core::IdentityProviderConfig {
+            id: issuerd_core::IdentityProviderId::new("idp-1").unwrap(),
+            alias: issuerd_core::Alias::new("corpidp").unwrap(),
+            provider_id: issuerd_core::ProviderId::new(provider_id),
+            enabled: true,
+            config,
+        };
+        state.storage.create_identity_provider(realm_id, &idp).await.unwrap();
+    }
+
+    fn idp_config(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn req(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer valid-token");
+        match body {
+            Some(json) => builder
+                .header("Content-Type", "application/json")
+                .body(Body::from(json.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn list_mappers(app: &Router) -> Vec<IdpMapper> {
+        let response = app.clone().oneshot(req("GET", MAPPERS_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_value(body_json(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idp_mapper_crud_roundtrip() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(&state, &realm_id, "oidc", std::collections::HashMap::new()).await;
+
+        // Create: 201, and the mapper shows up in the list.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                MAPPERS_URI,
+                Some(r#"{"name":"org","mapper_type":"attribute","config":{"claim":"org","attribute":"organization"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let mappers = list_mappers(&app).await;
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].name, "org");
+
+        // A distinct second name is accepted ...
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                MAPPERS_URI,
+                Some(r#"{"name":"admins","mapper_type":"role","config":{"claim":"groups","claim_value":"admins","role":"realm-admin"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // ... while an exact duplicate conflicts.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                MAPPERS_URI,
+                Some(r#"{"name":"org","mapper_type":"attribute","config":{"claim":"x","attribute":"y"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // In-place update (same name) succeeds and persists.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("{MAPPERS_URI}/org"),
+                Some(r#"{"name":"org","mapper_type":"attribute","config":{"claim":"department","attribute":"dept"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let mappers = list_mappers(&app).await;
+        assert_eq!(mappers.len(), 2);
+        let orgs: Vec<&IdpMapper> = mappers.iter().filter(|m| m.name == "org").collect();
+        assert_eq!(orgs.len(), 1, "in-place update must not touch the other mapper");
+        assert_eq!(orgs[0].config.get("claim").map(String::as_str), Some("department"));
+
+        // Renaming onto an existing mapper name conflicts ...
+        let response = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("{MAPPERS_URI}/org"),
+                Some(r#"{"name":"admins","mapper_type":"attribute","config":{}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // ... renaming to a fresh name succeeds ...
+        let response = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("{MAPPERS_URI}/org"),
+                Some(r#"{"name":"org-renamed","mapper_type":"attribute","config":{"claim":"department","attribute":"dept"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // ... and updating a mapper that does not exist is a 404.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("{MAPPERS_URI}/missing"),
+                Some(r#"{"name":"missing","mapper_type":"attribute","config":{}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Delete removes exactly the named mapper.
+        let response = app
+            .clone()
+            .oneshot(req("DELETE", &format!("{MAPPERS_URI}/admins"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let mappers = list_mappers(&app).await;
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].name, "org-renamed");
+
+        // Deleting it again is a 404.
+        let response = app
+            .clone()
+            .oneshot(req("DELETE", &format!("{MAPPERS_URI}/admins"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Deleting the last mapper empties the list.
+        let response = app
+            .clone()
+            .oneshot(req("DELETE", &format!("{MAPPERS_URI}/org-renamed"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(list_mappers(&app).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idp_mapper_validation_rejects_bad_names() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(&state, &realm_id, "oidc", std::collections::HashMap::new()).await;
+
+        for name in ["", "   ", "a/b"] {
+            let body = format!(r#"{{"name":"{name}","mapper_type":"attribute","config":{{}}}}"#);
+            let response =
+                app.clone().oneshot(req("POST", MAPPERS_URI, Some(&body))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "name {name:?}");
+        }
+        // Rejected mappers were not stored.
+        assert!(list_mappers(&app).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idp_mapper_subresources_404_for_unknown_idp() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        seed_realm(&state).await;
+
+        let base = "/admin/realms/test/identity-provider/instances/nope";
+        let response =
+            app.clone().oneshot(req("GET", &format!("{base}/mappers"), None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .clone()
+            .oneshot(req("POST", &format!("{base}/test-connection"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn idp_mapper_writes_require_manage_realm() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-realm").unwrap()
+            ]);
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(&state, &realm_id, "oidc", std::collections::HashMap::new()).await;
+
+        // The read-only role may list ...
+        let response = app.clone().oneshot(req("GET", MAPPERS_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // ... but every mutation is forbidden.
+        let mapper =
+            r#"{"name":"org","mapper_type":"attribute","config":{"claim":"c","attribute":"a"}}"#;
+        let instance = r#"{"alias":"corp2","provider_id":"oidc"}"#;
+        let instances_uri = "/admin/realms/test/identity-provider/instances";
+        let instance_uri = format!("{instances_uri}/corpidp");
+        for (method, uri, body) in [
+            ("POST", MAPPERS_URI.to_string(), Some(mapper)),
+            ("PUT", format!("{MAPPERS_URI}/org"), Some(mapper)),
+            ("DELETE", format!("{MAPPERS_URI}/org"), None),
+            ("POST", TEST_CONNECTION_URI.to_string(), None),
+            ("POST", instances_uri.to_string(), Some(instance)),
+            ("PUT", instance_uri.clone(), Some(instance)),
+            ("DELETE", instance_uri, None),
+        ] {
+            let response = app.clone().oneshot(req(method, &uri, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[test]
+    fn validate_mapper_rejects_empty_and_slash_names() {
+        let mapper = |name: &str| IdpMapper {
+            name: name.to_string(),
+            mapper_type: issuerd_core::IdpMapperType::Attribute,
+            config: std::collections::HashMap::new(),
+        };
+        assert!(matches!(validate_mapper(&mapper("")), Err(AdminApiError::BadRequest(_))));
+        assert!(matches!(validate_mapper(&mapper("   ")), Err(AdminApiError::BadRequest(_))));
+        assert!(matches!(validate_mapper(&mapper("a/b")), Err(AdminApiError::BadRequest(_))));
+        assert!(validate_mapper(&mapper("org")).is_ok());
+    }
+
+    #[test]
+    fn read_mappers_parses_stored_config_and_rejects_malformed() {
+        let idp = |config: std::collections::HashMap<String, String>| {
+            issuerd_core::IdentityProviderConfig {
+                id: issuerd_core::IdentityProviderId::new("idp-1").unwrap(),
+                alias: issuerd_core::Alias::new("corpidp").unwrap(),
+                provider_id: issuerd_core::ProviderId::new("oidc"),
+                enabled: true,
+                config,
+            }
+        };
+        // No `mappers` key: empty list.
+        assert!(read_mappers(&idp(std::collections::HashMap::new())).unwrap().is_empty());
+        // Well-formed JSON: parsed.
+        let stored = idp_config(&[(
+            "mappers",
+            r#"[{"name":"m","mapper_type":"attribute","config":{"claim":"c","attribute":"a"}}]"#,
+        )]);
+        let mappers = read_mappers(&idp(stored)).unwrap();
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].name, "m");
+        // Malformed JSON is a 500, never silently an empty list.
+        let broken = idp_config(&[("mappers", "not-json")]);
+        assert!(matches!(read_mappers(&idp(broken)), Err(AdminApiError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn test_connection_static_config_ok() {
+        // The default mock broker client has no expectations: any discovery
+        // fetch would panic, pinning that a static config is never fetched.
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(
+            &state,
+            &realm_id,
+            "oidc",
+            idp_config(&[
+                ("clientId", "cid"),
+                ("clientSecret", "sec"),
+                ("useDiscovery", "false"),
+                ("authorizationUrl", "https://idp.example.com/auth"),
+                ("tokenUrl", "https://idp.example.com/token"),
+            ]),
+        )
+        .await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["problems"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_connection_reports_static_config_problems() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        // Empty config: discovery defaults off (no issuer), so both explicit
+        // endpoint URLs are required too.
+        seed_idp(&state, &realm_id, "oidc", std::collections::HashMap::new()).await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "error");
+        let problems = body["problems"].as_array().unwrap();
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        for expected in ["clientId", "clientSecret", "authorizationUrl", "tokenUrl"] {
+            assert!(
+                problems.iter().any(|p| p.as_str().is_some_and(|s| s.contains(expected))),
+                "missing problem for {expected}: {problems:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_rejects_non_broker_provider() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        // Statically valid, but ldap is a federation provider, not a broker.
+        seed_idp(
+            &state,
+            &realm_id,
+            "ldap",
+            idp_config(&[
+                ("clientId", "cid"),
+                ("clientSecret", "sec"),
+                ("useDiscovery", "false"),
+                ("authorizationUrl", "https://idp.example.com/auth"),
+                ("tokenUrl", "https://idp.example.com/token"),
+            ]),
+        )
+        .await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "error");
+        let problems = body["problems"].as_array().unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0]
+            .as_str()
+            .is_some_and(|s| s.contains("not a broker-capable provider")));
+    }
+
+    #[tokio::test]
+    async fn test_connection_discovery_success() {
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        broker
+            .expect_get_json()
+            // The seeded issuer has a trailing slash: the fetch URL must not
+            // end up with a doubled path separator.
+            .withf(|url| {
+                url.starts_with("https://idp.example.com/.well-known/openid-configuration")
+                    && !url.contains("//.well-known")
+            })
+            .times(1)
+            .returning(|_| {
+                Ok(serde_json::json!({
+                    "issuer": "https://idp.example.com",
+                    "authorization_endpoint": "https://idp.example.com/auth",
+                    "token_endpoint": "https://idp.example.com/token"
+                }))
+            });
+        let state = crate::test_utils::tests::test_state_with_broker_client(
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+            Arc::new(broker),
+        );
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(
+            &state,
+            &realm_id,
+            "oidc",
+            idp_config(&[
+                ("clientId", "cid"),
+                ("clientSecret", "sec"),
+                ("issuer", "https://idp.example.com/"),
+            ]),
+        )
+        .await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["problems"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_connection_discovery_fetch_failure() {
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        broker.expect_get_json().times(1).returning(|_| {
+            Err(issuerd_core::IssuerdError::ServerError("connection refused".to_string()))
+        });
+        let state = crate::test_utils::tests::test_state_with_broker_client(
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+            Arc::new(broker),
+        );
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(
+            &state,
+            &realm_id,
+            "oidc",
+            idp_config(&[
+                ("clientId", "cid"),
+                ("clientSecret", "sec"),
+                ("issuer", "https://idp.example.com"),
+            ]),
+        )
+        .await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "error");
+        let problems = body["problems"].as_array().unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let problem = problems[0].as_str().unwrap();
+        assert!(problem.contains("discovery fetch failed"), "{problem}");
+        assert!(problem.contains("connection refused"), "{problem}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_discovery_unparseable_document() {
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        // Missing both endpoints the brokering flow cannot live without.
+        broker
+            .expect_get_json()
+            .times(1)
+            .returning(|_| Ok(serde_json::json!({"issuer": "https://idp.example.com"})));
+        let state = crate::test_utils::tests::test_state_with_broker_client(
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+            Arc::new(broker),
+        );
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(
+            &state,
+            &realm_id,
+            "oidc",
+            idp_config(&[
+                ("clientId", "cid"),
+                ("clientSecret", "sec"),
+                ("issuer", "https://idp.example.com"),
+            ]),
+        )
+        .await;
+
+        let response = app.oneshot(req("POST", TEST_CONNECTION_URI, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "error");
+        let problems = body["problems"].as_array().unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let problem = problems[0].as_str().unwrap();
+        assert!(problem.contains("discovery fetch failed"), "{problem}");
+        assert!(problem.contains("missing"), "{problem}");
     }
 }

@@ -610,6 +610,7 @@ mod tests {
     fn client_routes(state: Arc<AdminApiState>) -> Router {
         Router::new()
             .route("/admin/realms/{realm}/clients", get(list_clients).post(create_client))
+            .route("/admin/realms/{realm}/clients/count", get(count_clients))
             .route(
                 "/admin/realms/{realm}/clients/{id}",
                 get(get_client).put(update_client).delete(delete_client),
@@ -1057,5 +1058,158 @@ mod tests {
         let rep: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(rep.get("default_scopes").and_then(|v| v.as_array()).map(Vec::len), Some(0));
         assert_eq!(rep.get("optional_scopes").and_then(|v| v.as_array()).map(Vec::len), Some(0));
+    }
+
+    async fn get_client_count(app: &Router, realm_name: &str) -> i64 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/clients/count"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rep: CountRepresentation = serde_json::from_slice(&body).unwrap();
+        rep.count
+    }
+
+    #[tokio::test]
+    async fn count_clients_tracks_creates_and_deletes() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        // The seeded fixture client is counted and listed.
+        assert_eq!(get_client_count(&app, &realm_name).await, 1);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let clients: Vec<ClientRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].client_id, "my-app");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"second-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let created: ClientRepresentation = serde_json::from_slice(&body).unwrap();
+        let second_id = created.id.unwrap();
+        assert_eq!(get_client_count(&app, &realm_name).await, 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/realms/{realm_name}/clients/{second_id}"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(get_client_count(&app, &realm_name).await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_client_with_only_default_scopes_seeds_optional_from_realm() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        // Only default_scopes in the body: the explicit list is respected and
+        // optional_scopes is still seeded from the realm default tables.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"client_id":"one-sided-app","default_scopes":["openid","profile"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rep: ClientRepresentation = serde_json::from_slice(&body).unwrap();
+        let mut defaults = rep.default_scopes.unwrap();
+        defaults.sort();
+        assert_eq!(defaults, vec!["openid".to_string(), "profile".to_string()]);
+        let optionals = rep.optional_scopes.unwrap();
+        for expected in ["address", "phone", "offline_access", "web-origins", "acr"] {
+            assert!(optionals.iter().any(|s| s == expected), "missing optional scope {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_client_with_only_optional_scopes_seeds_defaults_from_realm() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        // Only optional_scopes in the body: the explicit list is respected and
+        // default_scopes is still seeded from the realm default tables.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"client_id":"one-sided-app","optional_scopes":["phone"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rep: ClientRepresentation = serde_json::from_slice(&body).unwrap();
+        let defaults = rep.default_scopes.unwrap();
+        for expected in ["profile", "email", "roles"] {
+            assert!(defaults.iter().any(|s| s == expected), "missing default scope {expected}");
+        }
+        assert_eq!(rep.optional_scopes.unwrap(), vec!["phone".to_string()]);
     }
 }
