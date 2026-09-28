@@ -185,6 +185,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_accepts_token_inside_expiry_leeway() {
+        let crypto = test_crypto();
+        // exp passed 30 s ago — inside the 60-second leeway: still accepted.
+        let claims =
+            action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", -30);
+        let token = issue_action_token(&crypto, &claims).await.unwrap();
+
+        let verified = verify_action_token(&crypto, &token, "reset-credentials", &test_realm_id())
+            .await
+            .unwrap();
+        assert_eq!(verified, claims);
+    }
+
+    #[test]
+    fn action_token_claims_exp_is_iat_plus_ttl() {
+        let claims = action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", 900);
+        assert_eq!(claims.exp - claims.iat, 900);
+    }
+
+    #[tokio::test]
     async fn verify_rejects_malformed_two_part_token() {
         let crypto = test_crypto();
         let err =

@@ -645,6 +645,23 @@ mod tests {
     }
 
     #[test]
+    fn iat_window_edges_accepted() {
+        let key = gen_ec();
+        let req = requirements();
+        // The acceptance window is inclusive on both ends: exactly
+        // `leeway_secs` in the future or `max_age_secs` in the past is valid.
+        for iat in [req.now + req.leeway_secs, req.now - req.max_age_secs] {
+            let mut claims = valid_claims();
+            claims["iat"] = serde_json::json!(iat);
+            let proof = key.proof(claims);
+            assert!(
+                validate_dpop_proof(&proof, &req).is_ok(),
+                "iat={iat} on the acceptance edge must be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn nonce_checked_when_expected() {
         let key = gen_ec();
         let req = DpopProofRequirements {

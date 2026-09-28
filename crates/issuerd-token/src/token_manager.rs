@@ -3742,6 +3742,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!at_roles.token.is_empty());
+
+        let jarm = ti
+            .sign_authorization_response(
+                &test_realm(),
+                "client1",
+                &[("code".to_string(), "authcode".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(jarm.split('.').count(), 3, "JARM is a compact JWS");
     }
 
     #[test]
@@ -4477,6 +4487,18 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(2));
         assert!(matches!(
             tm_zero.validate_access_token(&token.token),
+            Err(IssuerdError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn es512_future_nbf_token_rejected() {
+        let (tm, _) = multi_alg_tm().await;
+        let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+        claims.nbf = Utc::now().timestamp() + 3600;
+        let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
+        assert!(matches!(
+            tm.validate_access_token(&token),
             Err(IssuerdError::InvalidToken)
         ));
     }
