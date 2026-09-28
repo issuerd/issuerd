@@ -1630,6 +1630,7 @@ impl Storage for InMemoryStorage {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     fn test_realm() -> Realm {
@@ -4212,5 +4213,828 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    // ------------------------------------------------------------------
+    // event_matches truth table (query_events + count_events consistency)
+    // ------------------------------------------------------------------
+    #[rstest]
+    #[case::no_filters(None, None, None, None, None, &["e1", "e2", "e4"])]
+    #[case::type_match(Some(EventType::Login), None, None, None, None, &["e1"])]
+    #[case::type_mismatch(Some(EventType::CodeToToken), None, None, None, None, &[])]
+    #[case::client_match(None, Some("client-a"), None, None, None, &["e1"])]
+    #[case::client_mismatch(None, Some("client-zz"), None, None, None, &[])]
+    #[case::user_match(None, None, Some("user-b"), None, None, &["e2"])]
+    #[case::user_mismatch(None, None, Some("user-zz"), None, None, &[])]
+    #[case::from_inclusive_boundary(None, None, None, Some(0), None, &["e1", "e2", "e4"])]
+    #[case::from_excludes_earlier(None, None, None, Some(30), None, &["e2", "e4"])]
+    #[case::to_inclusive_boundary(None, None, None, None, Some(120), &["e1", "e2", "e4"])]
+    #[case::to_excludes_later(None, None, None, None, Some(60), &["e1", "e2"])]
+    #[case::date_range(None, None, None, Some(30), Some(90), &["e2"])]
+    #[case::all_filters(
+        Some(EventType::Login),
+        Some("client-a"),
+        Some("user-a"),
+        Some(0),
+        Some(60),
+        &["e1"]
+    )]
+    #[case::one_filter_mismatches(Some(EventType::Login), Some("client-b"), None, None, None, &[])]
+    #[tokio::test]
+    async fn event_matches_filter_combinations(
+        #[case] event_type: Option<EventType>,
+        #[case] client: Option<&str>,
+        #[case] user: Option<&str>,
+        #[case] from_secs: Option<i64>,
+        #[case] to_secs: Option<i64>,
+        #[case] expected: &[&str],
+    ) {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+
+        let base = Utc::now();
+        let mk = |id: &str,
+                  realm: &RealmId,
+                  event_type: EventType,
+                  secs: i64,
+                  client: Option<&str>,
+                  user: Option<&str>| {
+            Event {
+                id: EventId::new(id).unwrap(),
+                realm_id: realm.clone(),
+                event_time: base + chrono::Duration::seconds(secs),
+                event_type,
+                ip_address: Some("127.0.0.1".parse().unwrap()),
+                client_id: client.map(|c| ClientId::new(c).unwrap()),
+                user_id: user.map(|u| UserId::new(u).unwrap()),
+                session_id: None,
+                error: None,
+                details: HashMap::new(),
+            }
+        };
+        // e3 is the decoy: identical filter fields, but in the other realm.
+        // e4 has no client/user: filters on those fields must not match it.
+        let events = [
+            mk("e1", &realm_a.id, EventType::Login, 0, Some("client-a"), Some("user-a")),
+            mk("e2", &realm_a.id, EventType::Logout, 60, Some("client-b"), Some("user-b")),
+            mk("e3", &realm_b.id, EventType::Login, 0, Some("client-a"), Some("user-a")),
+            mk("e4", &realm_a.id, EventType::Register, 120, None, None),
+        ];
+        for ev in &events {
+            storage.save_event(&realm_a.id, ev).await.unwrap();
+        }
+
+        let query = EventQuery {
+            event_type,
+            client_id: client.map(|c| ClientId::new(c).unwrap()),
+            user_id: user.map(|u| UserId::new(u).unwrap()),
+            date_from: from_secs.map(|s| base + chrono::Duration::seconds(s)),
+            date_to: to_secs.map(|s| base + chrono::Duration::seconds(s)),
+            pagination: Pagination::default(),
+        };
+        let results = storage.query_events(&realm_a.id, &query).await.unwrap();
+        let mut ids: Vec<&str> = results.iter().map(|e| e.id.as_ref()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.as_slice(), expected);
+        // count_events shares event_matches, so the total must agree with the list.
+        assert_eq!(storage.count_events(&realm_a.id, &query).await.unwrap(), expected.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn event_delete_and_counts_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+
+        let all = EventQuery {
+            event_type: None,
+            client_id: None,
+            user_id: None,
+            date_from: None,
+            date_to: None,
+            pagination: Pagination::default(),
+        };
+        for (id, realm) in [("e1", "realm-1"), ("e2", "realm-1"), ("e3", "realm-2")] {
+            let mut ev = test_event(realm, EventType::Login);
+            ev.id = EventId::new(id).unwrap();
+            storage.save_event(&realm_a.id, &ev).await.unwrap();
+        }
+
+        assert_eq!(storage.count_events(&realm_a.id, &all).await.unwrap(), 2);
+        assert_eq!(storage.count_events(&realm_b.id, &all).await.unwrap(), 1);
+
+        storage.delete_events(&realm_a.id).await.unwrap();
+        assert_eq!(storage.count_events(&realm_a.id, &all).await.unwrap(), 0);
+        assert_eq!(storage.count_events(&realm_b.id, &all).await.unwrap(), 1);
+        let remaining = storage.query_events(&realm_b.id, &all).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.as_ref(), "e3");
+    }
+
+    // ------------------------------------------------------------------
+    // delete_user cascade: every entity kind, realm-scoped
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn delete_user_cascades_everything_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let target = test_user("realm-1"); // user-1 / alice
+        let mut bystander = test_user("realm-1");
+        bystander.id = UserId::new("user-2").unwrap();
+        bystander.username = Username::new("bob").unwrap();
+        bystander.email = Some(Email::new("bob@example.com").unwrap());
+        // Decoy: same user id and username as the target, but in realm B.
+        let decoy = test_user("realm-2");
+        storage.create_user(a, &target).await.unwrap();
+        storage.create_user(a, &bystander).await.unwrap();
+        storage.create_user(b, &decoy).await.unwrap();
+
+        // Every entity kind the cascade must reap, for the target, the
+        // same-realm bystander, and the cross-realm decoy.
+        for (realm, realm_name, user_name) in [
+            (a, "realm-1", "user-1"),
+            (a, "realm-1", "user-2"),
+            (b, "realm-2", "user-1"),
+        ] {
+            let uid = UserId::new(user_name).unwrap();
+
+            let mut cred = test_credential();
+            cred.id = CredentialId::new(format!("cred-{realm_name}-{user_name}")).unwrap();
+            storage.create_credential(realm, &uid, &cred).await.unwrap();
+
+            let mut session = test_session(realm_name);
+            session.id = SessionId::new(format!("sess-{realm_name}-{user_name}")).unwrap();
+            session.user_id = uid.clone();
+            storage.create_user_session(realm, &session).await.unwrap();
+
+            let mut consent = test_consent();
+            consent.user_id = uid.clone();
+            storage.create_consent(realm, &consent).await.unwrap();
+
+            let link = test_link(user_name, "google", &format!("sub-{realm_name}-{user_name}"));
+            storage.create_identity_provider_link(realm, &link).await.unwrap();
+
+            storage
+                .add_user_realm_role(realm, &uid, &RoleId::new("role-1").unwrap())
+                .await
+                .unwrap();
+            let client_role = if realm_name == "realm-1" {
+                "cr-a"
+            } else {
+                "cr-b"
+            };
+            storage
+                .add_user_client_role(realm, &uid, &RoleId::new(client_role).unwrap())
+                .await
+                .unwrap();
+            storage
+                .add_user_group(realm, &uid, &GroupId::new("group-1").unwrap())
+                .await
+                .unwrap();
+        }
+
+        storage.delete_user(a, &target.id).await.unwrap();
+
+        // Target in A: everything is gone.
+        let t = &target.id;
+        assert!(storage.get_user(a, t).await.unwrap().is_none());
+        assert!(storage.list_credentials(a, t).await.unwrap().is_empty());
+        assert_eq!(storage.count_sessions(a, Some(t.clone())).await.unwrap(), 0);
+        assert!(storage.get_consents(a, t).await.unwrap().is_empty());
+        assert!(storage.list_identity_provider_links(a, t).await.unwrap().is_empty());
+        assert!(storage.list_user_realm_roles(a, t).await.unwrap().is_empty());
+        assert!(storage.list_user_client_roles(a, t).await.unwrap().is_empty());
+        assert!(storage.list_user_groups(a, t).await.unwrap().is_empty());
+
+        // Bystander in A: untouched.
+        let s = &bystander.id;
+        assert!(storage.get_user(a, s).await.unwrap().is_some());
+        assert_eq!(storage.list_credentials(a, s).await.unwrap().len(), 1);
+        assert_eq!(storage.count_sessions(a, Some(s.clone())).await.unwrap(), 1);
+        assert_eq!(storage.get_consents(a, s).await.unwrap().len(), 1);
+        assert_eq!(storage.list_identity_provider_links(a, s).await.unwrap().len(), 1);
+        assert_eq!(
+            storage.list_user_realm_roles(a, s).await.unwrap(),
+            vec![RoleId::new("role-1").unwrap()]
+        );
+        assert_eq!(
+            storage.list_user_client_roles(a, s).await.unwrap(),
+            vec![RoleId::new("cr-a").unwrap()]
+        );
+        assert_eq!(
+            storage.list_user_groups(a, s).await.unwrap(),
+            vec![GroupId::new("group-1").unwrap()]
+        );
+
+        // Decoy in B (same user id): untouched.
+        let d = &decoy.id;
+        assert!(storage.get_user(b, d).await.unwrap().is_some());
+        assert_eq!(storage.list_credentials(b, d).await.unwrap().len(), 1);
+        assert_eq!(storage.count_sessions(b, Some(d.clone())).await.unwrap(), 1);
+        assert_eq!(storage.get_consents(b, d).await.unwrap().len(), 1);
+        assert_eq!(storage.list_identity_provider_links(b, d).await.unwrap().len(), 1);
+        assert_eq!(
+            storage.list_user_realm_roles(b, d).await.unwrap(),
+            vec![RoleId::new("role-1").unwrap()]
+        );
+        assert_eq!(
+            storage.list_user_client_roles(b, d).await.unwrap(),
+            vec![RoleId::new("cr-b").unwrap()]
+        );
+        assert_eq!(
+            storage.list_user_groups(b, d).await.unwrap(),
+            vec![GroupId::new("group-1").unwrap()]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Group CRUD, realm-scoped with decoys
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn group_crud_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        // Same group name in both realms.
+        let group_a = test_group("realm-1"); // group-1 / admins
+        let mut group_b = test_group("realm-2");
+        group_b.id = GroupId::new("group-b1").unwrap();
+        storage.create_group(a, &group_a).await.unwrap();
+        storage.create_group(b, &group_b).await.unwrap();
+
+        // Exact lookups, realm-scoped.
+        assert_eq!(storage.get_group(a, &group_a.id).await.unwrap(), Some(group_a.clone()));
+        assert!(storage.get_group(a, &group_b.id).await.unwrap().is_none());
+        assert_eq!(
+            storage.get_group_by_name(a, "admins").await.unwrap().map(|g| g.id),
+            Some(group_a.id.clone())
+        );
+        // A miss must be a miss even though A holds groups with other names
+        // and B holds this very name.
+        assert!(storage.get_group_by_name(a, "missing").await.unwrap().is_none());
+
+        // Duplicate name in the same realm is a conflict...
+        let mut dup = group_a.clone();
+        dup.id = GroupId::new("group-dup").unwrap();
+        assert_eq!(storage.create_group(a, &dup).await.unwrap_err(), IssuerdError::Conflict);
+        // ...but a name that only exists in the other realm is fine.
+        let mut b_only = test_group("realm-2");
+        b_only.id = GroupId::new("group-bonly").unwrap();
+        b_only.name = GroupName::new("b-only").unwrap();
+        storage.create_group(b, &b_only).await.unwrap();
+        let mut a_bonly = b_only.clone();
+        a_bonly.id = GroupId::new("group-abonly").unwrap();
+        a_bonly.realm_id = a.clone();
+        storage.create_group(a, &a_bonly).await.unwrap();
+        // A second distinct name in A is fine too.
+        let mut users = test_group("realm-1");
+        users.id = GroupId::new("group-users").unwrap();
+        users.name = GroupName::new("users").unwrap();
+        storage.create_group(a, &users).await.unwrap();
+
+        // Listing and count see only A's groups.
+        let groups = storage.list_groups(a, &Pagination::default()).await.unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["admins", "b-only", "users"]);
+        assert_eq!(storage.count_groups(a).await.unwrap(), 3);
+        assert_eq!(storage.count_groups(b).await.unwrap(), 2);
+
+        // Update: Ok for an existing (realm, id), NotFound otherwise.
+        let mut renamed = group_a.clone();
+        renamed.name = GroupName::new("superusers").unwrap();
+        renamed.realm_roles = vec![RoleName::new("user").unwrap()];
+        renamed.client_roles = HashMap::from([(
+            ClientId::new("client-1").unwrap(),
+            vec![RoleName::new("viewer").unwrap()],
+        )]);
+        storage.update_group(a, &renamed).await.unwrap();
+        assert_eq!(storage.get_group(a, &group_a.id).await.unwrap(), Some(renamed.clone()));
+        let mut missing = group_a.clone();
+        missing.id = GroupId::new("missing").unwrap();
+        assert_eq!(storage.update_group(a, &missing).await.unwrap_err(), IssuerdError::NotFound);
+        assert_eq!(storage.update_group(b, &group_a).await.unwrap_err(), IssuerdError::NotFound);
+
+        // Delete: gone from A, B untouched.
+        storage.delete_group(a, &group_a.id).await.unwrap();
+        assert!(storage.get_group(a, &group_a.id).await.unwrap().is_none());
+        assert_eq!(storage.count_groups(a).await.unwrap(), 2);
+        assert_eq!(storage.get_group(b, &group_b.id).await.unwrap(), Some(group_b.clone()));
+    }
+
+    #[tokio::test]
+    async fn group_delete_membership_cascade_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let mut doomed = test_group("realm-1");
+        doomed.id = GroupId::new("group-del").unwrap();
+        let mut keep = test_group("realm-1");
+        keep.id = GroupId::new("group-keep").unwrap();
+        keep.name = GroupName::new("keep").unwrap();
+        // Decoy: same group id as `doomed`, but in realm B.
+        let mut b_group = test_group("realm-2");
+        b_group.id = GroupId::new("group-del").unwrap();
+        b_group.name = GroupName::new("b-group").unwrap();
+        storage.create_group(a, &doomed).await.unwrap();
+        storage.create_group(a, &keep).await.unwrap();
+        storage.create_group(b, &b_group).await.unwrap();
+
+        let user_a = test_user("realm-1");
+        let mut other_a = test_user("realm-1");
+        other_a.id = UserId::new("user-2").unwrap();
+        other_a.username = Username::new("bob").unwrap();
+        let mut user_b = test_user("realm-2");
+        user_b.id = UserId::new("user-9").unwrap();
+        storage.create_user(a, &user_a).await.unwrap();
+        storage.create_user(a, &other_a).await.unwrap();
+        storage.create_user(b, &user_b).await.unwrap();
+
+        let del = GroupId::new("group-del").unwrap();
+        storage.add_user_group(a, &user_a.id, &del).await.unwrap();
+        storage.add_user_group(a, &user_a.id, &keep.id).await.unwrap();
+        storage.add_user_group(a, &other_a.id, &keep.id).await.unwrap();
+        storage.add_user_group(b, &user_b.id, &del).await.unwrap();
+
+        storage.delete_group(a, &del).await.unwrap();
+
+        // Only the deleted group leaves A's membership lists, nothing else.
+        assert_eq!(storage.list_user_groups(a, &user_a.id).await.unwrap(), vec![keep.id.clone()]);
+        assert_eq!(storage.list_user_groups(a, &other_a.id).await.unwrap(), vec![keep.id.clone()]);
+        // B's membership of the same-named-id group survives.
+        assert_eq!(storage.list_user_groups(b, &user_b.id).await.unwrap(), vec![del.clone()]);
+        assert!(storage.get_group(a, &del).await.unwrap().is_none());
+        assert_eq!(storage.get_group(b, &del).await.unwrap(), Some(b_group.clone()));
+    }
+
+    // ------------------------------------------------------------------
+    // Session lifecycle, realm-scoped
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn session_lifecycle_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let user1 = test_user("realm-1");
+        let mut user2 = test_user("realm-1");
+        user2.id = UserId::new("user-2").unwrap();
+        user2.username = Username::new("bob").unwrap();
+        storage.create_user(a, &user1).await.unwrap();
+        storage.create_user(a, &user2).await.unwrap();
+
+        let base = Utc::now();
+        // s1: A/user-1 with a client session attached; s2: A/user-2; s3: B/user-1 decoy.
+        let mut s1 = test_session("realm-1");
+        s1.id = SessionId::new("sess-a1").unwrap();
+        s1.last_session_refresh = base + chrono::Duration::seconds(60);
+        s1.clients = vec![ClientSession {
+            id: ClientSessionId::new("cs-1").unwrap(),
+            client_id: ClientId::new("client-1").unwrap(),
+            session_id: s1.id.clone(),
+            redirect_uri: None,
+            state: None,
+            auth_method: AuthMethod::Password,
+            timestamp: base,
+        }];
+        let mut s2 = test_session("realm-1");
+        s2.id = SessionId::new("sess-a2").unwrap();
+        s2.user_id = user2.id.clone();
+        s2.last_session_refresh = base;
+        let mut s3 = test_session("realm-2");
+        s3.id = SessionId::new("sess-b1").unwrap();
+
+        // Create must actually store the session, scoped to its realm.
+        storage.create_user_session(a, &s1).await.unwrap();
+        assert_eq!(storage.get_user_session(a, &s1.id).await.unwrap(), Some(s1.clone()));
+        assert!(storage.get_user_session(b, &s1.id).await.unwrap().is_none());
+        storage.create_user_session(a, &s2).await.unwrap();
+        storage.create_user_session(b, &s3).await.unwrap();
+
+        // Update stores the new value; a missing (realm, id) is NotFound.
+        s1.last_session_refresh = base + chrono::Duration::seconds(120);
+        storage.update_user_session(a, &s1).await.unwrap();
+        assert_eq!(storage.get_user_session(a, &s1.id).await.unwrap(), Some(s1.clone()));
+        let mut missing = test_session("realm-1");
+        missing.id = SessionId::new("missing").unwrap();
+        assert_eq!(
+            storage.update_user_session(a, &missing).await.unwrap_err(),
+            IssuerdError::NotFound
+        );
+
+        // Per-user listing and counts are exact and realm-scoped.
+        let one = storage
+            .list_sessions(a, Some(user1.id.clone()), &Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(one, vec![s1.clone()]);
+        // Unfiltered listing is newest-refresh first and stays inside the realm.
+        let all = storage.list_sessions(a, None, &Pagination::default()).await.unwrap();
+        assert_eq!(all, vec![s1.clone(), s2.clone()]);
+        assert_eq!(storage.count_sessions(a, Some(user1.id.clone())).await.unwrap(), 1);
+        assert_eq!(storage.count_sessions(a, Some(user2.id.clone())).await.unwrap(), 1);
+        assert_eq!(storage.count_sessions(a, None).await.unwrap(), 2);
+        assert_eq!(storage.count_sessions(b, None).await.unwrap(), 1);
+
+        // Delete removes exactly the one session.
+        storage.delete_user_session(a, &s1.id).await.unwrap();
+        assert!(storage.get_user_session(a, &s1.id).await.unwrap().is_none());
+        let remaining = storage.list_sessions(a, None, &Pagination::default()).await.unwrap();
+        assert_eq!(remaining, vec![s2.clone()]);
+        assert_eq!(storage.get_user_session(b, &s3.id).await.unwrap(), Some(s3.clone()));
+    }
+
+    // ------------------------------------------------------------------
+    // User lookups, realm-scoped
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn user_lookups_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        // alice: the lookup target in A.
+        let mut alice = test_user("realm-1");
+        alice.federation_link = Some("ldap|shared".to_string());
+        // bob: same realm, no matching fields, no federation link.
+        let mut bob = test_user("realm-1");
+        bob.id = UserId::new("user-2").unwrap();
+        bob.username = Username::new("bob").unwrap();
+        bob.email = Some(Email::new("bob@example.com").unwrap());
+        // carol: same realm, no email, a different federation link.
+        let mut carol = test_user("realm-1");
+        carol.id = UserId::new("user-3").unwrap();
+        carol.username = Username::new("carol").unwrap();
+        carol.email = None;
+        carol.federation_link = Some("ldap|other".to_string());
+        // decoy: same username/email/federation link as alice, but in B.
+        let mut decoy = test_user("realm-2");
+        decoy.id = UserId::new("user-b1").unwrap();
+        decoy.federation_link = Some("ldap|shared".to_string());
+        storage.create_user(a, &alice).await.unwrap();
+        storage.create_user(a, &bob).await.unwrap();
+        storage.create_user(a, &carol).await.unwrap();
+        storage.create_user(b, &decoy).await.unwrap();
+
+        assert_eq!(
+            storage.get_user_by_username(a, "alice").await.unwrap().map(|u| u.id),
+            Some(alice.id.clone())
+        );
+        assert!(storage.get_user_by_username(a, "missing").await.unwrap().is_none());
+        assert_eq!(
+            storage.get_user_by_email(a, "alice@example.com").await.unwrap().map(|u| u.id),
+            Some(alice.id.clone())
+        );
+        assert!(storage.get_user_by_email(a, "nobody@example.com").await.unwrap().is_none());
+        let linked: Vec<UserId> = storage
+            .get_user_by_federation_link(a, "ldap|shared")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(linked, vec![alice.id.clone()]);
+        assert!(storage.get_user_by_federation_link(a, "ldap|missing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_update_success_path() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let user = test_user("realm-1");
+        storage.create_user(a, &user).await.unwrap();
+
+        let mut updated = user.clone();
+        updated.email = Some(Email::new("alice@new.example.com").unwrap());
+        updated.first_name = Some(DisplayName::new("Alicia").unwrap());
+        storage.update_user(a, &updated).await.unwrap();
+
+        let fetched = storage.get_user(a, &user.id).await.unwrap().unwrap();
+        assert_eq!(fetched.email, updated.email);
+        assert_eq!(fetched.first_name, updated.first_name);
+
+        // Existence is keyed by (realm, id): the same user id in another
+        // realm is NotFound.
+        assert_eq!(storage.update_user(b, &updated).await.unwrap_err(), IssuerdError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn client_get_returns_created_client() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let client = test_client("realm-1");
+        storage.create_client(a, &client).await.unwrap();
+        assert_eq!(storage.get_client(a, &client.id).await.unwrap(), Some(client.clone()));
+        assert!(storage.get_client(b, &client.id).await.unwrap().is_none());
+        assert!(storage
+            .get_client(a, &ClientId::new("missing").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn role_get_and_by_name_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let role_a = test_role("realm-1"); // role-1 / admin
+        let mut role_b = test_role("realm-2");
+        role_b.id = RoleId::new("role-b1").unwrap();
+        storage.create_role(a, &role_a).await.unwrap();
+        storage.create_role(b, &role_b).await.unwrap();
+
+        assert_eq!(storage.get_role(a, &role_a.id).await.unwrap(), Some(role_a.clone()));
+        assert!(storage.get_role(b, &role_a.id).await.unwrap().is_none());
+        assert_eq!(
+            storage.get_role_by_name(a, "admin").await.unwrap().map(|r| r.id),
+            Some(role_a.id.clone())
+        );
+        assert!(storage.get_role_by_name(a, "missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn realm_default_client_scopes_mutation_paths() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let scope_x = test_client_scope("realm-1", "x-custom");
+        let scope_y = test_client_scope("realm-1", "y-custom");
+        storage.create_client_scope(a, &scope_x).await.unwrap();
+        storage.create_client_scope(a, &scope_y).await.unwrap();
+
+        let seeded = storage.list_realm_default_client_scopes(a).await.unwrap();
+        let seeded_len = seeded.len();
+
+        // Adds must actually store the rows.
+        storage.add_realm_default_client_scope(a, &scope_x.id, true).await.unwrap();
+        storage.add_realm_default_client_scope(a, &scope_y.id, true).await.unwrap();
+        let defaults = storage.list_realm_default_client_scopes(a).await.unwrap();
+        assert_eq!(defaults.len(), seeded_len + 2);
+        assert!(defaults.contains(&(scope_x.id.clone(), true)));
+        assert!(defaults.contains(&(scope_y.id.clone(), true)));
+
+        // Re-adding with a flipped flag updates that row only.
+        storage.add_realm_default_client_scope(a, &scope_x.id, false).await.unwrap();
+        let defaults = storage.list_realm_default_client_scopes(a).await.unwrap();
+        assert_eq!(defaults.len(), seeded_len + 2);
+        assert!(defaults.contains(&(scope_x.id.clone(), false)));
+        assert!(defaults.contains(&(scope_y.id.clone(), true)));
+        for pair in &seeded {
+            assert!(defaults.contains(pair));
+        }
+
+        // Removal drops exactly that row.
+        storage.remove_realm_default_client_scope(a, &scope_x.id).await.unwrap();
+        let defaults = storage.list_realm_default_client_scopes(a).await.unwrap();
+        assert_eq!(defaults.len(), seeded_len + 1);
+        assert!(!defaults.iter().any(|(s, _)| s == &scope_x.id));
+        assert!(defaults.contains(&(scope_y.id.clone(), true)));
+        for pair in &seeded {
+            assert!(defaults.contains(pair));
+        }
+
+        // The other realm's defaults are untouched.
+        assert_eq!(storage.list_realm_default_client_scopes(b).await.unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn user_realm_role_membership_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let role1 = test_role("realm-1");
+        let mut role2 = test_role("realm-1");
+        role2.id = RoleId::new("role-2").unwrap();
+        role2.name = RoleName::new("user").unwrap();
+        let role_b = test_role("realm-2"); // same role id as role1, other realm
+        storage.create_role(a, &role1).await.unwrap();
+        storage.create_role(a, &role2).await.unwrap();
+        storage.create_role(b, &role_b).await.unwrap();
+
+        let user_a = test_user("realm-1");
+        let user_b = test_user("realm-2"); // same user id, other realm
+        storage.create_user(a, &user_a).await.unwrap();
+        storage.create_user(b, &user_b).await.unwrap();
+
+        storage.add_user_realm_role(a, &user_a.id, &role1.id).await.unwrap();
+        storage.add_user_realm_role(a, &user_a.id, &role2.id).await.unwrap();
+        // A duplicate add must not duplicate the mapping.
+        storage.add_user_realm_role(a, &user_a.id, &role1.id).await.unwrap();
+        storage.add_user_realm_role(b, &user_b.id, &role_b.id).await.unwrap();
+
+        assert_eq!(
+            storage.list_user_realm_roles(a, &user_a.id).await.unwrap(),
+            vec![role1.id.clone(), role2.id.clone()]
+        );
+        assert_eq!(
+            storage.list_user_realm_roles(b, &user_b.id).await.unwrap(),
+            vec![role_b.id.clone()]
+        );
+
+        // Removal drops exactly the named role, in exactly this realm.
+        storage.remove_user_realm_role(a, &user_a.id, &role1.id).await.unwrap();
+        assert_eq!(
+            storage.list_user_realm_roles(a, &user_a.id).await.unwrap(),
+            vec![role2.id.clone()]
+        );
+        assert_eq!(
+            storage.list_user_realm_roles(b, &user_b.id).await.unwrap(),
+            vec![role_b.id.clone()]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Admin events: save/query/count/delete, realm-scoped
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn admin_event_count_query_and_delete_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let base = Utc::now();
+        let mk = |id: &str,
+                  realm: &RealmId,
+                  op: OperationType,
+                  rt: ResourceType,
+                  secs: i64,
+                  auth_user: &str| {
+            AdminEvent {
+                id: EventId::new(id).unwrap(),
+                realm_id: realm.clone(),
+                auth_realm_id: None,
+                auth_client_id: None,
+                auth_user_id: Some(UserId::new(auth_user).unwrap()),
+                operation_type: op,
+                resource_type: rt,
+                resource_path: "x/y".to_string(),
+                representation: None,
+                error: None,
+                event_time: base + chrono::Duration::seconds(secs),
+            }
+        };
+        let all = AdminEventQuery {
+            operation_type: None,
+            resource_type: None,
+            auth_user_id: None,
+            date_from: None,
+            date_to: None,
+            pagination: Pagination::default(),
+        };
+
+        // The first save must be visible to both query and count.
+        storage
+            .save_admin_event(&mk(
+                "ae1",
+                a,
+                OperationType::Create,
+                ResourceType::User,
+                0,
+                "admin-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(storage.count_admin_events(a, &all).await.unwrap(), 1);
+        storage
+            .save_admin_event(&mk(
+                "ae2",
+                a,
+                OperationType::Delete,
+                ResourceType::User,
+                60,
+                "admin-1",
+            ))
+            .await
+            .unwrap();
+        storage
+            .save_admin_event(&mk(
+                "ae3",
+                a,
+                OperationType::Update,
+                ResourceType::Client,
+                120,
+                "admin-2",
+            ))
+            .await
+            .unwrap();
+        storage
+            .save_admin_event(&mk(
+                "ae-b",
+                b,
+                OperationType::Create,
+                ResourceType::User,
+                0,
+                "admin-1",
+            ))
+            .await
+            .unwrap();
+
+        let results = storage.query_admin_events(a, &all).await.unwrap();
+        let mut ids: Vec<&str> = results.iter().map(|e| e.id.as_ref()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["ae1", "ae2", "ae3"]);
+        assert_eq!(storage.count_admin_events(a, &all).await.unwrap(), 3);
+        assert_eq!(storage.count_admin_events(b, &all).await.unwrap(), 1);
+
+        // Filtered counts.
+        let mut by_op = all.clone();
+        by_op.operation_type = Some(OperationType::Create);
+        assert_eq!(storage.count_admin_events(a, &by_op).await.unwrap(), 1);
+        let mut by_rt = all.clone();
+        by_rt.resource_type = Some(ResourceType::User);
+        assert_eq!(storage.count_admin_events(a, &by_rt).await.unwrap(), 2);
+        let mut by_user = all.clone();
+        by_user.auth_user_id = Some(UserId::new("admin-2").unwrap());
+        assert_eq!(storage.count_admin_events(a, &by_user).await.unwrap(), 1);
+        let mut from = all.clone();
+        from.date_from = Some(base + chrono::Duration::seconds(30));
+        assert_eq!(storage.count_admin_events(a, &from).await.unwrap(), 2);
+        let mut to = all.clone();
+        to.date_to = Some(base + chrono::Duration::seconds(60));
+        assert_eq!(storage.count_admin_events(a, &to).await.unwrap(), 2);
+
+        // Deletion wipes only the target realm.
+        storage.delete_admin_events(a).await.unwrap();
+        assert_eq!(storage.count_admin_events(a, &all).await.unwrap(), 0);
+        assert_eq!(storage.count_admin_events(b, &all).await.unwrap(), 1);
+        let remaining = storage.query_admin_events(b, &all).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.as_ref(), "ae-b");
+    }
+
+    // ------------------------------------------------------------------
+    // Provision markers
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn provision_marker_lifecycle() {
+        let storage = InMemoryStorage::new();
+
+        assert_eq!(storage.get_provision_marker("p1").await.unwrap(), None);
+        storage.set_provision_marker("p1", "v1").await.unwrap();
+        assert_eq!(storage.get_provision_marker("p1").await.unwrap(), Some("v1".to_string()));
+        // Overwrite.
+        storage.set_provision_marker("p1", "v2").await.unwrap();
+        assert_eq!(storage.get_provision_marker("p1").await.unwrap(), Some("v2".to_string()));
+
+        // Claim succeeds exactly once and stores the first value.
+        assert!(storage.claim_provision_marker("p2", "x").await.unwrap());
+        assert!(!storage.claim_provision_marker("p2", "y").await.unwrap());
+        assert_eq!(storage.get_provision_marker("p2").await.unwrap(), Some("x".to_string()));
+
+        // Markers ride the snapshot too.
+        let snapshot = storage.to_snapshot();
+        let restored = InMemoryStorage::new();
+        restored.load_snapshot(snapshot);
+        assert_eq!(restored.get_provision_marker("p1").await.unwrap(), Some("v2".to_string()));
+        assert_eq!(restored.get_provision_marker("p2").await.unwrap(), Some("x".to_string()));
     }
 }

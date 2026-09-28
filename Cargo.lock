@@ -2382,6 +2382,7 @@ dependencies = [
  "issuerd-core",
  "mockall",
  "ring",
+ "rstest",
  "serde",
  "serde_json",
  "sqlx",

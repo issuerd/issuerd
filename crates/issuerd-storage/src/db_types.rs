@@ -2760,4 +2760,57 @@ mod tests {
         assert_eq!(pg.representation, Some("{}".to_string()));
         assert_eq!(pg.error, Some("err".to_string()));
     }
+
+    // ------------------------------------------------------------------
+    // ssl_required <-> string mapping and integer clamp helpers
+    // ------------------------------------------------------------------
+
+    #[rstest::rstest]
+    #[case(SslRequired::None, "none")]
+    #[case(SslRequired::External, "external")]
+    #[case(SslRequired::All, "all")]
+    fn ssl_required_pg_string_roundtrip(#[case] variant: SslRequired, #[case] wire: &str) {
+        // DB string -> domain enum.
+        let mut pg = pg_realm();
+        pg.ssl_required = wire.to_string();
+        let realm: Realm = pg.try_into().unwrap();
+        assert_eq!(realm.ssl_required, variant);
+
+        // Domain enum -> DB string.
+        let pg: PgRealm = (&realm).try_into().unwrap();
+        assert_eq!(pg.ssl_required, wire);
+    }
+
+    #[rstest::rstest]
+    #[case("garbage")]
+    #[case("")]
+    #[case("NONE")]
+    #[case("External")]
+    fn ssl_required_unknown_string_falls_back_to_external(#[case] wire: &str) {
+        let mut pg = pg_realm();
+        pg.ssl_required = wire.to_string();
+        let realm: Realm = pg.try_into().unwrap();
+        assert_eq!(realm.ssl_required, SslRequired::External);
+    }
+
+    #[rstest::rstest]
+    #[case(0, 0)]
+    #[case(1, 1)]
+    #[case(2_147_483_647, i32::MAX)]
+    // Out of i32 range: clamped to i32::MAX.
+    #[case(2_147_483_648, i32::MAX)]
+    #[case(u32::MAX, i32::MAX)]
+    fn u32_to_i32_clamps_to_i32_max(#[case] input: u32, #[case] expected: i32) {
+        assert_eq!(u32_to_i32(input), expected);
+    }
+
+    #[rstest::rstest]
+    #[case(0, 0)]
+    #[case(1, 1)]
+    #[case(-1, 0)]
+    #[case(i32::MIN, 0)]
+    #[case(i32::MAX, 2_147_483_647)]
+    fn i32_to_u32_clamps_negatives_to_zero(#[case] input: i32, #[case] expected: u32) {
+        assert_eq!(i32_to_u32(input), expected);
+    }
 }

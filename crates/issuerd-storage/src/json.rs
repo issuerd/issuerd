@@ -1539,4 +1539,1116 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ------------------------------------------------------------------
+    // Full-entity persist + reload roundtrip
+    // ------------------------------------------------------------------
+
+    fn unique_test_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("issuerd-{tag}-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    fn full_realm() -> Realm {
+        let mut r = test_realm();
+        r.login_theme = Some(ThemeName::new("issuerd").unwrap());
+        r.email_theme = Some(ThemeName::new("custom-email").unwrap());
+        r.admin_theme = Some(ThemeName::new("custom-admin").unwrap());
+        r.default_role = Some("default-roles".to_string());
+        r.brute_force_protected = true;
+        r.registration_enabled = true;
+        r.reset_password_allowed = true;
+        r.remember_me_enabled = true;
+        r.verify_email_enabled = true;
+        r.duplicate_emails_allowed = true;
+        r.edit_username_allowed = false;
+        r.internationalization_enabled = true;
+        r.supported_locales = vec!["en".to_string(), "de".to_string()];
+        r.default_locale = Some("en".to_string());
+        r.events_enabled = true;
+        r.events_expiration_secs = 86_400;
+        r.admin_events_enabled = true;
+        r.include_representations = true;
+        r.events_listeners = vec!["logging".to_string(), "metrics".to_string()];
+        r.not_before = 1_700_000_000;
+        r.default_groups = vec!["/admins".to_string()];
+        r.browser_flow = Some("browser".to_string());
+        r.direct_grant_flow = Some("direct grant".to_string());
+        r.reset_credentials_flow = Some("reset credentials".to_string());
+        r.first_broker_login_flow = Some("first broker login".to_string());
+        r.registration_flow = Some("registration".to_string());
+        r.attributes.insert("custom".to_string(), "value".to_string());
+        r
+    }
+
+    fn full_user(realm_id: &RealmId) -> User {
+        let now = chrono::Utc::now();
+        User {
+            id: UserId::new("user-1").unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new("alice").unwrap(),
+            email: Some(Email::new("alice@example.com").unwrap()),
+            email_verified: true,
+            first_name: Some(DisplayName::new("Alice").unwrap()),
+            last_name: Some(DisplayName::new("Smith").unwrap()),
+            enabled: true,
+            federation_link: Some("ldap-1".to_string()),
+            attributes: HashMap::from([(
+                "department".to_string(),
+                vec!["engineering".to_string(), "ops".to_string()],
+            )]),
+            required_actions: vec!["UPDATE_PASSWORD".to_string()],
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn full_client(realm_id: &RealmId) -> Client {
+        Client {
+            id: ClientId::new("client-1").unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: ClientIdentifier::new("my-app").unwrap(),
+            name: Some(DisplayName::new("My App").unwrap()),
+            description: Some("test client".to_string()),
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: Some("s3cr3t".to_string()),
+            redirect_uris: vec![RedirectUri::new("https://app.example.com/callback").unwrap()],
+            web_origins: vec![WebOrigin::new("https://app.example.com").unwrap()],
+            default_scopes: Scope::parse("openid profile email"),
+            optional_scopes: Scope::parse("offline_access"),
+            consent_required: true,
+            full_scope_allowed: false,
+            service_accounts_enabled: true,
+            protocol_mappers: vec![ProtocolMapper {
+                id: MapperId::new("mapper-1").unwrap(),
+                name: "username".to_string(),
+                mapper_type: MapperType::UserProperty,
+                config: HashMap::from([(
+                    "claim.name".to_string(),
+                    "preferred_username".to_string(),
+                )]),
+            }],
+            scope_mappings: ScopeMappings {
+                realm_roles: vec![RoleId::new("role-realm").unwrap()],
+                client_roles: HashMap::from([(
+                    ClientId::new("client-1").unwrap(),
+                    vec![RoleId::new("role-client").unwrap()],
+                )]),
+            },
+            attributes: HashMap::from([("pkce.required".to_string(), "true".to_string())]),
+        }
+    }
+
+    fn realm_role() -> Role {
+        Role {
+            id: RoleId::new("role-realm").unwrap(),
+            name: RoleName::new("admin").unwrap(),
+            description: Some("Realm administrator".to_string()),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            client_role: false,
+            client_id: None,
+            composite: true,
+            composites: vec![RoleName::new("base").unwrap()],
+            attributes: HashMap::from([("tag".to_string(), vec!["a".to_string()])]),
+        }
+    }
+
+    fn client_role() -> Role {
+        Role {
+            id: RoleId::new("role-client").unwrap(),
+            name: RoleName::new("app-admin").unwrap(),
+            description: Some("Application administrator".to_string()),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            client_role: true,
+            client_id: Some(ClientId::new("client-1").unwrap()),
+            composite: false,
+            composites: vec![],
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn parent_group() -> Group {
+        Group {
+            id: GroupId::new("group-parent").unwrap(),
+            name: GroupName::new("admins").unwrap(),
+            path: GroupPath::new("/admins").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            parent_id: None,
+            sub_groups: vec![],
+            attributes: HashMap::new(),
+            realm_roles: vec![],
+            client_roles: HashMap::new(),
+        }
+    }
+
+    fn child_group() -> Group {
+        Group {
+            id: GroupId::new("group-child").unwrap(),
+            name: GroupName::new("ops").unwrap(),
+            path: GroupPath::new("/admins/ops").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            parent_id: Some(GroupId::new("group-parent").unwrap()),
+            sub_groups: vec![],
+            attributes: HashMap::from([("ldap_sync".to_string(), vec!["true".to_string()])]),
+            realm_roles: vec![RoleName::new("admin").unwrap()],
+            client_roles: HashMap::from([(
+                ClientId::new("client-1").unwrap(),
+                vec![RoleName::new("app-admin").unwrap()],
+            )]),
+        }
+    }
+
+    fn custom_scope() -> ClientScope {
+        ClientScope {
+            id: ClientScopeId::new("scope-custom").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            name: "custom-scope".to_string(),
+            description: Some("custom scope".to_string()),
+            protocol: ClientProtocol::OpenIdConnect,
+            attributes: HashMap::from([(
+                "display.on.consent.screen".to_string(),
+                "true".to_string(),
+            )]),
+            protocol_mappers: vec![ProtocolMapper {
+                id: MapperId::new("mapper-custom").unwrap(),
+                name: "department".to_string(),
+                mapper_type: MapperType::UserAttribute,
+                config: HashMap::from([
+                    ("user.attribute".to_string(), "department".to_string()),
+                    ("claim.name".to_string(), "department".to_string()),
+                ]),
+            }],
+            scope_mappings: ScopeMappings {
+                realm_roles: vec![RoleId::new("role-realm").unwrap()],
+                client_roles: HashMap::from([(
+                    ClientId::new("client-1").unwrap(),
+                    vec![RoleId::new("role-client").unwrap()],
+                )]),
+            },
+        }
+    }
+
+    fn sample_credential(id: &str, cred_type: CredentialType, priority: i32) -> Credential {
+        Credential {
+            id: CredentialId::new(id).unwrap(),
+            credential_type: cred_type,
+            user_label: Some(format!("{id}-label")),
+            created_date: chrono::Utc::now(),
+            secret_data: format!("{id}-secret").into_bytes(),
+            credential_data: serde_json::json!({"id": id}),
+            priority,
+        }
+    }
+
+    fn sample_session(id: &str, realm_id: &RealmId, user_id: &UserId) -> UserSession {
+        let now = chrono::Utc::now();
+        UserSession {
+            id: SessionId::new(id).unwrap(),
+            realm_id: realm_id.clone(),
+            user_id: user_id.clone(),
+            login_username: Username::new("alice").unwrap(),
+            ip_address: "192.168.1.10".parse().unwrap(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        }
+    }
+
+    fn sample_idp(id: &str, alias: &str) -> IdentityProviderConfig {
+        IdentityProviderConfig {
+            id: IdentityProviderId::new(id).unwrap(),
+            alias: Alias::new(alias).unwrap(),
+            provider_id: ProviderId::new("oidc"),
+            enabled: true,
+            config: HashMap::from([
+                ("clientId".to_string(), "abc".to_string()),
+                ("clientSecret".to_string(), "shh".to_string()),
+            ]),
+        }
+    }
+
+    fn sample_flow(alias: &str, realm_id: &RealmId) -> FlowConfig {
+        FlowConfig {
+            alias: Alias::new(alias).unwrap(),
+            realm_id: realm_id.clone(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: false,
+            stages: vec![FlowStage {
+                id: FlowStageId::new("stage-1").unwrap(),
+                requirement: Requirement::Required,
+                authenticator: Alias::new("auth-username-password-form").unwrap(),
+                priority: 10,
+                sub_flow_alias: None,
+                authenticator_config: Some(AuthenticatorConfig {
+                    alias: Alias::new("cfg").unwrap(),
+                    config: serde_json::Map::from_iter([(
+                        "key".to_string(),
+                        serde_json::json!("value"),
+                    )]),
+                }),
+            }],
+        }
+    }
+
+    fn sample_signing_key(kid: &str) -> StoredSigningKey {
+        StoredSigningKey {
+            kid: KeyId::new(kid).unwrap(),
+            alg: Algorithm::EdDsa,
+            created_at: chrono::Utc::now(),
+            private_der: vec![1, 2, 3, 4],
+            public_jwk: Jwk {
+                kty: JwkKty::Okp,
+                kid: KeyId::new(kid).unwrap(),
+                alg: Algorithm::EdDsa,
+                use_: JwkUse::Sig,
+                n: None,
+                e: None,
+                x: Some(Base64Url::new("dGVzdA").unwrap()),
+                y: None,
+                crv: Some(JwkCurve::Ed25519),
+                k: None,
+            },
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn json_storage_full_entity_roundtrip() {
+        let path = unique_test_path("json-roundtrip");
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let user_id = UserId::new("user-1").unwrap();
+        let client_id = ClientId::new("client-1").unwrap();
+        let now = chrono::Utc::now();
+
+        let user = full_user(&realm_id);
+        let client = full_client(&realm_id);
+        let password_cred = sample_credential("cred-pw", CredentialType::Password, 1);
+        let totp_cred = sample_credential("cred-totp", CredentialType::Totp, 2);
+        let webauthn_cred = sample_credential("cred-webauthn", CredentialType::WebAuthn, 3);
+        let mut session = sample_session("session-1", &realm_id, &user_id);
+        session.remember_me = true;
+        session.offline = true;
+        session.impersonator = Some(UserId::new("admin-1").unwrap());
+        session.clients = vec![ClientSession {
+            id: ClientSessionId::new("csess-1").unwrap(),
+            client_id: client_id.clone(),
+            session_id: session.id.clone(),
+            redirect_uri: Some(RedirectUri::new("https://app.example.com/callback").unwrap()),
+            state: Some("state-123".to_string()),
+            auth_method: AuthMethod::Password,
+            timestamp: now,
+        }];
+        let realm_role = realm_role();
+        let client_role = client_role();
+        let parent_group = parent_group();
+        let child_group = child_group();
+        let consent = Consent {
+            client_id: client_id.clone(),
+            user_id: user_id.clone(),
+            granted_scopes: Scope::parse("openid profile"),
+            granted_realm_roles: vec![RoleName::new("admin").unwrap()],
+            granted_client_roles: HashMap::from([(
+                client_id.clone(),
+                vec![RoleName::new("app-admin").unwrap()],
+            )]),
+            created_at: now,
+            last_updated_at: now,
+        };
+        let idp = sample_idp("idp-1", "google");
+        let idp_link = IdentityProviderLink {
+            user_id: user_id.clone(),
+            provider_alias: "google".to_string(),
+            external_subject: "ext-sub-1".to_string(),
+            external_username: Some("alice@gmail.com".to_string()),
+            stored_refresh_token: Some("external-refresh-token".to_string()),
+            created_at: now,
+        };
+        let flow = sample_flow("my-flow", &realm_id);
+        let event = Event {
+            id: EventId::new("event-1").unwrap(),
+            realm_id: realm_id.clone(),
+            event_time: now,
+            event_type: EventType::Login,
+            ip_address: Some("10.0.0.1".parse().unwrap()),
+            client_id: Some(client_id.clone()),
+            user_id: Some(user_id.clone()),
+            session_id: Some(session.id.clone()),
+            error: None,
+            details: HashMap::from([("auth_method".to_string(), "password".to_string())]),
+        };
+        let admin_event = AdminEvent {
+            id: EventId::new("admin-event-1").unwrap(),
+            realm_id: realm_id.clone(),
+            auth_realm_id: Some(realm_id.clone()),
+            auth_client_id: Some(ClientId::new("admin-cli").unwrap()),
+            auth_user_id: Some(UserId::new("admin-1").unwrap()),
+            operation_type: OperationType::Update,
+            resource_type: ResourceType::User,
+            resource_path: "/realms/test-realm/users/user-1".to_string(),
+            representation: Some("{\"enabled\":true}".to_string()),
+            error: None,
+            event_time: now,
+        };
+        let custom_scope = custom_scope();
+        let signing_key = sample_signing_key("key-1");
+
+        // Phase 1: populate every entity kind and persist.
+        let expected_realm = {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&full_realm()).await.unwrap();
+            storage.create_user(&realm_id, &user).await.unwrap();
+            storage.create_client(&realm_id, &client).await.unwrap();
+            for cred in [&password_cred, &totp_cred, &webauthn_cred] {
+                storage.create_credential(&realm_id, &user_id, cred).await.unwrap();
+            }
+            storage.create_user_session(&realm_id, &session).await.unwrap();
+            storage.create_role(&realm_id, &realm_role).await.unwrap();
+            storage.create_role(&realm_id, &client_role).await.unwrap();
+            storage.create_group(&realm_id, &parent_group).await.unwrap();
+            storage.create_group(&realm_id, &child_group).await.unwrap();
+            storage.add_user_realm_role(&realm_id, &user_id, &realm_role.id).await.unwrap();
+            storage
+                .add_user_client_role(&realm_id, &user_id, &client_role.id)
+                .await
+                .unwrap();
+            storage.add_user_group(&realm_id, &user_id, &child_group.id).await.unwrap();
+            storage.create_consent(&realm_id, &consent).await.unwrap();
+            storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+            storage.create_identity_provider_link(&realm_id, &idp_link).await.unwrap();
+            storage.create_flow_config(&realm_id, &flow).await.unwrap();
+            storage.save_event(&realm_id, &event).await.unwrap();
+            storage.save_admin_event(&admin_event).await.unwrap();
+            storage.create_client_scope(&realm_id, &custom_scope).await.unwrap();
+            storage
+                .add_realm_default_client_scope(&realm_id, &custom_scope.id, false)
+                .await
+                .unwrap();
+            storage.set_provision_marker("demo-seed", "v1").await.unwrap();
+            storage.create_signing_key(&signing_key).await.unwrap();
+            // The realm as stored (create_realm adds the pairwise sector key).
+            storage.get_realm(&realm_id).await.unwrap().unwrap()
+        };
+
+        // Phase 2: reload from disk and assert every entity roundtrips.
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let page = Pagination::default();
+
+            // Realm
+            assert!(expected_realm.pairwise_sector_key().is_some());
+            assert_eq!(storage.count_realms().await.unwrap(), 1);
+            assert_eq!(storage.get_realm(&realm_id).await.unwrap().unwrap(), expected_realm);
+            assert_eq!(
+                storage.get_realm_by_name("test-realm").await.unwrap().unwrap(),
+                expected_realm
+            );
+            assert_eq!(storage.list_realms(&page).await.unwrap(), vec![expected_realm.clone()]);
+
+            // User
+            assert_eq!(storage.count_users(&realm_id, "").await.unwrap(), 1);
+            assert_eq!(storage.get_user(&realm_id, &user_id).await.unwrap().unwrap(), user);
+            assert_eq!(
+                storage.get_user_by_username(&realm_id, "alice").await.unwrap().unwrap(),
+                user
+            );
+            assert_eq!(
+                storage
+                    .get_user_by_email(&realm_id, "alice@example.com")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                user
+            );
+            assert_eq!(
+                storage.get_user_by_federation_link(&realm_id, "ldap-1").await.unwrap(),
+                vec![user.clone()]
+            );
+            assert_eq!(storage.list_users(&realm_id, "", &page).await.unwrap(), vec![user.clone()]);
+
+            // Client
+            assert_eq!(storage.count_clients(&realm_id).await.unwrap(), 1);
+            assert_eq!(storage.get_client(&realm_id, &client_id).await.unwrap().unwrap(), client);
+            assert_eq!(
+                storage
+                    .get_client_by_client_id(&realm_id, &ClientIdentifier::new("my-app").unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                client
+            );
+            assert_eq!(storage.list_clients(&realm_id, &page).await.unwrap(), vec![client.clone()]);
+
+            // Credentials (list_credentials sorts by priority)
+            assert_eq!(
+                storage
+                    .get_credentials(&realm_id, &user_id, CredentialType::Password)
+                    .await
+                    .unwrap(),
+                vec![password_cred.clone()]
+            );
+            assert_eq!(
+                storage
+                    .get_credentials(&realm_id, &user_id, CredentialType::Totp)
+                    .await
+                    .unwrap(),
+                vec![totp_cred.clone()]
+            );
+            assert_eq!(
+                storage
+                    .get_credentials(&realm_id, &user_id, CredentialType::WebAuthn)
+                    .await
+                    .unwrap(),
+                vec![webauthn_cred.clone()]
+            );
+            assert_eq!(
+                storage.list_credentials(&realm_id, &user_id).await.unwrap(),
+                vec![
+                    password_cred.clone(),
+                    totp_cred.clone(),
+                    webauthn_cred.clone()
+                ]
+            );
+
+            // Sessions (incl. the client session inside the user session)
+            assert_eq!(storage.count_sessions(&realm_id, None).await.unwrap(), 1);
+            assert_eq!(storage.count_sessions(&realm_id, Some(user_id.clone())).await.unwrap(), 1);
+            assert_eq!(
+                storage.get_user_session(&realm_id, &session.id).await.unwrap().unwrap(),
+                session
+            );
+            assert_eq!(
+                storage.list_sessions(&realm_id, None, &page).await.unwrap(),
+                vec![session.clone()]
+            );
+            assert_eq!(
+                storage.list_sessions(&realm_id, Some(user_id.clone()), &page).await.unwrap(),
+                vec![session.clone()]
+            );
+
+            // Roles (list_roles sorts by name: admin < app-admin)
+            assert_eq!(storage.count_roles(&realm_id).await.unwrap(), 2);
+            assert_eq!(
+                storage.get_role(&realm_id, &realm_role.id).await.unwrap().unwrap(),
+                realm_role
+            );
+            assert_eq!(
+                storage.get_role_by_name(&realm_id, "admin").await.unwrap().unwrap(),
+                realm_role
+            );
+            assert_eq!(
+                storage.list_roles(&realm_id, &page).await.unwrap(),
+                vec![realm_role.clone(), client_role.clone()]
+            );
+            assert_eq!(
+                storage
+                    .get_client_role_by_name(&realm_id, &client_id, "app-admin")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                client_role
+            );
+            assert_eq!(
+                storage.list_client_roles(&realm_id, &client_id, &page).await.unwrap(),
+                vec![client_role.clone()]
+            );
+
+            // Groups
+            assert_eq!(storage.count_groups(&realm_id).await.unwrap(), 2);
+            assert_eq!(
+                storage.get_group(&realm_id, &parent_group.id).await.unwrap().unwrap(),
+                parent_group
+            );
+            assert_eq!(
+                storage.get_group(&realm_id, &child_group.id).await.unwrap().unwrap(),
+                child_group
+            );
+            assert_eq!(
+                storage.get_group_by_name(&realm_id, "admins").await.unwrap().unwrap(),
+                parent_group
+            );
+            let mut groups = storage.list_groups(&realm_id, &page).await.unwrap();
+            groups.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
+            let mut expected_groups = vec![parent_group.clone(), child_group.clone()];
+            expected_groups.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
+            assert_eq!(groups, expected_groups);
+
+            // Role & group memberships
+            assert_eq!(
+                storage.list_user_realm_roles(&realm_id, &user_id).await.unwrap(),
+                vec![realm_role.id.clone()]
+            );
+            assert_eq!(
+                storage.list_user_client_roles(&realm_id, &user_id).await.unwrap(),
+                vec![client_role.id.clone()]
+            );
+            assert_eq!(
+                storage.list_user_groups(&realm_id, &user_id).await.unwrap(),
+                vec![child_group.id.clone()]
+            );
+            assert_eq!(
+                storage.list_group_members(&realm_id, &child_group.id, 0, 10).await.unwrap(),
+                vec![user.clone()]
+            );
+
+            // Consent
+            assert_eq!(
+                storage.get_consents(&realm_id, &user_id).await.unwrap(),
+                vec![consent.clone()]
+            );
+
+            // Identity providers + links
+            assert_eq!(
+                storage.get_identity_provider(&realm_id, &idp.id).await.unwrap().unwrap(),
+                idp
+            );
+            assert_eq!(
+                storage
+                    .get_identity_provider_by_alias(&realm_id, "google")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                idp
+            );
+            assert_eq!(
+                storage.list_identity_providers(&realm_id).await.unwrap(),
+                vec![idp.clone()]
+            );
+            assert_eq!(
+                storage
+                    .get_identity_provider_link(&realm_id, "google", "ext-sub-1")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                idp_link
+            );
+            assert_eq!(
+                storage
+                    .get_identity_provider_link_for_user(&realm_id, &user_id, "google")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                idp_link
+            );
+            assert_eq!(
+                storage.list_identity_provider_links(&realm_id, &user_id).await.unwrap(),
+                vec![idp_link.clone()]
+            );
+
+            // Flows (two built-ins seeded at realm creation + the custom one)
+            assert_eq!(storage.get_flow_config(&realm_id, "my-flow").await.unwrap().unwrap(), flow);
+            let flow_aliases: Vec<String> = storage
+                .list_flow_configs(&realm_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|f| f.alias.to_string())
+                .collect();
+            assert_eq!(
+                flow_aliases,
+                vec![
+                    "browser".to_string(),
+                    "my-flow".to_string(),
+                    "registration".to_string()
+                ]
+            );
+
+            // Events + admin events
+            let event_query = EventQuery {
+                event_type: None,
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::default(),
+            };
+            assert_eq!(
+                storage.query_events(&realm_id, &event_query).await.unwrap(),
+                vec![event.clone()]
+            );
+            assert_eq!(storage.count_events(&realm_id, &event_query).await.unwrap(), 1);
+            let admin_query = AdminEventQuery {
+                operation_type: None,
+                resource_type: None,
+                auth_user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::default(),
+            };
+            assert_eq!(
+                storage.query_admin_events(&realm_id, &admin_query).await.unwrap(),
+                vec![admin_event.clone()]
+            );
+            assert_eq!(storage.count_admin_events(&realm_id, &admin_query).await.unwrap(), 1);
+
+            // Provision markers
+            assert_eq!(
+                storage.get_provision_marker("demo-seed").await.unwrap(),
+                Some("v1".to_string())
+            );
+            assert_eq!(storage.get_provision_marker("never-set").await.unwrap(), None);
+
+            // Signing keys
+            assert_eq!(storage.list_signing_keys().await.unwrap(), vec![signing_key.clone()]);
+
+            // Client scopes: 8 built-ins + the custom one
+            let scopes = storage.list_client_scopes(&realm_id, &page).await.unwrap();
+            assert_eq!(scopes.len(), 9);
+            assert_eq!(
+                storage.get_client_scope(&realm_id, &custom_scope.id).await.unwrap().unwrap(),
+                custom_scope
+            );
+            assert_eq!(
+                storage
+                    .get_client_scope_by_name(&realm_id, "custom-scope")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                custom_scope
+            );
+
+            // Scope assignments seeded from the client's scope lists plus the
+            // `roles` carve-out: profile+email default, offline_access
+            // optional, roles default.
+            let id_of = |name: &str| scopes.iter().find(|s| s.name == name).unwrap().id.clone();
+            let mut assignments =
+                storage.list_client_scope_assignments(&realm_id, &client_id).await.unwrap();
+            assignments.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+            let mut expected_assignments = vec![
+                (id_of("profile"), true),
+                (id_of("email"), true),
+                (id_of("offline_access"), false),
+                (id_of("roles"), true),
+            ];
+            expected_assignments.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+            assert_eq!(assignments, expected_assignments);
+
+            // Realm default scopes: 8 built-ins + the custom optional one.
+            let defaults = storage.list_realm_default_client_scopes(&realm_id).await.unwrap();
+            assert_eq!(defaults.len(), 9);
+            assert!(defaults.contains(&(custom_scope.id.clone(), false)));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn json_storage_updates_and_deletes_survive_reload() {
+        let path = unique_test_path("json-update-delete");
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let user_id = UserId::new("user-1").unwrap();
+        let client_id = ClientId::new("client-1").unwrap();
+        let now = chrono::Utc::now();
+
+        // Updated entities (constructed values asserted after reload).
+        let mut updated_client = full_client(&realm_id);
+        updated_client.name = Some(DisplayName::new("Renamed App").unwrap());
+        updated_client.consent_required = false;
+        let mut updated_cred = sample_credential("cred-1", CredentialType::Password, 1);
+        updated_cred.priority = 42;
+        updated_cred.user_label = Some("renamed".to_string());
+        let mut updated_session = sample_session("session-1", &realm_id, &user_id);
+        updated_session.remember_me = true;
+        updated_session.offline = true;
+        let mut updated_role = realm_role();
+        updated_role.description = Some("updated description".to_string());
+        updated_role.composites = vec![RoleName::new("base").unwrap(), RoleName::new("x").unwrap()];
+        let mut updated_group = parent_group();
+        updated_group.attributes = HashMap::from([("k".to_string(), vec!["v".to_string()])]);
+        updated_group.realm_roles = vec![RoleName::new("admin").unwrap()];
+        let mut updated_idp = sample_idp("idp-1", "google");
+        updated_idp.enabled = false;
+        updated_idp.config = HashMap::from([("k".to_string(), "v".to_string())]);
+        let mut updated_flow = sample_flow("upd-flow", &realm_id);
+        updated_flow.top_level = false;
+        updated_flow.provider_id = "custom-flow".to_string();
+        let mut updated_scope = custom_scope();
+        updated_scope.description = Some("v2".to_string());
+        let signing_key = sample_signing_key("key-1");
+        let mut updated_key = signing_key.clone();
+        updated_key.active = false;
+
+        let expected_realm = {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&full_realm()).await.unwrap();
+            storage.create_user(&realm_id, &full_user(&realm_id)).await.unwrap();
+            storage.create_client(&realm_id, &full_client(&realm_id)).await.unwrap();
+
+            // ---------------------- update paths ----------------------
+            let mut realm = storage.get_realm(&realm_id).await.unwrap().unwrap();
+            realm.display_name = Some(DisplayName::new("Updated Realm").unwrap());
+            storage.update_realm(&realm).await.unwrap();
+
+            let mut user = full_user(&realm_id);
+            user.first_name = Some(DisplayName::new("Updated").unwrap());
+            storage.update_user(&realm_id, &user).await.unwrap();
+
+            storage.update_client(&realm_id, &updated_client).await.unwrap();
+
+            let cred = sample_credential("cred-1", CredentialType::Password, 1);
+            storage.create_credential(&realm_id, &user_id, &cred).await.unwrap();
+            storage.update_credential(&realm_id, &user_id, &updated_cred).await.unwrap();
+
+            let session = sample_session("session-1", &realm_id, &user_id);
+            storage.create_user_session(&realm_id, &session).await.unwrap();
+            storage.update_user_session(&realm_id, &updated_session).await.unwrap();
+
+            storage.create_role(&realm_id, &realm_role()).await.unwrap();
+            storage.create_role(&realm_id, &client_role()).await.unwrap();
+            storage.update_role(&realm_id, &updated_role).await.unwrap();
+
+            storage.create_group(&realm_id, &parent_group()).await.unwrap();
+            storage.update_group(&realm_id, &updated_group).await.unwrap();
+
+            storage
+                .create_identity_provider(&realm_id, &sample_idp("idp-1", "google"))
+                .await
+                .unwrap();
+            storage.update_identity_provider(&realm_id, &updated_idp).await.unwrap();
+
+            storage
+                .create_flow_config(&realm_id, &sample_flow("upd-flow", &realm_id))
+                .await
+                .unwrap();
+            storage.update_flow_config(&realm_id, &updated_flow).await.unwrap();
+
+            storage.create_client_scope(&realm_id, &custom_scope()).await.unwrap();
+            storage.update_client_scope(&realm_id, &updated_scope).await.unwrap();
+
+            storage.create_signing_key(&signing_key).await.unwrap();
+            storage.update_signing_key(&updated_key).await.unwrap();
+
+            // ---------------------- delete paths ----------------------
+            let mut user2 = full_user(&realm_id);
+            user2.id = UserId::new("user-2").unwrap();
+            user2.username = Username::new("bob").unwrap();
+            user2.email = None;
+            storage.create_user(&realm_id, &user2).await.unwrap();
+            storage.delete_user(&realm_id, &user2.id).await.unwrap();
+
+            let mut client2 = full_client(&realm_id);
+            client2.id = ClientId::new("client-2").unwrap();
+            client2.client_id = ClientIdentifier::new("temp-app").unwrap();
+            storage.create_client(&realm_id, &client2).await.unwrap();
+            storage.delete_client(&realm_id, &client2.id).await.unwrap();
+
+            let cred2 = sample_credential("cred-2", CredentialType::Totp, 9);
+            storage.create_credential(&realm_id, &user_id, &cred2).await.unwrap();
+            storage.delete_credential(&realm_id, &user_id, &cred2.id).await.unwrap();
+
+            let session2 = sample_session("session-2", &realm_id, &user_id);
+            storage.create_user_session(&realm_id, &session2).await.unwrap();
+            storage.delete_user_session(&realm_id, &session2.id).await.unwrap();
+
+            let role2 = Role {
+                id: RoleId::new("role-temp").unwrap(),
+                name: RoleName::new("temprole").unwrap(),
+                description: None,
+                realm_id: realm_id.clone(),
+                client_role: false,
+                client_id: None,
+                composite: false,
+                composites: vec![],
+                attributes: HashMap::new(),
+            };
+            storage.create_role(&realm_id, &role2).await.unwrap();
+            storage.delete_role(&realm_id, &role2.id).await.unwrap();
+
+            let group2 = Group {
+                id: GroupId::new("group-temp").unwrap(),
+                name: GroupName::new("tempgroup").unwrap(),
+                path: GroupPath::new("/tempgroup").unwrap(),
+                realm_id: realm_id.clone(),
+                parent_id: None,
+                sub_groups: vec![],
+                attributes: HashMap::new(),
+                realm_roles: vec![],
+                client_roles: HashMap::new(),
+            };
+            storage.create_group(&realm_id, &group2).await.unwrap();
+            storage.delete_group(&realm_id, &group2.id).await.unwrap();
+
+            let consent = Consent {
+                client_id: client_id.clone(),
+                user_id: user_id.clone(),
+                granted_scopes: Scope::parse("openid"),
+                granted_realm_roles: vec![],
+                granted_client_roles: HashMap::new(),
+                created_at: now,
+                last_updated_at: now,
+            };
+            storage.create_consent(&realm_id, &consent).await.unwrap();
+            storage.delete_consent(&realm_id, &user_id, &consent.client_id).await.unwrap();
+
+            let idp_link = IdentityProviderLink {
+                user_id: user_id.clone(),
+                provider_alias: "google".to_string(),
+                external_subject: "ext-sub-1".to_string(),
+                external_username: None,
+                stored_refresh_token: None,
+                created_at: now,
+            };
+            storage.create_identity_provider_link(&realm_id, &idp_link).await.unwrap();
+            storage
+                .delete_identity_provider_link(&realm_id, &user_id, "google")
+                .await
+                .unwrap();
+
+            storage
+                .create_identity_provider(&realm_id, &sample_idp("idp-temp", "temp-idp"))
+                .await
+                .unwrap();
+            storage
+                .delete_identity_provider(&realm_id, &IdentityProviderId::new("idp-temp").unwrap())
+                .await
+                .unwrap();
+
+            storage
+                .create_flow_config(&realm_id, &sample_flow("temp-flow", &realm_id))
+                .await
+                .unwrap();
+            storage.delete_flow_config(&realm_id, "temp-flow").await.unwrap();
+
+            let event = Event {
+                id: EventId::new("event-1").unwrap(),
+                realm_id: realm_id.clone(),
+                event_time: now,
+                event_type: EventType::Login,
+                ip_address: None,
+                client_id: None,
+                user_id: None,
+                session_id: None,
+                error: None,
+                details: HashMap::new(),
+            };
+            storage.save_event(&realm_id, &event).await.unwrap();
+            storage.delete_events(&realm_id).await.unwrap();
+            let admin_event = AdminEvent {
+                id: EventId::new("admin-1").unwrap(),
+                realm_id: realm_id.clone(),
+                auth_realm_id: None,
+                auth_client_id: None,
+                auth_user_id: None,
+                operation_type: OperationType::Create,
+                resource_type: ResourceType::Realm,
+                resource_path: "/".to_string(),
+                representation: None,
+                error: None,
+                event_time: now,
+            };
+            storage.save_admin_event(&admin_event).await.unwrap();
+            storage.delete_admin_events(&realm_id).await.unwrap();
+
+            let temp_scope = ClientScope {
+                id: ClientScopeId::new("scope-temp").unwrap(),
+                realm_id: realm_id.clone(),
+                name: "temp-scope".to_string(),
+                description: None,
+                protocol: ClientProtocol::OpenIdConnect,
+                attributes: HashMap::new(),
+                protocol_mappers: vec![],
+                scope_mappings: ScopeMappings::default(),
+            };
+            storage.create_client_scope(&realm_id, &temp_scope).await.unwrap();
+            storage.delete_client_scope(&realm_id, &temp_scope.id).await.unwrap();
+
+            // Assign then unassign a scope that is NOT in the client's string
+            // lists (those would be re-seeded on load by design).
+            storage
+                .assign_client_scope(&realm_id, &client_id, &updated_scope.id, true)
+                .await
+                .unwrap();
+            storage
+                .unassign_client_scope(&realm_id, &client_id, &updated_scope.id)
+                .await
+                .unwrap();
+
+            // Add then remove a realm default (custom scopes are not re-seeded).
+            storage
+                .add_realm_default_client_scope(&realm_id, &updated_scope.id, false)
+                .await
+                .unwrap();
+            storage
+                .remove_realm_default_client_scope(&realm_id, &updated_scope.id)
+                .await
+                .unwrap();
+
+            // Add then remove memberships.
+            storage
+                .add_user_realm_role(&realm_id, &user_id, &updated_role.id)
+                .await
+                .unwrap();
+            storage
+                .remove_user_realm_role(&realm_id, &user_id, &updated_role.id)
+                .await
+                .unwrap();
+            let client_role = client_role();
+            storage
+                .add_user_client_role(&realm_id, &user_id, &client_role.id)
+                .await
+                .unwrap();
+            storage
+                .remove_user_client_role(&realm_id, &user_id, &client_role.id)
+                .await
+                .unwrap();
+            storage.add_user_group(&realm_id, &user_id, &updated_group.id).await.unwrap();
+            storage.remove_user_group(&realm_id, &user_id, &updated_group.id).await.unwrap();
+
+            realm
+        };
+
+        // Phase 2: reload from disk and assert.
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+
+            // Updated entities survived the reload.
+            assert_eq!(storage.get_realm(&realm_id).await.unwrap().unwrap(), expected_realm);
+            let user = storage.get_user(&realm_id, &user_id).await.unwrap().unwrap();
+            assert_eq!(user.first_name, Some(DisplayName::new("Updated").unwrap()));
+            assert_eq!(user.last_name, Some(DisplayName::new("Smith").unwrap()));
+            assert_eq!(
+                storage.get_client(&realm_id, &client_id).await.unwrap().unwrap(),
+                updated_client
+            );
+            assert_eq!(
+                storage
+                    .get_credentials(&realm_id, &user_id, CredentialType::Password)
+                    .await
+                    .unwrap(),
+                vec![updated_cred.clone()]
+            );
+            assert_eq!(
+                storage.get_user_session(&realm_id, &updated_session.id).await.unwrap().unwrap(),
+                updated_session
+            );
+            assert_eq!(
+                storage.get_role(&realm_id, &updated_role.id).await.unwrap().unwrap(),
+                updated_role
+            );
+            assert_eq!(
+                storage.get_group(&realm_id, &updated_group.id).await.unwrap().unwrap(),
+                updated_group
+            );
+            assert_eq!(
+                storage
+                    .get_identity_provider(&realm_id, &updated_idp.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                updated_idp
+            );
+            assert_eq!(
+                storage.get_flow_config(&realm_id, "upd-flow").await.unwrap().unwrap(),
+                updated_flow
+            );
+            assert_eq!(
+                storage.get_client_scope(&realm_id, &updated_scope.id).await.unwrap().unwrap(),
+                updated_scope
+            );
+            assert_eq!(storage.list_signing_keys().await.unwrap(), vec![updated_key.clone()]);
+
+            // Deleted entities stayed deleted.
+            assert_eq!(storage.count_users(&realm_id, "").await.unwrap(), 1);
+            assert!(storage
+                .get_user(&realm_id, &UserId::new("user-2").unwrap())
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(storage.count_clients(&realm_id).await.unwrap(), 1);
+            assert!(storage
+                .get_client(&realm_id, &ClientId::new("client-2").unwrap())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage
+                .get_credentials(&realm_id, &user_id, CredentialType::Totp)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(storage
+                .get_user_session(&realm_id, &SessionId::new("session-2").unwrap())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage
+                .get_role(&realm_id, &RoleId::new("role-temp").unwrap())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage
+                .get_group(&realm_id, &GroupId::new("group-temp").unwrap())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage.get_consents(&realm_id, &user_id).await.unwrap().is_empty());
+            assert!(storage
+                .get_identity_provider_link(&realm_id, "google", "ext-sub-1")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage
+                .get_identity_provider_by_alias(&realm_id, "temp-idp")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(storage.get_flow_config(&realm_id, "temp-flow").await.unwrap().is_none());
+            let event_query = EventQuery {
+                event_type: None,
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::default(),
+            };
+            assert!(storage.query_events(&realm_id, &event_query).await.unwrap().is_empty());
+            assert_eq!(storage.count_events(&realm_id, &event_query).await.unwrap(), 0);
+            let admin_query = AdminEventQuery {
+                operation_type: None,
+                resource_type: None,
+                auth_user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::default(),
+            };
+            assert!(storage.query_admin_events(&realm_id, &admin_query).await.unwrap().is_empty());
+            assert_eq!(storage.count_admin_events(&realm_id, &admin_query).await.unwrap(), 0);
+            assert!(storage
+                .get_client_scope_by_name(&realm_id, "temp-scope")
+                .await
+                .unwrap()
+                .is_none());
+
+            // The unassigned scope did not come back; the seeded assignments
+            // from the client's scope lists (+ `roles` carve-out) remain.
+            let assignments =
+                storage.list_client_scope_assignments(&realm_id, &client_id).await.unwrap();
+            assert!(!assignments.iter().any(|(id, _)| id == &updated_scope.id));
+            assert_eq!(assignments.len(), 4);
+
+            // The removed realm default stayed removed (8 built-ins remain).
+            let defaults = storage.list_realm_default_client_scopes(&realm_id).await.unwrap();
+            assert_eq!(defaults.len(), 8);
+            assert!(!defaults.iter().any(|(id, _)| id == &updated_scope.id));
+
+            // Removed memberships stayed removed.
+            assert!(storage.list_user_realm_roles(&realm_id, &user_id).await.unwrap().is_empty());
+            assert!(storage.list_user_client_roles(&realm_id, &user_id).await.unwrap().is_empty());
+            assert!(storage.list_user_groups(&realm_id, &user_id).await.unwrap().is_empty());
+
+            // Flow list: 2 built-ins + the updated custom flow; roles: realm
+            // role + client role (the temp role was deleted).
+            assert_eq!(storage.list_flow_configs(&realm_id).await.unwrap().len(), 3);
+            assert_eq!(storage.count_roles(&realm_id).await.unwrap(), 2);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
