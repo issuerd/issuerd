@@ -978,6 +978,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realm_themes_are_applied() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.realms[0].login_theme = Some("acme-login".to_string());
+        config.realms[0].email_theme = Some("acme-email".to_string());
+        config.realms[0].admin_theme = Some("acme-admin".to_string());
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().expect("realm missing");
+        assert_eq!(realm.login_theme.as_ref().map(|t| t.as_str()), Some("acme-login"));
+        assert_eq!(realm.email_theme.as_ref().map(|t| t.as_str()), Some("acme-email"));
+        assert_eq!(realm.admin_theme.as_ref().map(|t| t.as_str()), Some("acme-admin"));
+    }
+
+    #[tokio::test]
     async fn provisions_all_entity_types() {
         let storage = InMemoryStorage::new();
         let provisioner = Provisioner {

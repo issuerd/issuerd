@@ -629,6 +629,179 @@ async fn exchange_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
+    use crate::middleware::{proxy_ip::ClientIp, realm::ResolvedRealm};
+
+    /// Master-realm state where admin-cli has opted into token exchange and
+    /// admin holds a session-backed access token issued for admin-cli.
+    struct ExchangeFixture {
+        state: Arc<ServerState>,
+        subject_token: String,
+    }
+
+    async fn exchange_fixture() -> ExchangeFixture {
+        let state = Arc::new(ServerState::from_config(&ServerConfig::default()).await.unwrap());
+        let realm_id = RealmId::new("master").unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .attributes
+            .insert(CLIENT_TOKEN_EXCHANGE_ATTRIBUTE.to_string(), "true".to_string());
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+        // Mirrors the admin route's claims-cache invalidation for client
+        // mutations (direct storage writes would otherwise stay hidden).
+        issuerd_cluster::invalidate::invalidate_client_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &client.id,
+            client.client_id.as_ref(),
+        )
+        .await;
+
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let now = chrono::Utc::now();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: issuerd_core::AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        let token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        ExchangeFixture {
+            state,
+            subject_token: token.token,
+        }
+    }
+
+    /// Post an internal token-exchange request for the given subject token.
+    async fn exchange(state: &Arc<ServerState>, subject_token: &str) -> Response {
+        crate::routes::oidc::token_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=admin-cli&subject_token={subject_token}&subject_token_type=urn:ietf:params:oauth:token-type:access_token"
+            ),
+        )
+        .await
+    }
+
+    async fn json_body(resp: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn exchange_succeeds_for_opted_in_client() {
+        let fixture = exchange_fixture().await;
+        let resp = exchange(&fixture.state, &fixture.subject_token).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_body(resp).await;
+        assert!(json["access_token"].as_str().unwrap().len() > 10);
+        assert_eq!(
+            json["issued_token_type"].as_str().unwrap(),
+            "urn:ietf:params:oauth:token-type:access_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_disabled_subject_user() {
+        let fixture = exchange_fixture().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user = fixture
+            .state
+            .storage
+            .get_user_by_username(&realm_id, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        user.enabled = false;
+        fixture.state.storage.update_user(&realm_id, &user).await.unwrap();
+        // Mirrors the admin route's claims-cache invalidation for user
+        // mutations (direct storage writes would otherwise stay hidden).
+        issuerd_cluster::invalidate::invalidate_user_claims(
+            fixture.state.cache.as_ref(),
+            &realm_id,
+            &user.id,
+        )
+        .await;
+
+        let resp = exchange(&fixture.state, &fixture.subject_token).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn exchange_honors_realm_not_before_boundary() {
+        let fixture = exchange_fixture().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let iat = fixture
+            .state
+            .token_service
+            .validate_access_token(&fixture.subject_token)
+            .unwrap()
+            .claims
+            .iat;
+
+        let set_not_before = |cutoff: i64| {
+            let state = fixture.state.clone();
+            let realm_id = realm_id.clone();
+            async move {
+                let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+                realm.not_before = cutoff;
+                state.storage.update_realm(&realm).await.unwrap();
+                // Mirrors the admin route's synchronous realm-by-name
+                // invalidation.
+                state
+                    .cache
+                    .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // Boundary: a token issued exactly AT the cutoff is still valid
+        // (the revocation is strictly `iat < not_before`).
+        set_not_before(iat).await;
+        let resp = exchange(&fixture.state, &fixture.subject_token).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // One second past the token's issue time: revoked wholesale.
+        set_not_before(iat + 1).await;
+        let resp = exchange(&fixture.state, &fixture.subject_token).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_grant");
+    }
 
     /// Mint an unsigned-shaped JWT carrying `aud` for the audience helper
     /// (the helper never verifies the signature — the exchange validated the

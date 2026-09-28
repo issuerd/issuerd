@@ -1559,6 +1559,19 @@ mod tests {
         assert_eq!(verify_email_cache_key(&realm, "tok"), "verify-email:master:tok");
     }
 
+    #[test]
+    fn execute_actions_cache_key_scopes_realm_and_jti() {
+        assert_eq!(execute_actions_cache_key("master", "jti-1"), "execute-actions:master:jti-1");
+        assert_ne!(
+            execute_actions_cache_key("master", "jti-1"),
+            execute_actions_cache_key("other", "jti-1")
+        );
+        assert_ne!(
+            execute_actions_cache_key("master", "jti-1"),
+            execute_actions_cache_key("master", "jti-2")
+        );
+    }
+
     #[tokio::test]
     async fn webauthn_challenge_page_escapes_script_breakout() {
         let options =
@@ -1638,6 +1651,32 @@ mod tests {
             form_params("TERMS_AND_CONDITIONS", &form).is_empty(),
             "terms checkbox absent means no params"
         );
+
+        // UPDATE_PROFILE passes exactly its three profile fields through.
+        let mut form = HashMap::new();
+        form.insert("first_name".to_string(), "Ada".to_string());
+        form.insert("last_name".to_string(), "Lovelace".to_string());
+        form.insert("email".to_string(), "ada@example.com".to_string());
+        form.insert("csrf".to_string(), "x".to_string());
+        let params = form_params("UPDATE_PROFILE", &form);
+        assert_eq!(params.len(), 3);
+        assert_eq!(params["first_name"], vec!["Ada".to_string()]);
+        assert_eq!(params["last_name"], vec!["Lovelace".to_string()]);
+        assert_eq!(params["email"], vec!["ada@example.com".to_string()]);
+        assert!(!params.contains_key("csrf"));
+
+        // A ticked terms checkbox is forwarded to the action.
+        let mut form = HashMap::new();
+        form.insert("terms_accepted".to_string(), "true".to_string());
+        assert_eq!(
+            form_params("TERMS_AND_CONDITIONS", &form)["terms_accepted"],
+            vec!["true".to_string()]
+        );
+
+        // CONFIGURE_TOTP forwards the submitted code.
+        let mut form = HashMap::new();
+        form.insert("totp_code".to_string(), "123456".to_string());
+        assert_eq!(form_params("CONFIGURE_TOTP", &form)["totp_code"], vec!["123456".to_string()]);
     }
 
     #[tokio::test]
@@ -2234,5 +2273,251 @@ mod tests {
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
         assert_eq!(location, "https://app.example.com/after");
+    }
+
+    // -----------------------------------------------------------------------
+    // Action audit events, page guards, and the execute-actions merge.
+    // -----------------------------------------------------------------------
+
+    fn event_query() -> issuerd_core::EventQuery {
+        issuerd_core::EventQuery {
+            event_type: None,
+            client_id: None,
+            user_id: None,
+            date_from: None,
+            date_to: None,
+            pagination: issuerd_core::Pagination::default(),
+        }
+    }
+
+    fn bare_entry(realm_id: &RealmId, actions: &[&str]) -> PendingActionsData {
+        PendingActionsData {
+            pending: test_pending(realm_id),
+            user_id: UserId::new(issuerd_core::utils::generate_id()).unwrap().0,
+            session_id: issuerd_core::utils::generate_id(),
+            auth_time: Utc::now(),
+            remaining_actions: actions.iter().map(|s| s.to_string()).collect(),
+            email_sent: false,
+            error: None,
+            totp_secret: None,
+            redirect_uri: None,
+            _typestate_tag: action_required_tag(),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_action_event_maps_each_action_to_its_event_type() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let entry = bare_entry(&realm_id, &[]);
+
+        for action in ["UPDATE_PASSWORD", "UPDATE_PROFILE", "VERIFY_EMAIL"] {
+            emit_action_event(&state, &realm_id, &entry, action).await;
+        }
+        // Actions without an audit mapping emit nothing.
+        emit_action_event(&state, &realm_id, &entry, "TERMS_AND_CONDITIONS").await;
+        emit_action_event(&state, &realm_id, &entry, "CONFIGURE_TOTP").await;
+
+        let events = state.storage.query_events(&realm_id, &event_query()).await.unwrap();
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.event_type {
+                EventType::Custom(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 3, "unexpected events: {names:?}");
+        assert!(names.contains(&"update_password"));
+        assert!(names.contains(&"update_profile"));
+        assert!(names.contains(&"verify_email"));
+
+        // The event carries the completed action's id as a detail.
+        let update_profile = events
+            .iter()
+            .find(|e| e.event_type == EventType::Custom("update_profile".to_string()))
+            .unwrap();
+        assert_eq!(
+            update_profile.details.get("action").map(String::as_str),
+            Some("UPDATE_PROFILE")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_profile_submit_applies_changes_and_records_event() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "nora", &["UPDATE_PROFILE"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["UPDATE_PROFILE"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+        let cookie_name = flow_cookie_name_of(&resp);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, format!("{cookie_name}=1").parse().unwrap());
+        let resp = required_action_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution)),
+            headers,
+            Bytes::from("first_name=Nora&last_name=Jones&email=nora@example.com"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // The profile was updated and the assignment cleared.
+        let user = state.storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert_eq!(user.first_name.as_ref().map(|n| n.as_str()), Some("Nora"));
+        assert_eq!(user.last_name.as_ref().map(|n| n.as_str()), Some("Jones"));
+        assert!(user.required_actions.is_empty());
+
+        // ... and the completion is in the audit trail.
+        let events = state.storage.query_events(&realm_id, &event_query()).await.unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.event_type == EventType::Custom("update_profile".to_string()))
+            .expect("update_profile audit event");
+        assert_eq!(event.details.get("action").map(String::as_str), Some("UPDATE_PROFILE"));
+    }
+
+    #[tokio::test]
+    async fn verify_email_submit_after_verification_completes_and_records_event() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        // The verification link was clicked in another tab: the account is
+        // already verified but the continuation still lists VERIFY_EMAIL.
+        let mut user = test_user(&realm_id, "olga", &["VERIFY_EMAIL"]);
+        user.email_verified = true;
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["VERIFY_EMAIL"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+        let cookie_name = flow_cookie_name_of(&resp);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, format!("{cookie_name}=1").parse().unwrap());
+        let resp = required_action_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution)),
+            headers,
+            Bytes::from(""),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let user = state.storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert!(user.required_actions.is_empty());
+        let events = state.storage.query_events(&realm_id, &event_query()).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == EventType::Custom("verify_email".to_string())));
+    }
+
+    #[tokio::test]
+    async fn get_page_rejects_entry_bound_to_another_realm() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        // An entry stored under this realm's cache key but bound to a
+        // different realm id must be treated as expired.
+        let mut entry = bare_entry(&realm_id, &["UPDATE_PASSWORD"]);
+        entry.pending.realm_id = "some-other-realm-id".to_string();
+        state
+            .cache
+            .set(
+                &pending_actions_cache_key(&realm_id, "exec-foreign"),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        let resp = required_action_page(
+            State(state),
+            Path(("master".to_string(), "exec-foreign".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn configure_totp_page_renders_enrollment_and_mints_secret() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "peter", &["CONFIGURE_TOTP"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["CONFIGURE_TOTP"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Configure authenticator app"));
+        assert!(body.contains("name=\"totp_code\""));
+
+        // The pending enrollment secret was minted into the continuation
+        // entry (never persisted to storage before a code verifies).
+        let bytes = state
+            .cache
+            .get(&pending_actions_cache_key(&realm_id, &execution))
+            .await
+            .unwrap()
+            .unwrap();
+        let entry: PendingActionsData = serde_json::from_slice(&bytes).unwrap();
+        assert!(entry.totp_secret.as_deref().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn execute_actions_does_not_duplicate_already_assigned_actions() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "quinn", &["UPDATE_PASSWORD"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        let (token, _jti) = execute_actions_link(
+            &state,
+            &realm_id,
+            &user,
+            &["UPDATE_PASSWORD", "VERIFY_EMAIL"],
+            None,
+        )
+        .await;
+
+        let resp = call_execute_actions(&state, &token).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // The already-assigned action is kept exactly once; the new one is
+        // appended after it.
+        let user = state.storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert_eq!(
+            user.required_actions,
+            vec!["UPDATE_PASSWORD".to_string(), "VERIFY_EMAIL".to_string()]
+        );
     }
 }

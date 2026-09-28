@@ -469,3 +469,127 @@ async fn load_user_and_client(
     };
     Ok((user, client))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use issuerd_core::{
+        ClientAuthenticatorType, ClientId, ClientIdentifier, ClientProtocol, Consent, RoleName,
+        Scope,
+    };
+    use std::collections::HashMap;
+
+    async fn setup() -> (Arc<ServerState>, RealmId, UserId) {
+        let state = Arc::new(ServerState::from_config(&ServerConfig::default()).await.unwrap());
+        (state, RealmId::new("master").unwrap(), UserId::new("admin").unwrap())
+    }
+
+    /// The built-in admin-cli client (`consent_required = false`).
+    async fn admin_cli(state: &Arc<ServerState>, realm_id: &RealmId) -> Client {
+        state
+            .storage
+            .get_client_by_client_id(realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A fresh client with `consent_required = true`.
+    async fn consenting_client(state: &Arc<ServerState>, realm_id: &RealmId) -> Client {
+        let client = Client {
+            id: ClientId::new("consent-client-uuid").unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: ClientIdentifier::new("consent-client").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: true,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::empty(),
+            consent_required: true,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        };
+        state.storage.create_client(realm_id, &client).await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn no_consent_when_client_does_not_require_it() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = admin_cli(&state, &realm_id).await;
+        assert!(
+            !consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
+                .await,
+            "a client without consent_required must never pause for consent"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_consent_forces_the_screen() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = admin_cli(&state, &realm_id).await;
+        assert!(
+            consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], true)
+                .await,
+            "prompt=consent forces the page regardless of client settings or stored grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_required_client_without_grant_needs_consent() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = consenting_client(&state, &realm_id).await;
+        assert!(
+            consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
+                .await,
+            "no stored grant -> consent page"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_grant_skips_consent_only_when_covering_requested_scopes() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = consenting_client(&state, &realm_id).await;
+        let consent = Consent {
+            client_id: client.id.clone(),
+            user_id: user_id.clone(),
+            granted_scopes: Scope::parse("openid profile"),
+            granted_realm_roles: Vec::<RoleName>::new(),
+            granted_client_roles: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            last_updated_at: chrono::Utc::now(),
+        };
+        state.storage.create_consent(&realm_id, &consent).await.unwrap();
+
+        // Covered set -> skip the page.
+        assert!(
+            !consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
+                .await,
+            "a stored grant covering the requested scopes skips the page"
+        );
+        // Anything beyond the grant -> page again.
+        assert!(
+            consent_needed(
+                &state,
+                &realm_id,
+                &client,
+                &user_id,
+                &["openid".to_string(), "email".to_string()],
+                false
+            )
+            .await,
+            "a scope outside the stored grant re-triggers the page"
+        );
+    }
+}

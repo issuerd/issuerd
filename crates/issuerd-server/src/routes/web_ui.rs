@@ -221,6 +221,30 @@ mod tests {
         }
     }
 
+    #[cfg(webclient_present)]
+    #[tokio::test]
+    async fn static_file_body_matches_embedded_bytes() {
+        let cfg = ServerConfig::default();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let response = static_handler(
+            State(state),
+            Some(Path("index.html".to_string())),
+            Extension(ResolvedRealm(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let embedded = embedded::DIR.get_file("index.html").expect("index.html embedded");
+        assert!(!body.is_empty(), "the embedded index.html must not be empty");
+        assert_eq!(
+            &body[..],
+            embedded.contents(),
+            "the handler must serve the embedded file bytes verbatim"
+        );
+        // Leading slashes are normalized before the embedded lookup.
+        assert!(get_file("/index.html").is_some());
+    }
+
     #[tokio::test]
     async fn account_api_typo_is_404_not_spa_shell() {
         let cfg = ServerConfig::default();

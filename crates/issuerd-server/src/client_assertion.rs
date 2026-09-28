@@ -759,6 +759,19 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn jwks_cache_key_schema_is_exact() {
+        let realm_id = RealmId::new("master").unwrap();
+        let client_id = ClientId::new("client-uuid-1").unwrap();
+        assert_eq!(jwks_cache_key(&realm_id, &client_id), "client_jwks:master:client-uuid-1");
+        assert_eq!(
+            jwks_kid_miss_key(&realm_id, &client_id),
+            "client_jwks_kid_miss:master:client-uuid-1"
+        );
+        // The two key families must never collide.
+        assert_ne!(jwks_cache_key(&realm_id, &client_id), jwks_kid_miss_key(&realm_id, &client_id));
+    }
+
     #[tokio::test]
     async fn kid_miss_jwks_refetch_rate_limited_per_client() {
         let signer = issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig {

@@ -285,3 +285,220 @@ pub fn frontchannel_logout_page(continue_url: Option<&str>, iframe_urls: &[Strin
 pub fn issuer_for_realm(issuer_base: &str, realm_name: &str) -> String {
     format!("{}/realms/{}", issuer_base.trim_end_matches('/'), realm_name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use issuerd_core::{
+        AdminEventQuery, AuthMethod, Client, ClientAuthenticatorType, ClientId, ClientIdentifier,
+        ClientProtocol, ClientSession, ClientSessionId, Pagination, Scope, User, UserId, Username,
+    };
+    use issuerd_storage::InMemoryStorage;
+    use issuerd_token::{AccessToken, IdToken, RefreshToken, TokenIssuer};
+    use std::collections::HashMap;
+
+    /// TokenIssuer double whose every method fails: `dispatch` then records
+    /// the token-issuance failure for each client it selects, so the test
+    /// observes the client-selection decision without any network I/O.
+    struct FailingTokenIssuer;
+
+    #[async_trait]
+    impl TokenIssuer for FailingTokenIssuer {
+        async fn issue_access_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _scope: &[String],
+            _session_id: &SessionId,
+        ) -> Result<AccessToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_access_token_with_roles(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _scope: &[String],
+            _session_id: &SessionId,
+            _realm_access: Option<issuerd_core::RealmAccess>,
+            _claims: Option<serde_json::Value>,
+            _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<AccessToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_refresh_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _session_id: &SessionId,
+            _scope: &[String],
+            _offline: bool,
+            _dpop_jkt: Option<&str>,
+            _authorization_details: Option<&[serde_json::Value]>,
+        ) -> Result<RefreshToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_id_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _nonce: Option<&str>,
+            _auth_time: chrono::DateTime<chrono::Utc>,
+            _session_id: &SessionId,
+            _access_token: Option<&AccessToken>,
+            _code: Option<&str>,
+            _acr_values: Option<&[String]>,
+            _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<IdToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_logout_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _session_id: &SessionId,
+        ) -> Result<issuerd_core::LogoutToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn sign_authorization_response(
+            &self,
+            _realm: &Realm,
+            _client_id: &str,
+            _params: &[(String, String)],
+        ) -> Result<String, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+    }
+
+    fn client(uuid: &str, identifier: &str, backchannel_uri: Option<&str>) -> Client {
+        let mut attributes = HashMap::new();
+        if let Some(uri) = backchannel_uri {
+            attributes.insert(CLIENT_ATTR_BACKCHANNEL_LOGOUT_URI.to_string(), uri.to_string());
+        }
+        Client {
+            id: ClientId::new(uuid).unwrap(),
+            realm_id: RealmId::new("master").unwrap(),
+            client_id: ClientIdentifier::new(identifier).unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: true,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::empty(),
+            optional_scopes: Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_clients_without_a_configured_backchannel_uri() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let realm = Realm {
+            id: RealmId::new("master").unwrap(),
+            ..Default::default()
+        };
+        let user = User {
+            id: UserId::new("u-1").unwrap(),
+            realm_id: realm.id.clone(),
+            username: Username::new("alice").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let empty_uri = client("c-empty", "empty-uri-client", Some(""));
+        let configured =
+            client("c-conf", "configured-client", Some("http://client.example.com/logout"));
+        let unset = client("c-unset", "unset-client", None);
+        for c in [&empty_uri, &configured, &unset] {
+            storage.create_client(&realm.id, c).await.unwrap();
+        }
+
+        let session_id = SessionId::new("sess-1").unwrap();
+        let client_session = |c: &Client| ClientSession {
+            id: ClientSessionId::new(issuerd_core::utils::generate_id()).unwrap(),
+            client_id: c.id.clone(),
+            session_id: session_id.clone(),
+            redirect_uri: None,
+            state: None,
+            auth_method: AuthMethod::Password,
+            timestamp: chrono::Utc::now(),
+        };
+        let session = UserSession {
+            id: session_id.clone(),
+            realm_id: realm.id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: chrono::Utc::now(),
+            last_session_refresh: chrono::Utc::now(),
+            auth_time: chrono::Utc::now(),
+            impersonator: None,
+            clients: vec![
+                client_session(&empty_uri),
+                client_session(&configured),
+                client_session(&unset),
+            ],
+        };
+
+        let dispatcher =
+            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(FailingTokenIssuer))
+                .unwrap();
+        dispatcher.dispatch(&realm, &session).await;
+
+        let events = storage
+            .query_admin_events(
+                &realm.id,
+                &AdminEventQuery {
+                    operation_type: None,
+                    resource_type: None,
+                    auth_user_id: None,
+                    date_from: None,
+                    date_to: None,
+                    pagination: Pagination::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the client with a non-empty backchannel_logout_uri may be dispatched to: {events:?}"
+        );
+        assert_eq!(events[0].resource_path, "backchannel-logout/configured-client");
+        assert!(
+            events[0].error.as_deref().unwrap_or("").contains("token issuance failed"),
+            "the configured client must reach logout-token issuance: {events:?}"
+        );
+    }
+}

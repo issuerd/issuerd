@@ -270,6 +270,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_entry_misses_and_header_only_entry_serves() {
+        let (state, realm, user) = setup().await;
+        let key = cache_keys::userinfo_response(realm.as_ref(), user.as_ref(), "app|openid");
+        // Shorter than the 24-byte header → miss (never a panic, never served).
+        state.cache.set(&key, vec![0u8; 10], None).await.unwrap();
+        assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
+        // Exactly the header (zero-length body) is a well-formed entry and is
+        // served as an empty body.
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0u64.to_be_bytes());
+        entry.extend_from_slice(&0u64.to_be_bytes());
+        entry.extend_from_slice(&0u64.to_be_bytes());
+        state.cache.set(&key, entry, None).await.unwrap();
+        assert_eq!(read(&state, &realm, &user, "app", "app|openid").await, Some(Vec::new()));
+    }
+
+    #[tokio::test]
     async fn disabled_cache_never_serves() {
         let mut cfg = crate::config::ServerConfig::default();
         cfg.cache.read_cache_ttl_secs = 0;

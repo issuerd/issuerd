@@ -601,6 +601,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_par_request_uri_is_rejected_as_unsupported() {
+        let cfg = ServerConfig::default();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let realm = state.resolve_realm("master").await.unwrap().unwrap();
+
+        // A non-PAR request_uri is JAR-by-reference, which is not implemented.
+        let mut params = HashMap::new();
+        params.insert("client_id".to_string(), "admin-cli".to_string());
+        params.insert("request_uri".to_string(), "https://example.com/request.jwt".to_string());
+        let result = resolve_par_params(
+            &state,
+            &realm,
+            "master",
+            &std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            &axum::http::HeaderMap::new(),
+            params,
+        )
+        .await;
+        let Err(resp) = result else {
+            panic!("a non-PAR request_uri must be rejected");
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "request_not_supported");
+    }
+
+    #[tokio::test]
+    async fn empty_client_id_with_request_uri_is_rejected() {
+        let cfg = ServerConfig::default();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let realm = state.resolve_realm("master").await.unwrap().unwrap();
+
+        // Even with a resolvable entry bound to the empty client id, an empty
+        // `client_id` parameter next to a request_uri is malformed.
+        let request_id = "empty-client-id";
+        let data = ParData {
+            client_id: String::new(),
+            params: HashMap::new(),
+        };
+        state
+            .cache
+            .set(
+                &par_cache_key(&realm.id, request_id),
+                serde_json::to_vec(&data).unwrap(),
+                Some(std::time::Duration::from_secs(PAR_TTL_SECS)),
+            )
+            .await
+            .unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("client_id".to_string(), String::new());
+        params.insert("request_uri".to_string(), format!("{PAR_REQUEST_URI_PREFIX}{request_id}"));
+        let result = resolve_par_params(
+            &state,
+            &realm,
+            "master",
+            &std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            &axum::http::HeaderMap::new(),
+            params,
+        )
+        .await;
+        let Err(resp) = result else {
+            panic!("an empty client_id must be rejected");
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "invalid_request");
+    }
+
+    #[tokio::test]
     async fn client_id_mismatch_is_rejected() {
         let cfg = ServerConfig::default();
         let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());

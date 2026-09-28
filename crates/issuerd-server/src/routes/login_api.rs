@@ -1916,6 +1916,87 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn login_with_required_actions_hands_off_to_action_continuation() {
+        let state = setup_state().await;
+        // The account carries a pending required action: the login must pause
+        // for the action continuation instead of minting a code.
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.required_actions = vec!["UPDATE_PASSWORD".to_string()];
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let execution_id = FlowStageId::new("username-password").unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: execution_id.clone(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        };
+        let cache_key = crate::routes::oidc::pending_auth_cache_key(
+            &issuerd_core::RealmId::new("master").unwrap(),
+            &execution_id.0,
+        );
+        let cache_value = serde_json::to_vec(&pending).unwrap();
+        state
+            .cache
+            .set(&cache_key, cache_value, Some(std::time::Duration::from_secs(600)))
+            .await
+            .unwrap();
+
+        let response = login_handler(
+            State(state.clone()),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            Query(std::collections::HashMap::new()),
+            headers_with_flow_cookie(&execution_id.0),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&LoginRequest {
+                    execution_id,
+                    username: "admin".to_string(),
+                    password: "admin".to_string(),
+                    otp: None,
+                    remember_me: None,
+                    webauthn_assertion: None,
+                    resend: None,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = extract_json(response).await;
+        assert!(
+            json["code"].is_null(),
+            "no authorization code may be minted while required actions are pending: {json}"
+        );
+        let redirect = json["redirect_uri"].as_str().unwrap();
+        assert!(
+            redirect.starts_with("/realms/master/login/required-action/"),
+            "login must hand off to the action continuation, got: {redirect}"
+        );
+    }
+
+    #[tokio::test]
     async fn login_success_session_cookie_secure_under_https_issuer() {
         let config = ServerConfig {
             issuer_url: "https://issuerd.test.internal".to_string(),

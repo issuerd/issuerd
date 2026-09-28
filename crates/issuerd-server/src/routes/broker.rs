@@ -1231,3 +1231,1134 @@ pub async fn first_broker_login_submit(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use issuerd_core::{
+        Alias, DistributedCache, FlowStageId, IdentityProviderId, ProviderId, RealmName, Storage,
+    };
+
+    const MASTER: &str = "master";
+    const IDP_ALIAS: &str = "ext";
+
+    type TestStorage = Arc<issuerd_storage::InMemoryStorage>;
+    type TestCache = Arc<issuerd_cluster::InMemoryCache>;
+
+    /// Bootstrapped in-memory state (master realm + admin user + admin-cli client).
+    async fn test_state() -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let state = ServerState::from_components(&cfg, storage.clone(), cache.clone())
+            .await
+            .unwrap();
+        (Arc::new(state), storage, cache)
+    }
+
+    /// [`test_state`] with the external IdP HTTP client stubbed out.
+    async fn test_state_with_broker_client(
+        client: issuerd_core::MockBrokerClient,
+    ) -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let mut state = ServerState::from_components(&cfg, storage.clone(), cache.clone())
+            .await
+            .unwrap();
+        state.broker_client = Arc::new(client);
+        (Arc::new(state), storage, cache)
+    }
+
+    fn master_realm_id() -> RealmId {
+        RealmId::new(MASTER).unwrap()
+    }
+
+    /// A valid, enabled generic-OIDC broker config with explicit endpoints
+    /// (no discovery → endpoint resolution makes no HTTP calls).
+    fn broker_idp_config(alias: &str) -> IdentityProviderConfig {
+        IdentityProviderConfig {
+            id: IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+            alias: Alias::new(alias).unwrap(),
+            provider_id: ProviderId::Oidc,
+            enabled: true,
+            config: HashMap::from([
+                ("clientId".to_string(), "broker-client".to_string()),
+                ("clientSecret".to_string(), "broker-secret".to_string()),
+                ("authorizationUrl".to_string(), "https://idp.example.com/authorize".to_string()),
+                ("tokenUrl".to_string(), "https://idp.example.com/token".to_string()),
+                ("userInfoUrl".to_string(), "https://idp.example.com/userinfo".to_string()),
+            ]),
+        }
+    }
+
+    async fn seed_broker_idp(storage: &TestStorage, realm_id: &RealmId) {
+        storage
+            .create_identity_provider(realm_id, &broker_idp_config(IDP_ALIAS))
+            .await
+            .unwrap();
+    }
+
+    fn broker_identity() -> BrokeredIdentity {
+        BrokeredIdentity {
+            subject: "ext-sub-1".to_string(),
+            username: Some("extuser".to_string()),
+            email: Some("ext@example.com".to_string()),
+            email_verified: true,
+            first_name: None,
+            last_name: None,
+            display_name: None,
+            claims: serde_json::json!({"sub": "ext-sub-1"}),
+        }
+    }
+
+    fn broker_user(realm_id: &RealmId, username: &str, enabled: bool) -> User {
+        let now = chrono::Utc::now();
+        User {
+            id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new(username).unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn pending_auth_data(realm_id: &RealmId, flow_id: &str) -> PendingAuthData {
+        PendingAuthData {
+            realm_id: realm_id.0.clone(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: None,
+            execution_id: FlowStageId::new(flow_id).unwrap(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        }
+    }
+
+    fn first_login_entry(
+        realm_id: &RealmId,
+        mode: &str,
+        existing_user_id: Option<String>,
+    ) -> BrokerFirstLoginData {
+        BrokerFirstLoginData {
+            pending: pending_auth_data(realm_id, "fbl-flow"),
+            alias: IDP_ALIAS.to_string(),
+            identity: broker_identity(),
+            suggested_username: "extuser".to_string(),
+            mode: mode.to_string(),
+            existing_user_id,
+            external_refresh_token: None,
+            error: None,
+        }
+    }
+
+    async fn seed_first_login_entry(
+        cache: &TestCache,
+        realm_id: &RealmId,
+        execution: &str,
+        entry: &BrokerFirstLoginData,
+    ) {
+        cache
+            .set(
+                &first_login_cache_key(realm_id, execution),
+                serde_json::to_vec(entry).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_broker_state(
+        cache: &TestCache,
+        realm_id: &RealmId,
+        state_key: &str,
+        entry: &BrokerState,
+    ) {
+        cache
+            .set(
+                &broker_state_cache_key(realm_id, state_key),
+                serde_json::to_vec(entry).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn login_broker_state(flow_id: Option<&str>) -> BrokerState {
+        BrokerState {
+            nonce: "nonce-1".to_string(),
+            pkce_verifier: None,
+            flow_id: flow_id.map(str::to_string),
+            linking_user: None,
+        }
+    }
+
+    /// Token endpoint answers an access token only → userinfo fallback yields
+    /// the external identity.
+    fn successful_userinfo_client() -> issuerd_core::MockBrokerClient {
+        let mut client = issuerd_core::MockBrokerClient::new();
+        client.expect_post_form().returning(|_, _, _| {
+            Ok(serde_json::json!({
+                "access_token": "ext-at",
+                "token_type": "Bearer",
+                "refresh_token": "ext-rt",
+            }))
+        });
+        client.expect_get_json_bearer().returning(|_, _| {
+            Ok(serde_json::json!({
+                "sub": "ext-sub-1",
+                "preferred_username": "extuser",
+                "email": "ext@example.com",
+                "email_verified": true,
+            }))
+        });
+        client
+    }
+
+    fn flow_cookie_headers(flow_id: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::COOKIE, format!("issuerd_flow_{flow_id}=1").parse().unwrap());
+        h
+    }
+
+    fn resolved(segment: &str) -> axum::extract::Extension<ResolvedRealm> {
+        axum::extract::Extension(ResolvedRealm(Some(segment.to_string())))
+    }
+
+    fn location(resp: &Response) -> String {
+        resp.headers().get("location").unwrap().to_str().unwrap().to_string()
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn submit_first_login(
+        state: &Arc<ServerState>,
+        execution: &str,
+        form: HashMap<String, String>,
+        with_cookie: bool,
+    ) -> Response {
+        let headers = if with_cookie {
+            flow_cookie_headers(execution)
+        } else {
+            HeaderMap::new()
+        };
+        first_broker_login_submit(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), execution.to_string())),
+            headers,
+            Form(form),
+        )
+        .await
+    }
+
+    // -- cache key schema ----------------------------------------------------
+
+    #[test]
+    fn broker_cache_keys_have_exact_schema_and_are_distinct() {
+        let realm_a = RealmId::new("realm-a").unwrap();
+        let realm_b = RealmId::new("realm-b").unwrap();
+
+        assert_eq!(broker_state_cache_key(&realm_a, "state-1"), "broker_state:realm-a:state-1");
+        assert_eq!(first_login_cache_key(&realm_a, "exec-1"), "broker_fbl:realm-a:exec-1");
+
+        // Distinct per realm, per round-trip identifier, and across the two schemas.
+        assert_ne!(
+            broker_state_cache_key(&realm_a, "state-1"),
+            broker_state_cache_key(&realm_b, "state-1")
+        );
+        assert_ne!(
+            broker_state_cache_key(&realm_a, "state-1"),
+            broker_state_cache_key(&realm_a, "state-2")
+        );
+        assert_ne!(
+            first_login_cache_key(&realm_a, "exec-1"),
+            first_login_cache_key(&realm_b, "exec-1")
+        );
+        assert_ne!(
+            first_login_cache_key(&realm_a, "exec-1"),
+            first_login_cache_key(&realm_a, "exec-2")
+        );
+        assert_ne!(
+            broker_state_cache_key(&realm_a, "same"),
+            first_login_cache_key(&realm_a, "same")
+        );
+    }
+
+    // -- load_broker_target guards --------------------------------------------
+
+    #[tokio::test]
+    async fn load_broker_target_returns_realm_and_idp() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let (realm, idp) = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+            .await
+            .expect("enabled realm + enabled broker IdP must load");
+        assert_eq!(realm.name.as_str(), MASTER);
+        assert_eq!(idp.alias.as_str(), IDP_ALIAS);
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_missing_realm_segment_rejected() {
+        let (state, _storage, _cache) = test_state().await;
+        let err = load_broker_target(&state, &None, IDP_ALIAS)
+            .await
+            .expect_err("missing realm segment must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(err).await.contains("missing realm"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_unknown_realm_rejected() {
+        let (state, _storage, _cache) = test_state().await;
+        let err = load_broker_target(&state, &Some("no-such-realm".to_string()), IDP_ALIAS)
+            .await
+            .expect_err("unknown realm must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(err).await.contains("unknown realm"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_disabled_realm_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let locked = Realm {
+            id: RealmId::new("locked").unwrap(),
+            name: RealmName::new("locked").unwrap(),
+            display_name: None,
+            enabled: false,
+            ..Default::default()
+        };
+        storage.create_realm(&locked).await.unwrap();
+
+        let err = load_broker_target(&state, &Some("locked".to_string()), IDP_ALIAS)
+            .await
+            .expect_err("disabled realm must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(err).await.contains("unknown realm"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_unknown_alias_rejected() {
+        let (state, _storage, _cache) = test_state().await;
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), "no-such-idp")
+            .await
+            .expect_err("unknown alias must fail");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(body_text(err).await.contains("unknown identity provider"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_disabled_idp_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.enabled = false;
+        storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+            .await
+            .expect_err("disabled IdP must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(err).await.contains("not available for sign-in"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_non_broker_provider_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.provider_id = ProviderId::Ldap;
+        storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+            .await
+            .expect_err("user-federation provider must fail as a broker target");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(err).await.contains("not available for sign-in"));
+    }
+
+    #[tokio::test]
+    async fn load_broker_target_misconfigured_idp_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.remove("clientSecret");
+        storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+            .await
+            .expect_err("invalid IdP config must fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_text(err).await.contains("not configured correctly"));
+    }
+
+    // -- broker_login_handler -------------------------------------------------
+
+    #[tokio::test]
+    async fn broker_login_redirects_to_idp_and_stores_state() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let flow = "flow-123";
+        let pending = pending_auth_data(&realm_id, flow);
+        cache
+            .set(
+                &pending_auth_cache_key(&realm_id, flow),
+                serde_json::to_vec(&pending).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = broker_login_handler(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            Query(HashMap::from([("flow".to_string(), flow.to_string())])),
+            flow_cookie_headers(flow),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("https://idp.example.com/authorize?"), "{location}");
+        assert!(location.contains("response_type=code"), "{location}");
+        assert!(location.contains("client_id=broker-client"), "{location}");
+        assert!(location.contains("nonce="), "{location}");
+        assert!(location.contains("code_challenge="), "{location}");
+        assert!(location.contains("code_challenge_method=S256"), "{location}");
+
+        let url = url::Url::parse(&location).unwrap();
+        let param =
+            |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
+        // The redirect URI is this realm's broker callback.
+        assert_eq!(
+            param("redirect_uri").as_deref(),
+            Some("http://localhost:8080/realms/master/broker/ext/endpoint")
+        );
+        // The broker state round-trip entry is stored under the exact schema key.
+        let state_key = param("state").expect("state param present");
+        let stored = cache
+            .get(&broker_state_cache_key(&realm_id, &state_key))
+            .await
+            .unwrap()
+            .expect("broker state cached under broker_state:{realm}:{state}");
+        let stored: BrokerState = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored.flow_id.as_deref(), Some(flow));
+        assert!(stored.linking_user.is_none());
+        assert!(stored.pkce_verifier.is_some(), "PKCE defaults to enabled");
+    }
+
+    #[tokio::test]
+    async fn broker_login_missing_pending_entry_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        // The flow correlation cookie is present but the pending entry is gone.
+        let resp = broker_login_handler(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            Query(HashMap::from([("flow".to_string(), "gone-flow".to_string())])),
+            flow_cookie_headers("gone-flow"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn broker_login_missing_flow_cookie_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let flow = "flow-no-cookie";
+        let pending = pending_auth_data(&realm_id, flow);
+        cache
+            .set(
+                &pending_auth_cache_key(&realm_id, flow),
+                serde_json::to_vec(&pending).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = broker_login_handler(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            Query(HashMap::from([("flow".to_string(), flow.to_string())])),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn broker_login_without_flow_or_link_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let resp = broker_login_handler(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("missing sign-in session"));
+    }
+
+    // -- endpoint_inner -------------------------------------------------------
+
+    #[tokio::test]
+    async fn endpoint_unknown_state_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([("state".to_string(), "no-such-state".to_string())]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("is invalid or has expired"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_idp_error_redirects_back_to_login() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        seed_broker_state(&cache, &realm_id, "st-1", &login_broker_state(Some("flow-9"))).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-1".to_string()),
+                ("error".to_string(), "access_denied".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&resp),
+            "/login.html?execution_id=flow-9&realm=master&error=identity_provider_error"
+        );
+        // The state entry is single-use: consumed even on an IdP-side error.
+        assert!(cache.get(&broker_state_cache_key(&realm_id, "st-1")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_missing_code_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        seed_broker_state(&cache, &realm_id, "st-2", &login_broker_state(Some("flow-9"))).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([("state".to_string(), "st-2".to_string())]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("no authorization code"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_empty_code_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        seed_broker_state(&cache, &realm_id, "st-3", &login_broker_state(Some("flow-9"))).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-3".to_string()),
+                ("code".to_string(), String::new()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("no authorization code"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_exchange_failure_redirects_to_login() {
+        let mut client = issuerd_core::MockBrokerClient::new();
+        client
+            .expect_post_form()
+            .returning(|_, _, _| Err(IssuerdError::ServerError("idp down".to_string())));
+        let (state, storage, cache) = test_state_with_broker_client(client).await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        seed_broker_state(&cache, &realm_id, "st-4", &login_broker_state(Some("flow-11"))).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-4".to_string()),
+                ("code".to_string(), "real-code".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // A non-empty code proceeds to the exchange; its failure bounces the
+        // browser back to the login page (not a 400 "no code" error).
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&resp),
+            "/login.html?execution_id=flow-11&realm=master&error=identity_provider_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_missing_flow_session_rejected() {
+        let (state, storage, cache) =
+            test_state_with_broker_client(successful_userinfo_client()).await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // A link-mode-less state without a flow id cannot complete a login.
+        seed_broker_state(&cache, &realm_id, "st-5", &login_broker_state(None)).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-5".to_string()),
+                ("code".to_string(), "real-code".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("missing sign-in session"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_new_identity_redirects_to_first_login() {
+        let (state, storage, cache) =
+            test_state_with_broker_client(successful_userinfo_client()).await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let flow = "flow-77";
+        let pending = pending_auth_data(&realm_id, flow);
+        cache
+            .set(
+                &pending_auth_cache_key(&realm_id, flow),
+                serde_json::to_vec(&pending).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        seed_broker_state(&cache, &realm_id, "st-6", &login_broker_state(Some(flow))).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-6".to_string()),
+                ("code".to_string(), "real-code".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // Unknown identity + untrusted email → review-profile continuation.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("/realms/master/broker/first-login/"), "{location}");
+        let execution = location.rsplit('/').next().unwrap().to_string();
+
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(
+            set_cookie.contains(&format!("issuerd_flow_{execution}=1")),
+            "set-cookie: {set_cookie}"
+        );
+
+        // The continuation entry is cached under the exact schema key…
+        let stored = cache
+            .get(&first_login_cache_key(&realm_id, &execution))
+            .await
+            .unwrap()
+            .expect("first-login entry cached under broker_fbl:{realm}:{execution}");
+        let entry: BrokerFirstLoginData = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(entry.mode, "review");
+        assert_eq!(entry.alias, IDP_ALIAS);
+        assert_eq!(entry.suggested_username, "extuser");
+
+        // …and both round-trip entries were consumed.
+        assert!(cache.get(&broker_state_cache_key(&realm_id, "st-6")).await.unwrap().is_none());
+        assert!(cache.get(&pending_auth_cache_key(&realm_id, flow)).await.unwrap().is_none());
+    }
+
+    // -- finalize_brokered_login ----------------------------------------------
+
+    #[tokio::test]
+    async fn finalize_without_pending_actions_completes_login() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.resolve_realm(MASTER).await.unwrap().unwrap();
+        let user = broker_user(&realm_id, "brokered-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let identity = broker_identity();
+
+        let resp = finalize_brokered_login(
+            &state,
+            &realm,
+            &idp,
+            pending_auth_data(&realm_id, "flow-fin-1"),
+            user,
+            &identity,
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("http://localhost:8080/cb?"), "{location}");
+        assert!(location.contains("code="), "{location}");
+    }
+
+    #[tokio::test]
+    async fn finalize_with_pending_actions_starts_continuation() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.resolve_realm(MASTER).await.unwrap().unwrap();
+        let mut user = broker_user(&realm_id, "brokered-user", true);
+        user.required_actions = vec!["UPDATE_PASSWORD".to_string()];
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let identity = broker_identity();
+
+        let resp = finalize_brokered_login(
+            &state,
+            &realm,
+            &idp,
+            pending_auth_data(&realm_id, "flow-fin-2"),
+            user,
+            &identity,
+            false,
+        )
+        .await;
+
+        // An explicitly assigned required action pauses the login instead of
+        // issuing the authorization code.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("/realms/master/login/required-action/"), "{location}");
+    }
+
+    // -- find_available_username ----------------------------------------------
+
+    #[tokio::test]
+    async fn find_available_username_returns_suggestion_when_free() {
+        let (state, _storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let picked =
+            find_available_username(&state, &realm_id, "free-name", IDP_ALIAS, "sub-1").await;
+        assert_eq!(picked, "free-name");
+    }
+
+    #[tokio::test]
+    async fn find_available_username_falls_back_to_alias_subject_on_conflict() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        storage
+            .create_user(&realm_id, &broker_user(&realm_id, "taken-name", true))
+            .await
+            .unwrap();
+
+        let picked =
+            find_available_username(&state, &realm_id, "taken-name", IDP_ALIAS, "sub-9").await;
+        assert_eq!(picked, "ext.sub-9");
+    }
+
+    #[tokio::test]
+    async fn find_available_username_random_suffix_when_suggestion_and_fallback_taken() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        storage
+            .create_user(&realm_id, &broker_user(&realm_id, "taken-name", true))
+            .await
+            .unwrap();
+        storage
+            .create_user(&realm_id, &broker_user(&realm_id, "ext.sub-9", true))
+            .await
+            .unwrap();
+
+        let picked =
+            find_available_username(&state, &realm_id, "taken-name", IDP_ALIAS, "sub-9").await;
+        assert!(picked.starts_with("ext."), "{picked}");
+        assert_ne!(picked, "ext.sub-9");
+        assert!(Username::new(&picked).is_ok(), "{picked}");
+    }
+
+    // -- first_broker_login_submit --------------------------------------------
+
+    #[tokio::test]
+    async fn submit_without_flow_cookie_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let execution = "exec-no-cookie";
+        let entry = first_login_entry(&realm_id, "link", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([("action".to_string(), "link".to_string())]),
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("invalid sign-in session"));
+        // The entry is NOT consumed when the correlation cookie is missing.
+        assert!(load_first_login_entry(&state, &realm_id, execution).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_unknown_execution_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let resp = submit_first_login(
+            &state,
+            "exec-gone",
+            HashMap::from([("action".to_string(), "link".to_string())]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn submit_link_wrong_password_retries_with_banner() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let user = broker_user(&realm_id, "existing-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        issuerd_auth_flow::built_in::set_user_password(
+            storage.as_ref(),
+            &realm_id,
+            &user.id,
+            "correct-horse",
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let execution = "exec-link-wrong";
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "link".to_string()),
+                ("password".to_string(), "wrong-password".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        // PRG back to the page with the banner; no link may be created.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/realms/master/broker/first-login/{execution}"));
+        let stored = load_first_login_entry(&state, &realm_id, execution)
+            .await
+            .expect("entry re-stored for the retry");
+        assert_eq!(stored.error.as_deref(), Some("invalid password"));
+        assert_eq!(stored.mode, "link");
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_link_correct_password_links_and_completes() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let user = broker_user(&realm_id, "existing-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        issuerd_auth_flow::built_in::set_user_password(
+            storage.as_ref(),
+            &realm_id,
+            &user.id,
+            "correct-horse",
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let execution = "exec-link-ok";
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "link".to_string()),
+                ("password".to_string(), "correct-horse".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("http://localhost:8080/cb?"), "{location}");
+        assert!(location.contains("code="), "{location}");
+
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .expect("identity provider link created");
+        assert_eq!(link.user_id, user.id);
+        assert_eq!(link.external_username.as_deref(), Some("extuser"));
+        // The continuation entry was consumed by the successful submit.
+        assert!(load_first_login_entry(&state, &realm_id, execution).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_link_disabled_user_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let user = broker_user(&realm_id, "disabled-user", false);
+        storage.create_user(&realm_id, &user).await.unwrap();
+
+        let execution = "exec-link-disabled";
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "link".to_string()),
+                ("password".to_string(), "whatever".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(resp).await.contains("this account is disabled"));
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_link_unknown_account_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let execution = "exec-link-missing-user";
+        let missing = UserId::new(issuerd_core::utils::generate_id()).unwrap();
+        let entry = first_login_entry(&realm_id, "link", Some(missing.to_string()));
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "link".to_string()),
+                ("password".to_string(), "whatever".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("account not found"));
+    }
+
+    #[tokio::test]
+    async fn submit_create_switches_to_review_mode() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let execution = "exec-switch-to-review";
+        let entry = first_login_entry(&realm_id, "link", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([("action".to_string(), "create".to_string())]),
+            true,
+        )
+        .await;
+
+        // PRG back to the same page, now in review mode and without a banner —
+        // the "create" button must NOT fall through to the review-submit arm.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/realms/master/broker/first-login/{execution}"));
+        let stored = load_first_login_entry(&state, &realm_id, execution)
+            .await
+            .expect("entry re-stored in review mode");
+        assert_eq!(stored.mode, "review");
+        assert!(stored.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_review_creates_user_and_completes() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let execution = "exec-review-ok";
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "review".to_string()),
+                ("username".to_string(), "newbie".to_string()),
+                ("email".to_string(), "newbie@example.com".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("http://localhost:8080/cb?"), "{location}");
+        assert!(location.contains("code="), "{location}");
+
+        let created = storage
+            .get_user_by_username(&realm_id, "newbie")
+            .await
+            .unwrap()
+            .expect("review submit creates the local user");
+        assert_eq!(created.federation_link.as_deref(), Some("idp:ext"));
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_review_duplicate_username_retries() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        storage
+            .create_user(&realm_id, &broker_user(&realm_id, "taken-name", true))
+            .await
+            .unwrap();
+
+        let execution = "exec-review-taken";
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "review".to_string()),
+                ("username".to_string(), "taken-name".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/realms/master/broker/first-login/{execution}"));
+        let stored = load_first_login_entry(&state, &realm_id, execution)
+            .await
+            .expect("entry re-stored for the retry");
+        assert_eq!(stored.error.as_deref(), Some("that username is already taken"));
+    }
+}

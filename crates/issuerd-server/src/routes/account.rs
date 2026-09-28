@@ -2231,4 +2231,751 @@ mod tests {
         let resp = account_me_with_token(&state, &token.token).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // -----------------------------------------------------------------------
+    // Behavioral coverage: response bodies, ownership/guard checks, and the
+    // cache-key schemas the enrollment ceremonies depend on.
+    // -----------------------------------------------------------------------
+
+    fn bearer_headers(access_token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        headers
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn admin_user_id(state: &Arc<ServerState>) -> UserId {
+        state
+            .storage
+            .get_user_by_username(&RealmId::new("master").unwrap(), "admin")
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    fn make_user(realm_id: &RealmId, username: &str) -> User {
+        User {
+            id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new(username).unwrap(),
+            email: Some(Email::new(format!("{username}@example.com")).unwrap()),
+            email_verified: true,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: std::collections::HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_session(realm_id: &RealmId, user: &User) -> issuerd_core::UserSession {
+        issuerd_core::UserSession {
+            id: SessionId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: issuerd_core::AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: chrono::Utc::now(),
+            last_session_refresh: chrono::Utc::now(),
+            auth_time: chrono::Utc::now(),
+            impersonator: None,
+            clients: vec![],
+        }
+    }
+
+    /// Mint a plain (non-DPoP) access token for `user`, backed by a live
+    /// session — the same construction the DPoP test uses, minus the cnf
+    /// overlay.
+    async fn issue_token_for_user(state: &Arc<ServerState>, user: &User) -> String {
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let session = make_session(&realm_id, user);
+        let session_id = session.id.clone();
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        state
+            .token_manager
+            .issue_access_token_with_roles(
+                user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .token
+    }
+
+    async fn set_edit_username_allowed(state: &Arc<ServerState>, allowed: bool) {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.edit_username_allowed = allowed;
+        state.storage.update_realm(&realm).await.unwrap();
+        // The realm was already resolved (and cached) by the grant, so drop
+        // the name-lookup cache entry after the direct storage mutation.
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+    }
+
+    async fn create_idp(
+        state: &Arc<ServerState>,
+        alias: &str,
+        provider_id: issuerd_core::ProviderId,
+        enabled: bool,
+    ) {
+        let idp = issuerd_core::IdentityProviderConfig {
+            id: issuerd_core::IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+            alias: issuerd_core::Alias::new(alias).unwrap(),
+            provider_id,
+            enabled,
+            config: std::collections::HashMap::new(),
+        };
+        state
+            .storage
+            .create_identity_provider(&RealmId::new("master").unwrap(), &idp)
+            .await
+            .unwrap();
+    }
+
+    fn make_link(user_id: &UserId, alias: &str) -> issuerd_core::IdentityProviderLink {
+        issuerd_core::IdentityProviderLink {
+            user_id: user_id.clone(),
+            provider_alias: alias.to_string(),
+            external_subject: format!("ext-{alias}"),
+            external_username: Some(format!("{alias}-user")),
+            stored_refresh_token: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn call_link_identity(state: &Arc<ServerState>, token: &str, alias: &str) -> Response {
+        account_link_identity_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(token),
+            Path(("master".to_string(), alias.to_string())),
+        )
+        .await
+    }
+
+    async fn call_unlink_identity(state: &Arc<ServerState>, token: &str, alias: &str) -> Response {
+        account_unlink_identity_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(token),
+            Path(("master".to_string(), alias.to_string())),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn account_me_returns_profile_body() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["username"], "admin");
+        assert_eq!(json["enabled"], true);
+        assert!(json["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(json["roles"].is_array());
+    }
+
+    #[tokio::test]
+    async fn account_logout_session_deletes_own_session() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let sid = validated.claims.sid.clone().unwrap();
+
+        let resp = account_logout_session_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), sid.0.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_logout_session_rejects_other_users_session() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+
+        // A session owned by somebody else must not be deletable through the
+        // caller's token (P3-15).
+        let bob = make_user(&realm_id, "bob");
+        state.storage.create_user(&realm_id, &bob).await.unwrap();
+        let bobs_session = make_session(&realm_id, &bob);
+        let bobs_sid = bobs_session.id.clone();
+        state.storage.create_user_session(&realm_id, &bobs_session).await.unwrap();
+
+        let resp = account_logout_session_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), bobs_sid.0.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(state.storage.get_user_session(&realm_id, &bobs_sid).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn account_update_me_same_username_is_noop_when_edits_disallowed() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        set_edit_username_allowed(&state, false).await;
+
+        // Resending the current username is a no-op, not a change attempt.
+        let resp = account_update_me_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Json(UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: None,
+                username: Some("admin".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["username"], "admin");
+    }
+
+    #[tokio::test]
+    async fn account_update_me_rejects_username_change_when_disallowed() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        set_edit_username_allowed(&state, false).await;
+
+        let resp = account_update_me_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Json(UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: None,
+                username: Some("renamed-admin".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "username changes are not allowed in this realm");
+        // The username is untouched in storage.
+        assert!(state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn account_change_password_rejects_wrong_current_password() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+
+        let resp = account_change_password_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            bearer_headers(&access_token),
+            Json(ChangePasswordRequest {
+                current_password: "not-the-password".to_string(),
+                new_password: "N0wPassword!".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "current password is incorrect");
+
+        // The stored credential still verifies the original password.
+        let user_id = admin_user_id(&state).await;
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Password)
+            .await
+            .unwrap();
+        assert!(creds.iter().any(|c| verify_password_hash("admin", c)));
+    }
+
+    #[tokio::test]
+    async fn account_change_password_replaces_credential_on_success() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+
+        let resp = account_change_password_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            bearer_headers(&access_token),
+            Json(ChangePasswordRequest {
+                current_password: "admin".to_string(),
+                new_password: "N0wPassword!".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The old credential is gone; exactly one password verifies the new
+        // password and no longer the old one.
+        let user_id = admin_user_id(&state).await;
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 1);
+        assert!(verify_password_hash("N0wPassword!", &creds[0]));
+        assert!(!verify_password_hash("admin", &creds[0]));
+    }
+
+    #[test]
+    fn totp_enrollment_key_scopes_realm_and_user() {
+        let realm = RealmId::new("master").unwrap();
+        let user = UserId::new("user-1").unwrap();
+        assert_eq!(totp_enrollment_key(&realm, &user), "totp-enroll:master:user-1");
+        assert_ne!(
+            totp_enrollment_key(&realm, &user),
+            totp_enrollment_key(&RealmId::new("other").unwrap(), &user)
+        );
+        assert_ne!(
+            totp_enrollment_key(&realm, &user),
+            totp_enrollment_key(&realm, &UserId::new("user-2").unwrap())
+        );
+    }
+
+    #[test]
+    fn webauthn_registration_key_scopes_realm_and_user() {
+        let realm = RealmId::new("master").unwrap();
+        let user = UserId::new("user-1").unwrap();
+        assert_eq!(webauthn_registration_key(&realm, &user), "webauthn-reg:master:user-1");
+        assert_ne!(
+            webauthn_registration_key(&realm, &user),
+            webauthn_registration_key(&RealmId::new("other").unwrap(), &user)
+        );
+        assert_ne!(
+            webauthn_registration_key(&realm, &user),
+            webauthn_registration_key(&realm, &UserId::new("user-2").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn account_totp_start_returns_secret_and_stores_pending() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+
+        let resp = account_totp_start_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let secret = json["secret"].as_str().expect("secret");
+        assert!(!secret.is_empty());
+        assert!(json["otpauthUrl"].as_str().unwrap().starts_with("otpauth://totp/"));
+        assert!(json["qrSvg"].as_str().unwrap().contains("<svg"));
+
+        // The pending secret is cached under the per-user enrollment key.
+        let user_id = admin_user_id(&state).await;
+        let cached = state
+            .cache
+            .get(&totp_enrollment_key(&realm_id, &user_id))
+            .await
+            .unwrap()
+            .expect("pending enrollment secret");
+        assert_eq!(String::from_utf8(cached).unwrap(), secret);
+    }
+
+    #[tokio::test]
+    async fn account_totp_delete_removes_credential() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        let cred = Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"JBSWY3DPEHPK3PXP".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        state.storage.create_credential(&realm_id, &user_id, &cred).await.unwrap();
+
+        let resp = account_totp_delete_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Totp)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_webauthn_register_start_returns_options_and_stores_state() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+
+        let resp = account_webauthn_register_start_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["rp"]["id"], "localhost");
+        assert!(json["challenge"].as_str().is_some_and(|c| !c.is_empty()));
+        assert_eq!(json["user"]["name"], "admin");
+
+        // The in-flight ceremony state is cached under the per-user key.
+        let user_id = admin_user_id(&state).await;
+        assert!(state
+            .cache
+            .get(&webauthn_registration_key(&realm_id, &user_id))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn account_webauthn_delete_removes_only_the_target_credential() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        let make_cred = || Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"passkey-bytes".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        let cred_a = make_cred();
+        let cred_b = make_cred();
+        state.storage.create_credential(&realm_id, &user_id, &cred_a).await.unwrap();
+        state.storage.create_credential(&realm_id, &user_id, &cred_b).await.unwrap();
+
+        // Deleting cred A removes exactly cred A.
+        let resp = account_webauthn_delete_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), cred_a.id.0.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let remaining = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::WebAuthn)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, cred_b.id);
+
+        // Deleting an unknown id is an idempotent 204 that touches nothing.
+        let resp = account_webauthn_delete_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), "no-such-credential".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .storage
+                .get_credentials(&realm_id, &user_id, CredentialType::WebAuthn)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn account_consents_returns_granted_consents() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let consent = issuerd_core::Consent {
+            client_id: client.id.clone(),
+            user_id: user_id.clone(),
+            granted_scopes: issuerd_core::Scope::parse("openid profile"),
+            granted_realm_roles: vec![],
+            granted_client_roles: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
+            last_updated_at: chrono::Utc::now(),
+        };
+        state.storage.create_consent(&realm_id, &consent).await.unwrap();
+
+        let resp = account_consents_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().expect("consent list");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["client_id"], "admin-cli");
+        assert_eq!(arr[0]["granted_scopes"], serde_json::json!(["openid", "profile"]));
+    }
+
+    #[tokio::test]
+    async fn account_linked_accounts_resolves_idp_display_fields() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+
+        let idp = issuerd_core::IdentityProviderConfig {
+            id: issuerd_core::IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+            alias: issuerd_core::Alias::new("github").unwrap(),
+            provider_id: issuerd_core::ProviderId::Oidc,
+            enabled: true,
+            config: std::collections::HashMap::from([(
+                "displayName".to_string(),
+                "GitHub".to_string(),
+            )]),
+        };
+        state.storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "github"))
+            .await
+            .unwrap();
+        // A link whose IdP config row vanished falls back to the bare alias.
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "vanished"))
+            .await
+            .unwrap();
+
+        let resp = account_linked_accounts_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().expect("linked accounts");
+        assert_eq!(arr.len(), 2);
+        let github = arr.iter().find(|e| e["alias"] == "github").expect("github entry");
+        assert_eq!(github["provider_id"], "oidc");
+        assert_eq!(github["display_name"], "GitHub");
+        let vanished = arr.iter().find(|e| e["alias"] == "vanished").expect("vanished entry");
+        assert_eq!(vanished["provider_id"], "");
+        assert_eq!(vanished["display_name"], "vanished");
+    }
+
+    #[tokio::test]
+    async fn account_link_identity_rejects_disabled_idp() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        create_idp(&state, "disabled-idp", issuerd_core::ProviderId::Oidc, false).await;
+
+        let resp = call_link_identity(&state, &access_token, "disabled-idp").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "identity provider is not available for linking");
+    }
+
+    #[tokio::test]
+    async fn account_link_identity_rejects_non_broker_provider() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        // LDAP is a federation provider, not a broker: linking is meaningless.
+        create_idp(&state, "corp-ldap", issuerd_core::ProviderId::Ldap, true).await;
+
+        let resp = call_link_identity(&state, &access_token, "corp-ldap").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "identity provider is not available for linking");
+    }
+
+    #[tokio::test]
+    async fn account_link_identity_returns_broker_url_for_enabled_broker() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        create_idp(&state, "github", issuerd_core::ProviderId::Oidc, true).await;
+
+        let resp = call_link_identity(&state, &access_token, "github").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let url = json["redirect_url"].as_str().unwrap();
+        assert!(
+            url.starts_with("/realms/master/broker/github/login?link="),
+            "unexpected url: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_link_identity_conflicts_when_already_linked() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        create_idp(&state, "github", issuerd_core::ProviderId::Oidc, true).await;
+        let user_id = admin_user_id(&state).await;
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "github"))
+            .await
+            .unwrap();
+
+        let resp = call_link_identity(&state, &access_token, "github").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn account_unlink_identity_removes_the_link() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "github"))
+            .await
+            .unwrap();
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "google"))
+            .await
+            .unwrap();
+
+        let resp = call_unlink_identity(&state, &access_token, "github").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let links = state.storage.list_identity_provider_links(&realm_id, &user_id).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].provider_alias, "google");
+    }
+
+    #[tokio::test]
+    async fn account_unlink_identity_deletes_single_link_when_password_set() {
+        // admin has a password credential, so unlinking the only link is
+        // allowed and must actually remove it.
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "github"))
+            .await
+            .unwrap();
+
+        let resp = call_unlink_identity(&state, &access_token, "github").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state
+            .storage
+            .list_identity_provider_links(&realm_id, &user_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_unlink_identity_unknown_alias_is_noop() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&user_id, "github"))
+            .await
+            .unwrap();
+
+        let resp = call_unlink_identity(&state, &access_token, "unknown").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let links = state.storage.list_identity_provider_links(&realm_id, &user_id).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].provider_alias, "github");
+    }
+
+    #[tokio::test]
+    async fn account_unlink_identity_refuses_to_remove_last_signin_method() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        // carol has no password credential: unlinking her only IdP link would
+        // leave the account with no way to sign in at all.
+        let carol = make_user(&realm_id, "carol");
+        state.storage.create_user(&realm_id, &carol).await.unwrap();
+        state
+            .storage
+            .create_identity_provider_link(&realm_id, &make_link(&carol.id, "github"))
+            .await
+            .unwrap();
+        let token = issue_token_for_user(&state, &carol).await;
+
+        let resp = call_unlink_identity(&state, &token, "github").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "cannot unlink the only sign-in method; set a password first");
+        // The link survives.
+        assert_eq!(
+            state
+                .storage
+                .list_identity_provider_links(&realm_id, &carol.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

@@ -406,6 +406,43 @@ mod tests {
         assert!(!is_noisy_path("/admin/realms"));
     }
 
+    #[test]
+    fn noisy_path_exact_matches() {
+        // Every exact-match arm of the noisy-path chain must hold on its own:
+        // each of these paths must classify as noisy even though none of the
+        // other conditions apply.
+        for path in [
+            "/",
+            "/config.js",
+            "/favicon.ico",
+            "/robots.txt",
+            "/site.webmanifest",
+            "/health",
+            "/ready",
+            "/health/ready",
+            "/metrics",
+        ] {
+            assert!(is_noisy_path(path), "expected noisy: {path}");
+        }
+        // Near misses and ordinary endpoints must stay non-noisy.
+        for path in [
+            "",
+            "//",
+            "/config.json",
+            "/favicon.icox",
+            "/robots.txt2",
+            "/x/site.webmanifestx",
+            "/healthz",
+            "/readyz",
+            "/health/ready/x",
+            "/metrics/x",
+            "/realms/master/protocol/openid-connect/auth",
+            "/admin/realms/master/users",
+        ] {
+            assert!(!is_noisy_path(path), "expected non-noisy: {path}");
+        }
+    }
+
     #[tokio::test]
     async fn app_router_builds_and_responds() {
         use axum::extract::ConnectInfo;

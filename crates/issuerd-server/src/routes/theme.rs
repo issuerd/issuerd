@@ -99,6 +99,23 @@ mod tests {
     }
 
     #[test]
+    fn asset_path_rejects_dot_segments_and_backslashes() {
+        // Bare and embedded `.`/`..` segments.
+        assert!(!is_safe_asset_path("."));
+        assert!(!is_safe_asset_path(".."));
+        assert!(!is_safe_asset_path("a/./b"));
+        assert!(!is_safe_asset_path("./login.css"));
+        assert!(!is_safe_asset_path("a/../b"));
+        assert!(!is_safe_asset_path("login.css/.."));
+        // Backslash anywhere in a segment (Windows separator).
+        assert!(!is_safe_asset_path("a\\b"));
+        assert!(!is_safe_asset_path("img\\logo.svg"));
+        // Trailing separator yields an empty final segment.
+        assert!(!is_safe_asset_path("img/"));
+        assert!(!is_safe_asset_path("/img/logo.svg"));
+    }
+
+    #[test]
     fn available_themes_discovers_dirs_plus_default() {
         let base = std::env::temp_dir().join(format!("issuerd-theme-test-{}", std::process::id()));
         std::fs::create_dir_all(base.join("acme")).unwrap();
@@ -133,5 +150,80 @@ mod tests {
         // Percent-encoded separators arrive decoded by axum's Path extractor
         // in real requests; the raw string here still exercises the guard.
         assert!(resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND);
+    }
+
+    /// Build a server state whose theme root is `themes_dir` and whose master
+    /// realm has the given stored `login_theme`.
+    async fn state_with_login_theme(
+        themes_dir: &std::path::Path,
+        login_theme: &str,
+    ) -> Arc<ServerState> {
+        let mut cfg = ServerConfig::default();
+        cfg.themes.dir = themes_dir.to_path_buf();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.login_theme = Some(issuerd_core::ThemeName::new(login_theme).unwrap());
+        state.storage.update_realm(&realm).await.unwrap();
+        // Mirrors the admin route's synchronous realm-by-name invalidation.
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn dotdot_login_theme_falls_back_to_default_theme() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-theme-guard-dotdot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(themes.join("issuerd")).unwrap();
+        std::fs::write(themes.join("issuerd").join("probe.css"), b"default-theme").unwrap();
+        // Reachable only if the stored theme name ".." becomes a path
+        // component: `themes/../probe.css`.
+        std::fs::write(base.join("probe.css"), b"escaped").unwrap();
+
+        let state = state_with_login_theme(&themes, "..").await;
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "probe.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"default-theme",
+            "a malformed stored theme name must fall back to the default theme"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_custom_login_theme_serves_custom_file() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-theme-guard-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(themes.join("issuerd")).unwrap();
+        std::fs::create_dir_all(themes.join("custom")).unwrap();
+        std::fs::write(themes.join("issuerd").join("probe.css"), b"default-theme").unwrap();
+        std::fs::write(themes.join("custom").join("probe.css"), b"custom-theme").unwrap();
+
+        let state = state_with_login_theme(&themes, "custom").await;
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "probe.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"custom-theme", "a valid custom theme must win over the default");
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

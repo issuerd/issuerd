@@ -7527,6 +7527,84 @@ mod tests {
         assert!(json["access_token"].as_str().unwrap().len() > 10);
     }
 
+    /// Redeem an authorization code carrying the given scope list and return
+    /// the token-endpoint response.
+    async fn redeem_auth_code_with_scope(state: &Arc<ServerState>, scope: &[&str]) -> Response {
+        let code = issuerd_core::utils::generate_id();
+        let code_data = AuthCodeData {
+            user_id: "admin".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: scope.iter().map(|s| (*s).to_string()).collect(),
+            state: None,
+            nonce: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            session_id: None,
+            auth_time: None,
+            acr_values: vec![],
+            claims: None,
+            authorization_details: None,
+        };
+        state
+            .cache
+            .set(
+                &format!("auth_code:{code}"),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=authorization_code&code={code}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli&code_verifier=xyz"
+            ),
+        )
+        .await
+    }
+
+    /// All persisted sessions of the master-realm admin user.
+    async fn admin_sessions(state: &Arc<ServerState>) -> Vec<issuerd_core::UserSession> {
+        state
+            .storage
+            .list_sessions(
+                &RealmId::new("master").unwrap(),
+                Some(issuerd_core::UserId::new("admin").unwrap()),
+                &issuerd_core::Pagination::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_offline_access_scope_mints_offline_session() {
+        let state = setup_state().await;
+        let resp = redeem_auth_code_with_scope(&state, &["openid", "offline_access"]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sessions = admin_sessions(&state).await;
+        assert!(
+            sessions.iter().any(|s| s.offline),
+            "an offline_access grant must mint a separate offline session"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_without_offline_scope_mints_no_offline_session() {
+        let state = setup_state().await;
+        let resp = redeem_auth_code_with_scope(&state, &["openid"]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sessions = admin_sessions(&state).await;
+        assert!(!sessions.is_empty(), "the online session must exist");
+        assert!(
+            sessions.iter().all(|s| !s.offline),
+            "no offline session may be minted without the offline_access scope"
+        );
+    }
+
     #[tokio::test]
     async fn token_auth_code_reuse_revokes_access_token() {
         let state = setup_state().await;
@@ -8859,6 +8937,28 @@ mod tests {
         assert_eq!(json["error"], "invalid_grant");
     }
 
+    /// Disable the master-realm user `username` in storage (simulates an
+    /// admin disabling the account mid-flow).
+    async fn disable_master_user(state: &Arc<ServerState>, username: &str) {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, username).await.unwrap().unwrap();
+        user.enabled = false;
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_verify_handler_disabled_user_rejected() {
+        let state = setup_state().await;
+        disable_master_user(&state, "admin").await;
+        let user_code = seed_pending_device_code(&state).await;
+        // Correct credentials, but the account is disabled: the flow must
+        // fail closed before any password check.
+        let resp = device_verify_with(&state, &user_code, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
     /// Seed a pending device-code entry for master/admin-cli and return its
     /// `user_code`.
     async fn seed_pending_device_code(state: &Arc<ServerState>) -> String {
@@ -9114,6 +9214,117 @@ mod tests {
         assert_eq!(consumed_resp.status(), StatusCode::BAD_REQUEST);
         let consumed_json = extract_json(consumed_resp).await;
         assert_eq!(consumed_json["error"], "expired_token");
+    }
+
+    #[tokio::test]
+    async fn device_token_grant_rejects_different_client() {
+        let state = setup_state().await;
+
+        // A second public client that did NOT initiate the device flow.
+        let realm_id = RealmId::new("master").unwrap();
+        let other = issuerd_core::Client {
+            id: issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: ClientIdentifier::new("other-client").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: true,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::default(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        };
+        state.storage.create_client(&realm_id, &other).await.unwrap();
+
+        // A pending device code issued to admin-cli.
+        let device_code = "device-xyz".to_string();
+        let code_data = DeviceCodeData {
+            device_code: device_code.clone(),
+            user_code: "WXYZ-1234".to_string(),
+            client_id: "admin-cli".to_string(),
+            realm_id: "master".to_string(),
+            scope: vec!["openid".to_string()],
+            user_id: None,
+            authorized: false,
+            last_polled_at: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        };
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::device_code(&device_code),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        // RFC 8628 §3.4: redemption by any other client is invalid_grant.
+        let resp = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=other-client&device_code={device_code}"
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn device_token_grant_disabled_user_rejected() {
+        let state = setup_state().await;
+
+        // Full device flow up to user authorization.
+        let auth_resp = device_auth_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            "client_id=admin-cli&scope=openid".to_string(),
+        )
+        .await;
+        assert_eq!(auth_resp.status(), StatusCode::OK);
+        let auth_json = extract_json(auth_resp).await;
+        let device_code = auth_json["device_code"].as_str().unwrap().to_string();
+        let user_code = auth_json["user_code"].as_str().unwrap().to_string();
+
+        let verify_resp = device_verify_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            format!("user_code={user_code}&username=admin&password=admin"),
+        )
+        .await;
+        assert_eq!(verify_resp.status(), StatusCode::OK);
+
+        // The account is disabled between authorization and redemption.
+        disable_master_user(&state, "admin").await;
+
+        let resp = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=admin-cli&device_code={device_code}"
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
     }
 
     #[tokio::test]

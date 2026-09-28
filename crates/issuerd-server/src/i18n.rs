@@ -262,6 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_accept_language_is_skipped() {
+        // A bare wildcard is not a locale: it must never be returned, even
+        // with unrestricted supported_locales.
+        let realm = realm_with(true, &[], Some("de"));
+        assert_eq!(resolve_locale(&realm, &[], Some("*")), "de");
+        // Real candidates around a wildcard still resolve.
+        assert_eq!(resolve_locale(&realm, &[], Some("*, fr;q=0.5, de;q=0.9")), "de");
+    }
+
+    #[test]
     fn builtin_bundles_cover_same_keys() {
         let en = builtin_bundle("en").unwrap();
         let de = builtin_bundle("de").unwrap();

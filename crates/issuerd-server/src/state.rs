@@ -1282,4 +1282,76 @@ mod tests {
             "after invalidation the resolve reflects the storage change"
         );
     }
+
+    #[tokio::test]
+    async fn jwks_refresh_task_reloads_only_on_key_set_changes() {
+        use std::sync::atomic::Ordering;
+
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let crypto_config = issuerd_token::CryptoConfig::default();
+        let mut keys = Vec::new();
+        for generated in issuerd_token::KeyStore::generate_initial_key_set(
+            crypto_config.default_alg,
+            crypto_config.rsa_key_size,
+        )
+        .unwrap()
+        {
+            let stored = generated.to_stored(true);
+            storage.create_signing_key(&stored).await.unwrap();
+            keys.push(stored);
+        }
+        let crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys).unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let token_manager = Arc::new(TokenManager::with_default_alg(
+            crypto.clone(),
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            jwks,
+            issuerd_token::CryptoConfig::default().default_alg,
+        ));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_jwks_refresh_task(
+            storage.clone(),
+            crypto.clone(),
+            token_manager,
+            1,
+            generation.clone(),
+        );
+
+        // Multiple polling intervals with an unchanged key set: no reload may
+        // fire (a reload every tick would also invalidate discovery caches
+        // cluster-wide for no reason).
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            0,
+            "an unchanged key set must never trigger a reload"
+        );
+
+        // A key persisted by a peer node propagates on a subsequent tick.
+        let extra =
+            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048).unwrap();
+        let extra_kid = extra.kid.to_string();
+        storage.create_signing_key(&extra.to_stored(true)).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while generation.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            generation.load(Ordering::Relaxed) >= 1,
+            "a changed key set must trigger a reload"
+        );
+        let kids: Vec<String> = crypto
+            .get_public_keys()
+            .await
+            .unwrap()
+            .keys
+            .iter()
+            .map(|k| k.kid.to_string())
+            .collect();
+        assert!(kids.contains(&extra_kid), "keystore must reload with the new key");
+    }
 }
