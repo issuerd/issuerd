@@ -1601,6 +1601,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn id_token_lifespan_matches_access_token_lifespan() {
+        let mut mock = issuerd_core::MockCryptoProvider::new();
+        mock.expect_sign().times(1).returning(|_, _, _| Ok("header.payload.sig".into()));
+        mock.expect_get_public_keys().returning(|| {
+            Ok(JwkSet {
+                keys: vec![test_jwk(Algorithm::Rs256)],
+            })
+        });
+
+        let tm = TokenManager::new(
+            Arc::new(mock),
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            JwkSet {
+                keys: vec![test_jwk(Algorithm::Rs256)],
+            },
+        );
+
+        let id_token = tm
+            .issue_id_token(
+                &test_user(),
+                &test_client(),
+                &test_realm(),
+                None,
+                Utc::now(),
+                &SessionId::new("s1").unwrap(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // ID tokens expire after the realm's access-token lifespan (added to
+        // the issuance time, never multiplied into it).
+        assert_eq!(
+            id_token.claims.exp - id_token.claims.iat,
+            test_realm().access_token_lifespan.get() as i64
+        );
+    }
+
+    #[tokio::test]
     async fn id_token_with_address_claim() {
         // The address claim is assembled by a protocol mapper in
         // issuerd-server and passed in via the claims overlay; it lands only in the
@@ -3390,6 +3433,255 @@ mod tests {
         assert!(matches!(tm.validate_access_token(&token), Err(IssuerdError::InvalidToken)));
     }
 
+    fn id_claims_with_issuer(iss: &str) -> IdTokenClaims {
+        IdTokenClaims {
+            iss: Issuer::new(iss).unwrap(),
+            sub: UserId::new("user-1").unwrap(),
+            aud: Audience::new("my-app").unwrap(),
+            exp: Utc::now().timestamp() + 300,
+            iat: Utc::now().timestamp(),
+            auth_time: Some(Utc::now().timestamp()),
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            sid: Some(SessionId::new("s1").unwrap()),
+            at_hash: None,
+            c_hash: None,
+            name: None,
+            given_name: None,
+            family_name: None,
+            preferred_username: None,
+            email: None,
+            email_verified: None,
+            address: None,
+            phone_number: None,
+            phone_number_verified: None,
+            realm_access: None,
+            resource_access: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn access_token_future_iat_rejected_with_valid_issuer() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(60), jwks);
+
+        // A structurally valid realm issuer, so ONLY the iat guard can reject.
+        let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+        claims.iat = Utc::now().timestamp() + 3600;
+        claims.exp = claims.iat + 300;
+        let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();
+        assert!(
+            matches!(tm.validate_access_token(&token), Err(IssuerdError::InvalidToken)),
+            "an iat beyond the clock-skew window must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_token_issued_in_current_second_validates_with_zero_skew() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(0), jwks);
+
+        // The future-iat guard is inclusive at the boundary: with zero skew a
+        // token issued THIS second (iat == now) must still validate. The
+        // validator reads `Utc::now()` itself, so the boundary only holds
+        // exactly when issue+validate complete within a single wall-clock
+        // second — retry until one iteration does (outcome is deterministic
+        // once the same-second condition holds; only the attempt count
+        // varies).
+        for attempt in 0..100 {
+            assert!(attempt < 99, "issue+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let token = tm
+                .issue_access_token(
+                    &test_user(),
+                    &test_client(),
+                    &test_realm(),
+                    &["openid".to_string()],
+                    &SessionId::new("s1").unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = tm.validate_access_token(&token.token);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(
+                result.is_ok(),
+                "a token issued in the current second must validate with zero clock skew"
+            );
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_issued_in_current_second_validates_with_zero_skew() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(0), jwks);
+
+        for attempt in 0..100 {
+            assert!(attempt < 99, "issue+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let token = tm
+                .issue_refresh_token(
+                    &test_user(),
+                    &test_client(),
+                    &test_realm(),
+                    &SessionId::new("s1").unwrap(),
+                    &["openid".to_string()],
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let result = tm.validate_refresh_token(&token.token);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(
+                result.is_ok(),
+                "a token issued in the current second must validate with zero clock skew"
+            );
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn id_token_issued_in_current_second_validates_with_zero_skew() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(0), jwks);
+
+        for attempt in 0..100 {
+            assert!(attempt < 99, "issue+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let token = tm
+                .issue_id_token(
+                    &test_user(),
+                    &test_client(),
+                    &test_realm(),
+                    None,
+                    Utc::now(),
+                    &SessionId::new("s1").unwrap(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let result = tm.validate_id_token(&token.token, &test_client(), None);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(
+                result.is_ok(),
+                "a token issued in the current second must validate with zero clock skew"
+            );
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn id_token_hint_future_iat_rejected() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(60), jwks);
+
+        // A structurally valid realm issuer, so ONLY the iat guard can reject.
+        let mut claims = id_claims_with_issuer("https://issuer/realms/test");
+        claims.iat = Utc::now().timestamp() + 3600;
+        claims.exp = claims.iat + 300;
+        let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();
+        assert!(
+            matches!(tm.validate_id_token_hint(&token), Err(IssuerdError::InvalidToken)),
+            "an iat beyond the clock-skew window must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn id_token_hint_issued_in_current_second_validates_with_zero_skew() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm =
+            TokenManager::new(crypto, "https://issuer".to_string(), Duration::from_secs(0), jwks);
+
+        for attempt in 0..100 {
+            assert!(attempt < 99, "issue+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let token = tm
+                .issue_id_token(
+                    &test_user(),
+                    &test_client(),
+                    &test_realm(),
+                    None,
+                    Utc::now(),
+                    &SessionId::new("s1").unwrap(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let result = tm.validate_id_token_hint(&token.token);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(
+                result.is_ok(),
+                "a token issued in the current second must validate with zero clock skew"
+            );
+            return;
+        }
+    }
+
     // ------------------------------------------------------------------
     // jwk_to_decoding_key & map_jwt_alg coverage
     // ------------------------------------------------------------------
@@ -4497,10 +4789,7 @@ mod tests {
         let mut claims = access_claims_with_issuer("https://issuer/realms/test");
         claims.nbf = Utc::now().timestamp() + 3600;
         let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
-        assert!(matches!(
-            tm.validate_access_token(&token),
-            Err(IssuerdError::InvalidToken)
-        ));
+        assert!(matches!(tm.validate_access_token(&token), Err(IssuerdError::InvalidToken)));
     }
 
     #[tokio::test]
@@ -4523,5 +4812,85 @@ mod tests {
         parts[1] = Box::leak(fake.into_boxed_str());
         let tampered = parts.join(".");
         assert!(matches!(tm.validate_access_token(&tampered), Err(IssuerdError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn es512_expired_within_leeway_accepted() {
+        // multi_alg_tm runs with a 60 s clock skew: an ES512 token that
+        // expired 30 s ago is inside the leeway window and must validate —
+        // the leeway widens the accepted window, never narrows it (30 s
+        // margins absorb execution-time drift, so no boundary retry needed).
+        let (tm, _) = multi_alg_tm().await;
+        let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+        let now = Utc::now().timestamp();
+        claims.iat = now - 90;
+        claims.nbf = now - 90;
+        claims.exp = now - 30;
+        let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
+        assert!(tm.validate_access_token(&token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn es512_expired_beyond_leeway_rejected() {
+        // Same 60 s skew, but expired an hour ago: must be rejected. The
+        // existing zero-leeway variant of this test cannot catch a mutated
+        // leeway arithmetic (`exp * leeway` is 0 when leeway is 0), so this
+        // case runs with a nonzero skew on purpose.
+        let (tm, _) = multi_alg_tm().await;
+        let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+        let now = Utc::now().timestamp();
+        claims.iat = now - 3600;
+        claims.nbf = now - 3600;
+        claims.exp = now - 3300;
+        let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
+        assert!(matches!(tm.validate_access_token(&token), Err(IssuerdError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn es512_expiry_at_leeway_boundary_accepted() {
+        // The expiry check is inclusive: `now == exp + leeway` still
+        // validates. `decode_es512_claims` reads `Utc::now()` itself, so the
+        // boundary only holds exactly when sign+validate complete within a
+        // single wall-clock second — retry until one iteration does (outcome
+        // is deterministic once the same-second condition holds; only the
+        // attempt count varies).
+        let (tm, _) = multi_alg_tm().await;
+        for attempt in 0..100 {
+            assert!(attempt < 99, "sign+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+            claims.iat = started - 120;
+            claims.nbf = started - 120;
+            claims.exp = started - 60;
+            let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
+            let result = tm.validate_access_token(&token);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(result.is_ok(), "exp exactly at the leeway boundary must be accepted");
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn es512_nbf_at_future_skew_boundary_accepted() {
+        // The nbf check is inclusive: `now + leeway == nbf` still validates.
+        // Same single-wall-clock-second retry as above.
+        let (tm, _) = multi_alg_tm().await;
+        for attempt in 0..100 {
+            assert!(attempt < 99, "sign+validate did not fit into one wall-clock second");
+            let started = Utc::now().timestamp();
+            let mut claims = access_claims_with_issuer("https://issuer/realms/test");
+            claims.nbf = started + 60;
+            claims.iat = started;
+            claims.exp = started + 300;
+            let (token, _) = tm.sign_claims(&claims, Algorithm::Es512).await.unwrap();
+            let result = tm.validate_access_token(&token);
+            if Utc::now().timestamp() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(result.is_ok(), "nbf exactly at the future skew boundary must be accepted");
+            return;
+        }
     }
 }

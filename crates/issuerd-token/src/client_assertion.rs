@@ -569,4 +569,62 @@ mod tests {
             assert!(validate_client_secret_assertion(&token, SECRET, &req_with(&aud)).is_ok());
         }
     }
+
+    #[test]
+    fn client_secret_jwt_iat_at_future_leeway_boundary_accepted() {
+        let aud = accepted();
+        // The future-iat guard is inclusive: `iat` exactly `leeway_secs` ahead
+        // of now is still acceptable clock skew. `check_claims` reads
+        // `Utc::now()` itself, so the boundary only holds exactly when
+        // sign+validate complete within a single wall-clock second — retry
+        // until one iteration does (outcome is deterministic once the
+        // same-second condition holds; only the attempt count varies).
+        for attempt in 0..100 {
+            assert!(attempt < 99, "sign+validate did not fit into one wall-clock second");
+            let started = now();
+            let mut claims = valid_claims();
+            claims["iat"] = serde_json::json!(started + req_with(&aud).leeway_secs as i64);
+            let token = sign_hs256(claims, SECRET);
+            let result = validate_client_secret_assertion(&token, SECRET, &req_with(&aud));
+            if now() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(result.is_ok(), "iat exactly at the future leeway boundary must be accepted");
+            return;
+        }
+    }
+
+    #[test]
+    fn client_secret_jwt_exp_at_lifetime_cap_boundary_accepted() {
+        let aud = accepted();
+        // The lifetime cap is inclusive: `exp` exactly
+        // `max_lifetime_secs + leeway_secs` out is still acceptable.
+        for attempt in 0..100 {
+            assert!(attempt < 99, "sign+validate did not fit into one wall-clock second");
+            let started = now();
+            let req = req_with(&aud);
+            let mut claims = valid_claims();
+            claims["exp"] =
+                serde_json::json!(started + req.max_lifetime_secs as i64 + req.leeway_secs as i64);
+            let token = sign_hs256(claims, SECRET);
+            let result = validate_client_secret_assertion(&token, SECRET, &req);
+            if now() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(result.is_ok(), "exp exactly at the lifetime cap must be accepted");
+            return;
+        }
+    }
+
+    #[test]
+    fn client_secret_jwt_exp_within_lifetime_cap_accepted() {
+        let aud = accepted();
+        // exp as far out as the lifetime cap alone allows: the leeway widens
+        // the accepted window, it never narrows it (the 60 s margin absorbs
+        // execution-time drift both ways, so no boundary retry is needed).
+        let mut claims = valid_claims();
+        claims["exp"] = serde_json::json!(now() + req_with(&aud).max_lifetime_secs as i64);
+        let token = sign_hs256(claims, SECRET);
+        assert!(validate_client_secret_assertion(&token, SECRET, &req_with(&aud)).is_ok());
+    }
 }

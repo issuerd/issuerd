@@ -1165,6 +1165,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_signing_algorithms_sorted_regardless_of_input_order() {
+        // `from_stored_keys` must sort active keys by created_at ascending
+        // (kid tiebreak) itself: persisted row order is not guaranteed, and
+        // `active_signing_algorithms` derives newest-first by reversing the
+        // stored order. Feeding the NEWEST key first proves the sort happens.
+        let rsa = KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
+        let mut es = KeyStore::generate_key(Algorithm::Es256, 2048).unwrap();
+        es.created_at = rsa.created_at + chrono::Duration::seconds(1);
+        let provider = RingCryptoProvider::from_signing_keys(
+            CryptoConfig::default(),
+            &[es.to_stored(true), rsa.to_stored(true)],
+        )
+        .unwrap();
+        assert_eq!(
+            provider.active_signing_algorithms().await.unwrap(),
+            vec![Algorithm::Es256, Algorithm::Rs256],
+            "the newest active key must lead regardless of persisted row order"
+        );
+
+        // Identical timestamps fall back to the kid tiebreak: the derived
+        // order is fully deterministic for a given stored set.
+        let rsa = KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
+        let mut es = KeyStore::generate_key(Algorithm::Es256, 2048).unwrap();
+        es.created_at = rsa.created_at;
+        let provider = RingCryptoProvider::from_signing_keys(
+            CryptoConfig::default(),
+            &[es.to_stored(true), rsa.to_stored(true)],
+        )
+        .unwrap();
+        let expected = if es.kid > rsa.kid {
+            vec![Algorithm::Es256, Algorithm::Rs256]
+        } else {
+            vec![Algorithm::Rs256, Algorithm::Es256]
+        };
+        assert_eq!(provider.active_signing_algorithms().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn sign_verify_roundtrip_es256() {
         let provider = RingCryptoProvider::new(CryptoConfig {
             default_alg: Algorithm::Es256,

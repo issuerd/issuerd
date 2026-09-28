@@ -200,8 +200,38 @@ mod tests {
 
     #[test]
     fn action_token_claims_exp_is_iat_plus_ttl() {
-        let claims = action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", 900);
+        let claims =
+            action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", 900);
         assert_eq!(claims.exp - claims.iat, 900);
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_token_at_exact_expiry_leeway_boundary() {
+        let crypto = test_crypto();
+        // The leeway boundary is inclusive: a token whose `exp` is exactly
+        // `EXP_LEEWAY_SECS` in the past (`now == exp + leeway`) must still
+        // verify. `Utc::now()` is read again inside `verify_action_token`, so
+        // the boundary only holds exactly when issue+verify complete within a
+        // single wall-clock second — retry until one iteration does (each
+        // attempt is microseconds; the outcome is deterministic once the
+        // same-second condition holds, only the attempt count varies).
+        for attempt in 0..100 {
+            assert!(attempt < 99, "issue+verify did not fit into one wall-clock second");
+            let now = Utc::now().timestamp();
+            let mut claims =
+                action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", 900);
+            claims.exp = now - EXP_LEEWAY_SECS;
+            let token = issue_action_token(&crypto, &claims).await.unwrap();
+            let result =
+                verify_action_token(&crypto, &token, "reset-credentials", &test_realm_id()).await;
+            if Utc::now().timestamp() != now {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            let verified =
+                result.expect("token exactly at the exp + leeway boundary must still be accepted");
+            assert_eq!(verified, claims);
+            return;
+        }
     }
 
     #[tokio::test]

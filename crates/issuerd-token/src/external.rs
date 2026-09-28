@@ -446,4 +446,42 @@ mod tests {
         };
         assert!(validate_external_id_token(&fx.jwks, &token, &req).is_ok());
     }
+
+    #[test]
+    fn alg_matches_kty_family_table() {
+        use jsonwebtoken::Algorithm as A;
+        // Every RSA/EC/OKP algorithm matches its own family...
+        for alg in [A::RS256, A::RS384, A::RS512] {
+            assert!(alg_matches_kty("RSA", alg), "RSA must match {alg:?}");
+        }
+        for alg in [A::ES256, A::ES384] {
+            assert!(alg_matches_kty("EC", alg), "EC must match {alg:?}");
+        }
+        assert!(alg_matches_kty("OKP", A::EdDSA));
+        // ...and nothing matches across families or for unknown ktys.
+        for alg in [A::ES256, A::ES384, A::EdDSA, A::HS256] {
+            assert!(!alg_matches_kty("RSA", alg), "RSA must not match {alg:?}");
+        }
+        for alg in [A::RS256, A::RS384, A::RS512, A::EdDSA, A::HS256] {
+            assert!(!alg_matches_kty("EC", alg), "EC must not match {alg:?}");
+        }
+        for alg in [A::RS256, A::RS384, A::RS512, A::ES256, A::ES384, A::HS256] {
+            assert!(!alg_matches_kty("OKP", alg), "OKP must not match {alg:?}");
+        }
+        assert!(!alg_matches_kty("oct", A::HS256));
+        assert!(!alg_matches_kty("unknown", A::RS256));
+    }
+
+    #[tokio::test]
+    async fn single_element_aud_array_does_not_require_azp() {
+        let fx = fixture().await;
+        // OIDC Core 3.1.3.7: azp is required only when aud lists SEVERAL
+        // audiences. A single-element aud array (some IdPs always serialize
+        // aud as an array) needs no azp.
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!([CLIENT_ID]);
+        let token = fx.sign(claims).await;
+        let claims = validate_external_id_token(&fx.jwks, &token, &requirements()).unwrap();
+        assert_eq!(claims["aud"], serde_json::json!([CLIENT_ID]));
+    }
 }

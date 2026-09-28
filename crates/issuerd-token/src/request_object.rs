@@ -331,6 +331,41 @@ mod tests {
     }
 
     #[test]
+    fn aud_array_containing_only_issuer_accepted() {
+        // The coverage test is `any(aud == issuer)`: a single-element array
+        // holding exactly the issuer is the minimal covering form — with an
+        // `any(aud != issuer)` implementation it would be the first array to
+        // be wrongly rejected.
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!([ISSUER]);
+        let jwt = sign_hs256(&claims, SECRET);
+        assert!(validate_request_object(&jwt, None, Some(SECRET), &requirements()).is_ok());
+    }
+
+    #[test]
+    fn iat_at_future_leeway_boundary_accepted() {
+        // The future-iat guard is inclusive: `iat` exactly `leeway_secs` ahead
+        // of now is still acceptable clock skew. `check_claims` reads
+        // `Utc::now()` itself, so the boundary only holds exactly when
+        // sign+validate complete within a single wall-clock second — retry
+        // until one iteration does (outcome is deterministic once the
+        // same-second condition holds; only the attempt count varies).
+        for attempt in 0..100 {
+            assert!(attempt < 99, "sign+validate did not fit into one wall-clock second");
+            let started = now();
+            let mut claims = valid_claims();
+            claims["iat"] = serde_json::json!(started + requirements().leeway_secs as i64);
+            let jwt = sign_hs256(&claims, SECRET);
+            let result = validate_request_object(&jwt, None, Some(SECRET), &requirements());
+            if now() != started {
+                continue; // second ticked over mid-check: retry for an exact boundary
+            }
+            assert!(result.is_ok(), "iat exactly at the future leeway boundary must be accepted");
+            return;
+        }
+    }
+
+    #[test]
     fn missing_aud_tolerated() {
         let mut claims = valid_claims();
         claims.as_object_mut().unwrap().remove("aud");

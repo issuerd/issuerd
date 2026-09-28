@@ -483,6 +483,21 @@ mod tests {
         assert!(matches!(jwk_thumbprint(&incomplete), Err(IssuerdError::InvalidDpopProof)));
     }
 
+    #[test]
+    fn thumbprint_rejects_incomplete_rsa_and_okp_keys() {
+        // Every member the thumbprint (and signature verification) needs must
+        // be present — a partial key is rejected, not completed with empty
+        // members.
+        let rsa_missing_e = serde_json::json!({"kty": "RSA", "n": "nn"});
+        assert!(matches!(jwk_thumbprint(&rsa_missing_e), Err(IssuerdError::InvalidDpopProof)));
+        let rsa_missing_n = serde_json::json!({"kty": "RSA", "e": "AQAB"});
+        assert!(matches!(jwk_thumbprint(&rsa_missing_n), Err(IssuerdError::InvalidDpopProof)));
+        let okp_missing_crv = serde_json::json!({"kty": "OKP", "x": "xx"});
+        assert!(matches!(jwk_thumbprint(&okp_missing_crv), Err(IssuerdError::InvalidDpopProof)));
+        let okp_missing_x = serde_json::json!({"kty": "OKP", "crv": "Ed25519"});
+        assert!(matches!(jwk_thumbprint(&okp_missing_x), Err(IssuerdError::InvalidDpopProof)));
+    }
+
     // ------------------------------------------------------------------
     // Proof validation
     // ------------------------------------------------------------------
