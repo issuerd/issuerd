@@ -5037,4 +5037,354 @@ mod tests {
         assert_eq!(restored.get_provision_marker("p1").await.unwrap(), Some("v2".to_string()));
         assert_eq!(restored.get_provision_marker("p2").await.unwrap(), Some("x".to_string()));
     }
+
+    // ------------------------------------------------------------------
+    // Counts: realm/user/client totals must reflect the actual maps
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn count_realms_tracks_creates_and_deletes() {
+        let storage = InMemoryStorage::new();
+        assert_eq!(storage.count_realms().await.unwrap(), 0);
+
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        assert_eq!(storage.count_realms().await.unwrap(), 2);
+
+        storage.delete_realm(&realm_a.id).await.unwrap();
+        assert_eq!(storage.count_realms().await.unwrap(), 1);
+        storage.delete_realm(&realm_b.id).await.unwrap();
+        assert_eq!(storage.count_realms().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_users_matches_query_within_realm_only() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        // alice: username and email share the "alice" substring.
+        let alice = test_user("realm-1");
+        // bob: the "example.org" query hits only his email, never his username.
+        let mut bob = test_user("realm-1");
+        bob.id = UserId::new("user-2").unwrap();
+        bob.username = Username::new("bob").unwrap();
+        bob.email = Some(Email::new("robert@example.org").unwrap());
+        // carol: no email at all.
+        let mut carol = test_user("realm-1");
+        carol.id = UserId::new("user-3").unwrap();
+        carol.username = Username::new("carol").unwrap();
+        carol.email = None;
+        // decoy: same username/email as alice, but in the other realm.
+        let decoy = test_user("realm-2");
+        storage.create_user(a, &alice).await.unwrap();
+        storage.create_user(a, &bob).await.unwrap();
+        storage.create_user(a, &carol).await.unwrap();
+        storage.create_user(b, &decoy).await.unwrap();
+
+        // An empty query counts every user in exactly this realm — including
+        // email-less carol and excluding the other realm's decoy.
+        assert_eq!(storage.count_users(a, "").await.unwrap(), 3);
+        assert_eq!(storage.count_users(b, "").await.unwrap(), 1);
+        // Username-only match (carol has no email to fall back on).
+        assert_eq!(storage.count_users(a, "carol").await.unwrap(), 1);
+        // Email-only match ("example.org" is not a substring of "bob").
+        assert_eq!(storage.count_users(a, "example.org").await.unwrap(), 1);
+        // Case-insensitive on both fields.
+        assert_eq!(storage.count_users(a, "ALICE").await.unwrap(), 1);
+        // No match anywhere.
+        assert_eq!(storage.count_users(a, "nobody").await.unwrap(), 0);
+        // The realm-B alice counts only inside its own realm.
+        assert_eq!(storage.count_users(b, "alice").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn count_clients_realm_scoped() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let client_a1 = test_client("realm-1");
+        let mut client_a2 = test_client("realm-1");
+        client_a2.id = ClientId::new("client-2").unwrap();
+        client_a2.client_id = ClientIdentifier::new("second-app").unwrap();
+        storage.create_client(a, &client_a1).await.unwrap();
+        storage.create_client(a, &client_a2).await.unwrap();
+
+        assert_eq!(storage.count_clients(a).await.unwrap(), 2);
+        assert_eq!(storage.count_clients(b).await.unwrap(), 0);
+
+        // Same id/client_id pair in the other realm counts only there.
+        let client_b = test_client("realm-2");
+        storage.create_client(b, &client_b).await.unwrap();
+        assert_eq!(storage.count_clients(a).await.unwrap(), 2);
+        assert_eq!(storage.count_clients(b).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_realm_cascades_role_and_group_memberships() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let role_a = test_role("realm-1");
+        let role_b = test_role("realm-2");
+        storage.create_role(a, &role_a).await.unwrap();
+        storage.create_role(b, &role_b).await.unwrap();
+        let group_a = test_group("realm-1");
+        let group_b = test_group("realm-2");
+        storage.create_group(a, &group_a).await.unwrap();
+        storage.create_group(b, &group_b).await.unwrap();
+        // Same user id in both realms: the mappings are realm-keyed.
+        let user_a = test_user("realm-1");
+        let user_b = test_user("realm-2");
+        storage.create_user(a, &user_a).await.unwrap();
+        storage.create_user(b, &user_b).await.unwrap();
+
+        storage.add_user_realm_role(a, &user_a.id, &role_a.id).await.unwrap();
+        storage.add_user_realm_role(b, &user_b.id, &role_b.id).await.unwrap();
+        storage.add_user_group(a, &user_a.id, &group_a.id).await.unwrap();
+        storage.add_user_group(b, &user_b.id, &group_b.id).await.unwrap();
+
+        storage.delete_realm(a).await.unwrap();
+
+        // The deleted realm's mappings are wiped...
+        assert!(storage.list_user_realm_roles(a, &user_a.id).await.unwrap().is_empty());
+        assert!(storage.list_user_groups(a, &user_a.id).await.unwrap().is_empty());
+        // ...while the surviving realm keeps its own.
+        assert_eq!(
+            storage.list_user_realm_roles(b, &user_b.id).await.unwrap(),
+            vec![role_b.id.clone()]
+        );
+        assert_eq!(
+            storage.list_user_groups(b, &user_b.id).await.unwrap(),
+            vec![group_b.id.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_client_by_client_id_matches_realm_and_identifier() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let client_a = test_client("realm-1"); // "my-app"
+        let mut client_b = test_client("realm-2");
+        client_b.id = ClientId::new("client-b1").unwrap();
+        client_b.client_id = ClientIdentifier::new("other-app").unwrap();
+        storage.create_client(a, &client_a).await.unwrap();
+        storage.create_client(b, &client_b).await.unwrap();
+
+        assert_eq!(
+            storage.get_client_by_client_id(a, &client_a.client_id).await.unwrap(),
+            Some(client_a.clone())
+        );
+        // Realm A has no "other-app": neither the realm match alone nor the
+        // identifier match alone may resolve.
+        assert!(storage.get_client_by_client_id(a, &client_b.client_id).await.unwrap().is_none());
+        assert!(storage.get_client_by_client_id(b, &client_a.client_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_client_strips_client_roles_from_user_realm_role_lists() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let client_a = test_client("realm-1");
+        storage.create_client(a, &client_a).await.unwrap();
+        let client_role = test_client_role("realm-1", &client_a.id, "cr-1", "viewer");
+        let realm_role = test_role("realm-1");
+        let other_realm_role = test_role("realm-2");
+        storage.create_role(a, &client_role).await.unwrap();
+        storage.create_role(a, &realm_role).await.unwrap();
+        storage.create_role(b, &other_realm_role).await.unwrap();
+        let user_a = test_user("realm-1");
+        let user_b = test_user("realm-2");
+        storage.create_user(a, &user_a).await.unwrap();
+        storage.create_user(b, &user_b).await.unwrap();
+
+        // The storage layer does not discriminate role kinds in the mapping
+        // lists, so a client role id can ride the realm-role list.
+        storage.add_user_realm_role(a, &user_a.id, &client_role.id).await.unwrap();
+        storage.add_user_realm_role(a, &user_a.id, &realm_role.id).await.unwrap();
+        storage.add_user_realm_role(b, &user_b.id, &other_realm_role.id).await.unwrap();
+
+        storage.delete_client(a, &client_a.id).await.unwrap();
+
+        // Only the deleted client's role id is stripped, in this realm only.
+        assert_eq!(
+            storage.list_user_realm_roles(a, &user_a.id).await.unwrap(),
+            vec![realm_role.id.clone()]
+        );
+        assert_eq!(
+            storage.list_user_realm_roles(b, &user_b.id).await.unwrap(),
+            vec![other_realm_role.id.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_credential_only_touches_the_target_user_and_realm() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let user_a1 = test_user("realm-1");
+        let mut user_a2 = test_user("realm-1");
+        user_a2.id = UserId::new("user-2").unwrap();
+        user_a2.username = Username::new("bob").unwrap();
+        let user_b1 = test_user("realm-2"); // same user id as user_a1
+        storage.create_user(a, &user_a1).await.unwrap();
+        storage.create_user(a, &user_a2).await.unwrap();
+        storage.create_user(b, &user_b1).await.unwrap();
+
+        // The same credential id exists for both users and in both realms.
+        let cred = test_credential();
+        storage.create_credential(a, &user_a1.id, &cred).await.unwrap();
+        storage.create_credential(a, &user_a2.id, &cred).await.unwrap();
+        storage.create_credential(b, &user_b1.id, &cred).await.unwrap();
+
+        storage.delete_credential(a, &user_a1.id, &cred.id).await.unwrap();
+
+        assert!(storage
+            .get_credentials(a, &user_a1.id, CredentialType::Password)
+            .await
+            .unwrap()
+            .is_empty());
+        // Same realm, different user: untouched.
+        assert_eq!(
+            storage
+                .get_credentials(a, &user_a2.id, CredentialType::Password)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Same user id, different realm: untouched.
+        assert_eq!(
+            storage
+                .get_credentials(b, &user_b1.id, CredentialType::Password)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_identity_provider_cascades_only_its_own_links() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        let idp_google_a = test_idp(); // idp-1 / "google"
+        let mut idp_github_a = test_idp();
+        idp_github_a.id = IdentityProviderId::new("idp-2").unwrap();
+        idp_github_a.alias = Alias::new("github").unwrap();
+        let mut idp_google_b = test_idp(); // same alias, other realm
+        idp_google_b.id = IdentityProviderId::new("idp-b1").unwrap();
+        storage.create_identity_provider(a, &idp_google_a).await.unwrap();
+        storage.create_identity_provider(a, &idp_github_a).await.unwrap();
+        storage.create_identity_provider(b, &idp_google_b).await.unwrap();
+
+        storage
+            .create_identity_provider_link(a, &test_link("user-1", "google", "sub-g"))
+            .await
+            .unwrap();
+        storage
+            .create_identity_provider_link(a, &test_link("user-1", "github", "sub-h"))
+            .await
+            .unwrap();
+        storage
+            .create_identity_provider_link(b, &test_link("user-1", "google", "sub-b"))
+            .await
+            .unwrap();
+
+        storage.delete_identity_provider(a, &idp_google_a.id).await.unwrap();
+
+        // The deleted provider's own links go with it...
+        assert!(storage
+            .get_identity_provider_link(a, "google", "sub-g")
+            .await
+            .unwrap()
+            .is_none());
+        // ...but links to other providers in the same realm survive...
+        assert!(storage
+            .get_identity_provider_link(a, "github", "sub-h")
+            .await
+            .unwrap()
+            .is_some());
+        // ...and the same alias in another realm survives.
+        assert!(storage
+            .get_identity_provider_link(b, "google", "sub-b")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn identity_provider_link_for_user_requires_all_three_keys() {
+        let storage = InMemoryStorage::new();
+        let realm_a = test_realm();
+        let realm_b = test_realm_2();
+        storage.create_realm(&realm_a).await.unwrap();
+        storage.create_realm(&realm_b).await.unwrap();
+        let (a, b) = (&realm_a.id, &realm_b.id);
+
+        storage
+            .create_identity_provider_link(a, &test_link("user-1", "google", "sub-a"))
+            .await
+            .unwrap();
+        storage
+            .create_identity_provider_link(b, &test_link("user-1", "google", "sub-b"))
+            .await
+            .unwrap();
+
+        let user1 = UserId::new("user-1").unwrap();
+        let user2 = UserId::new("user-2").unwrap();
+
+        // The exact (realm, alias, user) triple resolves.
+        let found = storage.get_identity_provider_link_for_user(a, &user1, "google").await.unwrap();
+        assert_eq!(found.map(|l| l.external_subject), Some("sub-a".to_string()));
+        // Wrong alias, even though the user has a link in this realm.
+        assert!(storage
+            .get_identity_provider_link_for_user(a, &user1, "github")
+            .await
+            .unwrap()
+            .is_none());
+        // Wrong user, even though the alias exists in this realm.
+        assert!(storage
+            .get_identity_provider_link_for_user(a, &user2, "google")
+            .await
+            .unwrap()
+            .is_none());
+        // The other realm's identical (user, alias) pair does not leak across.
+        assert!(storage
+            .get_identity_provider_link_for_user(b, &user1, "github")
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

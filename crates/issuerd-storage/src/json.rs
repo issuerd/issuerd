@@ -2651,4 +2651,101 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[tokio::test]
+    async fn json_storage_counts_track_actual_entities() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("issuerd-json-test-{}.json", uuid::Uuid::new_v4()));
+
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let realm_id = RealmId::new("realm-1").unwrap();
+            let realm2_id = RealmId::new("realm-2").unwrap();
+
+            // Empty storage: every count is zero.
+            assert_eq!(storage.count_realms().await.unwrap(), 0);
+            assert_eq!(storage.count_users(&realm_id, "").await.unwrap(), 0);
+            assert_eq!(storage.count_clients(&realm_id).await.unwrap(), 0);
+            assert_eq!(storage.count_sessions(&realm_id, None).await.unwrap(), 0);
+
+            let mut realm2 = test_realm();
+            realm2.id = realm2_id.clone();
+            realm2.name = RealmName::new("test-realm-2").unwrap();
+            storage.create_realm(&test_realm()).await.unwrap();
+            storage.create_realm(&realm2).await.unwrap();
+            assert_eq!(storage.count_realms().await.unwrap(), 2);
+
+            let user1 = test_user();
+            let mut user2 = test_user();
+            user2.id = UserId::new("user-2").unwrap();
+            user2.username = Username::new("bob").unwrap();
+            storage.create_user(&realm_id, &user1).await.unwrap();
+            storage.create_user(&realm_id, &user2).await.unwrap();
+            assert_eq!(storage.count_users(&realm_id, "").await.unwrap(), 2);
+            assert_eq!(storage.count_users(&realm2_id, "").await.unwrap(), 0);
+
+            let client1 = full_client(&realm_id);
+            let mut client2 = full_client(&realm_id);
+            client2.id = ClientId::new("client-2").unwrap();
+            client2.client_id = ClientIdentifier::new("second-app").unwrap();
+            storage.create_client(&realm_id, &client1).await.unwrap();
+            storage.create_client(&realm_id, &client2).await.unwrap();
+            assert_eq!(storage.count_clients(&realm_id).await.unwrap(), 2);
+            assert_eq!(storage.count_clients(&realm2_id).await.unwrap(), 0);
+
+            let session1 = sample_session("session-1", &realm_id, &user1.id);
+            let session2 = sample_session("session-2", &realm_id, &user2.id);
+            storage.create_user_session(&realm_id, &session1).await.unwrap();
+            storage.create_user_session(&realm_id, &session2).await.unwrap();
+            assert_eq!(storage.count_sessions(&realm_id, None).await.unwrap(), 2);
+            assert_eq!(storage.count_sessions(&realm_id, Some(user1.id.clone())).await.unwrap(), 1);
+            assert_eq!(storage.count_sessions(&realm2_id, None).await.unwrap(), 0);
+        }
+
+        // The counts agree after a reload from disk.
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let realm_id = RealmId::new("realm-1").unwrap();
+            assert_eq!(storage.count_realms().await.unwrap(), 2);
+            assert_eq!(storage.count_users(&realm_id, "").await.unwrap(), 2);
+            assert_eq!(storage.count_clients(&realm_id).await.unwrap(), 2);
+            assert_eq!(storage.count_sessions(&realm_id, None).await.unwrap(), 2);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn json_storage_assign_client_scope_persists() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("issuerd-json-test-{}.json", uuid::Uuid::new_v4()));
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let client_id = ClientId::new("client-1").unwrap();
+        let scope = custom_scope();
+
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&test_realm()).await.unwrap();
+            storage.create_client(&realm_id, &full_client(&realm_id)).await.unwrap();
+            storage.create_client_scope(&realm_id, &scope).await.unwrap();
+
+            storage
+                .assign_client_scope(&realm_id, &client_id, &scope.id, false)
+                .await
+                .unwrap();
+            let assignments =
+                storage.list_client_scope_assignments(&realm_id, &client_id).await.unwrap();
+            assert!(assignments.contains(&(scope.id.clone(), false)));
+        }
+
+        // The assignment survives a reload from disk.
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let assignments =
+                storage.list_client_scope_assignments(&realm_id, &client_id).await.unwrap();
+            assert!(assignments.contains(&(scope.id.clone(), false)));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -278,6 +278,30 @@ mod tests {
     }
 
     #[test]
+    fn key_id_length_boundary() {
+        // Exactly MAX_KEY_ID_LEN is accepted, for the active id and for
+        // previous ids alike...
+        let at_max = "k".repeat(MAX_KEY_ID_LEN);
+        assert!(Aes256GcmKekProvider::new(at_max.clone(), [1u8; 32], vec![]).is_ok());
+        assert!(Aes256GcmKekProvider::new("a".to_string(), [1u8; 32], vec![(at_max, [2u8; 32])])
+            .is_ok());
+        // ...one char over the limit is rejected.
+        assert!(
+            Aes256GcmKekProvider::new("k".repeat(MAX_KEY_ID_LEN + 1), [1u8; 32], vec![]).is_err()
+        );
+    }
+
+    #[test]
+    fn empty_plaintext_round_trip_at_min_blob_len() {
+        let p = provider();
+        // An empty plaintext yields the shortest legal blob (version ||
+        // nonce || tag with zero ciphertext bytes). It must still decrypt.
+        let blob = p.encrypt(b"").unwrap();
+        assert_eq!(blob.len(), MIN_BLOB_LEN);
+        assert_eq!(p.decrypt("kek-1", &blob).unwrap(), b"");
+    }
+
+    #[test]
     fn previous_kek_decrypts_but_active_encrypts() {
         // Rotation window: old rows (encrypted under 'old') still read, new
         // rows are written under 'new'.
