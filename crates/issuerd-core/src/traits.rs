@@ -1443,13 +1443,17 @@ mod tests {
         }
     }
 
-    /// Records `create_user` calls and serves fixed client/role rows; every
-    /// other method is unimplemented. The batch default methods under test are
-    /// NOT overridden, so the trait defaults run.
+    /// Records `create_user` calls and serves fixed client/role/scope/group
+    /// rows plus a marker map; every other method is unimplemented. The batch
+    /// default methods under test are NOT overridden, so the trait defaults run.
+    #[derive(Default)]
     struct StubStorage {
         created_users: std::sync::Mutex<Vec<String>>,
         clients: Vec<Client>,
         client_roles: Vec<Role>,
+        client_scopes: Vec<ClientScope>,
+        groups: Vec<Group>,
+        provision_markers: std::sync::Mutex<HashMap<String, String>>,
     }
 
     #[allow(unused_variables)]
@@ -1709,14 +1713,14 @@ mod tests {
             realm: &RealmId,
             id: &ClientScopeId,
         ) -> Result<Option<ClientScope>, IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            Ok(self.client_scopes.iter().find(|s| &s.id == id).cloned())
         }
         async fn get_client_scope_by_name(
             &self,
             realm: &RealmId,
             name: &str,
         ) -> Result<Option<ClientScope>, IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            Ok(self.client_scopes.iter().find(|s| s.name == name).cloned())
         }
         async fn list_client_scopes(
             &self,
@@ -1796,7 +1800,7 @@ mod tests {
             realm: &RealmId,
             id: &GroupId,
         ) -> Result<Option<Group>, IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            Ok(self.groups.iter().find(|g| &g.id == id).cloned())
         }
         async fn get_group_by_name(
             &self,
@@ -2078,10 +2082,14 @@ mod tests {
             unimplemented!("StubStorage implements only what the default-method tests use")
         }
         async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            Ok(self.provision_markers.lock().unwrap().get(name).cloned())
         }
         async fn set_provision_marker(&self, name: &str, value: &str) -> Result<(), IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            self.provision_markers
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), value.to_string());
+            Ok(())
         }
         async fn list_signing_keys(&self) -> Result<Vec<StoredSigningKey>, IssuerdError> {
             unimplemented!("StubStorage implements only what the default-method tests use")
@@ -2098,8 +2106,7 @@ mod tests {
     async fn default_bulk_create_users_fans_out_to_create_user() {
         let storage = StubStorage {
             created_users: std::sync::Mutex::new(vec![]),
-            clients: vec![],
-            client_roles: vec![],
+            ..Default::default()
         };
         let realm = RealmId::new("r1").unwrap();
         let users = vec![stub_user("alice"), stub_user("bob"), stub_user("carol")];
@@ -2114,9 +2121,8 @@ mod tests {
     #[tokio::test]
     async fn default_get_clients_batch_preserves_order_and_skips_unknown() {
         let storage = StubStorage {
-            created_users: std::sync::Mutex::new(vec![]),
             clients: vec![stub_client("c1"), stub_client("c2")],
-            client_roles: vec![],
+            ..Default::default()
         };
         let realm = RealmId::new("r1").unwrap();
         let ids = vec![
@@ -2132,12 +2138,11 @@ mod tests {
     #[tokio::test]
     async fn default_get_client_roles_by_names_preserves_order_and_skips_unknown() {
         let storage = StubStorage {
-            created_users: std::sync::Mutex::new(vec![]),
-            clients: vec![],
             client_roles: vec![
                 stub_client_role("r1", "admin", "c1"),
                 stub_client_role("r2", "reader", "c1"),
             ],
+            ..Default::default()
         };
         let realm = RealmId::new("r1").unwrap();
         let client = ClientId::new("c1").unwrap();
@@ -2149,6 +2154,117 @@ mod tests {
         let roles = storage.get_client_roles_by_names(&realm, &client, &names).await.unwrap();
         let got: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(got, vec!["reader", "admin"], "input order kept, unknown names skipped");
+    }
+
+    fn stub_client_scope(id: &str, name: &str) -> ClientScope {
+        ClientScope {
+            id: ClientScopeId::new(id).unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            name: name.to_string(),
+            description: None,
+            protocol: ClientProtocol::OpenIdConnect,
+            attributes: HashMap::new(),
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+        }
+    }
+
+    fn stub_group(id: &str, name: &str) -> Group {
+        Group {
+            id: GroupId::new(id).unwrap(),
+            name: GroupName::new(name).unwrap(),
+            path: GroupPath::new(format!("/{name}")).unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            parent_id: None,
+            sub_groups: vec![],
+            attributes: HashMap::new(),
+            realm_roles: vec![],
+            client_roles: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_get_client_scopes_by_names_preserves_order_and_skips_unknown() {
+        let storage = StubStorage {
+            client_scopes: vec![
+                stub_client_scope("s1", "profile"),
+                stub_client_scope("s2", "email"),
+            ],
+            ..Default::default()
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let names = vec![
+            "email".to_string(),
+            "ghost".to_string(),
+            "profile".to_string(),
+        ];
+        let scopes = storage.get_client_scopes_by_names(&realm, &names).await.unwrap();
+        let got: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(got, vec!["email", "profile"], "input order kept, unknown names skipped");
+    }
+
+    #[tokio::test]
+    async fn default_get_client_scopes_by_ids_preserves_order_and_skips_unknown() {
+        let storage = StubStorage {
+            client_scopes: vec![
+                stub_client_scope("s1", "profile"),
+                stub_client_scope("s2", "email"),
+            ],
+            ..Default::default()
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let ids = vec![
+            ClientScopeId::new("s2").unwrap(),
+            ClientScopeId::new("ghost").unwrap(),
+            ClientScopeId::new("s1").unwrap(),
+        ];
+        let scopes = storage.get_client_scopes_by_ids(&realm, &ids).await.unwrap();
+        let got: Vec<String> = scopes.iter().map(|s| s.id.to_string()).collect();
+        assert_eq!(got, vec!["s2", "s1"], "input order kept, unknown ids skipped");
+    }
+
+    #[tokio::test]
+    async fn default_get_groups_batch_preserves_order_and_skips_unknown() {
+        let storage = StubStorage {
+            groups: vec![stub_group("g1", "admins"), stub_group("g2", "devs")],
+            ..Default::default()
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let ids = vec![
+            GroupId::new("g2").unwrap(),
+            GroupId::new("ghost").unwrap(),
+            GroupId::new("g1").unwrap(),
+        ];
+        let groups = storage.get_groups_batch(&realm, &ids).await.unwrap();
+        let got: Vec<String> = groups.iter().map(|g| g.id.to_string()).collect();
+        assert_eq!(got, vec!["g2", "g1"], "input order kept, unknown ids skipped");
+    }
+
+    #[tokio::test]
+    async fn default_claim_provision_marker_creates_when_absent() {
+        let storage = StubStorage::default();
+        assert!(storage.claim_provision_marker("boot", "v1").await.unwrap());
+        assert_eq!(
+            storage.provision_markers.lock().unwrap().get("boot"),
+            Some(&"v1".to_string()),
+            "the default check-then-set stores the claimed value"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_claim_provision_marker_false_when_present_and_does_not_overwrite() {
+        let storage = StubStorage::default();
+        storage
+            .provision_markers
+            .lock()
+            .unwrap()
+            .insert("boot".to_string(), "original".to_string());
+        assert!(!storage.claim_provision_marker("boot", "v2").await.unwrap());
+        assert_eq!(
+            storage.provision_markers.lock().unwrap().get("boot"),
+            Some(&"original".to_string()),
+            "an existing marker is left untouched"
+        );
     }
 
     /// Map-backed cache; `increment` and `scan_keys` stay on the trait defaults.
@@ -2216,6 +2332,21 @@ mod tests {
         assert_eq!(cache.increment("counter", None).await.unwrap(), 1);
         assert_eq!(cache.increment("counter", None).await.unwrap(), 2);
         assert_eq!(cache.increment("counter", None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn default_get_and_delete_returns_value_and_removes_key() {
+        let cache = StubCache {
+            map: std::sync::Mutex::new(HashMap::new()),
+        };
+        cache.set("code", b"v1".to_vec(), None).await.unwrap();
+        // First consume returns the stored value...
+        assert_eq!(cache.get_and_delete("code").await.unwrap(), Some(b"v1".to_vec()));
+        // ...and the key is actually gone afterwards (single-use semantics).
+        assert_eq!(cache.get_and_delete("code").await.unwrap(), None);
+        assert_eq!(cache.get("code").await.unwrap(), None);
+        // A missing key yields None without error.
+        assert_eq!(cache.get_and_delete("missing").await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -419,6 +419,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn marker_name_defaults_and_override() {
+        // No `marker` key at all: the effective name is "default".
+        let cfg: ProvisionConfig = serde_yaml::from_str("realms: []").unwrap();
+        assert_eq!(cfg.marker_name(), "default");
+
+        let mut cfg = ProvisionConfig::generate_example();
+        assert_eq!(cfg.marker_name(), "default");
+        cfg.marker = Some("bootstrap-v2".to_string());
+        assert_eq!(cfg.marker_name(), "bootstrap-v2");
+        cfg.marker = None;
+        assert_eq!(cfg.marker_name(), "default");
+    }
+
+    #[test]
     fn example_roundtrip_yaml() {
         let original = ProvisionConfig::generate_example();
         let yaml = serde_yaml::to_string(&original).unwrap();

@@ -809,6 +809,53 @@ mod tests {
     }
 
     #[test]
+    fn token_response_with_a_single_token_kind_is_accepted() {
+        // Either token alone satisfies the "at least one token" rule.
+        let resp = BrokerTokenResponse::parse(&serde_json::json!({"access_token": "at"})).unwrap();
+        assert_eq!(resp.access_token.as_deref(), Some("at"));
+        assert_eq!(resp.id_token, None);
+
+        let resp = BrokerTokenResponse::parse(&serde_json::json!({"id_token": "it"})).unwrap();
+        assert_eq!(resp.id_token.as_deref(), Some("it"));
+        assert_eq!(resp.access_token, None);
+    }
+
+    /// Hand-written stub: mockall's `MockBrokerClient` overrides EVERY method,
+    /// so the `get_json_untrusted` default body never runs through the mock.
+    struct StubBrokerClient;
+
+    #[async_trait::async_trait]
+    impl BrokerClient for StubBrokerClient {
+        async fn get_json(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
+            Ok(serde_json::json!({"fetched": url}))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _basic_auth: Option<(String, String)>,
+        ) -> Result<serde_json::Value, IssuerdError> {
+            unimplemented!("StubBrokerClient implements only what the default-method tests use")
+        }
+
+        async fn get_json_bearer(
+            &self,
+            _url: &str,
+            _access_token: &str,
+        ) -> Result<serde_json::Value, IssuerdError> {
+            unimplemented!("StubBrokerClient implements only what the default-method tests use")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_get_json_untrusted_delegates_to_get_json() {
+        let client = StubBrokerClient;
+        let value = client.get_json_untrusted("https://idp.example.com/jwks").await.unwrap();
+        assert_eq!(value, serde_json::json!({"fetched": "https://idp.example.com/jwks"}));
+    }
+
+    #[test]
     fn identity_from_oidc_claims() {
         let id = BrokeredIdentity::from_claims(serde_json::json!({
             "sub": "abc-123",
@@ -857,6 +904,65 @@ mod tests {
         assert_eq!(id.suggested_username("github"), "local");
         id.email = None;
         assert_eq!(id.suggested_username("github"), "github.s1");
+    }
+
+    #[test]
+    fn suggested_username_prefers_username_over_email_and_alias() {
+        // A non-empty preferred username wins outright; without an email the
+        // fallback chain must not even be consulted.
+        let id = BrokeredIdentity::from_claims(serde_json::json!({
+            "sub": "s1",
+            "preferred_username": "octocat"
+        }))
+        .unwrap();
+        assert_eq!(id.suggested_username("github"), "octocat");
+
+        // Username beating a *different* email local part pins the priority.
+        let id = BrokeredIdentity::from_claims(serde_json::json!({
+            "sub": "s1",
+            "preferred_username": "octocat",
+            "email": "other@example.com"
+        }))
+        .unwrap();
+        assert_eq!(id.suggested_username("github"), "octocat");
+
+        // A whitespace-only username is not a username: fall through.
+        let mut id = BrokeredIdentity::from_claims(serde_json::json!({
+            "sub": "s1",
+            "preferred_username": "octocat"
+        }))
+        .unwrap();
+        id.username = Some("   ".to_string());
+        assert_eq!(id.suggested_username("github"), "github.s1");
+    }
+
+    #[test]
+    fn claim_strings_extracts_scalar_and_array_values() {
+        let claims = serde_json::json!({
+            "name": "acme",
+            "n": 42,
+            "flag": true,
+            "off": false,
+            "groups": ["users", "admins"],
+            "mixed": ["s", 7, false, {"nested": 1}, ["x"]],
+            "obj": {"a": 1},
+        });
+        assert_eq!(claim_strings(&claims, "name"), vec!["acme".to_string()]);
+        assert_eq!(claim_strings(&claims, "n"), vec!["42".to_string()]);
+        assert_eq!(claim_strings(&claims, "flag"), vec!["true".to_string()]);
+        assert_eq!(claim_strings(&claims, "off"), vec!["false".to_string()]);
+        assert_eq!(
+            claim_strings(&claims, "groups"),
+            vec!["users".to_string(), "admins".to_string()]
+        );
+        // Arrays keep string/number/bool members and skip objects/sub-arrays.
+        assert_eq!(
+            claim_strings(&claims, "mixed"),
+            vec!["s".to_string(), "7".to_string(), "false".to_string()]
+        );
+        // Objects and missing claims contribute nothing.
+        assert!(claim_strings(&claims, "obj").is_empty());
+        assert!(claim_strings(&claims, "missing").is_empty());
     }
 
     #[test]

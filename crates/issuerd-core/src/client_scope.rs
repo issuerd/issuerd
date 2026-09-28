@@ -484,6 +484,65 @@ mod tests {
     }
 
     #[test]
+    fn mapper_type_labels_are_stable() {
+        // Labels feed admin UIs via the enums API; pin the exact strings.
+        let expected = [
+            (MapperType::UserAttribute, "User Attribute"),
+            (MapperType::UserProperty, "User Property"),
+            (MapperType::FullName, "Full Name"),
+            (MapperType::Address, "User Address"),
+            (MapperType::GroupMembership, "Group Membership"),
+            (MapperType::RealmRoleList, "User Realm Role"),
+            (MapperType::ClientRoleList, "User Client Role"),
+            (MapperType::Audience, "Audience"),
+            (MapperType::AllowedWebOrigins, "Allowed Web Origins"),
+        ];
+        assert_eq!(expected.len(), MapperType::ALL.len());
+        for (mt, label) in expected {
+            assert_eq!(mt.label(), label);
+        }
+    }
+
+    #[test]
+    fn mapper_type_descriptions_are_stable() {
+        // Descriptions are part of the enums API contract (the admin SPA
+        // surfaces them); pin the exact strings per variant.
+        let expected = [
+            (
+                MapperType::UserAttribute,
+                "Map a custom user attribute to a token claim, with optional JSON typing",
+            ),
+            (
+                MapperType::UserProperty,
+                "Map a built-in user property (username, email, first/last name, ...) to a claim",
+            ),
+            (MapperType::FullName, "Map the user's first + last name to the `name` claim"),
+            (
+                MapperType::Address,
+                "Map address_* user attributes to the nested `address` claim",
+            ),
+            (MapperType::GroupMembership, "Map the user's group memberships to a token claim"),
+            (
+                MapperType::RealmRoleList,
+                "Map the user's effective realm roles into the `realm_access` claim",
+            ),
+            (
+                MapperType::ClientRoleList,
+                "Map the user's effective client roles into the `resource_access` claim",
+            ),
+            (MapperType::Audience, "Add an audience to the `aud` claim of the access token"),
+            (
+                MapperType::AllowedWebOrigins,
+                "Map the client's allowed web origins into the `allowed_origins` claim",
+            ),
+        ];
+        assert_eq!(expected.len(), MapperType::ALL.len());
+        for (mt, description) in expected {
+            assert_eq!(mt.description(), description);
+        }
+    }
+
+    #[test]
     fn builtin_scopes_cover_expected_names() {
         let realm = RealmId::new("r1").unwrap();
         let scopes = builtin_client_scopes(&realm);

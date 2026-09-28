@@ -346,6 +346,59 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// A provider whose `find_user` returns a user; the
+    /// `validate_imported_user` / `supports_password_update` trait defaults
+    /// stay untouched so the default bodies run.
+    struct FindUserProvider;
+
+    #[async_trait::async_trait]
+    impl FederationProvider for FindUserProvider {
+        fn id(&self) -> &str {
+            "find-user"
+        }
+        fn provider_type(&self) -> FederationProviderType {
+            FederationProviderType::Ldap
+        }
+        async fn find_user(
+            &self,
+            username: &str,
+        ) -> Result<Option<FederatedUser>, FederationError> {
+            Ok(Some(FederatedUser {
+                username: username.to_string(),
+                enabled: true,
+                ..FederatedUser::default()
+            }))
+        }
+        async fn find_user_by_email(
+            &self,
+            _email: &str,
+        ) -> Result<Option<FederatedUser>, FederationError> {
+            Ok(None)
+        }
+        async fn validate_password(
+            &self,
+            _username: &str,
+            _password: &str,
+        ) -> Result<bool, FederationError> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_validate_imported_user_returns_found_user() {
+        let provider = FindUserProvider;
+        let result = provider.validate_imported_user("alice").await.unwrap();
+        assert_eq!(result.map(|u| u.username), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn default_supports_password_update_is_false() {
+        // The capability default is conservative: only providers that override
+        // `update_password` meaningfully may report `true`.
+        assert!(!MockProvider.supports_password_update());
+        assert!(!FindUserProvider.supports_password_update());
+    }
+
     #[tokio::test]
     async fn default_sync_users_returns_not_supported() {
         let provider = MockProvider;

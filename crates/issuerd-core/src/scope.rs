@@ -221,6 +221,30 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_scope_is_not_empty_and_counts_tokens() {
+        let scope = Scope::parse("openid profile email");
+        assert!(!scope.is_empty());
+        assert_eq!(scope.len(), 3);
+        let single = Scope::parse("openid");
+        assert_eq!(single.len(), 1);
+        assert!(!single.is_empty());
+    }
+
+    #[test]
+    fn as_slice_views_normalized_tokens() {
+        let scope = Scope::parse("profile openid");
+        assert_eq!(scope.as_slice(), &["openid".to_string(), "profile".to_string()]);
+        assert!(Scope::empty().as_slice().is_empty());
+    }
+
+    #[test]
+    fn into_vec_returns_normalized_tokens() {
+        let scope = Scope::parse("profile openid");
+        assert_eq!(scope.into_vec(), vec!["openid".to_string(), "profile".to_string()]);
+        assert!(Scope::empty().into_vec().is_empty());
+    }
+
+    #[test]
     fn from_vec_normalizes() {
         let scope = Scope::from(vec![
             "profile".to_string(),

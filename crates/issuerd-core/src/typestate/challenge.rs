@@ -161,6 +161,15 @@ mod tests {
     }
 
     #[test]
+    fn otp_form_challenge_action_url() {
+        let ch = Challenge::OtpForm {
+            action_url: "/otp-submit".to_string(),
+        };
+        let typed = TypedChallenge::<OtpFormKind>::from_challenge(ch).unwrap();
+        assert_eq!(typed.action_url(), "/otp-submit");
+    }
+
+    #[test]
     fn redirect_challenge_url() {
         let ch = Challenge::Redirect {
             url: "https://idp.example.com".to_string(),

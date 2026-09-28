@@ -3503,6 +3503,11 @@ mod tests {
         let r = Realm::default();
         assert!(r.enabled);
         assert_eq!(r.access_token_lifespan, 300);
+        // Brute-force defaults (Keycloak parity).
+        assert_eq!(r.max_login_failures, 5);
+        assert_eq!(r.wait_increment_secs, 60);
+        assert_eq!(r.max_failure_wait_secs, 900);
+        assert_eq!(r.lockout_duration_secs, 900);
     }
 
     #[test]
@@ -3544,6 +3549,11 @@ mod tests {
         assert_eq!(r.ssl_required, SslRequired::External);
         assert_eq!(r.default_role, Some("default-roles-test".to_string()));
         assert_eq!(r.attributes.get("key"), Some(&"value".to_string()));
+        // Fields absent from the JSON take the serde defaults.
+        assert_eq!(r.max_login_failures, 5);
+        assert_eq!(r.wait_increment_secs, 60);
+        assert_eq!(r.max_failure_wait_secs, 900);
+        assert_eq!(r.lockout_duration_secs, 900);
     }
 
     // ------------------------------------------------------------------
@@ -4487,6 +4497,55 @@ mod tests {
         assert!(c != *"other-app");
         assert!(*"other-app" != c);
         assert_ne!(c, "other-app");
+
+        let r = RedirectUri::new("https://app.example.com/cb").unwrap();
+        assert!(r == *"https://app.example.com/cb");
+        assert!(*"https://app.example.com/cb" == r);
+        assert!(r != *"https://other.example.com/cb");
+        assert!(*"https://other.example.com/cb" != r);
+        assert_ne!(r, "https://other.example.com/cb");
+
+        let rn = RealmName::new("myrealm").unwrap();
+        assert!(rn == *"myrealm");
+        assert!(*"myrealm" == rn);
+        assert!(rn != *"other");
+        assert!(*"other" != rn);
+        assert_ne!(rn, "other");
+
+        let t = ThemeName::new("keycloak").unwrap();
+        assert!(t == *"keycloak");
+        assert!(*"keycloak" == t);
+        assert!(t != *"other");
+        assert!(*"other" != t);
+        assert_ne!(t, "other");
+
+        let d = DisplayName::new("Alice").unwrap();
+        assert!(d == *"Alice");
+        assert!(*"Alice" == d);
+        assert!(d != *"Bob");
+        assert!(*"Bob" != d);
+        assert_ne!(d, "Bob");
+
+        let cn = ClaimName::new("email").unwrap();
+        assert!(cn == *"email");
+        assert!(*"email" == cn);
+        assert!(cn != *"sub");
+        assert!(*"sub" != cn);
+        assert_ne!(cn, "sub");
+
+        let a = Alias::new("google").unwrap();
+        assert!(a == *"google");
+        assert!(*"google" == a);
+        assert!(a != *"github");
+        assert!(*"github" != a);
+        assert_ne!(a, "github");
+
+        let n = Nonce::new("nonce-1").unwrap();
+        assert!(n == *"nonce-1");
+        assert!(*"nonce-1" == n);
+        assert!(n != *"nonce-2");
+        assert!(*"nonce-2" != n);
+        assert_ne!(n, "nonce-2");
     }
 
     // ------------------------------------------------------------------
@@ -5057,6 +5116,21 @@ mod tests {
         assert_eq!(a.as_str(), "client-1");
         assert_eq!(a.as_ref(), "client-1");
         assert_eq!(Audience::try_from("client-1".to_string()).unwrap(), a);
+    }
+
+    #[test]
+    fn audience_deserialize_single_and_multi_audience_forms() {
+        // Plain string form.
+        let a: Audience = serde_json::from_str(r#""client-1""#).unwrap();
+        assert_eq!(a.as_str(), "client-1");
+        // JWT multi-audience array form: the first entry wins.
+        let a: Audience = serde_json::from_str(r#"["client-1","client-2"]"#).unwrap();
+        assert_eq!(a.as_str(), "client-1");
+        // An empty array is rejected (and must not panic).
+        let err = serde_json::from_str::<Audience>(r#"[]"#).unwrap_err();
+        assert!(err.to_string().contains("audience must not be empty"));
+        // An array whose first entry is empty still fails validation.
+        assert!(serde_json::from_str::<Audience>(r#"["","client-2"]"#).is_err());
     }
 
     // ------------------------------------------------------------------

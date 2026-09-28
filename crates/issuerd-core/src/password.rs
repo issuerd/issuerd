@@ -235,6 +235,11 @@ mod tests {
         };
         let err = p.validate("abcdefghijklmnop", &user()).unwrap_err();
         assert_eq!(codes(&err), vec!["max_length"]);
+        // Boundary: a password of exactly `max_length` characters is allowed.
+        assert!(p.validate("abcdefghij", &user()).is_ok());
+        // One character over the boundary is rejected.
+        let err = p.validate("abcdefghijk", &user()).unwrap_err();
+        assert_eq!(codes(&err), vec!["max_length"]);
     }
 
     #[test]
