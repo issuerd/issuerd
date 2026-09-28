@@ -609,4 +609,39 @@ mod tests {
             elapsed
         );
     }
+
+    #[tokio::test]
+    async fn increment_after_expiry_recreates_a_live_key() {
+        let cache = InMemoryCache::new();
+        assert_eq!(cache.increment("counter", Some(Duration::from_millis(50))).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The counter expired: recreation resets it to 1 under the new TTL.
+        assert_eq!(cache.increment("counter", Some(Duration::from_millis(300))).await.unwrap(), 1);
+        // The recreated key must be live immediately (its expiry is in the future).
+        assert_eq!(cache.get("counter").await.unwrap(), Some(b"1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_returns_value_once() {
+        let cache = InMemoryCache::new();
+        cache.set("k", b"v".to_vec(), None).await.unwrap();
+
+        assert_eq!(cache.get_and_delete("k").await.unwrap(), Some(b"v".to_vec()));
+        // Consumed: the key is gone.
+        assert_eq!(cache.get_and_delete("k").await.unwrap(), None);
+        assert_eq!(cache.get("k").await.unwrap(), None);
+
+        // Absent key: None.
+        assert_eq!(cache.get_and_delete("absent").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_expired_entry_yields_none() {
+        let cache = InMemoryCache::new();
+        cache.set("k", b"v".to_vec(), Some(Duration::from_millis(50))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(cache.get_and_delete("k").await.unwrap(), None);
+    }
 }
