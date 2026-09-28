@@ -271,4 +271,50 @@ mod tests {
         let scope: Scope = serde_json::from_str(r#"["profile","openid","profile"]"#).unwrap();
         assert_eq!(scope.to_vec(), vec!["openid", "profile"]);
     }
+
+    #[test]
+    fn join_with_custom_separator() {
+        let scope = Scope::parse("profile openid email");
+        assert_eq!(scope.join(","), "email,openid,profile");
+        assert_eq!(Scope::empty().join(","), "");
+    }
+
+    #[test]
+    fn ref_into_iter_yields_sorted_tokens() {
+        let scope = Scope::parse("profile openid");
+        let collected: Vec<&String> = (&scope).into_iter().collect();
+        assert_eq!(collected, vec!["openid", "profile"]);
+        // The borrow ends with the collect; the scope itself is untouched.
+        assert!(scope.contains("openid"));
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct SpaceSeparatedFields {
+        #[serde(with = "space_separated")]
+        scope: Scope,
+        #[serde(with = "space_separated_opt")]
+        opt: Option<Scope>,
+    }
+
+    #[test]
+    fn space_separated_serde_roundtrip() {
+        let value = SpaceSeparatedFields {
+            scope: Scope::parse("profile openid"),
+            opt: Some(Scope::parse("email profile")),
+        };
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, r#"{"scope":"openid profile","opt":"email profile"}"#);
+        let back: SpaceSeparatedFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, value);
+
+        // None serializes as null; an empty scope as the empty string.
+        let value = SpaceSeparatedFields {
+            scope: Scope::empty(),
+            opt: None,
+        };
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, r#"{"scope":"","opt":null}"#);
+        let back: SpaceSeparatedFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, value);
+    }
 }

@@ -99,4 +99,10 @@ mod tests {
     fn safe_redirect_rejects_empty() {
         assert!(SafeRedirectTarget::new("", "/realms/master/protocol/openid-connect/auth").is_err());
     }
+
+    #[test]
+    fn safe_redirect_into_url_returns_raw_target() {
+        let target = SafeRedirectTarget::new("/realms/master/account", "/login.html").unwrap();
+        assert_eq!(target.into_url(), "/realms/master/account");
+    }
 }

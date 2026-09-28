@@ -1092,4 +1092,154 @@ mod tests {
         let github = presets.iter().find(|p| p.provider_id == "github").unwrap();
         assert_eq!(github.config.get("useDiscovery").map(String::as_str), Some("false"));
     }
+
+    fn idp_with_config(alias: &str, config: HashMap<String, String>) -> IdentityProviderConfig {
+        IdentityProviderConfig {
+            id: crate::IdentityProviderId::new("id").unwrap(),
+            alias: crate::Alias::new(alias).unwrap(),
+            provider_id: ProviderId::Oidc,
+            enabled: true,
+            config,
+        }
+    }
+
+    #[test]
+    fn settings_all_accessors_fully_populated() {
+        let idp = idp_with_config(
+            "corpidp",
+            [
+                ("clientId".into(), "cid".into()),
+                ("clientSecret".into(), "sec".into()),
+                ("issuer".into(), "https://idp.example.com".into()),
+                ("authorizationUrl".into(), "https://idp.example.com/auth".into()),
+                ("tokenUrl".into(), "https://idp.example.com/token".into()),
+                ("userInfoUrl".into(), "https://idp.example.com/userinfo".into()),
+                ("jwksUrl".into(), "https://idp.example.com/jwks".into()),
+                // Explicitly disabled even though an issuer is configured.
+                ("useDiscovery".into(), "false".into()),
+                ("defaultScope".into(), "custom-scope".into()),
+                ("trustEmail".into(), "true".into()),
+                ("syncMode".into(), "force".into()),
+                ("storeTokens".into(), "true".into()),
+                // Explicitly disabled (default is on).
+                ("pkceEnabled".into(), "false".into()),
+                ("clientAuthMethod".into(), "client_secret_post".into()),
+                ("displayName".into(), "Corp SSO".into()),
+                ("mappers".into(), r#"[{"name":"m","mapper_type":"attribute","config":{"claim":"c","attribute":"a"}}]"#.into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let s = BrokerIdpSettings::new(&idp);
+        assert_eq!(s.client_id(), Some("cid"));
+        assert_eq!(s.client_secret(), Some("sec"));
+        assert_eq!(s.issuer(), Some("https://idp.example.com"));
+        assert_eq!(s.authorization_url(), Some("https://idp.example.com/auth"));
+        assert_eq!(s.token_url(), Some("https://idp.example.com/token"));
+        assert_eq!(s.userinfo_url(), Some("https://idp.example.com/userinfo"));
+        assert_eq!(s.jwks_url(), Some("https://idp.example.com/jwks"));
+        assert!(!s.use_discovery(), "explicit useDiscovery=false wins over the issuer default");
+        assert_eq!(s.default_scope(), "custom-scope");
+        assert!(s.trust_email());
+        assert_eq!(s.sync_mode(), BrokerSyncMode::Force);
+        assert!(s.store_tokens());
+        assert!(!s.pkce_enabled());
+        assert_eq!(s.client_auth_method(), BrokerClientAuthMethod::ClientSecretPost);
+        assert_eq!(s.display_name(), "Corp SSO");
+        assert_eq!(s.mappers().len(), 1);
+        assert!(s.validate().is_empty(), "fully configured provider is valid");
+        assert!(s.is_broker_provider());
+    }
+
+    #[test]
+    fn settings_defaults_on_empty_config() {
+        let idp = idp_with_config("myidp", HashMap::new());
+        let s = BrokerIdpSettings::new(&idp);
+        assert_eq!(s.client_id(), None);
+        assert_eq!(s.client_secret(), None);
+        assert_eq!(s.issuer(), None);
+        assert_eq!(s.authorization_url(), None);
+        assert_eq!(s.token_url(), None);
+        assert_eq!(s.userinfo_url(), None);
+        assert_eq!(s.jwks_url(), None);
+        assert!(!s.use_discovery(), "no issuer configured: discovery defaults off");
+        assert_eq!(s.default_scope(), "openid profile email");
+        assert!(!s.trust_email());
+        assert_eq!(s.sync_mode(), BrokerSyncMode::Import);
+        assert!(!s.store_tokens());
+        assert!(s.pkce_enabled());
+        assert_eq!(s.client_auth_method(), BrokerClientAuthMethod::ClientSecretBasic);
+        assert_eq!(s.display_name(), "myidp", "display name falls back to the alias");
+        assert!(s.mappers().is_empty());
+        assert!(s.is_broker_provider(), "oidc providers broker");
+
+        let problems = s.validate();
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        for expected in ["clientId", "clientSecret", "authorizationUrl", "tokenUrl"] {
+            assert!(problems.iter().any(|p| p.contains(expected)), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn settings_validate_discovery_branches() {
+        // Discovery enabled (explicitly) but no issuer: issuer problem only.
+        let idp = idp_with_config(
+            "a",
+            [
+                ("clientId".into(), "cid".into()),
+                ("clientSecret".into(), "sec".into()),
+                ("useDiscovery".into(), "true".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let problems = BrokerIdpSettings::new(&idp).validate();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("issuer"));
+
+        // Discovery disabled with explicit endpoints: valid without an issuer.
+        let idp = idp_with_config(
+            "a",
+            [
+                ("clientId".into(), "cid".into()),
+                ("clientSecret".into(), "sec".into()),
+                ("useDiscovery".into(), "false".into()),
+                ("authorizationUrl".into(), "https://idp.example.com/auth".into()),
+                ("tokenUrl".into(), "https://idp.example.com/token".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(BrokerIdpSettings::new(&idp).validate().is_empty());
+
+        // An issuer alone turns discovery on by default.
+        let idp = idp_with_config(
+            "a",
+            [
+                ("clientId".into(), "cid".into()),
+                ("clientSecret".into(), "sec".into()),
+                ("issuer".into(), "https://idp.example.com".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let s = BrokerIdpSettings::new(&idp);
+        assert!(s.use_discovery());
+        assert!(s.validate().is_empty());
+    }
+
+    #[test]
+    fn first_broker_login_decision_table() {
+        use FirstBrokerLoginDecision::*;
+        // Email conflict: auto-link only for a trusted IdP with a verified email.
+        assert_eq!(decide_first_broker_login(true, true, true), AutoLink);
+        assert_eq!(decide_first_broker_login(true, true, false), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, true), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, false), LinkOrCreate);
+        // No conflict: trusted providers skip the review page.
+        assert_eq!(decide_first_broker_login(false, true, true), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, true, false), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, false, true), ReviewProfile);
+        assert_eq!(decide_first_broker_login(false, false, false), ReviewProfile);
+    }
 }

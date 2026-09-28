@@ -4319,6 +4319,43 @@ mod tests {
         assert_eq!(n, 60);
     }
 
+    #[test]
+    fn seconds_non_zero_positive_try_from_edges() {
+        assert_eq!(SecondsNonZero::try_from(1u64).unwrap().get(), 1);
+        assert_eq!(SecondsNonZero::try_from(1i64).unwrap().get(), 1);
+        assert!(SecondsNonZero::try_from(0i64).is_err());
+        let s = SecondsNonZero::new(300);
+        assert_eq!(s.get(), 300);
+        assert_ne!(s, 301u64);
+        assert_ne!(301u64, s);
+    }
+
+    #[test]
+    fn password_length_boundaries() {
+        assert!(PasswordLength::try_from(0).is_err());
+        assert_eq!(u32::from(PasswordLength::try_from(1).unwrap()), 1);
+        assert_eq!(u32::from(PasswordLength::try_from(64).unwrap()), 64);
+        assert_eq!(u32::from(PasswordLength::try_from(128).unwrap()), 128);
+        assert!(PasswordLength::try_from(129).is_err());
+    }
+
+    #[test]
+    fn jwk_curve_wire_names_roundtrip() {
+        for (curve, name) in [
+            (JwkCurve::P256, "P-256"),
+            (JwkCurve::P384, "P-384"),
+            (JwkCurve::P521, "P-521"),
+            (JwkCurve::Ed25519, "Ed25519"),
+            (JwkCurve::Ed448, "Ed448"),
+            (JwkCurve::Secp256k1, "secp256k1"),
+        ] {
+            assert_eq!(curve.as_str(), name);
+            assert_eq!(curve.to_string(), name);
+            assert_eq!(name.parse::<JwkCurve>().unwrap(), curve);
+        }
+        assert!("P-192".parse::<JwkCurve>().is_err());
+    }
+
     // ------------------------------------------------------------------
     // Username validation & traits
     // ------------------------------------------------------------------
@@ -4426,6 +4463,30 @@ mod tests {
         assert_eq!(c.as_ref(), "my-app");
         assert_eq!(c, "my-app");
         // reverse partial_eq not implemented
+    }
+
+    #[test]
+    fn newtype_str_comparisons_are_not_tautological() {
+        let u = Username::new("alice").unwrap();
+        assert!(u == *"alice");
+        assert!(*"alice" == u);
+        assert!(u != *"bob");
+        assert!(*"bob" != u);
+        assert_ne!(u, "bob");
+
+        let e = Email::new("alice@example.com").unwrap();
+        assert!(e == *"alice@example.com");
+        assert!(*"alice@example.com" == e);
+        assert!(e != *"bob@example.com");
+        assert!(*"bob@example.com" != e);
+        assert_ne!(e, "bob@example.com");
+
+        let c = ClientIdentifier::new("my-app").unwrap();
+        assert!(c == *"my-app");
+        assert!(*"my-app" == c);
+        assert!(c != *"other-app");
+        assert!(*"other-app" != c);
+        assert_ne!(c, "other-app");
     }
 
     // ------------------------------------------------------------------

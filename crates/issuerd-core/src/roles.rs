@@ -680,4 +680,157 @@ mod tests {
             assert_eq!(result.created_groups, 0);
         }
     }
+
+    // ------------------------------------------------------------------
+    // effective_user_roles / effective_group_roles / GroupIndex::load
+    // ------------------------------------------------------------------
+
+    mod effective {
+        use super::*;
+        use crate::models::RoleName;
+        use crate::MockStorage;
+
+        fn mk_client_role(id: &str, name: &str, owner: &str) -> Role {
+            Role {
+                id: RoleId::new(id).unwrap(),
+                name: RoleName::new(name).unwrap(),
+                description: None,
+                realm_id: RealmId::new("realm-1").unwrap(),
+                client_role: true,
+                client_id: Some(crate::ids::ClientId::new(owner).unwrap()),
+                composite: false,
+                composites: vec![],
+                attributes: std::collections::HashMap::new(),
+            }
+        }
+
+        fn group_fixture(id: &str, name: &str) -> Group {
+            Group {
+                id: GroupId::new(id).unwrap(),
+                name: crate::models::GroupName::new(name).unwrap(),
+                path: crate::models::GroupPath::new(format!("/{name}")).unwrap(),
+                realm_id: RealmId::new("r1").unwrap(),
+                parent_id: None,
+                sub_groups: vec![],
+                attributes: std::collections::HashMap::new(),
+                realm_roles: vec![],
+                client_roles: std::collections::HashMap::new(),
+            }
+        }
+
+        fn realm() -> RealmId {
+            RealmId::new("r1").unwrap()
+        }
+
+        fn user() -> UserId {
+            UserId::new("u1").unwrap()
+        }
+
+        /// Roles: realm roles `direct`, `group-role` (composite of `base`),
+        /// `base`; client roles `decoy` and `c-role`, both owned by client c1.
+        /// Group g1 maps `group-role` + `c-role`. The decoy distinguishes the
+        /// exact client+name resolution in `resolve_group_role_names`.
+        fn fixture() -> (Vec<Role>, Group) {
+            let roles = vec![
+                mk_role("r1", "direct", &[]),
+                mk_role("r2", "group-role", &["base"]),
+                mk_role("r3", "base", &[]),
+                mk_client_role("r5", "decoy", "c1"),
+                mk_client_role("r4", "c-role", "c1"),
+            ];
+            let mut group = group_fixture("g1", "devs");
+            group.realm_roles = vec![RoleName::new("group-role").unwrap()];
+            group.client_roles = [(
+                crate::ids::ClientId::new("c1").unwrap(),
+                vec![RoleName::new("c-role").unwrap()],
+            )]
+            .into_iter()
+            .collect();
+            (roles, group)
+        }
+
+        fn sorted_names(roles: &[Role]) -> Vec<&str> {
+            let mut names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn effective_user_roles_combines_direct_group_and_composites() {
+            let (roles, group) = fixture();
+            let mut mock = MockStorage::new();
+            mock.expect_list_roles().returning(move |_, _| Ok(roles.clone()));
+            mock.expect_list_user_realm_roles()
+                .returning(|_, _| Ok(vec![RoleId::new("r1").unwrap()]));
+            mock.expect_list_user_client_roles().returning(|_, _| Ok(vec![]));
+            mock.expect_list_user_groups()
+                .returning(|_, _| Ok(vec![GroupId::new("g1").unwrap()]));
+            mock.expect_get_group().returning(move |_, _| Ok(Some(group.clone())));
+
+            let effective = effective_user_roles(&mock, &realm(), &user()).await.unwrap();
+            assert_eq!(sorted_names(&effective), vec!["base", "c-role", "direct", "group-role"]);
+        }
+
+        #[tokio::test]
+        async fn effective_group_roles_resolves_mappings_and_expands_composites() {
+            let (roles, group) = fixture();
+            let mut mock = MockStorage::new();
+            mock.expect_list_roles().returning(move |_, _| Ok(roles.clone()));
+            mock.expect_get_group().returning(move |_, _| Ok(Some(group.clone())));
+
+            let effective = effective_group_roles(&mock, &realm(), &GroupId::new("g1").unwrap())
+                .await
+                .unwrap();
+            assert_eq!(sorted_names(&effective), vec!["base", "c-role", "group-role"]);
+        }
+
+        #[tokio::test]
+        async fn effective_group_roles_missing_group_is_not_found() {
+            let mut mock = MockStorage::new();
+            mock.expect_list_roles().returning(|_, _| Ok(vec![]));
+            mock.expect_get_group().returning(|_, _| Ok(None));
+
+            let err = effective_group_roles(&mock, &realm(), &GroupId::new("ghost").unwrap())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, IssuerdError::NotFound));
+        }
+
+        #[test]
+        fn composites_of_realm_role_fall_back_to_client_roles() {
+            let a = mk_role("r-a", "a", &["c-only"]);
+            let decoy = mk_client_role("r-d", "other", "c1");
+            let target = mk_client_role("r-c", "c-only", "c1");
+            let all = vec![a.clone(), decoy, target];
+            let expanded = expand_composites(vec![a], &all);
+            assert_eq!(sorted_names(&expanded), vec!["a", "c-only"]);
+        }
+
+        #[tokio::test]
+        async fn group_index_load_paginates_until_empty_batch() {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen_in_mock = seen.clone();
+            let mut mock = MockStorage::new();
+            mock.expect_list_groups().returning(move |_, page: &crate::traits::Pagination| {
+                seen_in_mock.lock().unwrap().push((page.first, page.max));
+                match page.first {
+                    0 => Ok(vec![group_fixture("g1", "Alpha")]),
+                    1000 => Ok(vec![group_fixture("g2", "Beta")]),
+                    _ => Ok(vec![]),
+                }
+            });
+
+            let index = GroupIndex::load(&mock, &realm()).await.unwrap();
+            // Case-insensitive name lookup against the loaded index (the index
+            // keys are lowercased; callers pass lowercased names).
+            assert_eq!(index.get_by_name("alpha").unwrap().id.to_string(), "g1");
+            assert_eq!(index.get_by_name("beta").unwrap().id.to_string(), "g2");
+            assert!(index.get_by_name("ghost").is_none());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![(0, 1000), (1000, 1000), (2000, 1000)],
+                "load walks first += max until an empty batch"
+            );
+        }
+    }
 }

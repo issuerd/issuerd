@@ -1374,4 +1374,856 @@ mod tests {
         let all = provider.get_public_keys().await.unwrap();
         assert_eq!(active.keys.len(), all.keys.len());
     }
+
+    // ------------------------------------------------------------------
+    // Default trait-method coverage via hand-written stubs.
+    //
+    // The generated mocks (MockStorage, MockDistributedCache) override EVERY
+    // method, so the trait default bodies never execute through the mocks.
+    // These minimal hand-written implementations leave the defaults untouched:
+    // Storage::bulk_create_users / get_clients_batch / get_client_roles_by_names
+    // and DistributedCache::increment / scan_keys.
+    // ------------------------------------------------------------------
+
+    fn stub_user(username: &str) -> User {
+        User {
+            id: UserId::new(format!("id-{username}")).unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            username: Username::new(username).unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn stub_client(id: &str) -> Client {
+        Client {
+            id: ClientId::new(id).unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            client_id: ClientIdentifier::new(format!("client-{id}")).unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: crate::Scope::empty(),
+            optional_scopes: crate::Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn stub_client_role(id: &str, name: &str, owner: &str) -> Role {
+        Role {
+            id: RoleId::new(id).unwrap(),
+            name: RoleName::new(name).unwrap(),
+            description: None,
+            realm_id: RealmId::new("r1").unwrap(),
+            client_role: true,
+            client_id: Some(ClientId::new(owner).unwrap()),
+            composite: false,
+            composites: vec![],
+            attributes: HashMap::new(),
+        }
+    }
+
+    /// Records `create_user` calls and serves fixed client/role rows; every
+    /// other method is unimplemented. The batch default methods under test are
+    /// NOT overridden, so the trait defaults run.
+    struct StubStorage {
+        created_users: std::sync::Mutex<Vec<String>>,
+        clients: Vec<Client>,
+        client_roles: Vec<Role>,
+    }
+
+    #[allow(unused_variables)]
+    #[async_trait]
+    impl Storage for StubStorage {
+        async fn create_user(&self, realm: &RealmId, user: &User) -> Result<(), IssuerdError> {
+            self.created_users.lock().unwrap().push(user.username.to_string());
+            Ok(())
+        }
+
+        async fn get_client(
+            &self,
+            realm: &RealmId,
+            id: &ClientId,
+        ) -> Result<Option<Client>, IssuerdError> {
+            Ok(self.clients.iter().find(|c| &c.id == id).cloned())
+        }
+
+        async fn get_client_role_by_name(
+            &self,
+            realm: &RealmId,
+            client: &ClientId,
+            name: &str,
+        ) -> Result<Option<Role>, IssuerdError> {
+            Ok(self
+                .client_roles
+                .iter()
+                .find(|r| r.client_id.as_ref() == Some(client) && r.name.as_str() == name)
+                .cloned())
+        }
+
+        async fn get_realm(&self, id: &RealmId) -> Result<Option<Realm>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_realm_by_name(&self, name: &str) -> Result<Option<Realm>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_realms(&self, pagination: &Pagination) -> Result<Vec<Realm>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_realms(&self) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_realm(&self, realm: &Realm) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_realm(&self, realm: &Realm) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_realm(&self, id: &RealmId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_user(
+            &self,
+            realm: &RealmId,
+            id: &UserId,
+        ) -> Result<Option<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_user_by_username(
+            &self,
+            realm: &RealmId,
+            username: &str,
+        ) -> Result<Option<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_user_by_email(
+            &self,
+            realm: &RealmId,
+            email: &str,
+        ) -> Result<Option<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_user_by_federation_link(
+            &self,
+            realm: &RealmId,
+            link: &str,
+        ) -> Result<Vec<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_users(
+            &self,
+            realm: &RealmId,
+            query: &str,
+            pagination: &Pagination,
+        ) -> Result<Vec<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_users(&self, realm: &RealmId, query: &str) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_user(&self, realm: &RealmId, user: &User) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_user(&self, realm: &RealmId, id: &UserId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_client_by_client_id(
+            &self,
+            realm: &RealmId,
+            client_id: &ClientIdentifier,
+        ) -> Result<Option<Client>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_clients(
+            &self,
+            realm: &RealmId,
+            pagination: &Pagination,
+        ) -> Result<Vec<Client>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_clients(&self, realm: &RealmId) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_client(
+            &self,
+            realm: &RealmId,
+            client: &Client,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_client(
+            &self,
+            realm: &RealmId,
+            client: &Client,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_client(&self, realm: &RealmId, id: &ClientId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_credentials(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            cred_type: CredentialType,
+        ) -> Result<Vec<Credential>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_credentials(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<Credential>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_credential(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            cred: &Credential,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_credential(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            cred: &Credential,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_credential(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            cred_id: &CredentialId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_user_session(
+            &self,
+            realm: &RealmId,
+            id: &SessionId,
+        ) -> Result<Option<UserSession>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_sessions(
+            &self,
+            realm: &RealmId,
+            user: Option<UserId>,
+            pagination: &Pagination,
+        ) -> Result<Vec<UserSession>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_sessions(
+            &self,
+            realm: &RealmId,
+            user: Option<UserId>,
+        ) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_user_session(
+            &self,
+            realm: &RealmId,
+            session: &UserSession,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_user_session(
+            &self,
+            realm: &RealmId,
+            session: &UserSession,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_user_session(
+            &self,
+            realm: &RealmId,
+            id: &SessionId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_role(
+            &self,
+            realm: &RealmId,
+            id: &RoleId,
+        ) -> Result<Option<Role>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_role_by_name(
+            &self,
+            realm: &RealmId,
+            name: &str,
+        ) -> Result<Option<Role>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_roles(
+            &self,
+            realm: &RealmId,
+            pagination: &Pagination,
+        ) -> Result<Vec<Role>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_roles(&self, realm: &RealmId) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_role(&self, realm: &RealmId, role: &Role) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_role(&self, realm: &RealmId, role: &Role) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_role(&self, realm: &RealmId, id: &RoleId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_client_roles(
+            &self,
+            realm: &RealmId,
+            client: &ClientId,
+            pagination: &Pagination,
+        ) -> Result<Vec<Role>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_client_scope(
+            &self,
+            realm: &RealmId,
+            id: &ClientScopeId,
+        ) -> Result<Option<ClientScope>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_client_scope_by_name(
+            &self,
+            realm: &RealmId,
+            name: &str,
+        ) -> Result<Option<ClientScope>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_client_scopes(
+            &self,
+            realm: &RealmId,
+            pagination: &Pagination,
+        ) -> Result<Vec<ClientScope>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_client_scope(
+            &self,
+            realm: &RealmId,
+            scope: &ClientScope,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_client_scope(
+            &self,
+            realm: &RealmId,
+            scope: &ClientScope,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_client_scope(
+            &self,
+            realm: &RealmId,
+            id: &ClientScopeId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn assign_client_scope(
+            &self,
+            realm: &RealmId,
+            client: &ClientId,
+            scope: &ClientScopeId,
+            is_default: bool,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn unassign_client_scope(
+            &self,
+            realm: &RealmId,
+            client: &ClientId,
+            scope: &ClientScopeId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_client_scope_assignments(
+            &self,
+            realm: &RealmId,
+            client: &ClientId,
+        ) -> Result<Vec<(ClientScopeId, bool)>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_realm_default_client_scopes(
+            &self,
+            realm: &RealmId,
+        ) -> Result<Vec<(ClientScopeId, bool)>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn add_realm_default_client_scope(
+            &self,
+            realm: &RealmId,
+            scope: &ClientScopeId,
+            is_default: bool,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn remove_realm_default_client_scope(
+            &self,
+            realm: &RealmId,
+            scope: &ClientScopeId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_group(
+            &self,
+            realm: &RealmId,
+            id: &GroupId,
+        ) -> Result<Option<Group>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_group_by_name(
+            &self,
+            realm: &RealmId,
+            name: &str,
+        ) -> Result<Option<Group>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_groups(
+            &self,
+            realm: &RealmId,
+            pagination: &Pagination,
+        ) -> Result<Vec<Group>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_groups(&self, realm: &RealmId) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_group(&self, realm: &RealmId, group: &Group) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_group(&self, realm: &RealmId, group: &Group) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_group(&self, realm: &RealmId, id: &GroupId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn add_user_realm_role(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            role_id: &RoleId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn remove_user_realm_role(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            role_id: &RoleId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_user_realm_roles(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<RoleId>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn add_user_client_role(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            role_id: &RoleId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn remove_user_client_role(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            role_id: &RoleId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_user_client_roles(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<RoleId>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn add_user_group(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            group_id: &GroupId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn remove_user_group(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            group_id: &GroupId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_user_groups(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<GroupId>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_group_members(
+            &self,
+            realm: &RealmId,
+            group: &GroupId,
+            first: i32,
+            max: i32,
+        ) -> Result<Vec<User>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_consents(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<Consent>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_consent(
+            &self,
+            realm: &RealmId,
+            consent: &Consent,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_consent(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            client_id: &ClientId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_identity_provider(
+            &self,
+            realm: &RealmId,
+            id: &IdentityProviderId,
+        ) -> Result<Option<IdentityProviderConfig>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_identity_provider_by_alias(
+            &self,
+            realm: &RealmId,
+            alias: &str,
+        ) -> Result<Option<IdentityProviderConfig>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_identity_providers(
+            &self,
+            realm: &RealmId,
+        ) -> Result<Vec<IdentityProviderConfig>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_identity_provider(
+            &self,
+            realm: &RealmId,
+            idp: &IdentityProviderConfig,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_identity_provider(
+            &self,
+            realm: &RealmId,
+            idp: &IdentityProviderConfig,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_identity_provider(
+            &self,
+            realm: &RealmId,
+            id: &IdentityProviderId,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_identity_provider_link(
+            &self,
+            realm: &RealmId,
+            alias: &str,
+            external_subject: &str,
+        ) -> Result<Option<IdentityProviderLink>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_identity_provider_link_for_user(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            alias: &str,
+        ) -> Result<Option<IdentityProviderLink>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_identity_provider_links(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+        ) -> Result<Vec<IdentityProviderLink>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_identity_provider_link(
+            &self,
+            realm: &RealmId,
+            link: &IdentityProviderLink,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_identity_provider_link(
+            &self,
+            realm: &RealmId,
+            user: &UserId,
+            alias: &str,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_flow_config(
+            &self,
+            realm: &RealmId,
+            alias: &str,
+        ) -> Result<Option<FlowConfig>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_flow_config(
+            &self,
+            realm: &RealmId,
+            config: &FlowConfig,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_flow_config(
+            &self,
+            realm: &RealmId,
+            config: &FlowConfig,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_flow_config(
+            &self,
+            realm: &RealmId,
+            alias: &str,
+        ) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_flow_configs(
+            &self,
+            realm: &RealmId,
+        ) -> Result<Vec<FlowConfig>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn save_event(&self, realm: &RealmId, event: &Event) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn query_events(
+            &self,
+            realm: &RealmId,
+            query: &EventQuery,
+        ) -> Result<Vec<Event>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_events(
+            &self,
+            realm: &RealmId,
+            query: &EventQuery,
+        ) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_events(&self, realm: &RealmId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn save_admin_event(&self, event: &AdminEvent) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn query_admin_events(
+            &self,
+            realm: &RealmId,
+            query: &AdminEventQuery,
+        ) -> Result<Vec<AdminEvent>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn count_admin_events(
+            &self,
+            realm: &RealmId,
+            query: &AdminEventQuery,
+        ) -> Result<i64, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn delete_admin_events(&self, realm: &RealmId) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn set_provision_marker(&self, name: &str, value: &str) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn list_signing_keys(&self) -> Result<Vec<StoredSigningKey>, IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn create_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+        async fn update_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
+            unimplemented!("StubStorage implements only what the default-method tests use")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_bulk_create_users_fans_out_to_create_user() {
+        let storage = StubStorage {
+            created_users: std::sync::Mutex::new(vec![]),
+            clients: vec![],
+            client_roles: vec![],
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let users = vec![stub_user("alice"), stub_user("bob"), stub_user("carol")];
+        storage.bulk_create_users(&realm, &users).await.unwrap();
+        assert_eq!(
+            *storage.created_users.lock().unwrap(),
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()],
+            "the default loops over create_user for every user"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_get_clients_batch_preserves_order_and_skips_unknown() {
+        let storage = StubStorage {
+            created_users: std::sync::Mutex::new(vec![]),
+            clients: vec![stub_client("c1"), stub_client("c2")],
+            client_roles: vec![],
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let ids = vec![
+            ClientId::new("c2").unwrap(),
+            ClientId::new("ghost").unwrap(),
+            ClientId::new("c1").unwrap(),
+        ];
+        let clients = storage.get_clients_batch(&realm, &ids).await.unwrap();
+        let got: Vec<String> = clients.iter().map(|c| c.id.to_string()).collect();
+        assert_eq!(got, vec!["c2", "c1"], "input order kept, unknown ids skipped");
+    }
+
+    #[tokio::test]
+    async fn default_get_client_roles_by_names_preserves_order_and_skips_unknown() {
+        let storage = StubStorage {
+            created_users: std::sync::Mutex::new(vec![]),
+            clients: vec![],
+            client_roles: vec![
+                stub_client_role("r1", "admin", "c1"),
+                stub_client_role("r2", "reader", "c1"),
+            ],
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let client = ClientId::new("c1").unwrap();
+        let names = vec![
+            "reader".to_string(),
+            "ghost".to_string(),
+            "admin".to_string(),
+        ];
+        let roles = storage.get_client_roles_by_names(&realm, &client, &names).await.unwrap();
+        let got: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(got, vec!["reader", "admin"], "input order kept, unknown names skipped");
+    }
+
+    /// Map-backed cache; `increment` and `scan_keys` stay on the trait defaults.
+    struct StubCache {
+        map: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl DistributedCache for StubCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            Ok(self.map.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), IssuerdError> {
+            let _ = ttl;
+            self.map.lock().unwrap().insert(key.to_string(), value);
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.map.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            let mut map = self.map.lock().unwrap();
+            if map.get(key).cloned() == expected {
+                map.insert(key.to_string(), new);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            let _ = (channel, message);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            let _ = (channel, handler);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_increment_counts_up_via_cas_retry_loop() {
+        let cache = StubCache {
+            map: std::sync::Mutex::new(HashMap::new()),
+        };
+        assert_eq!(cache.increment("counter", None).await.unwrap(), 1);
+        assert_eq!(cache.increment("counter", None).await.unwrap(), 2);
+        assert_eq!(cache.increment("counter", None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn default_scan_keys_returns_empty_list() {
+        let cache = StubCache {
+            map: std::sync::Mutex::new(HashMap::new()),
+        };
+        cache.set("login-lockout:r1:x", b"v".to_vec(), None).await.unwrap();
+        assert!(cache.scan_keys("login-lockout:r1:*").await.unwrap().is_empty());
+    }
 }

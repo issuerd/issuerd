@@ -488,6 +488,17 @@ registration_flow: custom-registration
         assert!(realm.registration_flow.is_none());
     }
 
+    #[test]
+    fn user_and_flow_boolean_defaults() {
+        let user: ProvisionUser = serde_yaml::from_str("realm: r1\nusername: u1").unwrap();
+        assert!(!user.email_verified);
+        assert!(user.enabled);
+
+        let flow: ProvisionFlowConfig = serde_yaml::from_str("realm: r1\nalias: f1").unwrap();
+        assert!(!flow.built_in);
+        assert!(flow.top_level);
+    }
+
     /// Verify the committed `examples/provision.example.yaml` is valid and matches the
     /// generated example struct. If this fails, regenerate with:
     ///   cargo run --bin issuerd -- example provision-config -o examples/provision.example.yaml
