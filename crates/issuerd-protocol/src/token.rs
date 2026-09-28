@@ -352,6 +352,11 @@ mod tests {
     #[case("client_secret")]
     #[case("refresh_token")]
     #[case("password")]
+    #[case("assertion")]
+    #[case("subject_token")]
+    #[case("audience")]
+    #[case("requested_subject")]
+    #[case("actor_token")]
     fn empty_string_form_params_are_treated_as_absent(#[case] param: &str) {
         fn is_some(req: &TokenRequest, param: &str) -> bool {
             match param {
@@ -359,6 +364,11 @@ mod tests {
                 "client_secret" => req.client_secret.is_some(),
                 "refresh_token" => req.refresh_token.is_some(),
                 "password" => req.password.is_some(),
+                "assertion" => req.assertion.is_some(),
+                "subject_token" => req.subject_token.is_some(),
+                "audience" => req.audience.is_some(),
+                "requested_subject" => req.requested_subject.is_some(),
+                "actor_token" => req.actor_token.is_some(),
                 _ => unreachable!(),
             }
         }
@@ -695,5 +705,80 @@ mod tests {
             scope_mappings: Default::default(),
             attributes: std::collections::HashMap::new(),
         }
+    }
+
+    fn bare_request(grant_type: GrantType) -> TokenRequest {
+        TokenRequest {
+            grant_type,
+            code: None,
+            redirect_uri: None,
+            client_id: None,
+            client_secret: None,
+            code_verifier: None,
+            refresh_token: None,
+            scope: Scope::empty(),
+            username: None,
+            password: None,
+            totp: None,
+            assertion: None,
+            assertion_type: None,
+            device_code: None,
+            auth_req_id: None,
+            subject_token: None,
+            subject_token_type: None,
+            requested_token_type: None,
+            audience: None,
+            requested_subject: None,
+            actor_token: None,
+            authorization_details: None,
+        }
+    }
+
+    #[test]
+    fn validate_code_verifier_required_only_for_public_clients() {
+        let mut req = bare_request(GrantType::AuthorizationCode);
+        req.code = Some(AuthorizationCode::new("code").unwrap());
+        req.redirect_uri = Some("https://example.com/cb".parse().unwrap());
+
+        // PKCE is demanded of public clients only.
+        assert!(req.validate(&Realm::default(), &make_test_client(false)).is_ok());
+        assert!(req.validate(&Realm::default(), &make_test_client(true)).is_err());
+
+        req.code_verifier = Some("verifier".to_string());
+        assert!(req.validate(&Realm::default(), &make_test_client(true)).is_ok());
+    }
+
+    #[test]
+    fn validate_jwt_bearer_requires_assertion_and_type() {
+        let client = make_test_client(false);
+        let mut req = bare_request(GrantType::JwtBearer);
+        assert!(req.validate(&Realm::default(), &client).is_err());
+
+        // An assertion without its type is still incomplete.
+        req.assertion = Some(Assertion::new("jwt").unwrap());
+        assert!(req.validate(&Realm::default(), &client).is_err());
+
+        req.assertion_type = Some(CLIENT_ASSERTION_TYPE_JWT_BEARER.to_string());
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+    }
+
+    #[test]
+    fn validate_token_endpoint_scope_availability() {
+        let mut client = make_test_client(false);
+        client.default_scopes = Scope::parse("openid");
+
+        let mut req = bare_request(GrantType::ClientCredentials);
+        req.scope = Scope::parse("admin");
+        assert!(matches!(
+            req.validate(&Realm::default(), &client),
+            Err(IssuerdError::InvalidScope)
+        ));
+
+        req.scope = Scope::parse("openid");
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+
+        // No explicit scope: the availability check does not apply.
+        req.scope = Scope::empty();
+        assert!(req.validate(&Realm::default(), &client).is_ok());
     }
 }

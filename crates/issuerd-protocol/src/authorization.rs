@@ -1151,6 +1151,107 @@ mod tests {
         assert!(req.validate(&Realm::default(), &client).is_err());
     }
 
+    fn auth_req(
+        response_type: ResponseType,
+        scope: &str,
+        prompt: Vec<Prompt>,
+    ) -> AuthorizationRequest {
+        AuthorizationRequest {
+            response_type,
+            client_id: ClientIdentifier::new("client1").unwrap(),
+            redirect_uri: "https://client.example.com/cb".parse().unwrap(),
+            scope: Scope::parse(scope),
+            state: None,
+            nonce: None,
+            response_mode: None,
+            prompt,
+            max_age: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            login_hint: None,
+            id_token_hint: None,
+            acr_values: vec![],
+            ui_locales: vec![],
+            claims: None,
+            authorization_details: None,
+            registration: false,
+            request: None,
+            request_uri: None,
+        }
+    }
+
+    fn openid_profile_client() -> Client {
+        Client {
+            redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+            default_scopes: Scope::parse("openid profile"),
+            optional_scopes: Scope::empty(),
+            public_client: false,
+            attributes: std::collections::HashMap::new(),
+            ..make_client_defaults()
+        }
+    }
+
+    #[test]
+    fn validate_openid_guard_is_distinct_from_scope_availability() {
+        let client = openid_profile_client();
+
+        // id_token without the openid scope: the openid guard fires (the
+        // requested scope itself IS assigned to the client, so no other
+        // guard can mask this).
+        let req = auth_req(ResponseType::IdToken, "profile", vec![]);
+        assert!(matches!(
+            req.validate(&Realm::default(), &client),
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+
+        // id_token with openid: valid.
+        let req = auth_req(ResponseType::IdToken, "openid profile", vec![]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+
+        // code without openid: the guard does not apply to non-id_token types.
+        let req = auth_req(ResponseType::Code, "profile", vec![]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+    }
+
+    #[test]
+    fn validate_prompt_none_must_be_the_only_value() {
+        let client = openid_profile_client();
+
+        // `none` alone is fine.
+        let req = auth_req(ResponseType::Code, "openid", vec![Prompt::None]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+
+        // Combined with any other prompt value it is rejected.
+        let req = auth_req(ResponseType::Code, "openid", vec![Prompt::None, Prompt::Login]);
+        assert!(matches!(
+            req.validate(&Realm::default(), &client),
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+
+        // Other prompt values combine freely.
+        let req = auth_req(ResponseType::Code, "openid", vec![Prompt::Login, Prompt::Consent]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
+    }
+
+    #[rstest]
+    #[case(ResponseType::Code, true, false, false)]
+    #[case(ResponseType::Token, false, true, false)]
+    #[case(ResponseType::IdToken, false, false, true)]
+    #[case(ResponseType::CodeIdToken, true, false, true)]
+    #[case(ResponseType::CodeToken, true, true, false)]
+    #[case(ResponseType::IdTokenToken, false, true, true)]
+    #[case(ResponseType::CodeIdTokenToken, true, true, true)]
+    fn response_type_predicates(
+        #[case] rt: ResponseType,
+        #[case] code: bool,
+        #[case] token: bool,
+        #[case] id_token: bool,
+    ) {
+        assert_eq!(rt.has_code(), code);
+        assert_eq!(rt.has_token(), token);
+        assert_eq!(rt.has_id_token(), id_token);
+    }
+
     #[test]
     fn validate_scope_not_allowed() {
         let client = Client {
