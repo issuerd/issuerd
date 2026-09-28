@@ -239,3 +239,44 @@ fn map_ldap_err(e: LdapError) -> FederationError {
         _ => FederationError::NetworkError(e.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ldap3::LdapResult;
+
+    fn ldap_result(rc: u32) -> LdapError {
+        LdapError::LdapResult {
+            result: LdapResult {
+                rc,
+                matched: String::new(),
+                text: format!("result rc={rc}"),
+                refs: vec![],
+                ctrls: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn map_ldap_err_rc49_is_invalid_credentials() {
+        // RFC 4511 rc 49 = invalidCredentials (bad bind password).
+        assert!(matches!(map_ldap_err(ldap_result(49)), FederationError::InvalidCredentials));
+    }
+
+    #[test]
+    fn map_ldap_err_other_rc_is_network_error() {
+        assert!(matches!(map_ldap_err(ldap_result(32)), FederationError::NetworkError(_)));
+    }
+
+    #[test]
+    fn map_ldap_err_io_is_network_error_with_source_message() {
+        let e = LdapError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed"),
+        };
+        match map_ldap_err(e) {
+            // The message is the io::Error's own Display, not the LdapError's.
+            FederationError::NetworkError(msg) => assert_eq!(msg, "pipe closed"),
+            other => panic!("expected NetworkError, got {other:?}"),
+        }
+    }
+}

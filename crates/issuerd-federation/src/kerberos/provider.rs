@@ -165,10 +165,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(user.username, "alice");
+        assert_eq!(user.federation_link, "krb-test");
+        assert!(user.enabled);
         assert_eq!(
             user.attributes.get("KERBEROS_PRINCIPAL"),
             Some(&vec!["alice@TEST.ISSUERD.LOCAL".to_string()])
         );
+    }
+
+    #[test]
+    fn kerberos_provider_id_and_type() {
+        let provider =
+            KerberosFederationProvider::new("krb-test".to_string(), test_config()).unwrap();
+        assert_eq!(provider.id(), "krb-test");
+        assert_eq!(provider.provider_type(), FederationProviderType::Kerberos);
     }
 
     #[test]

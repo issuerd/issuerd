@@ -112,3 +112,35 @@ impl SpnegoAuthenticator {
         self.response_token.as_deref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> KerberosConfig {
+        KerberosConfig {
+            kerberos_realm: "TEST.ISSUERD.LOCAL".to_string(),
+            server_principal: "HTTP/issuerd.test.issuerd.local@TEST.ISSUERD.LOCAL".to_string(),
+            // Any existing regular file satisfies the keytab presence check.
+            keytab_path: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").to_string(),
+            allow_password_authentication: false,
+            allow_kerberos_authentication: true,
+            update_profile_first_login: true,
+            debug: false,
+        }
+    }
+
+    #[test]
+    fn fresh_authenticator_has_no_principal_or_response_token() {
+        let auth = SpnegoAuthenticator::new(test_config()).unwrap();
+        assert_eq!(auth.authenticated_principal(), None);
+        assert_eq!(auth.response_token(), None);
+    }
+
+    #[test]
+    fn new_rejects_missing_keytab() {
+        let mut config = test_config();
+        config.keytab_path = "/nonexistent/issuerd.keytab".to_string();
+        assert!(matches!(SpnegoAuthenticator::new(config), Err(FederationError::ConfigError(_))));
+    }
+}

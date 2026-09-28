@@ -77,6 +77,53 @@ mod tests {
     use issuerd_core::DisplayName;
     use issuerd_core::FederatedUser;
 
+    struct DummyMapper;
+
+    impl LdapMapper for DummyMapper {
+        fn id(&self) -> &str {
+            "dummy"
+        }
+
+        fn map_user(
+            &self,
+            _ldap_attrs: &HashMap<String, Vec<String>>,
+            _user: &mut FederatedUser,
+        ) -> Result<(), FederationError> {
+            Ok(())
+        }
+    }
+
+    fn test_user() -> User {
+        User {
+            id: issuerd_core::UserId::new("u1").unwrap(),
+            realm_id: issuerd_core::RealmId::new("r1").unwrap(),
+            username: issuerd_core::Username::new("jdoe").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn ldap_mapper_default_trait_bodies() {
+        let mapper = DummyMapper;
+        let attrs = HashMap::new();
+        // The defaults are deliberately inert: mappers opt into each behavior.
+        assert_eq!(mapper.map_enabled(&attrs), None);
+        assert!(mapper.map_memberships(&attrs).is_empty());
+        assert!(mapper.map_groups(&attrs).is_empty());
+        assert!(mapper.requested_attributes().is_empty());
+        assert!(!mapper.reports_groups());
+        assert!(mapper.to_ldap_attrs(&test_user()).is_empty());
+    }
+
     #[test]
     fn user_attribute_mapper_email() {
         let mapper = UserAttributeMapper {
