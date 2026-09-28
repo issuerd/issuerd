@@ -347,6 +347,34 @@ mod tests {
         assert!(TokenRequest::parse(&body).unwrap().totp.is_none());
     }
 
+    #[rstest]
+    #[case("code")]
+    #[case("client_secret")]
+    #[case("refresh_token")]
+    #[case("password")]
+    fn empty_string_form_params_are_treated_as_absent(#[case] param: &str) {
+        fn is_some(req: &TokenRequest, param: &str) -> bool {
+            match param {
+                "code" => req.code.is_some(),
+                "client_secret" => req.client_secret.is_some(),
+                "refresh_token" => req.refresh_token.is_some(),
+                "password" => req.password.is_some(),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut body = HashMap::new();
+        body.insert("grant_type".to_string(), "authorization_code".to_string());
+
+        body.insert(param.to_string(), "x".to_string());
+        let req = TokenRequest::parse(&body).unwrap();
+        assert!(is_some(&req, param), "non-empty {param} must be kept");
+
+        body.insert(param.to_string(), String::new());
+        let req = TokenRequest::parse(&body).unwrap();
+        assert!(!is_some(&req, param), "empty {param} must be treated as absent");
+    }
+
     #[test]
     fn token_request_parse_missing_grant_type() {
         let body = HashMap::new();

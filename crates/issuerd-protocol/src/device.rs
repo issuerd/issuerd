@@ -151,4 +151,30 @@ mod tests {
         };
         assert!(req.validate(&client).is_err());
     }
+
+    #[test]
+    fn device_auth_validate_scope_availability() {
+        let mut client = make_test_client();
+        client.default_scopes = Scope::parse("openid");
+        client.optional_scopes = Scope::parse("profile");
+
+        // RFC 6749 §3.3: a scope assigned to the client (default or optional) is accepted.
+        for scope in ["openid", "profile"] {
+            let req = DeviceAuthorizationRequest {
+                client_id: ClientIdentifier::new("client1").unwrap(),
+                scope: Scope::parse(scope),
+            };
+            assert!(req.validate(&client).is_ok(), "{scope} is assigned");
+        }
+
+        // A scope the client does not have assigned is rejected.
+        let req = DeviceAuthorizationRequest {
+            client_id: ClientIdentifier::new("client1").unwrap(),
+            scope: Scope::parse("admin"),
+        };
+        assert!(matches!(
+            req.validate(&client),
+            Err(IssuerdError::InvalidScope)
+        ));
+    }
 }

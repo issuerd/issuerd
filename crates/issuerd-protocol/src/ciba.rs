@@ -187,4 +187,50 @@ mod tests {
         let req = CibaRequest::parse(&body).unwrap();
         assert_eq!(req.requested_expiry, Some(3600));
     }
+
+    fn make_test_client() -> issuerd_core::Client {
+        issuerd_core::Client {
+            id: issuerd_core::ClientId::new("client-1").unwrap(),
+            realm_id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            client_id: issuerd_core::ClientIdentifier::new("client1").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: issuerd_core::ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: issuerd_core::ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn ciba_validate_scope_availability() {
+        let client = make_test_client();
+        let parse = |scope: &str| {
+            let mut body = HashMap::new();
+            body.insert("login_hint".to_string(), "user@example.com".to_string());
+            body.insert("scope".to_string(), scope.to_string());
+            CibaRequest::parse(&body).unwrap()
+        };
+
+        // RFC 6749 §3.3: a scope assigned to the client is accepted.
+        assert!(parse("openid").validate_scope(&client).is_ok());
+
+        // A scope the client does not have assigned is rejected.
+        assert!(matches!(
+            parse("admin").validate_scope(&client),
+            Err(IssuerdError::InvalidScope)
+        ));
+    }
 }
