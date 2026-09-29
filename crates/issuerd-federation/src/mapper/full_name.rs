@@ -37,3 +37,50 @@ impl LdapMapper for FullNameMapper {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attrs(value: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([("cn".to_string(), vec![value.to_string()])])
+    }
+
+    fn user() -> FederatedUser {
+        FederatedUser {
+            username: "jdoe".to_string(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            attributes: HashMap::new(),
+            federation_link: "f1".to_string(),
+            external_id: None,
+            groups: None,
+        }
+    }
+
+    #[test]
+    fn splits_on_first_space_and_trims_last_name() {
+        let mapper = FullNameMapper {
+            ldap_attribute: "cn".to_string(),
+        };
+        let mut u = user();
+        mapper.map_user(&attrs("John Doe"), &mut u).unwrap();
+        assert_eq!(u.first_name.as_deref(), Some("John"));
+        // `idx + 1` must skip the space: the `*` mutant yields " Doe".
+        assert_eq!(u.last_name.as_deref(), Some("Doe"));
+    }
+
+    #[test]
+    fn single_word_sets_only_first_name() {
+        let mapper = FullNameMapper {
+            ldap_attribute: "cn".to_string(),
+        };
+        let mut u = user();
+        mapper.map_user(&attrs("John"), &mut u).unwrap();
+        assert_eq!(u.first_name.as_deref(), Some("John"));
+        assert_eq!(u.last_name, None);
+    }
+}

@@ -264,4 +264,16 @@ mod tests {
         assert_eq!(unescape_dn_value(r"foo\"), "foo\\");
         assert_eq!(unescape_dn_value(r"a\,b\=c"), "a,b=c");
     }
+
+    #[test]
+    fn from_config_defaults_optional_attributes_when_blank() {
+        let m = GroupMapper::from_config(&HashMap::from([
+            ("groupsDn".to_string(), "OU=Groups,DC=ex".to_string()),
+            ("groupNameLdapAttribute".to_string(), "   ".to_string()),
+            ("memberOfLdapAttribute".to_string(), String::new()),
+        ]))
+        .unwrap();
+        assert_eq!(m.group_name_attribute, "cn");
+        assert_eq!(m.member_of_attribute, "memberOf");
+    }
 }
