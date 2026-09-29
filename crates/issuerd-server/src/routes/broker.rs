@@ -2361,4 +2361,733 @@ mod tests {
             .expect("entry re-stored for the retry");
         assert_eq!(stored.error.as_deref(), Some("that username is already taken"));
     }
+
+    // -- endpoint handler wrappers (GET/POST) --------------------------------
+
+    #[tokio::test]
+    async fn endpoint_get_and_post_reject_unknown_state() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let params = HashMap::from([("state".to_string(), "no-such-state".to_string())]);
+
+        let resp = broker_endpoint_handler_get(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            Query(params.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("is invalid or has expired"));
+
+        let resp = broker_endpoint_handler_post(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), IDP_ALIAS.to_string())),
+            HeaderMap::new(),
+            Form(params),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("is invalid or has expired"));
+    }
+
+    // -- session_cookie_user / finish_linking ---------------------------------
+
+    /// Mint a realm-bound SSO access token for `user` (the cookie payload).
+    async fn mint_sso_token(state: &Arc<ServerState>, realm: &Realm, user: &User) -> String {
+        // The token's `iss` is realm-derived; the client only feeds claims, so
+        // the master realm's built-in admin-cli serves for any realm.
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &master_realm_id(),
+                &issuerd_core::ClientIdentifier::new("admin-cli").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        state
+            .token_manager
+            .issue_access_token_with_roles(
+                user,
+                &client,
+                realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .token
+    }
+
+    fn cookie_headers(cookie: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn session_cookie_user_validates_realm_and_signature() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = broker_user(&realm_id, "cookie-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+
+        // No cookie → nobody.
+        assert_eq!(session_cookie_user(&state, &realm, &HeaderMap::new()).await, None);
+        // A garbage token → nobody.
+        let bad = cookie_headers("issuerd_session_master=garbage");
+        assert_eq!(session_cookie_user(&state, &realm, &bad).await, None);
+
+        // A valid realm-bound SSO cookie → the signed-in user.
+        let token = mint_sso_token(&state, &realm, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={token}"));
+        assert_eq!(session_cookie_user(&state, &realm, &headers).await, Some(user.id.clone()));
+
+        // A token minted for ANOTHER realm must not match this realm.
+        let other = Realm {
+            id: RealmId::new("other").unwrap(),
+            name: RealmName::new("other").unwrap(),
+            display_name: None,
+            enabled: true,
+            ..Default::default()
+        };
+        storage.create_realm(&other).await.unwrap();
+        let foreign = mint_sso_token(&state, &other, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={foreign}"));
+        assert_eq!(session_cookie_user(&state, &realm, &headers).await, None);
+    }
+
+    #[tokio::test]
+    async fn finish_linking_links_external_identity_to_signed_in_user() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let user = broker_user(&realm_id, "linked-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+
+        let token = mint_sso_token(&state, &realm, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={token}"));
+
+        let resp = finish_linking(
+            &state,
+            &realm,
+            &idp,
+            &headers,
+            MASTER,
+            user.id.to_string(),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/realms/master/account/linked-accounts?linked=ext");
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .expect("link created");
+        assert_eq!(link.user_id, user.id);
+        assert_eq!(link.external_username.as_deref(), Some("extuser"));
+    }
+
+    #[tokio::test]
+    async fn finish_linking_requires_session_for_the_link_token_subject() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let user = broker_user(&realm_id, "signed-in-user", true);
+        let other = broker_user(&realm_id, "token-subject", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage.create_user(&realm_id, &other).await.unwrap();
+
+        // The SSO cookie belongs to `user`, but the link token was issued to
+        // `other` — a login-CSRF link injection must be refused.
+        let token = mint_sso_token(&state, &realm, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={token}"));
+        let resp = finish_linking(
+            &state,
+            &realm,
+            &idp,
+            &headers,
+            MASTER,
+            other.id.to_string(),
+            broker_identity(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&resp),
+            "/realms/master/account/linked-accounts?error=link-session-mismatch"
+        );
+
+        // No session cookie at all → same refusal.
+        let resp = finish_linking(
+            &state,
+            &realm,
+            &idp,
+            &HeaderMap::new(),
+            MASTER,
+            other.id.to_string(),
+            broker_identity(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            location(&resp),
+            "/realms/master/account/linked-accounts?error=link-session-mismatch"
+        );
+
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_linking_idempotent_when_already_linked_to_same_user() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let user = broker_user(&realm_id, "linked-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage
+            .create_identity_provider_link(
+                &realm_id,
+                &IdentityProviderLink {
+                    user_id: user.id.clone(),
+                    provider_alias: IDP_ALIAS.to_string(),
+                    external_subject: "ext-sub-1".to_string(),
+                    external_username: None,
+                    stored_refresh_token: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let token = mint_sso_token(&state, &realm, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={token}"));
+
+        let resp = finish_linking(
+            &state,
+            &realm,
+            &idp,
+            &headers,
+            MASTER,
+            user.id.to_string(),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        // Already linked to THIS account: a success, not an error.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/realms/master/account/linked-accounts?linked=ext");
+    }
+
+    #[tokio::test]
+    async fn finish_linking_refuses_identity_linked_to_another_user() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let user = broker_user(&realm_id, "signed-in-user", true);
+        let other = broker_user(&realm_id, "other-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage.create_user(&realm_id, &other).await.unwrap();
+        // The external identity belongs to `other`.
+        storage
+            .create_identity_provider_link(
+                &realm_id,
+                &IdentityProviderLink {
+                    user_id: other.id.clone(),
+                    provider_alias: IDP_ALIAS.to_string(),
+                    external_subject: "ext-sub-1".to_string(),
+                    external_username: None,
+                    stored_refresh_token: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let token = mint_sso_token(&state, &realm, &user).await;
+        let headers = cookie_headers(&format!("issuerd_session_master={token}"));
+
+        let resp = finish_linking(
+            &state,
+            &realm,
+            &idp,
+            &headers,
+            MASTER,
+            user.id.to_string(),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/realms/master/account/linked-accounts?error=already-linked");
+        // The link still points at the original owner.
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.user_id, other.id);
+    }
+
+    // -- finish_login -----------------------------------------------------------
+
+    async fn seed_pending_auth(cache: &TestCache, realm_id: &RealmId, flow_id: &str) {
+        cache
+            .set(
+                &pending_auth_cache_key(realm_id, flow_id),
+                serde_json::to_vec(&pending_auth_data(realm_id, flow_id)).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn realm_role(realm_id: &RealmId, name: &str) -> issuerd_core::Role {
+        issuerd_core::Role {
+            id: issuerd_core::RoleId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: issuerd_core::RoleName::new(name).unwrap(),
+            description: None,
+            realm_id: realm_id.clone(),
+            client_role: false,
+            client_id: None,
+            composite: false,
+            composites: vec![],
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn existing_link(user_id: &UserId) -> IdentityProviderLink {
+        IdentityProviderLink {
+            user_id: user_id.clone(),
+            provider_alias: IDP_ALIAS.to_string(),
+            external_subject: "ext-sub-1".to_string(),
+            external_username: None,
+            stored_refresh_token: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_login_known_link_disabled_user_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+        let user = broker_user(&realm_id, "linked-user", false);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage
+            .create_identity_provider_link(&realm_id, &existing_link(&user.id))
+            .await
+            .unwrap();
+        seed_pending_auth(&cache, &realm_id, "flow-disabled").await;
+
+        let resp = finish_login(
+            &state,
+            &realm,
+            &idp,
+            MASTER,
+            login_broker_state(Some("flow-disabled")),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(resp).await.contains("this account is disabled"));
+    }
+
+    #[tokio::test]
+    async fn finish_login_force_sync_applies_mapped_roles() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.insert("syncMode".to_string(), "force".to_string());
+        idp.config.insert(
+            "mappers".to_string(),
+            r#"[{"name":"grant-admins","mapper_type":"role","config":{"claim":"groups","claim_value":"admins","role":"broker-mapped-role"}}]"#
+                .to_string(),
+        );
+        let role = realm_role(&realm_id, "broker-mapped-role");
+        storage.create_role(&realm_id, &role).await.unwrap();
+        let user = broker_user(&realm_id, "linked-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage
+            .create_identity_provider_link(&realm_id, &existing_link(&user.id))
+            .await
+            .unwrap();
+        seed_pending_auth(&cache, &realm_id, "flow-force").await;
+
+        let mut identity = broker_identity();
+        identity.claims = serde_json::json!({"sub": "ext-sub-1", "groups": ["admins"]});
+
+        let resp = finish_login(
+            &state,
+            &realm,
+            &idp,
+            MASTER,
+            login_broker_state(Some("flow-force")),
+            identity,
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("http://localhost:8080/cb?"));
+        // syncMode=force re-applies mappers on every login: the role the
+        // mapper grants must actually be assigned.
+        let roles = storage.list_user_realm_roles(&realm_id, &user.id).await.unwrap();
+        assert!(roles.contains(&role.id), "mapped role assigned on force-sync login");
+    }
+
+    #[tokio::test]
+    async fn finish_login_autolink_rejects_disabled_account() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.insert("trustEmail".to_string(), "true".to_string());
+        let mut existing = broker_user(&realm_id, "existing-user", false);
+        existing.email = Some(Email::new("ext@example.com").unwrap());
+        storage.create_user(&realm_id, &existing).await.unwrap();
+        seed_pending_auth(&cache, &realm_id, "flow-autolink-disabled").await;
+
+        let resp = finish_login(
+            &state,
+            &realm,
+            &idp,
+            MASTER,
+            login_broker_state(Some("flow-autolink-disabled")),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(resp).await.contains("this account is disabled"));
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_login_autolink_links_enabled_account_and_completes() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.insert("trustEmail".to_string(), "true".to_string());
+        let mut existing = broker_user(&realm_id, "existing-user", true);
+        existing.email = Some(Email::new("ext@example.com").unwrap());
+        storage.create_user(&realm_id, &existing).await.unwrap();
+        seed_pending_auth(&cache, &realm_id, "flow-autolink-ok").await;
+
+        let resp = finish_login(
+            &state,
+            &realm,
+            &idp,
+            MASTER,
+            login_broker_state(Some("flow-autolink-ok")),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("http://localhost:8080/cb?"));
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .expect("auto-link created");
+        assert_eq!(link.user_id, existing.id);
+    }
+
+    // -- create_brokered_user -----------------------------------------------------
+
+    #[tokio::test]
+    async fn create_brokered_user_marks_email_verified_only_when_unedited() {
+        let (state, _storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = broker_idp_config(IDP_ALIAS);
+
+        // IdP-verified email, passed through unedited → verified.
+        let user = create_brokered_user(
+            &state,
+            &realm,
+            &idp,
+            &broker_identity(),
+            "user-one".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(user.email_verified, "IdP-verified email, unedited → verified");
+        assert_eq!(user.email.as_ref().map(|e| e.as_str()), Some("ext@example.com"));
+
+        // Edited on the review form → NOT verified, even though the IdP
+        // verified the original address.
+        let user = create_brokered_user(
+            &state,
+            &realm,
+            &idp,
+            &broker_identity(),
+            "user-two".to_string(),
+            Some("edited@example.com".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!user.email_verified, "edited email must not be marked verified");
+        assert_eq!(user.email.as_ref().map(|e| e.as_str()), Some("edited@example.com"));
+
+        // Not IdP-verified → not verified even when unedited.
+        let mut identity = broker_identity();
+        identity.email_verified = false;
+        let user = create_brokered_user(
+            &state,
+            &realm,
+            &idp,
+            &identity,
+            "user-three".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!user.email_verified);
+    }
+
+    #[tokio::test]
+    async fn create_brokered_user_assigns_verify_email_only_for_unverified_email() {
+        let (state, _storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.verify_email_enabled = true;
+        let idp = broker_idp_config(IDP_ALIAS);
+
+        // Unverified email + verify-email realm → VERIFY_EMAIL assigned.
+        let mut identity = broker_identity();
+        identity.email_verified = false;
+        let user = create_brokered_user(
+            &state,
+            &realm,
+            &idp,
+            &identity,
+            "user-v1".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            user.required_actions.iter().any(|a| a == "VERIFY_EMAIL"),
+            "unverified email → VERIFY_EMAIL: {:?}",
+            user.required_actions
+        );
+
+        // IdP-verified email surviving unedited → no VERIFY_EMAIL.
+        let user = create_brokered_user(
+            &state,
+            &realm,
+            &idp,
+            &broker_identity(),
+            "user-v2".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !user.required_actions.iter().any(|a| a == "VERIFY_EMAIL"),
+            "verified email → no VERIFY_EMAIL: {:?}",
+            user.required_actions
+        );
+    }
+
+    // -- first_broker_login_page ----------------------------------------------------
+
+    #[tokio::test]
+    async fn first_login_page_renders_review_and_link_modes() {
+        let (state, _storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+
+        // Review mode: prefilled, editable profile form.
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, "exec-page-review", &entry).await;
+        let resp = first_broker_login_page(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), "exec-page-review".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("Review your profile"), "body: {body}");
+        assert!(body.contains("value=\"extuser\""));
+        assert!(body.contains("value=\"ext@example.com\""));
+        assert!(body.contains("value=\"review\""));
+        assert!(body.contains("/realms/master/broker/first-login/exec-page-review"));
+
+        // Link mode: password confirmation form.
+        let entry = first_login_entry(&realm_id, "link", Some("some-user".to_string()));
+        seed_first_login_entry(&cache, &realm_id, "exec-page-link", &entry).await;
+        let resp = first_broker_login_page(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), "exec-page-link".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("Link your account"), "body: {body}");
+        assert!(body.contains("ext@example.com"));
+        assert!(body.contains("value=\"link\""));
+        assert!(body.contains("value=\"create\""));
+
+        // Unknown execution → error page, not a form.
+        let resp = first_broker_login_page(
+            State(state),
+            resolved(MASTER),
+            Path((MASTER.to_string(), "gone".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn submit_with_disabled_idp_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.enabled = false;
+        storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+
+        let execution = "exec-idp-disabled";
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "review".to_string()),
+                ("username".to_string(), "newbie".to_string()),
+                ("email".to_string(), "newbie@example.com".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("unknown identity provider"));
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_review_maps_profile_fields() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+
+        let execution = "exec-review-fields";
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "review".to_string()),
+                ("username".to_string(), "mapped-user".to_string()),
+                ("email".to_string(), "mapped@example.com".to_string()),
+                ("first_name".to_string(), "Mapped".to_string()),
+                ("last_name".to_string(), "Person".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("http://localhost:8080/cb?"));
+        let created = storage
+            .get_user_by_username(&realm_id, "mapped-user")
+            .await
+            .unwrap()
+            .expect("review submit creates the local user");
+        // The form values win over the identity fallback: a dropped non-empty
+        // filter would silently fall back to the IdP claims instead.
+        assert_eq!(created.email.as_ref().map(|e| e.as_str()), Some("mapped@example.com"));
+        assert_eq!(created.first_name.as_ref().map(|n| n.as_str()), Some("Mapped"));
+        assert_eq!(created.last_name.as_ref().map(|n| n.as_str()), Some("Person"));
+    }
+
+    #[tokio::test]
+    async fn submit_review_duplicate_email_retries() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let mut existing = broker_user(&realm_id, "existing-user", true);
+        existing.email = Some(Email::new("dup@example.com").unwrap());
+        storage.create_user(&realm_id, &existing).await.unwrap();
+
+        let execution = "exec-review-dup";
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, execution, &entry).await;
+
+        let resp = submit_first_login(
+            &state,
+            execution,
+            HashMap::from([
+                ("action".to_string(), "review".to_string()),
+                ("username".to_string(), "unique-name".to_string()),
+                ("email".to_string(), "dup@example.com".to_string()),
+            ]),
+            true,
+        )
+        .await;
+
+        // The realm forbids duplicate emails: PRG back with the banner.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/realms/master/broker/first-login/{execution}"));
+        let stored = load_first_login_entry(&state, &realm_id, execution)
+            .await
+            .expect("entry re-stored for the retry");
+        assert_eq!(stored.error.as_deref(), Some("that email address is already in use"));
+        assert!(storage.get_user_by_username(&realm_id, "unique-name").await.unwrap().is_none());
+    }
 }

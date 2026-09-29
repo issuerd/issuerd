@@ -686,6 +686,168 @@ async fn try_resume_login_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
+    use crate::routes::oidc::{pending_auth_cache_key, PendingAuthData};
+    use issuerd_core::{CredentialType, DistributedCache, Realm, Storage};
+
+    type TestStorage = Arc<issuerd_storage::InMemoryStorage>;
+    type TestCache = Arc<issuerd_cluster::InMemoryCache>;
+
+    async fn test_state() -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let state = ServerState::from_components(&cfg, storage.clone(), cache.clone())
+            .await
+            .unwrap();
+        (Arc::new(state), storage, cache)
+    }
+
+    fn master_realm_id() -> RealmId {
+        RealmId::new("master").unwrap()
+    }
+
+    /// Flip `registration_enabled` on the master realm and make sure the
+    /// by-name resolution cache cannot serve a stale pre-update row.
+    async fn enable_registration(state: &Arc<ServerState>) -> Realm {
+        let mut realm = state
+            .storage
+            .get_realm(&master_realm_id())
+            .await
+            .unwrap()
+            .expect("master realm bootstrapped");
+        realm.registration_enabled = true;
+        state.storage.update_realm(&realm).await.unwrap();
+        let _ = state.cache.delete(&issuerd_cluster::cache_keys::realm_by_name("master")).await;
+        realm
+    }
+
+    fn client_ip() -> axum::extract::Extension<ClientIp> {
+        axum::extract::Extension(ClientIp(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+    }
+
+    /// A paused browser-login entry as the authorize endpoint stores it.
+    fn pending_login(realm_id: &RealmId, execution_id: &str) -> PendingAuthData {
+        PendingAuthData {
+            realm_id: realm_id.0.clone(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: None,
+            execution_id: FlowStageId::new(execution_id).unwrap(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        }
+    }
+
+    async fn seed_pending_login(cache: &TestCache, realm_id: &RealmId, execution_id: &str) {
+        cache
+            .set(
+                &pending_auth_cache_key(realm_id, execution_id),
+                serde_json::to_vec(&pending_login(realm_id, "username-password")).unwrap(),
+                Some(Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// GET the registration page; returns the minted flow id and the response.
+    async fn start_registration(
+        state: &Arc<ServerState>,
+        login_execution_id: Option<&str>,
+    ) -> (String, Response) {
+        let resp = register_page(
+            State(state.clone()),
+            Path("master".to_string()),
+            axum::extract::Query(RegisterPageQuery {
+                execution_id: login_execution_id.map(str::to_string),
+            }),
+            client_ip(),
+        )
+        .await;
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("flow cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let flow_id = set_cookie
+            .strip_prefix("issuerd_flow_")
+            .and_then(|rest| rest.split('=').next())
+            .expect("issuerd_flow_<id>=1 cookie")
+            .to_string();
+        (flow_id, resp)
+    }
+
+    async fn submit_registration(
+        state: &Arc<ServerState>,
+        flow_id: &str,
+        cookies: &[String],
+        fields: &[(&str, &str)],
+    ) -> Response {
+        let mut form: Vec<(String, String)> =
+            fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        form.push(("flow".to_string(), flow_id.to_string()));
+        let body = serde_urlencoded::to_string(form).unwrap();
+        let mut headers = HeaderMap::new();
+        if !cookies.is_empty() {
+            headers.insert(axum::http::header::COOKIE, cookies.join("; ").parse().unwrap());
+        }
+        register_submit(
+            State(state.clone()),
+            Path("master".to_string()),
+            client_ip(),
+            headers,
+            Bytes::from(body),
+        )
+        .await
+    }
+
+    fn flow_cookie(flow_id: &str) -> String {
+        format!("issuerd_flow_{flow_id}=1")
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn pending_entry(
+        cache: &TestCache,
+        realm_id: &RealmId,
+        flow_id: &str,
+    ) -> Option<PendingRegistration> {
+        cache
+            .get(&pending_registration_cache_key(realm_id, flow_id))
+            .await
+            .unwrap()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn valid_form() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("username", "newbie"),
+            ("email", "newbie@example.com"),
+            ("first_name", "New"),
+            ("last_name", "User"),
+            ("password", "password-123"),
+            ("confirm_password", "password-123"),
+        ]
+    }
 
     #[test]
     fn cache_key_is_realm_scoped() {
@@ -782,5 +944,315 @@ mod tests {
         });
         let entry: PendingRegistration = serde_json::from_value(legacy).unwrap();
         assert_eq!(entry.login_execution_id, None);
+    }
+
+    // -- register_page -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn page_renders_form_and_mints_flow_cookie() {
+        let (state, _storage, cache) = test_state().await;
+
+        // Disabled by default: a 404 page, not the form.
+        let resp = register_page(
+            State(state.clone()),
+            Path("master".to_string()),
+            axum::extract::Query(RegisterPageQuery { execution_id: None }),
+            client_ip(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(resp).await.contains("Registration is not enabled"));
+
+        enable_registration(&state).await;
+        let (flow_id, resp) = start_registration(&state, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Create your account"));
+        assert!(body.contains(&format!("name=\"flow\" value=\"{flow_id}\"")));
+        assert!(body.contains("action=\"/realms/master/login/register\""));
+
+        // The pending entry exists under the exact schema key.
+        let realm_id = master_realm_id();
+        let entry = pending_entry(&cache, &realm_id, &flow_id)
+            .await
+            .expect("pending registration cached");
+        assert_eq!(entry.realm_id, realm_id.0);
+        assert_eq!(entry.login_execution_id, None);
+    }
+
+    #[tokio::test]
+    async fn page_keeps_only_live_login_execution_link() {
+        let (state, _storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        seed_pending_login(&cache, &realm_id, "login-exec-1").await;
+
+        // A live pending login flow is threaded into the registration.
+        let (flow_id, resp) = start_registration(&state, Some("login-exec-1")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let entry = pending_entry(&cache, &realm_id, &flow_id).await.unwrap();
+        assert_eq!(entry.login_execution_id.as_deref(), Some("login-exec-1"));
+
+        // An expired/unknown execution degrades the registration to standalone.
+        let (flow_id, resp) = start_registration(&state, Some("gone-exec")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let entry = pending_entry(&cache, &realm_id, &flow_id).await.unwrap();
+        assert_eq!(entry.login_execution_id, None);
+    }
+
+    // -- register_submit -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn submit_creates_account_and_success_page() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        let (flow_id, resp) = start_registration(&state, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp =
+            submit_registration(&state, &flow_id, &[flow_cookie(&flow_id)], &valid_form()).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Registration successful"));
+        assert!(body.contains("Continue to sign-in"));
+
+        // The account exists with a working password credential.
+        let user = storage
+            .get_user_by_username(&realm_id, "newbie")
+            .await
+            .unwrap()
+            .expect("registered user persisted");
+        assert_eq!(user.email.as_ref().map(|e| e.as_str()), Some("newbie@example.com"));
+        assert!(user.enabled);
+        let creds = storage
+            .get_credentials(&realm_id, &user.id, CredentialType::Password)
+            .await
+            .unwrap();
+        assert!(
+            creds
+                .iter()
+                .any(|c| issuerd_auth_flow::built_in::verify_password_hash("password-123", c)),
+            "password credential stored"
+        );
+        // The pending entry is single-use.
+        assert!(pending_entry(&cache, &realm_id, &flow_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_without_flow_cookie_rejected() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        let (flow_id, resp) = start_registration(&state, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The correlation cookie is missing: reject before touching the entry.
+        let resp = submit_registration(&state, &flow_id, &[], &valid_form()).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("Invalid or expired registration flow."));
+        assert!(pending_entry(&cache, &realm_id, &flow_id).await.is_some());
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_entry_from_another_realm() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        let (flow_id, resp) = start_registration(&state, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Overwrite the entry with one bound to a different realm (the cache
+        // key is realm-scoped, so this is defense-in-depth).
+        let foreign = PendingRegistration {
+            realm_id: "other-realm".to_string(),
+            execution_id: FlowStageId::new("registration").unwrap(),
+            ip_address: None,
+            login_execution_id: None,
+        };
+        cache
+            .set(
+                &pending_registration_cache_key(&realm_id, &flow_id),
+                serde_json::to_vec(&foreign).unwrap(),
+                Some(Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp =
+            submit_registration(&state, &flow_id, &[flow_cookie(&flow_id)], &valid_form()).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("registration session has expired"));
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_validation_failure_rerenders_form_with_message() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        let (flow_id, resp) = start_registration(&state, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // "admin" exists in the bootstrapped master realm.
+        let mut form = valid_form();
+        form[0] = ("username", "admin");
+        let resp = submit_registration(&state, &flow_id, &[flow_cookie(&flow_id)], &form).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        // The authenticator's user-facing message — never the generic
+        // internal-error text — lands in the banner.
+        assert!(body.contains("username already in use"), "body: {body}");
+        assert!(!body.contains("internal error"), "body: {body}");
+        // The form re-renders with the non-secret values prefilled.
+        assert!(body.contains("value=\"admin\""));
+        assert!(body.contains("value=\"newbie@example.com\""));
+        // …and the entry is re-stored so the user can correct and resubmit.
+        assert!(pending_entry(&cache, &realm_id, &flow_id).await.is_some());
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_none());
+    }
+
+    // -- login-flow resume ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn submit_resumes_originating_login_flow() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        seed_pending_login(&cache, &realm_id, "login-exec-1").await;
+
+        let (flow_id, resp) = start_registration(&state, Some("login-exec-1")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = submit_registration(
+            &state,
+            &flow_id,
+            &[flow_cookie(&flow_id), flow_cookie("login-exec-1")],
+            &valid_form(),
+        )
+        .await;
+
+        // The paused browser login resumes with the fresh credentials and
+        // lands the user on the originating app with an authorization code.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+        assert!(location.starts_with("http://localhost:8080/cb?"), "{location}");
+        assert!(location.contains("code="), "{location}");
+        assert!(location.contains("state=xyz"), "{location}");
+
+        // The login flow entry was consumed by the resume.
+        assert!(cache
+            .get(&pending_auth_cache_key(&realm_id, "login-exec-1"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_without_login_cookie_falls_back_to_success_page() {
+        let (state, _storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        seed_pending_login(&cache, &realm_id, "login-exec-2").await;
+
+        let (flow_id, resp) = start_registration(&state, Some("login-exec-2")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Only the registration cookie — the login flow's correlation cookie
+        // is missing, so the resume must NOT run.
+        let resp =
+            submit_registration(&state, &flow_id, &[flow_cookie(&flow_id)], &valid_form()).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Registration successful"));
+        // The success page keeps the sign-in inside the app flow.
+        assert!(body.contains("execution_id=login-exec-2"), "body: {body}");
+        // The paused login flow is untouched: the user can still sign in.
+        assert!(cache
+            .get(&pending_auth_cache_key(&realm_id, "login-exec-2"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_declines_cross_realm_pending_and_restores_it() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+
+        // A registered user whose credentials the resumed flow would accept.
+        let now = chrono::Utc::now();
+        let user = issuerd_core::User {
+            id: issuerd_core::UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: issuerd_core::Username::new("flowuser").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        storage.create_user(&realm_id, &user).await.unwrap();
+        issuerd_auth_flow::built_in::set_user_password(
+            storage.as_ref(),
+            &realm_id,
+            &user.id,
+            "password-123",
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The pending entry claims a different realm (defense-in-depth: the
+        // cache key is already realm-scoped).
+        let mut foreign = pending_login(&realm_id, "username-password");
+        foreign.realm_id = "other-realm".to_string();
+        let cache_key = pending_auth_cache_key(&realm_id, "login-exec-x");
+        cache
+            .set(
+                &cache_key,
+                serde_json::to_vec(&foreign).unwrap(),
+                Some(Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let form: HashMap<String, String> = HashMap::from([
+            ("username".to_string(), "flowuser".to_string()),
+            ("password".to_string(), "password-123".to_string()),
+        ]);
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::COOKIE,
+            flow_cookie("login-exec-x").parse().unwrap(),
+        )]);
+
+        let resp = try_resume_login_flow(
+            &state,
+            &realm,
+            "master",
+            &realm_id,
+            "login-exec-x",
+            &form,
+            &headers,
+        )
+        .await;
+
+        assert!(resp.is_none(), "cross-realm pending entry must not resume");
+        // The entry is restored so the user can still sign in manually.
+        assert!(cache.get(&cache_key).await.unwrap().is_some());
     }
 }

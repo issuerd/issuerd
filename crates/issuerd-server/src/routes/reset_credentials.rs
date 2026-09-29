@@ -504,6 +504,150 @@ pub async fn update_credentials_submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
+    use issuerd_core::{CredentialType, DistributedCache, Email, Storage, User, Username};
+
+    type TestStorage = Arc<issuerd_storage::InMemoryStorage>;
+    type TestCache = Arc<issuerd_cluster::InMemoryCache>;
+
+    async fn test_state() -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let state = ServerState::from_components(&cfg, storage.clone(), cache.clone())
+            .await
+            .unwrap();
+        (Arc::new(state), storage, cache)
+    }
+
+    /// (to, subject, text body) of every mail the mock sender was asked to send.
+    type SentMails = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+    type MockSender = Arc<issuerd_core::MockEmailSender>;
+
+    /// A recording [`EmailSender`] mock plus the shared capture buffer.
+    fn recording_state() -> (SentMails, MockSender) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = sent.clone();
+        let mut mock = issuerd_core::MockEmailSender::new();
+        mock.expect_send().returning(move |_realm, to, subject, text, _html| {
+            captured
+                .lock()
+                .unwrap()
+                .push((to.to_string(), subject.to_string(), text.to_string()));
+            Ok(())
+        });
+        (sent, Arc::new(mock))
+    }
+
+    async fn state_with_sender(sender: MockSender) -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let state = ServerState::from_components_with_email_sender(
+            &cfg,
+            storage.clone(),
+            cache.clone(),
+            sender,
+        )
+        .await
+        .unwrap();
+        (Arc::new(state), storage, cache)
+    }
+
+    fn master_realm_id() -> RealmId {
+        RealmId::new("master").unwrap()
+    }
+
+    /// Flip `reset_password_allowed` on the master realm and make sure the
+    /// by-name resolution cache cannot serve a stale pre-update row.
+    async fn enable_reset_password(state: &Arc<ServerState>) -> Realm {
+        let mut realm = state
+            .storage
+            .get_realm(&master_realm_id())
+            .await
+            .unwrap()
+            .expect("master realm bootstrapped");
+        realm.reset_password_allowed = true;
+        state.storage.update_realm(&realm).await.unwrap();
+        let _ = state.cache.delete(&issuerd_cluster::cache_keys::realm_by_name("master")).await;
+        realm
+    }
+
+    async fn seed_user(
+        storage: &TestStorage,
+        realm_id: &RealmId,
+        username: &str,
+        email: Option<&str>,
+        enabled: bool,
+        required_actions: &[&str],
+    ) -> User {
+        let now = chrono::Utc::now();
+        let user = User {
+            id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new(username).unwrap(),
+            email: email.map(|e| Email::new(e).unwrap()),
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: required_actions.iter().map(|a| a.to_string()).collect(),
+            created_at: now,
+            updated_at: now,
+        };
+        storage.create_user(realm_id, &user).await.unwrap();
+        user
+    }
+
+    /// Mint a reset-credentials action token and return it with its `jti`.
+    async fn mint_reset_token(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        user_id: &UserId,
+    ) -> (String, String) {
+        let claims = action_token_claims(
+            user_id,
+            realm_id,
+            ACTION_TOKEN_PURPOSE_RESET_CREDENTIALS,
+            RESET_CREDENTIALS_LINK_TTL_SECS,
+        );
+        let jti = claims.jti.clone();
+        let token = issue_action_token(state.crypto.as_ref(), &claims).await.unwrap();
+        (token, jti)
+    }
+
+    async fn seed_pending_jti(cache: &TestCache, realm_id: &RealmId, jti: &str, user_id: &UserId) {
+        cache
+            .set(
+                &reset_credentials_cache_key(realm_id, jti),
+                user_id.0.clone().into_bytes(),
+                Some(Duration::from_secs(RESET_CREDENTIALS_LINK_TTL_SECS as u64)),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn client_ip() -> axum::extract::Extension<ClientIp> {
+        axum::extract::Extension(ClientIp(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+    }
+
+    async fn call_update_submit(state: &Arc<ServerState>, form: &[(&str, &str)]) -> Response {
+        let body = serde_urlencoded::to_string(form).unwrap();
+        update_credentials_submit(
+            State(state.clone()),
+            Path("master".to_string()),
+            client_ip(),
+            Bytes::from(body),
+        )
+        .await
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     #[test]
     fn cache_key_is_realm_scoped() {
@@ -579,5 +723,385 @@ mod tests {
         assert_eq!(parse_username(&headers, &body), None);
         let body = Bytes::from(r#"{"other":"x"}"#);
         assert_eq!(parse_username(&headers, &body), None);
+    }
+
+    // -- reset_credentials_page ------------------------------------------------
+
+    #[tokio::test]
+    async fn page_renders_form_only_when_reset_enabled() {
+        let (state, _storage, _cache) = test_state().await;
+
+        // Disabled by default: a 404 page, not the form.
+        let resp = reset_credentials_page(State(state.clone()), Path("master".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(resp).await.contains("not enabled"));
+
+        enable_reset_password(&state).await;
+        let resp = reset_credentials_page(State(state), Path("master".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Forgot your password?"));
+        assert!(body.contains("action=\"/realms/master/login/reset-credentials\""));
+        assert!(body.contains("name=\"username\""));
+    }
+
+    // -- reset_credentials_submit ----------------------------------------------
+
+    #[tokio::test]
+    async fn submit_answers_204_regardless_of_account_existence() {
+        let (state, storage, _cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+
+        // The default state wires the loud NoOpEmailSender: even a delivery
+        // failure for an existing account must surface as the same 204.
+        for username in ["alice", "no-such-user"] {
+            let resp = reset_credentials_submit(
+                State(state.clone()),
+                Path("master".to_string()),
+                HeaderMap::new(),
+                Bytes::from(format!("username={username}")),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "username {username}");
+            assert!(body_string(resp).await.is_empty(), "204 carries no body");
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_requires_realm_flag() {
+        let (state, _storage, _cache) = test_state().await;
+        let resp = reset_credentials_submit(
+            State(state),
+            Path("master".to_string()),
+            HeaderMap::new(),
+            Bytes::from("username=alice"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(resp).await.contains("not enabled"));
+    }
+
+    // -- send_reset_email --------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_reset_email_delivers_token_link_with_expiry_minutes() {
+        let (sent, sender) = recording_state();
+        let (state, storage, cache) = state_with_sender(sender).await;
+        let realm = enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+
+        send_reset_email(&state, &realm, "master", "alice")
+            .await
+            .expect("send succeeds");
+
+        // Snapshot the recording and drop the lock guard before any await.
+        let (to, subject, text) = {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1, "exactly one reset email sent");
+            sent[0].clone()
+        };
+        assert_eq!(to, "alice@example.com");
+        assert_eq!(subject, "Reset your password");
+        // The 900 s TTL is rendered in minutes (`TTL / 60` — not `% 60` = 0,
+        // not `* 60` = 54000).
+        assert!(text.contains("15 minutes"), "text: {text}");
+        let link = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("/login/update-credentials?token="))
+            .expect("reset link in the text body");
+        assert!(
+            link.starts_with("http://localhost:8080/realms/master/login/update-credentials?token="),
+            "link: {link}"
+        );
+        // The embedded token verifies and its jti is tracked for single-use.
+        let token = link.rsplit("token=").next().unwrap();
+        let claims = verify_action_token(
+            state.crypto.as_ref(),
+            token,
+            ACTION_TOKEN_PURPOSE_RESET_CREDENTIALS,
+            &realm_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claims.sub, user.id.0);
+        let cached = cache
+            .get(&reset_credentials_cache_key(&realm_id, &claims.jti))
+            .await
+            .unwrap()
+            .expect("jti tracked in the cache");
+        assert_eq!(cached, user.id.0.clone().into_bytes());
+    }
+
+    #[tokio::test]
+    async fn send_reset_email_probes_addresses_only_when_email_login_allowed() {
+        let (sent, sender) = recording_state();
+        let (state, storage, _cache) = state_with_sender(sender).await;
+        let realm = enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        // Findable only by email — the username lookup misses.
+        seed_user(&storage, &realm_id, "bob", Some("bob@example.com"), true, &[]).await;
+
+        // Default realms allow email login: the address probe runs.
+        send_reset_email(&state, &realm, "master", "bob@example.com").await.unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1, "email login allowed → probe sends");
+
+        // With email login disabled the address is never probed.
+        let mut realm = realm;
+        realm.login_with_email_allowed = false;
+        send_reset_email(&state, &realm, "master", "bob@example.com").await.unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1, "email login disabled → no probe, no mail");
+    }
+
+    #[tokio::test]
+    async fn send_reset_email_silently_skips_unusable_accounts() {
+        let (sent, sender) = recording_state();
+        let (state, storage, _cache) = state_with_sender(sender).await;
+        let realm = enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        seed_user(&storage, &realm_id, "disabled", Some("d@example.com"), false, &[]).await;
+        seed_user(&storage, &realm_id, "no-email", None, true, &[]).await;
+
+        for username in ["no-such-user", "disabled", "no-email"] {
+            send_reset_email(&state, &realm, "master", username).await.unwrap();
+        }
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no mail for unknown/disabled/address-less accounts"
+        );
+    }
+
+    // -- update_credentials_page -------------------------------------------------
+
+    #[tokio::test]
+    async fn update_page_renders_form_for_pending_token() {
+        let (state, storage, cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+        let (token, jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        seed_pending_jti(&cache, &realm_id, &jti, &user.id).await;
+
+        let resp = update_credentials_page(
+            State(state),
+            Path("master".to_string()),
+            Query(HashMap::from([("token".to_string(), token.clone())])),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Choose a new password"));
+        assert!(body.contains("name=\"new_password\""));
+        assert!(body.contains("name=\"confirm_password\""));
+        assert!(body.contains(&format!("value=\"{token}\"")));
+    }
+
+    #[tokio::test]
+    async fn update_page_rejects_invalid_and_consumed_links() {
+        let (state, storage, _cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+
+        // Garbage token → invalid-link page.
+        let resp = update_credentials_page(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(HashMap::from([("token".to_string(), "garbage".to_string())])),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("invalid or has expired"));
+
+        // Valid token whose jti is not pending → single-use page.
+        let (token, _jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        let resp = update_credentials_page(
+            State(state),
+            Path("master".to_string()),
+            Query(HashMap::from([("token".to_string(), token)])),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("already been used"));
+    }
+
+    // -- update_credentials_submit -----------------------------------------------
+
+    #[tokio::test]
+    async fn update_submit_sets_password_consumes_token_and_clears_required_action() {
+        let (state, storage, cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user = seed_user(
+            &storage,
+            &realm_id,
+            "alice",
+            Some("alice@example.com"),
+            true,
+            &["UPDATE_PASSWORD"],
+        )
+        .await;
+        let (token, jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        seed_pending_jti(&cache, &realm_id, &jti, &user.id).await;
+
+        let resp = call_update_submit(
+            &state,
+            &[
+                ("token", token.as_str()),
+                ("new_password", "new-secret-123"),
+                ("confirm_password", "new-secret-123"),
+            ],
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("Password updated"));
+
+        // The new password credential was actually written…
+        let creds = storage
+            .get_credentials(&realm_id, &user.id, CredentialType::Password)
+            .await
+            .unwrap();
+        assert!(
+            creds
+                .iter()
+                .any(|c| issuerd_auth_flow::built_in::verify_password_hash("new-secret-123", c)),
+            "new password verifies against the stored credential"
+        );
+        // …the jti was consumed (single-use)…
+        assert!(
+            cache
+                .get(&reset_credentials_cache_key(&realm_id, &jti))
+                .await
+                .unwrap()
+                .is_none(),
+            "jti consumed after success"
+        );
+        // …and a successful reset satisfies the UPDATE_PASSWORD required action.
+        let user = storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert!(
+            !user.required_actions.iter().any(|a| a == "UPDATE_PASSWORD"),
+            "UPDATE_PASSWORD cleared: {:?}",
+            user.required_actions
+        );
+    }
+
+    #[tokio::test]
+    async fn update_submit_rejects_disabled_account() {
+        let (state, storage, cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), false, &[]).await;
+        let (token, jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        seed_pending_jti(&cache, &realm_id, &jti, &user.id).await;
+
+        let resp = call_update_submit(
+            &state,
+            &[
+                ("token", token.as_str()),
+                ("new_password", "new-secret-123"),
+                ("confirm_password", "new-secret-123"),
+            ],
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("no longer available"));
+        assert!(
+            storage
+                .get_credentials(&realm_id, &user.id, CredentialType::Password)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no password written for a disabled account"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_submit_mismatched_passwords_rerender_without_consuming() {
+        let (state, storage, cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+        let (token, jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        seed_pending_jti(&cache, &realm_id, &jti, &user.id).await;
+
+        let resp = call_update_submit(
+            &state,
+            &[
+                ("token", token.as_str()),
+                ("new_password", "new-secret-123"),
+                ("confirm_password", "something-else"),
+            ],
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("The passwords do not match."));
+        // The token stays pending so the user can correct and resubmit.
+        assert!(
+            cache
+                .get(&reset_credentials_cache_key(&realm_id, &jti))
+                .await
+                .unwrap()
+                .is_some(),
+            "jti not consumed on a form error"
+        );
+        assert!(storage
+            .get_credentials(&realm_id, &user.id, CredentialType::Password)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_submit_replay_after_success_is_rejected() {
+        let (state, storage, cache) = test_state().await;
+        enable_reset_password(&state).await;
+        let realm_id = master_realm_id();
+        let user =
+            seed_user(&storage, &realm_id, "alice", Some("alice@example.com"), true, &[]).await;
+        let (token, jti) = mint_reset_token(&state, &realm_id, &user.id).await;
+        seed_pending_jti(&cache, &realm_id, &jti, &user.id).await;
+
+        let form = [
+            ("token", token.as_str()),
+            ("new_password", "new-secret-123"),
+            ("confirm_password", "new-secret-123"),
+        ];
+        let first = call_update_submit(&state, &form).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let resp = call_update_submit(&state, &form).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn update_submit_rejects_garbage_token() {
+        let (state, _storage, _cache) = test_state().await;
+        enable_reset_password(&state).await;
+
+        let resp = call_update_submit(
+            &state,
+            &[
+                ("token", "garbage"),
+                ("new_password", "new-secret-123"),
+                ("confirm_password", "new-secret-123"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(resp).await.contains("invalid or has expired"));
     }
 }
