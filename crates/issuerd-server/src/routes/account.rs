@@ -2978,4 +2978,853 @@ mod tests {
             1
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Sessions listing, error-mapping helpers, email-change rules, TOTP
+    // verify, passkey label handling, and the expiry peek.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn account_sessions_returns_live_session_rows() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let sid = validated.claims.sid.clone().unwrap();
+        let admin_cli = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let resp = account_sessions_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().expect("session list");
+        let entry = arr.iter().find(|s| s["id"] == sid.0).expect("the grant's session is listed");
+        assert_eq!(entry["ip_address"], "127.0.0.1");
+        assert!(entry["started"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(entry["last_session_refresh"].as_str().is_some_and(|s| !s.is_empty()));
+        // The clients list carries the INTERNAL client id, not the public one.
+        assert_eq!(entry["clients"], serde_json::json!([admin_cli.id.0]));
+    }
+
+    /// Mock-backed state whose `update_user` fails with `update_error`; every
+    /// other read on the update-me path answers with the bootstrapped master
+    /// fixtures. Returns the state plus a valid access token for `admin`.
+    async fn update_me_failing_state(update_error: IssuerdError) -> (Arc<ServerState>, String) {
+        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let session = make_session(&realm_id, &user);
+        let session_id = session.id.clone();
+
+        let mut storage = issuerd_core::MockStorage::new();
+        {
+            let realm = realm.clone();
+            storage
+                .expect_get_realm_by_name()
+                .returning(move |name| Ok((name == "master").then(|| realm.clone())));
+        }
+        {
+            let user = user.clone();
+            storage.expect_get_user().returning(move |_, _| Ok(Some(user.clone())));
+        }
+        storage
+            .expect_get_user_session()
+            .returning(move |_, _| Ok(Some(session.clone())));
+        storage.expect_list_user_groups().returning(|_, _| Ok(vec![]));
+        storage.expect_get_groups_batch().returning(|_, _| Ok(vec![]));
+        storage.expect_list_user_realm_roles().returning(|_, _| Ok(vec![]));
+        storage.expect_list_user_client_roles().returning(|_, _| Ok(vec![]));
+        {
+            let realm = realm.clone();
+            storage.expect_get_realm().returning(move |_| Ok(Some(realm.clone())));
+        }
+        storage.expect_update_user().returning(move |_, _| Err(update_error.clone()));
+        state.storage = Arc::new(storage);
+        let state = Arc::new(state);
+
+        let token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .token;
+        (state, token)
+    }
+
+    async fn update_me(state: &Arc<ServerState>, token: &str, body: UpdateMeRequest) -> Response {
+        account_update_me_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(token),
+            Json(body),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn account_update_me_maps_storage_conflict_to_bad_request() {
+        let (state, token) = update_me_failing_state(IssuerdError::Conflict).await;
+        let resp = update_me(
+            &state,
+            &token,
+            UpdateMeRequest {
+                first_name: Some(Some("New".to_string())),
+                last_name: None,
+                email: None,
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "username already in use");
+    }
+
+    #[tokio::test]
+    async fn account_update_me_maps_duplicate_username_error_to_bad_request() {
+        let (state, token) = update_me_failing_state(IssuerdError::InvalidRequest(
+            "username already exists in realm".to_string(),
+        ))
+        .await;
+        let resp = update_me(
+            &state,
+            &token,
+            UpdateMeRequest {
+                first_name: Some(Some("New".to_string())),
+                last_name: None,
+                email: None,
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "username already in use");
+    }
+
+    /// Recording federation provider: accepts exactly `correct-horse` at the
+    /// directory and remembers password writes.
+    struct StubFederationProvider {
+        id: String,
+        updates: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::FederationProvider for StubFederationProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn provider_type(&self) -> issuerd_core::FederationProviderType {
+            issuerd_core::FederationProviderType::Ldap
+        }
+
+        async fn find_user(
+            &self,
+            _username: &str,
+        ) -> Result<Option<issuerd_core::FederatedUser>, issuerd_core::FederationError> {
+            Ok(None)
+        }
+
+        async fn find_user_by_email(
+            &self,
+            _email: &str,
+        ) -> Result<Option<issuerd_core::FederatedUser>, issuerd_core::FederationError> {
+            Ok(None)
+        }
+
+        async fn validate_password(
+            &self,
+            _username: &str,
+            password: &str,
+        ) -> Result<bool, issuerd_core::FederationError> {
+            Ok(password == "correct-horse")
+        }
+
+        async fn update_password(
+            &self,
+            username: &str,
+            password: &str,
+        ) -> Result<(), issuerd_core::FederationError> {
+            self.updates.lock().unwrap().push((username.to_string(), password.to_string()));
+            Ok(())
+        }
+
+        fn supports_password_update(&self) -> bool {
+            true
+        }
+    }
+
+    struct StubFederationManager {
+        provider: Arc<StubFederationProvider>,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::FederationManager for StubFederationManager {
+        async fn providers_for_realm(
+            &self,
+            _realm_id: &RealmId,
+        ) -> Result<Vec<Arc<dyn issuerd_core::FederationProvider>>, IssuerdError> {
+            Ok(vec![self.provider.clone()])
+        }
+
+        async fn find_user(
+            &self,
+            _realm_id: &RealmId,
+            _username: &str,
+        ) -> Result<
+            Option<(Arc<dyn issuerd_core::FederationProvider>, issuerd_core::FederatedUser)>,
+            IssuerdError,
+        > {
+            Ok(None)
+        }
+
+        async fn find_user_by_email(
+            &self,
+            _realm_id: &RealmId,
+            _email: &str,
+        ) -> Result<
+            Option<(Arc<dyn issuerd_core::FederationProvider>, issuerd_core::FederatedUser)>,
+            IssuerdError,
+        > {
+            Ok(None)
+        }
+    }
+
+    /// State whose federation manager resolves the `ldap-1` link to the stub
+    /// provider, with a linked user carrying a stale local password credential.
+    async fn federated_state() -> (Arc<ServerState>, Arc<StubFederationProvider>, UserId) {
+        let provider = Arc::new(StubFederationProvider {
+            id: "ldap-1".to_string(),
+            updates: std::sync::Mutex::new(vec![]),
+        });
+        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        state.federation_manager = Arc::new(StubFederationManager {
+            provider: provider.clone(),
+        });
+        let state = Arc::new(state);
+
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user = make_user(&realm_id, "feduser");
+        user.federation_link = Some("ldap-1".to_string());
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        // A leftover local password: a dormant fallback the write-through
+        // must delete once the directory accepts the new password.
+        let cred = Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"stale-local-hash".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 1,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &cred).await.unwrap();
+        (state, provider, user.id)
+    }
+
+    async fn change_password(
+        state: &Arc<ServerState>,
+        token: &str,
+        current: &str,
+        new: &str,
+    ) -> Response {
+        account_change_password_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            bearer_headers(token),
+            Json(ChangePasswordRequest {
+                current_password: current.to_string(),
+                new_password: new.to_string(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn account_change_password_federated_rejects_wrong_current_password() {
+        let (state, provider, user_id) = federated_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = state.storage.get_user(&realm_id, &user_id).await.unwrap().unwrap();
+        let token = issue_token_for_user(&state, &user).await;
+
+        let resp = change_password(&state, &token, "wrong-password", "N3wPassword!x").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "current password is incorrect");
+        // No directory write happened; the stale local credential survives.
+        assert!(provider.updates.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .storage
+                .get_credentials(&realm_id, &user_id, CredentialType::Password)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn account_change_password_federated_writes_through_and_drops_local_credential() {
+        let (state, provider, user_id) = federated_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = state.storage.get_user(&realm_id, &user_id).await.unwrap().unwrap();
+        let token = issue_token_for_user(&state, &user).await;
+
+        let resp = change_password(&state, &token, "correct-horse", "N3wPassword!x").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            provider.updates.lock().unwrap().as_slice(),
+            [("feduser".to_string(), "N3wPassword!x".to_string())]
+        );
+        // The dormant local fallback credential is gone.
+        assert!(state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Password)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// RFC 4648 base32 (no padding required for 20-byte TOTP secrets).
+    fn base32_decode(s: &str) -> Vec<u8> {
+        let mut acc: u64 = 0;
+        let mut nbits: u32 = 0;
+        let mut out = Vec::new();
+        for c in s.chars() {
+            let v = match c {
+                'A'..='Z' => c as u8 - b'A',
+                'a'..='z' => c as u8 - b'a',
+                '2'..='7' => c as u8 - b'2' + 26,
+                '=' => continue,
+                _ => panic!("invalid base32 character: {c}"),
+            };
+            acc = (acc << 5) | u64::from(v);
+            nbits += 5;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((acc >> nbits) as u8);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn account_totp_verify_persists_credential_and_clears_enrollment() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+
+        let start = account_totp_start_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let start_json = body_json(start).await;
+        let secret = start_json["secret"].as_str().unwrap().to_string();
+
+        // Compute the current step's code with the realm's OTP policy.
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let policy = &realm.otp_policy;
+        let key = base32_decode(&secret);
+        let now = issuerd_core::utils::now_secs();
+        let code = totp::totp_at(
+            &key,
+            now / u64::from(policy.period_secs.max(1)),
+            policy.digits,
+            &policy.algorithm,
+        );
+
+        let resp = account_totp_verify_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Json(TotpVerifyRequest { code }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The authenticator is persisted with the verified secret.
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].secret_data, secret.as_bytes());
+        assert!(creds[0].credential_data["last_used_step"].is_number());
+        // The pending enrollment is consumed.
+        assert!(state
+            .cache
+            .get(&totp_enrollment_key(&realm_id, &user_id))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn passkey_display_name_prefers_full_name_then_username() {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user = make_user(&realm_id, "webby");
+        assert_eq!(passkey_display_name(&user), "webby");
+        user.first_name = Some(DisplayName::new("Ada").unwrap());
+        assert_eq!(passkey_display_name(&user), "Ada");
+        user.last_name = Some(DisplayName::new("Lovelace").unwrap());
+        assert_eq!(passkey_display_name(&user), "Ada Lovelace");
+        user.first_name = None;
+        assert_eq!(passkey_display_name(&user), "Lovelace");
+    }
+
+    // --- passkey ceremony helpers (hand-rolled soft authenticator) ----------
+
+    fn b64url(data: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
+    }
+
+    fn cose_ec2_key_cbor(x: &[u8], y: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xA5]; // map(5)
+        out.extend([0x01, 0x02]); // 1: 2 (kty EC2)
+        out.extend([0x03, 0x26]); // 3: -7 (ES256)
+        out.extend([0x20, 0x01]); // -1: 1 (P-256)
+        out.push(0x21); // -2: x
+        out.extend([0x58, 0x20]); // bytes(32)
+        out.extend_from_slice(x);
+        out.push(0x22); // -3: y
+        out.extend([0x58, 0x20]);
+        out.extend_from_slice(y);
+        out
+    }
+
+    fn none_attestation_object(auth_data: &[u8]) -> Vec<u8> {
+        assert!(auth_data.len() < 256);
+        let mut out = vec![0xA3]; // map(3)
+        out.push(0x63); // text(3)
+        out.extend(b"fmt");
+        out.push(0x64); // text(4)
+        out.extend(b"none");
+        out.push(0x67); // text(7)
+        out.extend(b"attStmt");
+        out.push(0xA0); // empty map
+        out.push(0x68); // text(8)
+        out.extend(b"authData");
+        out.extend([0x58, auth_data.len() as u8]); // bytes(n), n < 256
+        out.extend_from_slice(auth_data);
+        out
+    }
+
+    /// A genuine "none"-attestation registration credential answering the
+    /// given challenge (the relying party is `localhost` /
+    /// `http://localhost:8080`, the test config's issuer).
+    fn soft_register_credential(challenge: &str, cred_id: &[u8]) -> serde_json::Value {
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let public_key = key_pair.public_key().as_ref();
+        assert_eq!(public_key.len(), 65, "expected uncompressed P-256 point");
+        let (x, y) = (&public_key[1..33], &public_key[33..65]);
+
+        let mut auth_data =
+            ring::digest::digest(&ring::digest::SHA256, b"localhost").as_ref().to_vec();
+        auth_data.push(0x45); // user present | user verified | attested data
+        auth_data.extend([0, 0, 0, 0]); // counter 0
+        auth_data.extend([0u8; 16]); // zero AAGUID
+        auth_data.extend([0, 32]); // credential id length (u16 BE)
+        auth_data.extend_from_slice(cred_id);
+        auth_data.extend(cose_ec2_key_cbor(x, y));
+
+        let client_data = serde_json::to_vec(&serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": challenge,
+            "origin": "http://localhost:8080",
+            "crossOrigin": false,
+        }))
+        .unwrap();
+        serde_json::json!({
+            "id": b64url(cred_id),
+            "rawId": b64url(cred_id),
+            "response": {
+                "attestationObject": b64url(&none_attestation_object(&auth_data)),
+                "clientDataJSON": b64url(&client_data),
+            },
+            "type": "public-key",
+        })
+    }
+
+    /// Run one full register start→finish ceremony; returns the finish status.
+    async fn register_passkey(
+        state: &Arc<ServerState>,
+        token: &str,
+        cred_id_seed: u8,
+        label: Option<&str>,
+    ) -> StatusCode {
+        let start = account_webauthn_register_start_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(token),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let options = body_json(start).await;
+        let challenge = options["challenge"].as_str().unwrap().to_string();
+        let cred_id: Vec<u8> =
+            (0u8..32).map(|i| i.wrapping_mul(cred_id_seed).wrapping_add(1)).collect();
+        let credential = soft_register_credential(&challenge, &cred_id);
+        account_webauthn_register_finish_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(token),
+            Json(WebAuthnRegisterFinishRequest {
+                label: label.map(str::to_string),
+                credential,
+            }),
+        )
+        .await
+        .status()
+    }
+
+    #[tokio::test]
+    async fn account_webauthn_register_finish_trims_and_stores_label() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+
+        // A whitespace-only label trims away to None.
+        let status = register_passkey(&state, &access_token, 7, Some("   ")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::WebAuthn)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].user_label, None, "whitespace-only labels must be dropped");
+
+        // A real label is stored verbatim.
+        let status = register_passkey(&state, &access_token, 13, Some("Work laptop")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &user_id, CredentialType::WebAuthn)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 2);
+        assert!(creds.iter().any(|c| c.user_label.as_deref() == Some("Work laptop")));
+    }
+
+    #[tokio::test]
+    async fn account_credentials_reports_webauthn_variants() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let user_id = admin_user_id(&state).await;
+
+        // Baseline: password only (from the bootstrap), nothing else.
+        let resp = account_credentials_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json, serde_json::json!({"password": true, "totp": false, "webauthn": false}));
+
+        // A second-factor passkey alone flips the webauthn flag.
+        let cred = Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"passkey-bytes".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        state.storage.create_credential(&realm_id, &user_id, &cred).await.unwrap();
+        let resp = account_credentials_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+        )
+        .await;
+        let json = body_json(resp).await;
+        assert_eq!(json, serde_json::json!({"password": true, "totp": false, "webauthn": true}));
+
+        // A passwordless passkey alone also counts as webauthn.
+        let carol = make_user(&realm_id, "carol");
+        state.storage.create_user(&realm_id, &carol).await.unwrap();
+        let cred = Credential {
+            credential_type: CredentialType::WebAuthnPasswordless,
+            ..cred
+        };
+        state.storage.create_credential(&realm_id, &carol.id, &cred).await.unwrap();
+        let carol_token = issue_token_for_user(&state, &carol).await;
+        let resp = account_credentials_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&carol_token),
+        )
+        .await;
+        let json = body_json(resp).await;
+        assert_eq!(json, serde_json::json!({"password": false, "totp": false, "webauthn": true}));
+    }
+
+    #[tokio::test]
+    async fn internal_error_is_a_500_json_body() {
+        let resp = internal_error("boom");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "boom");
+    }
+
+    #[tokio::test]
+    async fn policy_error_response_is_a_400_with_violation_list() {
+        let err = PasswordPolicyError {
+            violations: vec![issuerd_core::PasswordPolicyViolation {
+                code: "min_length".to_string(),
+                message: "too short".to_string(),
+            }],
+        };
+        let resp = policy_error_response(err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["policyViolations"][0]["code"], "min_length");
+        assert!(json["error"].as_str().unwrap().contains("too short"));
+    }
+
+    async fn set_verify_email_enabled(state: &Arc<ServerState>, enabled: bool) {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.verify_email_enabled = enabled;
+        state.storage.update_realm(&realm).await.unwrap();
+        // The realm was already resolved (and cached) by the grant, so drop
+        // the name-lookup cache entry after the direct storage mutation.
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_update_me_applies_email_change_and_requests_verification() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        set_verify_email_enabled(&state, true).await;
+
+        let resp = update_me(
+            &state,
+            &access_token,
+            UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: Some(Some("admin-new@example.com".to_string())),
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["email"], "admin-new@example.com");
+        assert_eq!(json["email_verified"], false);
+
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        assert_eq!(user.email.as_ref().map(|e| e.as_str()), Some("admin-new@example.com"));
+        assert!(!user.email_verified);
+        assert_eq!(user.required_actions, vec!["VERIFY_EMAIL".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn account_update_me_unchanged_email_keeps_verified_state() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        set_verify_email_enabled(&state, true).await;
+
+        // Resubmitting the current address is a no-op: still verified, no
+        // VERIFY_EMAIL required action, no mail.
+        let resp = update_me(
+            &state,
+            &access_token,
+            UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: Some(Some("admin@localhost.local".to_string())),
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["email"], "admin@localhost.local");
+        assert_eq!(json["email_verified"], true);
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        assert!(user.email_verified);
+        assert!(user.required_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_update_me_rejects_duplicate_email() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let bob = make_user(&realm_id, "bob");
+        state.storage.create_user(&realm_id, &bob).await.unwrap();
+
+        let resp = update_me(
+            &state,
+            &access_token,
+            UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: Some(Some("bob@example.com".to_string())),
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "email already in use");
+        // Admin's email is untouched.
+        let admin = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        assert_eq!(admin.email.as_ref().map(|e| e.as_str()), Some("admin@localhost.local"));
+    }
+
+    #[tokio::test]
+    async fn account_update_me_clearing_email_never_requests_verification() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        set_verify_email_enabled(&state, true).await;
+
+        let resp = update_me(
+            &state,
+            &access_token,
+            UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: Some(None),
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["email"].is_null());
+        assert_eq!(json["email_verified"], false);
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        assert!(user.email.is_none());
+        assert!(!user.email_verified);
+        assert!(
+            user.required_actions.is_empty(),
+            "a cleared email must not enqueue VERIFY_EMAIL: {:?}",
+            user.required_actions
+        );
+    }
+
+    #[tokio::test]
+    async fn account_update_me_does_not_duplicate_verify_email_action() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut dave = make_user(&realm_id, "dave");
+        dave.required_actions.push("VERIFY_EMAIL".to_string());
+        state.storage.create_user(&realm_id, &dave).await.unwrap();
+        let token = issue_token_for_user(&state, &dave).await;
+        set_verify_email_enabled(&state, true).await;
+
+        let resp = update_me(
+            &state,
+            &token,
+            UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: Some(Some("dave-new@example.com".to_string())),
+                username: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let dave = state.storage.get_user_by_username(&realm_id, "dave").await.unwrap().unwrap();
+        assert_eq!(
+            dave.required_actions,
+            vec!["VERIFY_EMAIL".to_string()],
+            "VERIFY_EMAIL must not be duplicated"
+        );
+    }
+
+    fn jwt_with_payload(payload: serde_json::Value) -> String {
+        let b64 = |bytes: &[u8]| {
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+        };
+        format!("{}.{}.sig", b64(br#"{"alg":"none"}"#), b64(payload.to_string().as_bytes()))
+    }
+
+    #[test]
+    fn token_is_expired_reads_the_exp_claim() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(token_is_expired(&jwt_with_payload(serde_json::json!({"exp": now - 3600}))));
+        assert!(!token_is_expired(&jwt_with_payload(serde_json::json!({"exp": now + 3600}))));
+        // Malformed shapes are "not expired": the result only steers the log
+        // level of an already-rejected token.
+        assert!(!token_is_expired("not-a-jwt"));
+        assert!(!token_is_expired("a.!!!.b"));
+        assert!(!token_is_expired(&jwt_with_payload(serde_json::json!({"sub": "u"}))));
+        assert!(!token_is_expired(&jwt_with_payload(serde_json::json!({"exp": "soon"}))));
+    }
+
+    #[test]
+    fn token_is_expired_treats_exp_equal_to_now_as_valid() {
+        // exp == now must NOT count as expired (strict <). Retry across a
+        // potential second boundary between building and evaluating.
+        for _ in 0..10 {
+            let now = chrono::Utc::now().timestamp();
+            let token = jwt_with_payload(serde_json::json!({"exp": now}));
+            let result = token_is_expired(&token);
+            if chrono::Utc::now().timestamp() == now {
+                assert!(!result, "exp == now is not yet expired");
+                return;
+            }
+        }
+    }
 }

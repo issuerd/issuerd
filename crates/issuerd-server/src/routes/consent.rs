@@ -592,4 +592,405 @@ mod tests {
             "a scope outside the stored grant re-triggers the page"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Continuation state: cache-key schema, page rendering, submit handling.
+    // -----------------------------------------------------------------------
+
+    fn test_pending_auth(client_id: &str, redirect_uri: &str, scope: &[&str]) -> PendingAuthData {
+        PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            state: Some("state-xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: issuerd_core::FlowStageId::new("username-password").unwrap(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "challenged".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: true,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        }
+    }
+
+    fn consent_entry(pending: PendingAuthData) -> PendingConsentData {
+        PendingConsentData {
+            pending,
+            user_id: "admin".to_string(),
+            session_id: issuerd_core::utils::generate_id(),
+            // Distinct timestamps: the non-SSO resume must stamp the session
+            // with the flow-result time, not the SSO-preserved auth_time.
+            result_auth_time: chrono::Utc::now() - chrono::Duration::hours(1),
+            auth_time: chrono::Utc::now(),
+            is_browser_form: true,
+            sso_resume: false,
+            auth_method: AuthMethod::Spnego,
+            method_label: "password".to_string(),
+            error: None,
+            _typestate_tag: consent_tag(),
+        }
+    }
+
+    /// Seed the pending-consent entry under its cache key; returns the key.
+    async fn seed_entry(
+        state: &Arc<ServerState>,
+        execution: &str,
+        entry: &PendingConsentData,
+    ) -> String {
+        let key = pending_consent_cache_key(&RealmId::new("master").unwrap(), execution);
+        state
+            .cache
+            .set(&key, serde_json::to_vec(entry).unwrap(), Some(Duration::from_secs(600)))
+            .await
+            .unwrap();
+        key
+    }
+
+    fn cookie_headers(state: &Arc<ServerState>, execution: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let cookie = flow_cookie_header(execution, state.config.secure_cookies());
+        headers.insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+        headers
+    }
+
+    /// The consent-required test client: display name for the page, a
+    /// registered redirect URI for the submit paths.
+    fn named_client_model(realm_id: &RealmId) -> Client {
+        Client {
+            id: ClientId::new("named-client-uuid").unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: ClientIdentifier::new("named-client").unwrap(),
+            name: Some(issuerd_core::DisplayName::new("My App").unwrap()),
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: true,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![issuerd_core::RedirectUri::new(
+                "https://app.example.com/callback".to_string(),
+            )
+            .unwrap()],
+            web_origins: vec![],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::empty(),
+            consent_required: true,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    async fn named_client(state: &Arc<ServerState>, realm_id: &RealmId) -> Client {
+        let client = named_client_model(realm_id);
+        state.storage.create_client(realm_id, &client).await.unwrap();
+        client
+    }
+
+    fn admin_user_model(realm_id: &RealmId) -> User {
+        User {
+            id: UserId::new("admin").unwrap(),
+            realm_id: realm_id.clone(),
+            username: issuerd_core::Username::new("admin").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn seed_scope(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        name: &str,
+        description: Option<&str>,
+    ) {
+        let scope = issuerd_core::ClientScope {
+            id: issuerd_core::ClientScopeId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            protocol: ClientProtocol::OpenIdConnect,
+            attributes: HashMap::new(),
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+        };
+        state.storage.create_client_scope(realm_id, &scope).await.unwrap();
+    }
+
+    #[test]
+    fn pending_consent_cache_key_scopes_realm_and_execution() {
+        let realm = RealmId::new("master").unwrap();
+        assert_eq!(pending_consent_cache_key(&realm, "exec-1"), "pending_consent:master:exec-1");
+        assert_ne!(
+            pending_consent_cache_key(&realm, "exec-1"),
+            pending_consent_cache_key(&RealmId::new("other").unwrap(), "exec-1")
+        );
+        assert_ne!(
+            pending_consent_cache_key(&realm, "exec-1"),
+            pending_consent_cache_key(&realm, "exec-2")
+        );
+    }
+
+    #[test]
+    fn consent_tag_is_the_stable_typestate_marker() {
+        assert_eq!(consent_tag(), "consent");
+        // Entries written before the tag field existed still deserialize,
+        // tagged as consent entries by the serde default.
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid"],
+        ));
+        let mut json = serde_json::to_value(&entry).unwrap();
+        json.as_object_mut().unwrap().remove("_typestate_tag");
+        let parsed: PendingConsentData = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed._typestate_tag, "consent");
+    }
+
+    #[test]
+    fn continuation_url_points_at_the_consent_endpoint() {
+        assert_eq!(continuation_url("master", "exec-1"), "/realms/master/login/consent/exec-1");
+    }
+
+    #[tokio::test]
+    async fn begin_consent_redirects_browser_and_stores_entry() {
+        let (state, realm_id, _user_id) = setup().await;
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid"],
+        ));
+        let resp = begin_consent(&state, "master", entry.clone()).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers()["location"].to_str().unwrap();
+        let prefix = "/realms/master/login/consent/";
+        assert!(location.starts_with(prefix), "location: {location}");
+        let execution = &location[prefix.len()..];
+        let set_cookie = resp.headers()["set-cookie"].to_str().unwrap();
+        assert!(
+            set_cookie.contains(&format!("issuerd_flow_{execution}=1")),
+            "cookie: {set_cookie}"
+        );
+
+        // The paused login waits in the cache under the execution key.
+        let bytes = state
+            .cache
+            .get(&pending_consent_cache_key(&realm_id, execution))
+            .await
+            .unwrap()
+            .expect("pending consent entry");
+        let stored: PendingConsentData = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.user_id, entry.user_id);
+        assert_eq!(stored.pending.client_id, "named-client");
+    }
+
+    #[tokio::test]
+    async fn consent_page_renders_client_name_and_scope_labels() {
+        let (state, realm_id, _user_id) = setup().await;
+        named_client(&state, &realm_id).await;
+        // A scope with a real description renders "name — description"; a
+        // whitespace-only description falls back to the bare scope name.
+        seed_scope(&state, &realm_id, "read:files", Some("Read your files")).await;
+        seed_scope(&state, &realm_id, "reports", Some("   ")).await;
+
+        let execution = "exec-page";
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid", "read:files", "reports"],
+        ));
+        seed_entry(&state, execution, &entry).await;
+
+        let resp =
+            consent_page(State(state.clone()), Path(("master".to_string(), execution.to_string())))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<strong>My App</strong>"), "body: {body}");
+        assert!(body.contains("<li>read:files — Read your files</li>"), "body: {body}");
+        assert!(body.contains("<li>reports</li>"), "body: {body}");
+        assert!(!body.contains("reports —"), "body: {body}");
+        assert!(
+            body.contains("action=\"/realms/master/login/consent/exec-page\""),
+            "body: {body}"
+        );
+        assert!(body.contains("Grant access"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn consent_submit_without_flow_cookie_is_forbidden() {
+        let (state, _realm_id, _user_id) = setup().await;
+        let resp = consent_submit(
+            State(state),
+            Path(("master".to_string(), "exec-1".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"decision=allow"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn consent_submit_denial_redirects_access_denied_and_consumes_entry() {
+        let (state, realm_id, user_id) = setup().await;
+        named_client(&state, &realm_id).await;
+        let execution = "exec-deny";
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid"],
+        ));
+        let key = seed_entry(&state, execution, &entry).await;
+
+        let resp = consent_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.to_string())),
+            cookie_headers(&state, execution),
+            Bytes::from_static(b"decision=deny"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers()["location"].to_str().unwrap();
+        assert!(
+            location.starts_with("https://app.example.com/callback?"),
+            "location: {location}"
+        );
+        assert!(location.contains("error=access_denied"), "location: {location}");
+        assert!(location.contains("state=state-xyz"), "location: {location}");
+
+        // No grant is persisted, and the entry is consumed (single-submit).
+        assert!(state.storage.get_consents(&realm_id, &user_id).await.unwrap().is_empty());
+        assert!(state.cache.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn consent_submit_approval_persists_grant_and_resumes_login() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = named_client(&state, &realm_id).await;
+        let execution = "exec-allow";
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid"],
+        ));
+        let session_id = entry.session_id.clone();
+        let result_auth_time = entry.result_auth_time;
+        let key = seed_entry(&state, execution, &entry).await;
+
+        let resp = consent_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.to_string())),
+            cookie_headers(&state, execution),
+            Bytes::from_static(b"decision=allow"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers()["location"].to_str().unwrap();
+        assert!(
+            location.starts_with("https://app.example.com/callback?"),
+            "location: {location}"
+        );
+        assert!(location.contains("code="), "location: {location}");
+        assert!(location.contains("state=state-xyz"), "location: {location}");
+
+        // The grant is persisted, keyed on the client's internal id.
+        let consents = state.storage.get_consents(&realm_id, &user_id).await.unwrap();
+        assert_eq!(consents.len(), 1);
+        assert_eq!(consents[0].client_id, client.id);
+        assert!(consents[0].granted_scopes.contains("openid"));
+
+        // The login resumed on the non-SSO path: a fresh session stamped with
+        // the flow-result time and the entry's auth method.
+        let session = state
+            .storage
+            .get_user_session(&realm_id, &SessionId::new(session_id).unwrap())
+            .await
+            .unwrap()
+            .expect("resumed session");
+        assert_eq!(session.auth_method, AuthMethod::Spnego);
+        assert_eq!(session.auth_time, result_auth_time);
+
+        // Single-submit: the entry is gone.
+        assert!(state.cache.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn consent_submit_restores_entry_and_redirects_when_grant_persist_fails() {
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = Realm {
+            id: realm_id.clone(),
+            name: issuerd_core::RealmName::new("master").unwrap(),
+            display_name: None,
+            enabled: true,
+            ..Default::default()
+        };
+        let user = admin_user_model(&realm_id);
+        let client = named_client_model(&realm_id);
+
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_realm_by_name()
+            .returning(move |name| Ok((name == "master").then(|| realm.clone())));
+        storage.expect_get_user().returning(move |_, _| Ok(Some(user.clone())));
+        storage
+            .expect_get_client_by_client_id()
+            .returning(move |_, _| Ok(Some(client.clone())));
+        storage
+            .expect_create_consent()
+            .returning(|_, _| Err(issuerd_core::IssuerdError::ServerError("db down".to_string())));
+
+        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        state.storage = Arc::new(storage);
+        let state = Arc::new(state);
+
+        let execution = "exec-persist-fail";
+        let entry = consent_entry(test_pending_auth(
+            "named-client",
+            "https://app.example.com/callback",
+            &["openid"],
+        ));
+        let key = seed_entry(&state, execution, &entry).await;
+
+        let resp = consent_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.to_string())),
+            cookie_headers(&state, execution),
+            Bytes::from_static(b"decision=allow"),
+        )
+        .await;
+        // PRG: back to the consent page, with the entry (and the one-shot
+        // error banner) restored for the retry.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()["location"].to_str().unwrap(),
+            format!("/realms/master/login/consent/{execution}")
+        );
+        let bytes = state.cache.get(&key).await.unwrap().expect("entry restored after failure");
+        let restored: PendingConsentData = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            restored.error.as_deref(),
+            Some("could not record your choice — please try again")
+        );
+    }
 }
