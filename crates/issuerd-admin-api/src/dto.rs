@@ -2570,6 +2570,60 @@ mod tests {
     }
 
     #[test]
+    fn credential_try_from_temporary_flag_rides_into_credential_data() {
+        let base = CredentialRepresentation {
+            id: None,
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: None,
+            secret_data: None,
+            credential_data: None,
+            priority: None,
+            temporary: Some(true),
+            value: None,
+        };
+        // No credential_data: the flag alone materializes.
+        let cred: Credential = base.clone().try_into().unwrap();
+        assert_eq!(cred.credential_data, serde_json::json!({"temporary": true}));
+
+        // An opaque (non-object) credential_data string cannot hold the flag
+        // and is replaced by the object carrying it.
+        let cred: Credential = CredentialRepresentation {
+            credential_data: Some("opaque".to_string()),
+            ..base.clone()
+        }
+        .try_into()
+        .unwrap();
+        assert_eq!(cred.credential_data, serde_json::json!({"temporary": true}));
+    }
+
+    #[test]
+    fn credential_try_from_non_temporary_leaves_credential_data_alone() {
+        let base = CredentialRepresentation {
+            id: None,
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: None,
+            secret_data: None,
+            credential_data: None,
+            priority: None,
+            temporary: None,
+            value: None,
+        };
+        // temporary omitted: no flag materializes.
+        let cred: Credential = base.clone().try_into().unwrap();
+        assert_eq!(cred.credential_data, serde_json::Value::Null);
+        // temporary = false is not temporary: no flag materializes either.
+        let cred: Credential = CredentialRepresentation {
+            temporary: Some(false),
+            ..base
+        }
+        .try_into()
+        .unwrap();
+        assert_eq!(cred.credential_data, serde_json::Value::Null);
+    }
+
+    #[test]
     fn role_try_from_representation() {
         let rep = RoleRepresentation {
             id: Some("role-1".to_string()),

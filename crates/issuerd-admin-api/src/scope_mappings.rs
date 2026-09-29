@@ -933,4 +933,82 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
+
+    #[tokio::test]
+    async fn available_client_roles_lists_the_unassigned_target_roles() {
+        let state = manage_state();
+        let app = scope_mapping_routes(state.clone());
+        let (realm, client_id, target_id, _, client_role) = fixture(&state).await;
+        let base =
+            format!("/admin/realms/{realm}/clients/{client_id}/scope-mappings/clients/{target_id}");
+
+        // Before anything is assigned, the target client's role is available.
+        let response = app
+            .clone()
+            .oneshot(authed("GET", format!("{base}/available"), None))
+            .await
+            .unwrap();
+        let available = body_json(response).await;
+        let names: Vec<&str> = available
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["target-role"]);
+
+        // After assigning it, it leaves the available set.
+        let response = app
+            .clone()
+            .oneshot(authed("POST", base.clone(), Some(format!("[{}]", role_ref(&client_role)))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app.oneshot(authed("GET", format!("{base}/available"), None)).await.unwrap();
+        assert!(body_json(response).await.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scope_mapping_mutations_emit_admin_events() {
+        let state = manage_state();
+        let app = scope_mapping_routes(state.clone());
+        let (realm, client_id, _, realm_role, _) = fixture(&state).await;
+        let base = format!("/admin/realms/{realm}/clients/{client_id}/scope-mappings/realm");
+
+        // The fixture realm records admin events by default: add and remove
+        // each write one, addressed at the scope-mappings sub-resource.
+        let response = app
+            .clone()
+            .oneshot(authed("POST", base.clone(), Some(format!("[{}]", role_ref(&realm_role)))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .oneshot(authed("DELETE", base, Some(format!("[{}]", role_ref(&realm_role)))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = state
+            .storage
+            .query_admin_events(
+                &issuerd_core::RealmId::new("realm-1").unwrap(),
+                &issuerd_core::AdminEventQuery {
+                    operation_type: None,
+                    resource_type: None,
+                    auth_user_id: None,
+                    date_from: None,
+                    date_to: None,
+                    pagination: issuerd_core::Pagination::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2, "add + remove each record an admin event");
+        assert!(
+            events.iter().all(|e| e.resource_type == issuerd_core::ResourceType::Client
+                && e.resource_path.ends_with("/scope-mappings/realm")),
+            "events address the scope-mappings sub-resource: {events:?}"
+        );
+    }
 }

@@ -1048,4 +1048,147 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    async fn create_second_client(
+        state: &Arc<AdminApiState>,
+        realm_id: &issuerd_core::RealmId,
+    ) -> issuerd_core::Client {
+        let client = issuerd_core::Client {
+            id: issuerd_core::ClientId::new("client-2").unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: issuerd_core::ClientIdentifier::new("other-app").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: issuerd_core::ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: issuerd_core::ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: issuerd_core::Scope::empty(),
+            optional_scopes: issuerd_core::Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: std::collections::HashMap::new(),
+        };
+        state.storage.create_client(realm_id, &client).await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn realm_role_composites_clients_filters_to_the_listing_client() {
+        let state = manager_state();
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        let other = create_second_client(&state, &realm.id).await;
+        create_role(&state, &realm.id, "role-p", "parent", None).await;
+        create_role(&state, &realm.id, "role-a", "a-role", Some(&client)).await;
+        create_role(&state, &realm.id, "role-b", "b-role", Some(&other)).await;
+
+        let status = send_reps(
+            &app,
+            "POST",
+            "/admin/realms/test/roles/parent/composites".to_string(),
+            &format!(
+                r#"[{{"name":"a-role","client_role":true,"container_id":"{}"}},{{"name":"b-role","client_role":true,"container_id":"{}"}}]"#,
+                client.id, other.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The per-client sub-listing shows only the listing client's roles…
+        let (_, names) = get_names(
+            &app,
+            format!("/admin/realms/test/roles/parent/composites/clients/{}", client.id),
+        )
+        .await;
+        assert_eq!(names, vec!["a-role"]);
+        // …for either client.
+        let (_, names) = get_names(
+            &app,
+            format!("/admin/realms/test/roles/parent/composites/clients/{}", other.id),
+        )
+        .await;
+        assert_eq!(names, vec!["b-role"]);
+    }
+
+    #[tokio::test]
+    async fn client_role_composites_clients_empty_for_unrelated_listing_client() {
+        let state = manager_state();
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        let other = create_second_client(&state, &realm.id).await;
+        create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        create_role(&state, &realm.id, "role-c", "app-child", Some(&client)).await;
+
+        let base = format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id);
+        let status = send_reps(&app, "POST", base.clone(), r#"[{"name":"app-child"}]"#).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The owning client's listing shows the child…
+        let (_, names) = get_names(&app, format!("{base}/clients/{}", client.id)).await;
+        assert_eq!(names, vec!["app-child"]);
+        // …but an unrelated client's listing shows nothing: the child belongs
+        // to a different client (an OR-ed filter would leak it here).
+        let (status, names) = get_names(&app, format!("{base}/clients/{}", other.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(names.is_empty(), "foreign client roles must not leak: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn realm_role_composite_dangling_name_is_skipped() {
+        let state = manager_state();
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        let parent = create_role(&state, &realm.id, "role-p", "parent", None).await;
+        // A client role that must NOT be picked up as a substitute for the
+        // dangling realm-role name.
+        create_role(&state, &realm.id, "role-x", "unrelated-client-role", Some(&client)).await;
+
+        // "ghost-name" was left behind by a deleted realm role.
+        let mut parent = parent;
+        parent.composites = vec![issuerd_core::RoleName::new("ghost-name").unwrap()];
+        parent.composite = true;
+        state.storage.update_role(&realm.id, &parent).await.unwrap();
+
+        let (status, names) =
+            get_names(&app, "/admin/realms/test/roles/parent/composites".to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(names.is_empty(), "dangling composite name resolves to nothing: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn client_role_composite_dangling_name_is_skipped() {
+        let state = manager_state();
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        let other = create_second_client(&state, &realm.id).await;
+        let parent = create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        // "ghost" exists only as a role of a DIFFERENT client — it must not
+        // resolve as a child of this client's role.
+        create_role(&state, &realm.id, "role-g", "ghost", Some(&other)).await;
+
+        let mut parent = parent;
+        parent.composites = vec![issuerd_core::RoleName::new("ghost").unwrap()];
+        parent.composite = true;
+        state.storage.update_role(&realm.id, &parent).await.unwrap();
+
+        let (status, names) = get_names(
+            &app,
+            format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(names.is_empty(), "another client's role is not a child: {names:?}");
+    }
 }

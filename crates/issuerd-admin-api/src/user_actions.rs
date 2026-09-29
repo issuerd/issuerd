@@ -664,6 +664,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_actions_email_states_the_expiry_in_minutes() {
+        let sender = Arc::new(RecordingEmailSender::new());
+        let state = email_test_state(
+            vec![issuerd_core::RoleName::new("manage-users").unwrap()],
+            sender.clone(),
+        );
+        let app = action_routes(state.clone());
+        let (realm, user_id) = realm_and_user(&state, Some("alice@example.com")).await;
+
+        // 3600 seconds render as "60 minutes" in the human-facing body.
+        let (status, _) = call(
+            app,
+            "PUT",
+            format!("/admin/realms/{realm}/users/{user_id}/execute-actions-email?lifespan=3600"),
+            Some(r#"["UPDATE_PASSWORD"]"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, _, text, html) = {
+            let sent = sender.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            sent[0].clone()
+        };
+        assert!(text.contains("60 minutes"), "text body renders the minutes: {text}");
+        assert!(html.as_ref().unwrap().contains("60 minutes"), "html body renders the minutes");
+    }
+
+    #[tokio::test]
     async fn execute_actions_email_send_failure_is_500() {
         struct FailingSender;
         #[async_trait::async_trait]

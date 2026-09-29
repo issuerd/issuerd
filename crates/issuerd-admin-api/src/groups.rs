@@ -2061,4 +2061,297 @@ mod tests {
             .unwrap();
         assert!(groups.is_empty());
     }
+
+    #[tokio::test]
+    async fn list_groups_returns_seeded_groups() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let realm = realm_fixture();
+        state.storage.create_realm(&realm).await.unwrap();
+        for (id, name) in [("group-1", "admins"), ("group-2", "developers")] {
+            let group = group_fixture(&realm.id, id, name, &format!("/{name}"), None);
+            state.storage.create_group(&realm.id, &group).await.unwrap();
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/realms/test/groups")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let groups: Vec<GroupRepresentation> = serde_json::from_slice(&body).unwrap();
+        let mut names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["admins", "developers"]);
+    }
+
+    #[tokio::test]
+    async fn group_client_roles_endpoints_return_assigned_roles() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let (realm_name, group) = role_mapping_fixture(&state).await;
+        let client = create_client(&state, "client-1", "my-app").await;
+        create_role(&state, "role-a", "app-admin", Some(&client)).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"[{"id":"role-a","name":"app-admin"}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The assigned list (plain GET) returns the role…
+        for suffix in ["", "/composite"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1{suffix}",
+                            group.id
+                        ))
+                        .header("Authorization", "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let roles: Vec<RoleRepresentation> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                vec!["app-admin"],
+                "{suffix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn group_effective_client_roles_exclude_other_clients() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let (realm_name, group) = role_mapping_fixture(&state).await;
+        let client = create_client(&state, "client-1", "my-app").await;
+        let other = create_client(&state, "client-2", "other-app").await;
+        create_role(&state, "role-a", "app-admin", Some(&client)).await;
+        create_role(&state, "role-x", "other-role", Some(&other)).await;
+
+        // Assign one role per client.
+        for (client_uuid, role_id, role_name) in [
+            ("client-1", "role-a", "app-admin"),
+            ("client-2", "role-x", "other-role"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/{client_uuid}",
+                            group.id
+                        ))
+                        .header("Authorization", "Bearer valid-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(
+                            r#"[{{"id":"{role_id}","name":"{role_name}"}}]"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        // The effective listing for client-1 must not leak client-2's role.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1/composite",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let roles: Vec<RoleRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["app-admin"]);
+    }
+
+    #[tokio::test]
+    async fn group_client_roles_resolve_only_same_container_names() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let (realm_name, group) = role_mapping_fixture(&state).await;
+        create_client(&state, "client-1", "my-app").await;
+        let other = create_client(&state, "client-2", "other-app").await;
+        // "shared-name" exists as a realm role and as a role of ANOTHER
+        // client — never on client-1 itself.
+        create_role(&state, "role-r", "shared-name", None).await;
+        create_role(&state, "role-o", "shared-name", Some(&other)).await;
+
+        // The group names "shared-name" under client-1.
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let mut group = group;
+        group.client_roles.insert(
+            issuerd_core::ClientId::new("client-1").unwrap(),
+            vec![issuerd_core::RoleName::new("shared-name").unwrap()],
+        );
+        state.storage.update_group(&realm_id, &group).await.unwrap();
+
+        // Nothing resolves: a same-named realm role or another client's role
+        // is not client-1's role.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let roles: Vec<RoleRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert!(roles.is_empty(), "foreign same-named roles must not resolve: {roles:?}");
+    }
+
+    #[tokio::test]
+    async fn group_realm_roles_resolve_only_realm_roles() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let (realm_name, group) = role_mapping_fixture(&state).await;
+        let client = create_client(&state, "client-1", "my-app").await;
+        // "shared" exists only as a CLIENT role; "decoy" is an unrelated
+        // realm role.
+        create_role(&state, "role-c", "shared", Some(&client)).await;
+        create_role(&state, "role-d", "decoy", None).await;
+
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let mut group = group;
+        group.realm_roles = vec![issuerd_core::RoleName::new("shared").unwrap()];
+        state.storage.update_group(&realm_id, &group).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/realm",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let roles: Vec<RoleRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            roles.is_empty(),
+            "a client role name must not resolve as a realm mapping: {roles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_client_roles_reject_foreign_container() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-realm").unwrap()
+            ]);
+        let app = group_routes(state.clone());
+        let (realm_name, group) = role_mapping_fixture(&state).await;
+        create_client(&state, "client-1", "my-app").await;
+        let other = create_client(&state, "client-2", "other-app").await;
+        create_role(&state, "role-x", "other-role", Some(&other)).await;
+
+        // A role of client-2 addressed through client-1's endpoint is a 404
+        // on add…
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"[{"id":"role-x","name":"other-role"}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // …and on remove.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/groups/{}/role-mappings/clients/client-1",
+                        group.id
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"[{"id":"role-x","name":"other-role"}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Nothing was stored under either client.
+        let stored = state
+            .storage
+            .get_group(&issuerd_core::RealmId::new("realm-1").unwrap(), &group.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.client_roles.is_empty());
+    }
 }

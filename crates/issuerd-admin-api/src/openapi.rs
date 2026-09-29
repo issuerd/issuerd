@@ -346,4 +346,42 @@ mod tests {
     fn openapi_does_not_overflow() {
         let _ = AdminApiDoc::openapi();
     }
+
+    #[test]
+    fn security_addon_registers_bearer_and_oidc_schemes() {
+        let doc = AdminApiDoc::openapi();
+        let components = doc.components.as_ref().expect("components present");
+        let schemes = &components.security_schemes;
+
+        let bearer = schemes.get("bearer_auth").expect("bearer_auth scheme registered");
+        match bearer {
+            utoipa::openapi::security::SecurityScheme::Http(http) => {
+                assert!(
+                    http.scheme == utoipa::openapi::security::HttpAuthScheme::Bearer,
+                    "bearer_auth uses the bearer HTTP scheme"
+                );
+                assert_eq!(http.bearer_format.as_deref(), Some("JWT"));
+            }
+            _ => panic!("bearer_auth must be an HTTP scheme"),
+        }
+
+        let oidc = schemes.get("oidc_auth").expect("oidc_auth scheme registered");
+        match oidc {
+            utoipa::openapi::security::SecurityScheme::OAuth2(oauth2) => {
+                let flow = oauth2
+                    .flows
+                    .get("authorizationCode")
+                    .expect("oidc_auth carries an authorization-code flow");
+                match flow {
+                    utoipa::openapi::security::Flow::AuthorizationCode(code) => {
+                        assert_eq!(code.token_url, "/realms/master/protocol/openid-connect/token");
+                        let serialized = serde_json::to_string(&code).unwrap();
+                        assert!(serialized.contains("openid"), "flow advertises the openid scope");
+                    }
+                    _ => panic!("oidc_auth must use the authorization-code flow"),
+                }
+            }
+            _ => panic!("oidc_auth must be an OAuth2 scheme"),
+        }
+    }
 }

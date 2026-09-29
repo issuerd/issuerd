@@ -856,4 +856,58 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
+
+    #[test]
+    fn key_params_derives_rsa_bits_from_modulus_length() {
+        // An RSA-2048 modulus base64url-encodes to 342 chars; 6 bits per char
+        // rounded down to whole bytes restores the 2048-bit size.
+        let rsa = issuerd_token::KeyStore::generate_key(Algorithm::Rs256, 2048).unwrap();
+        assert_eq!(key_params(&rsa.public_jwk), (Algorithm::Rs256, 2048));
+
+        // Non-RSA keys carry no modulus: the size defaults to 2048 and is
+        // ignored by generation downstream.
+        let ed = issuerd_token::KeyStore::generate_key(Algorithm::EdDsa, 2048).unwrap();
+        assert_eq!(key_params(&ed.public_jwk), (Algorithm::EdDsa, 2048));
+    }
+
+    #[tokio::test]
+    async fn rotate_keys_tie_prefers_server_default_algorithm() {
+        // Two active keys persisted in the same microsecond (the fresh-boot
+        // pair can land like that): the empty-body rotation must pick the
+        // server-default algorithm (EdDSA), not whichever key the kid
+        // tie-break or storage iteration order would surface. The EdDSA key
+        // deliberately gets the SMALLER kid so a broken algorithm tie-break
+        // deterministically resolves to RS256 instead.
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        create_test_realm(&storage, false).await;
+        let created_at = chrono::Utc::now();
+        let mut ed = issuerd_token::KeyStore::generate_key(Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(true);
+        ed.created_at = created_at;
+        ed.kid = issuerd_core::KeyId::new("aaaa").unwrap();
+        let mut rsa = issuerd_token::KeyStore::generate_key(Algorithm::Rs256, 2048)
+            .unwrap()
+            .to_stored(true);
+        rsa.created_at = created_at;
+        rsa.kid = issuerd_core::KeyId::new("zzzz").unwrap();
+        issuerd_core::Storage::create_signing_key(storage.as_ref(), &ed).await.unwrap();
+        issuerd_core::Storage::create_signing_key(storage.as_ref(), &rsa).await.unwrap();
+
+        let (reload, _) = flag_reload();
+        let state = test_state(storage, reload);
+
+        let (status, body) =
+            call(key_routes(state.clone()), "POST", "/admin/realms/test/keys/rotate").await;
+        assert_eq!(status, StatusCode::OK);
+        let meta: KeysMetadataRepresentation = serde_json::from_slice(&body).unwrap();
+
+        // A new EdDSA key is active; the seeded EdDSA key is demoted, the
+        // other-algorithm RS256 key keeps signing.
+        let ed_kid = meta.active.get("EdDSA").expect("EdDSA stays active").clone();
+        assert_ne!(ed_kid, "aaaa", "rotation replaced the seeded EdDSA key");
+        assert_eq!(meta.active.get("RS256").map(String::as_str), Some("zzzz"));
+        let demoted = meta.passive.iter().find(|k| k.kid == "aaaa").unwrap();
+        assert_eq!(demoted.status, issuerd_core::KeyStatus::Passive);
+    }
 }

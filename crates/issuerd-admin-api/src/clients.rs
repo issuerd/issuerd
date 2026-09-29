@@ -1212,4 +1212,142 @@ mod tests {
         }
         assert_eq!(rep.optional_scopes.unwrap(), vec!["phone".to_string()]);
     }
+
+    #[tokio::test]
+    async fn create_client_duplicate_client_id_returns_409() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        // "my-app" is taken by the fixture client: a second registration must
+        // conflict (not a silent duplicate or a storage-layer 400/500).
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"my-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn update_client_rename_onto_taken_client_id_returns_409() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/clients"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"second-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let created: ClientRepresentation = serde_json::from_slice(&body).unwrap();
+        let second_id = created.id.unwrap();
+
+        // Renaming second-app onto the existing "my-app" identifier conflicts.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/admin/realms/{realm_name}/clients/{second_id}"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"my-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored = state
+            .storage
+            .get_client(
+                &issuerd_core::RealmId::new("realm-1").unwrap(),
+                &issuerd_core::ClientId::new(&second_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id.as_ref(), "second-app", "rename rejected atomically");
+
+        // Renaming onto the client's OWN identifier is not a conflict.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/admin/realms/{realm_name}/clients/{second_id}"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"second-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn update_client_rename_drops_new_identifier_cache_key() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = client_routes(state.clone());
+        let (realm_name, client_id) = create_test_realm_and_client(&state).await;
+
+        // A stale read-model entry under the NEW identifier must not survive
+        // the rename (it would shadow the renamed client's claims lookups).
+        let new_key = issuerd_cluster::cache_keys::client("realm-1", "renamed-app");
+        state.cache.set(&new_key, b"stale".to_vec(), None).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/admin/realms/{realm_name}/clients/{client_id}"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"client_id":"renamed-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.cache.get(&new_key).await.unwrap().is_none(),
+            "rename dropped the new identifier's cache entry"
+        );
+        let stored = state
+            .storage
+            .get_client(
+                &issuerd_core::RealmId::new("realm-1").unwrap(),
+                &issuerd_core::ClientId::new(&client_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id.as_ref(), "renamed-app");
+    }
 }

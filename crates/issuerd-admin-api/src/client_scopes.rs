@@ -2023,4 +2023,274 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn scope_list_add_appends_and_dedups() {
+        // Tokens are sorted/deduped on rebuild, so expectations are exact.
+        let base = issuerd_core::Scope::from(vec!["roles".to_string()]);
+        let added = scope_list_add(&base, "email");
+        assert_eq!(added.to_vec(), vec!["email".to_string(), "roles".to_string()]);
+        // Adding a token already present is a no-op (no duplicates).
+        let again = scope_list_add(&added, "email");
+        assert_eq!(again.to_vec(), vec!["email".to_string(), "roles".to_string()]);
+    }
+
+    #[test]
+    fn scope_list_remove_drops_only_the_named_token() {
+        let base = issuerd_core::Scope::from(vec!["email".to_string(), "roles".to_string()]);
+        let removed = scope_list_remove(&base, "email");
+        assert_eq!(removed.to_vec(), vec!["roles".to_string()]);
+        // Removing a token that is not present leaves the list untouched.
+        let untouched = scope_list_remove(&base, "address");
+        assert_eq!(untouched.to_vec(), vec!["email".to_string(), "roles".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn assign_two_default_scopes_keeps_both_lists_in_sync() {
+        let state = manage_state();
+        let app = client_scope_routes(state.clone());
+        let (realm, client_id) = fixture(&state).await;
+        let email_id = scope_id_by_name(&state, "email").await;
+        let profile_id = scope_id_by_name(&state, "profile").await;
+
+        // Two sequential assignments must both land: the second add starts
+        // from a non-empty list, where a flipped membership check would drop
+        // it silently.
+        for scope_id in [&email_id, &profile_id] {
+            let response = app
+                .clone()
+                .oneshot(authed(
+                    "PUT",
+                    format!(
+                        "/admin/realms/{realm}/clients/{client_id}/default-client-scopes/{scope_id}"
+                    ),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        // Re-assigning the same scope must not duplicate the token.
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "PUT",
+                format!(
+                    "/admin/realms/{realm}/clients/{client_id}/default-client-scopes/{email_id}"
+                ),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let client = state
+            .storage
+            .get_client(
+                &RealmId::new("realm-1").unwrap(),
+                &issuerd_core::ClientId::new(&client_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let defaults = client.default_scopes.to_vec();
+        assert!(defaults.contains(&"email".to_string()), "email assigned: {defaults:?}");
+        assert!(defaults.contains(&"profile".to_string()), "profile assigned: {defaults:?}");
+        assert_eq!(
+            defaults.iter().filter(|t| t.as_str() == "email").count(),
+            1,
+            "re-assignment deduped: {defaults:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unassign_scope_preserves_the_other_list() {
+        let state = manage_state();
+        let app = client_scope_routes(state.clone());
+        let (realm, client_id) = fixture(&state).await;
+        let email_id = scope_id_by_name(&state, "email").await;
+        let address_id = scope_id_by_name(&state, "address").await;
+
+        // email as default, address as optional.
+        for (kind, scope_id) in [("default", &email_id), ("optional", &address_id)] {
+            let response = app
+                .clone()
+                .oneshot(authed(
+                    "PUT",
+                    format!(
+                        "/admin/realms/{realm}/clients/{client_id}/{kind}-client-scopes/{scope_id}"
+                    ),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        // Unassigning email must drop ONLY "email": the optional "address"
+        // assignment survives (a remove-all regression would clear it too).
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "DELETE",
+                format!(
+                    "/admin/realms/{realm}/clients/{client_id}/default-client-scopes/{email_id}"
+                ),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let client = state
+            .storage
+            .get_client(
+                &RealmId::new("realm-1").unwrap(),
+                &issuerd_core::ClientId::new(&client_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!client.default_scopes.contains("email"));
+        assert!(
+            client.optional_scopes.contains("address"),
+            "unrelated optional assignment preserved: {:?}",
+            client.optional_scopes
+        );
+    }
+
+    #[tokio::test]
+    async fn update_scope_rename_onto_other_scope_conflicts() {
+        let state = manage_state();
+        let app = client_scope_routes(state.clone());
+        let (realm, _) = fixture(&state).await;
+        let profile_id = scope_id_by_name(&state, "profile").await;
+
+        // Renaming "profile" onto the existing "email" scope is a conflict…
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "PUT",
+                format!("/admin/realms/{realm}/client-scopes/{profile_id}"),
+                Some(r#"{"name":"email"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // …and the stored scope keeps its name.
+        let stored = state
+            .storage
+            .get_client_scope_by_name(&RealmId::new("realm-1").unwrap(), "profile")
+            .await
+            .unwrap();
+        assert!(stored.is_some(), "profile not renamed onto email");
+
+        // Renaming onto a FREE name succeeds.
+        let response = app
+            .oneshot(authed(
+                "PUT",
+                format!("/admin/realms/{realm}/client-scopes/{profile_id}"),
+                Some(r#"{"name":"profile-renamed"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_client_mapper_returns_the_addressed_mapper() {
+        let state = manage_state();
+        let app = client_scope_routes(state.clone());
+        let (realm, client_id) = fixture(&state).await;
+        let models = format!("/admin/realms/{realm}/clients/{client_id}/protocol-mappers/models");
+
+        let mut mapper_ids = Vec::new();
+        for name in ["first-mapper", "second-mapper"] {
+            let response = app
+                .clone()
+                .oneshot(authed(
+                    "POST",
+                    models.clone(),
+                    Some(&format!(
+                        r#"{{"name":"{name}","protocol_mapper":"oidc-full-name-mapper"}}"#
+                    )),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let created = body_json(response).await;
+            mapper_ids.push(created.get("id").and_then(|v| v.as_str()).unwrap().to_string());
+        }
+
+        // Each GET returns exactly the addressed mapper — with two mappers
+        // present, an inverted id comparison would return the other one.
+        for (mapper_id, name) in mapper_ids.iter().zip(["first-mapper", "second-mapper"]) {
+            let response = app
+                .clone()
+                .oneshot(authed("GET", format!("{models}/{mapper_id}"), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mapper = body_json(response).await;
+            assert_eq!(mapper.get("id").and_then(|v| v.as_str()), Some(mapper_id.as_str()));
+            assert_eq!(mapper.get("name").and_then(|v| v.as_str()), Some(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_default_default_client_scope_drops_the_assignment() {
+        let state = manage_state();
+        let app = client_scope_routes(state.clone());
+        let (realm, _) = fixture(&state).await;
+
+        // A custom scope added to the realm default table…
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                format!("/admin/realms/{realm}/client-scopes"),
+                Some(r#"{"name":"custom-default"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let custom_id = scope_id_by_name(&state, "custom-default").await;
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "PUT",
+                format!("/admin/realms/{realm}/default-default-client-scopes/{custom_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // …is removed again with 204 and disappears from the table.
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "DELETE",
+                format!("/admin/realms/{realm}/default-default-client-scopes/{custom_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .oneshot(authed(
+                "GET",
+                format!("/admin/realms/{realm}/default-default-client-scopes"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let list = body_json(response).await;
+        assert!(!list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("custom-default")));
+    }
 }

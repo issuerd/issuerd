@@ -3132,4 +3132,304 @@ mod tests {
             .unwrap();
         assert_eq!(stored.username, issuerd_core::Username::new("bob").unwrap());
     }
+
+    #[tokio::test]
+    async fn create_user_applies_password_policy_to_password_credentials() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+        let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        realm.password_policy.require_digits = true;
+        state.storage.update_realm(&realm).await.unwrap();
+
+        // A digit-less initial password violates the policy: the whole create
+        // is rejected, no user is persisted.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/users"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"bob","credentials":[{"type":"password","value":"onlylowercase"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let violations = json.get("policyViolations").and_then(|v| v.as_array()).unwrap();
+        assert!(violations
+            .iter()
+            .any(|v| v.get("code").and_then(|c| c.as_str()) == Some("require_digits")));
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        assert!(
+            state.storage.get_user_by_username(&realm_id, "bob").await.unwrap().is_none(),
+            "policy-rejected create persists nothing"
+        );
+
+        // A compliant password passes the same policy gate.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/realms/{realm_name}/users"))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"carol","credentials":[{"type":"password","value":"has1digit"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn reset_password_non_temporary_leaves_required_actions_untouched() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let uid = issuerd_core::UserId::new(&user_id).unwrap();
+
+        // A user with NO required actions must not gain UPDATE_PASSWORD from
+        // an explicit non-temporary reset.
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"N0n-temp!pass","temporary":false}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let user = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        assert!(
+            !user.required_actions.iter().any(|a| a == "UPDATE_PASSWORD"),
+            "non-temporary reset adds nothing: {:?}",
+            user.required_actions
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_password_temporary_adds_update_password_alongside_other_actions() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let uid = issuerd_core::UserId::new(&user_id).unwrap();
+
+        // The user already carries an unrelated required action: the
+        // membership check must look for UPDATE_PASSWORD specifically (any
+        // other action must not suppress the push).
+        let mut user = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        user.required_actions = vec!["VERIFY_EMAIL".to_string()];
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"Temp!pass1","temporary":true}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let user = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        assert!(
+            user.required_actions.iter().any(|a| a == "VERIFY_EMAIL"),
+            "unrelated action preserved: {:?}",
+            user.required_actions
+        );
+        assert_eq!(
+            user.required_actions.iter().filter(|a| *a == "UPDATE_PASSWORD").count(),
+            1,
+            "UPDATE_PASSWORD added exactly once: {:?}",
+            user.required_actions
+        );
+
+        // A second temporary reset does not duplicate the action.
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"Temp!pass2","temporary":true}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let user = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        assert_eq!(
+            user.required_actions.iter().filter(|a| *a == "UPDATE_PASSWORD").count(),
+            1,
+            "second temporary reset deduped: {:?}",
+            user.required_actions
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_password_same_value_allowed_when_history_disabled() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+
+        // history_size defaults to 0: no history is kept and reusing the
+        // current password is NOT a violation.
+        for _ in 0..2 {
+            let response = do_reset_password(
+                &app,
+                &realm_name,
+                &user_id,
+                r#"{"type":"password","value":"Same!pass1"}"#,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "history disabled: re-setting the same password is allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_password_retains_no_history_when_disabled() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let uid = issuerd_core::UserId::new(&user_id).unwrap();
+
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"First!pass1"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"Sec0nd!pass"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // With history_size = 0 the superseded password is deleted, not
+        // retained as an inert history credential.
+        let history = state
+            .storage
+            .get_credentials(
+                &realm_id,
+                &uid,
+                CredentialType::Custom(PASSWORD_HISTORY_CREDENTIAL_TYPE.to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(history.is_empty(), "history disabled: no retained credentials");
+        let current = state
+            .storage
+            .get_credentials(&realm_id, &uid, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1, "exactly one live password credential");
+    }
+
+    #[tokio::test]
+    async fn user_client_roles_filter_to_the_addressed_client() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+
+        let client = create_test_client(&state, &realm_id, "client-1", "my-app").await;
+        let other = create_test_client(&state, &realm_id, "client-2", "other-app").await;
+        create_test_role(&state, &realm_id, "role-a", "app-admin", Some(&client)).await;
+        create_test_role(&state, &realm_id, "role-x", "other-role", Some(&other)).await;
+
+        // Assign one role per client.
+        for (client_uuid, role_id, role_name) in [
+            ("client-1", "role-a", "app-admin"),
+            ("client-2", "role-x", "other-role"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/admin/realms/{realm_name}/users/{user_id}/role-mappings/clients/{client_uuid}"
+                        ))
+                        .header("Authorization", "Bearer valid-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(
+                            r#"[{{"id":"{role_id}","name":"{role_name}"}}]"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        // Assigned and effective listings for client-1 show only its role —
+        // an OR-ed filter would leak client-2's role into both.
+        for suffix in ["", "/composite"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/admin/realms/{realm_name}/users/{user_id}/role-mappings/clients/client-1{suffix}"
+                        ))
+                        .header("Authorization", "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let roles: Vec<RoleRepresentation> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                vec!["app-admin"],
+                "{suffix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_user_client_roles_rejects_foreign_container() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+
+        create_test_client(&state, &realm_id, "client-1", "my-app").await;
+        let other = create_test_client(&state, &realm_id, "client-2", "other-app").await;
+        create_test_role(&state, &realm_id, "role-x", "other-role", Some(&other)).await;
+
+        // A role of client-2 addressed through client-1's removal endpoint is
+        // a 404, exactly like the add path.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/users/{user_id}/role-mappings/clients/client-1"
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"[{"id":"role-x","name":"other-role"}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

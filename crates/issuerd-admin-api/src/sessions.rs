@@ -235,8 +235,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let sessions: Vec<UserSessionRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions.len(), 1, "the seeded session is listed");
+        assert_eq!(sessions[0].username, "alice");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -248,6 +253,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // After the delete the list is empty.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/realms/test/sessions")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let sessions: Vec<UserSessionRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]

@@ -460,6 +460,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn not_before_zero_disables_the_cutoff() {
+        // `not_before = 0` (the default) means "no revocation cutoff": the
+        // comparison must stay disabled even for a degenerate negative-iat
+        // token, which `0 >= 0 && iat < 0` would wrongly reject.
+        let state = state_with_tenant_and_iat("http://localhost:8080/realms/tenant", -1).await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/realms/tenant/users").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn not_before_of_path_realm_rejects_master_token() {
         // A master token administering another realm is checked against the
         // path realm's cutoff too.

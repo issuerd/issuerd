@@ -1681,4 +1681,127 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[test]
+    fn replace_flow_substitutes_only_the_matching_alias() {
+        let flow = |alias: &str, provider: &str| issuerd_core::FlowConfig {
+            alias: issuerd_core::Alias::new(alias).unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: provider.to_string(),
+            top_level: true,
+            built_in: false,
+            stages: vec![],
+        };
+        let flows = vec![flow("alpha", "p-alpha"), flow("beta", "p-beta")];
+        let updated = flow("beta", "p-beta-new");
+        let result = replace_flow(&flows, &updated);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], flows[0], "non-matching flow left untouched");
+        assert_eq!(result[1], updated, "matching flow replaced");
+    }
+
+    /// Parent referencing `child` as a sub-flow, both custom (non-built-in).
+    async fn seed_sub_flow_reference(app: &Router) {
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/admin/realms/test/authentication/flows",
+                Some(serde_json::json!({"alias": "child", "top_level": false})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/admin/realms/test/authentication/flows",
+                Some(serde_json::json!({
+                    "alias": "parent",
+                    "stages": [{
+                        "id": "s1",
+                        "requirement": "required",
+                        "authenticator": "child",
+                        "sub_flow_alias": "child",
+                        "priority": 1
+                    }]
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn delete_flow_sub_flow_guard_fires_before_set_validation() {
+        let state = manage_state();
+        let app = flow_routes(state.clone());
+        seeded_realm(&state).await;
+        seed_sub_flow_reference(&app).await;
+
+        // The dedicated guard — not the trailing whole-set validation — must
+        // produce the rejection (the validation error phrases the same
+        // dangling reference differently).
+        let response = app
+            .oneshot(authed_request(
+                "DELETE",
+                "/admin/realms/test/authentication/flows/child",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        let message = json["errorMessage"].as_str().unwrap();
+        assert!(
+            message.contains("references it as a sub-flow"),
+            "guard wording expected, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_flow_unrelated_to_existing_sub_flow_reference_succeeds() {
+        let state = manage_state();
+        let app = flow_routes(state.clone());
+        let realm = seeded_realm(&state).await;
+        seed_sub_flow_reference(&app).await;
+        create_custom_flow(&app, "standalone").await;
+
+        // Deleting an unrelated flow must not trip the sub-flow guard: only
+        // stages pointing at the DELETED alias count.
+        let response = app
+            .oneshot(authed_request(
+                "DELETE",
+                "/admin/realms/test/authentication/flows/standalone",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.storage.get_flow_config(&realm.id, "standalone").await.unwrap().is_none());
+        assert!(state.storage.get_flow_config(&realm.id, "parent").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_flow_that_references_a_sub_flow_succeeds() {
+        let state = manage_state();
+        let app = flow_routes(state.clone());
+        let realm = seeded_realm(&state).await;
+        seed_sub_flow_reference(&app).await;
+
+        // Deleting the PARENT is legal (nothing references it): the
+        // post-delete set is everything else, which still contains child.
+        let response = app
+            .oneshot(authed_request(
+                "DELETE",
+                "/admin/realms/test/authentication/flows/parent",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.storage.get_flow_config(&realm.id, "parent").await.unwrap().is_none());
+        assert!(state.storage.get_flow_config(&realm.id, "child").await.unwrap().is_some());
+    }
 }

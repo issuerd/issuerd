@@ -373,6 +373,17 @@ mod tests {
     }
 
     #[test]
+    fn used_counter_ttl_outlives_only_expiring_tokens() {
+        // A never-expiring token (expiration 0) must get a never-expiring use
+        // counter — otherwise the count window would silently reset.
+        assert_eq!(used_counter_ttl(0), None);
+        // An expiring token's counter outlives the token entry by a 60-second
+        // grace so a registration racing the expiry still counts correctly.
+        assert_eq!(used_counter_ttl(60), Some(std::time::Duration::from_secs(120)));
+        assert_eq!(used_counter_ttl(3600), Some(std::time::Duration::from_secs(3660)));
+    }
+
+    #[test]
     fn sha256_hex_is_stable() {
         // RFC 6234-style check: SHA-256 of the empty string.
         assert_eq!(
