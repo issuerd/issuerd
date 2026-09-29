@@ -394,6 +394,11 @@ mod tests {
         assert_eq!(sanitize_url("redis://:secret@10.0.0.1:6379"), "redis://***@10.0.0.1:6379");
         assert_eq!(sanitize_url("redis://10.0.0.1:6379/2"), "redis://10.0.0.1:6379/2");
         assert_eq!(sanitize_url("not a url"), "not a url");
+        // Userinfo shorter than the scheme: everything before '@' is
+        // discarded, so the output only changes if the `scheme_end + 3`
+        // slice does not skip exactly past "://" (e.g. `+`→`*` mutants).
+        assert_eq!(sanitize_url("redis://u:p@h/0"), "redis://***@h/0");
+        assert_eq!(sanitize_url("rediss://u:p@h"), "rediss://***@h");
     }
 
     #[test]
@@ -575,6 +580,17 @@ mod tests {
 
         assert_eq!(count1.load(Ordering::SeqCst), 1);
         assert_eq!(count2.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn redis_get_and_delete_roundtrip() {
+        let (cache, _container) = setup_redis().await;
+        assert_eq!(cache.get_and_delete("gd").await.unwrap(), None);
+
+        cache.set("gd", b"value1".to_vec(), None).await.unwrap();
+        assert_eq!(cache.get_and_delete("gd").await.unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(cache.get("gd").await.unwrap(), None);
     }
 
     #[tokio::test]
