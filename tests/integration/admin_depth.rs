@@ -152,8 +152,10 @@ async fn get_realm_doc(harness: &TestHarness, realm: &str, token: &str) -> serde
     body_json(resp).await
 }
 
-/// Round-trip a realm document with one field changed (PUT resets omitted
-/// fields to defaults, so the full GET document must be sent back).
+/// Round-trip a realm document with one field changed. The PUT merges by
+/// default (omitted fields keep their stored values), and the full GET
+/// document applies every field explicitly, so this works under both modes —
+/// except when the change CLEARS a field to null (see below).
 async fn put_realm_field(
     harness: &TestHarness,
     realm: &str,
@@ -164,6 +166,24 @@ async fn put_realm_field(
     let mut doc = get_realm_doc(harness, realm, token).await;
     doc[field] = value;
     let resp = put_json_auth(harness, &format!("/admin/realms/{realm}"), token, doc).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "realm PUT failed");
+}
+
+/// Same round-trip but pins the legacy full-replacement semantics
+/// (`merge=false`) — required when the change clears a nullable field to
+/// null: in merge mode null is indistinguishable from an absent field and
+/// keeps the stored value.
+async fn put_realm_field_full_replace(
+    harness: &TestHarness,
+    realm: &str,
+    token: &str,
+    field: &str,
+    value: serde_json::Value,
+) {
+    let mut doc = get_realm_doc(harness, realm, token).await;
+    doc[field] = value;
+    let resp =
+        put_json_auth(harness, &format!("/admin/realms/{realm}?merge=false"), token, doc).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "realm PUT failed");
 }
 
@@ -453,11 +473,54 @@ async fn flow_requirement_change_via_binding_drives_runtime_login() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(resp).await["error"], "access_denied");
 
-    // Restore the default binding — login works again.
-    put_realm_field(&harness, "flow-bind", &admin, "browserFlow", serde_json::Value::Null).await;
+    // Restore the default binding — login works again. Clearing a nullable
+    // field requires the full-replacement mode (merge treats null as "keep").
+    put_realm_field_full_replace(
+        &harness,
+        "flow-bind",
+        &admin,
+        "browserFlow",
+        serde_json::Value::Null,
+    )
+    .await;
     let exec = start_auth_flow(&harness, "flow-bind", client.client_id.as_ref()).await;
     let resp = submit_login(&harness, "flow-bind", &exec, "olga", "Password123!").await;
     assert_eq!(resp.status(), StatusCode::OK, "unbound realm falls back to the default flow");
+}
+
+/// The IaC foot-gun the merge default fixes: a partial PUT (e.g. automation
+/// touching only the display name) must not silently reset brute-force
+/// protection or token lifespans to model defaults.
+#[tokio::test]
+async fn realm_put_merge_preserves_security_settings() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("merge-keep").await;
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+
+    // Turn brute-force protection ON and set a custom lifespan via a
+    // full-replacement PUT.
+    let mut doc = get_realm_doc(&harness, "merge-keep", &admin).await;
+    doc["bruteForceProtected"] = serde_json::json!(true);
+    doc["maxLoginFailures"] = serde_json::json!(3);
+    doc["access_token_lifespan"] = serde_json::json!(777);
+    let resp = put_json_auth(&harness, "/admin/realms/merge-keep?merge=false", &admin, doc).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Partial PUT (default merge mode): only the display name is touched.
+    let resp = put_json_auth(
+        &harness,
+        "/admin/realms/merge-keep",
+        &admin,
+        serde_json::json!({ "realm": "merge-keep", "display_name": "Touched by automation" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let doc = get_realm_doc(&harness, "merge-keep", &admin).await;
+    assert_eq!(doc["display_name"], "Touched by automation");
+    assert_eq!(doc["bruteForceProtected"], true, "merge keeps brute-force protection");
+    assert_eq!(doc["maxLoginFailures"], 3);
+    assert_eq!(doc["access_token_lifespan"], 777, "merge keeps the stored lifespan");
 }
 
 #[tokio::test]
@@ -497,8 +560,16 @@ async fn flow_delete_guards_bound_and_referenced_flows() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(body_string(resp).await.contains("browser_flow"));
 
-    // Unbind — deletion now succeeds.
-    put_realm_field(&harness, "flow-guards", &admin, "browserFlow", serde_json::Value::Null).await;
+    // Unbind (clearing a nullable field needs full-replacement mode) —
+    // deletion now succeeds.
+    put_realm_field_full_replace(
+        &harness,
+        "flow-guards",
+        &admin,
+        "browserFlow",
+        serde_json::Value::Null,
+    )
+    .await;
     let resp = harness
         .delete_auth("/admin/realms/flow-guards/authentication/flows/custom-bound", &admin)
         .await;

@@ -83,7 +83,14 @@ export function useUpdateRealm() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ realm, body }: { realm: string; body: RealmRepresentation }) => {
-      const res = await updateRealm({ path: { realm }, body: sanitizeRealmBody(body) })
+      // The console always sends the full realm document and relies on null
+      // clearing nullable fields (themes, display name), so pin the legacy
+      // full-replacement semantics instead of the default merge mode.
+      const res = await updateRealm({
+        path: { realm },
+        query: { merge: false },
+        body: sanitizeRealmBody(body),
+      })
       if (res.error) throw new Error(res.error.errorMessage)
       return res.data!
     },

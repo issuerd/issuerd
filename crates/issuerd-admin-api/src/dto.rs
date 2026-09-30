@@ -1037,6 +1037,25 @@ pub struct PaginationQueryParams {
     pub max: i32,
 }
 
+fn default_merge() -> bool {
+    true
+}
+
+/// Query parameters for `PUT /admin/realms/{realm}`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct RealmUpdateParams {
+    /// Update semantics. With `merge=true` (default) only the fields present
+    /// in the body are applied; omitted (or null) fields keep their stored
+    /// values, so a partial body cannot silently reset security settings
+    /// (brute-force protection, token lifespans, events config) to model
+    /// defaults. With `merge=false` the body fully replaces the realm —
+    /// omitted fields reset to model defaults (legacy behavior), which is
+    /// also the only way to clear a nullable field such as `loginTheme` or
+    /// `browserFlow` back to unset.
+    #[serde(default = "default_merge")]
+    pub merge: bool,
+}
+
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct UserCountQueryParams {
     /// Search string matched against username, email, first name, and last name.
@@ -1053,20 +1072,21 @@ pub struct CountRepresentation {
 // Mappers
 // ---------------------------------------------------------------------------
 
+/// Convert an optional lifespan in seconds into a `SecondsNonZero`, falling
+/// back to `default` when omitted and rejecting zero/negative values.
+fn lifespan(
+    value: Option<i64>,
+    default: i64,
+    field: &str,
+) -> Result<SecondsNonZero, issuerd_core::IssuerdError> {
+    SecondsNonZero::try_from(value.unwrap_or(default))
+        .map_err(|e| issuerd_core::IssuerdError::InvalidRequest(format!("invalid {field}: {e}")))
+}
+
 impl TryFrom<RealmRepresentation> for Realm {
     type Error = issuerd_core::IssuerdError;
 
     fn try_from(rep: RealmRepresentation) -> Result<Self, Self::Error> {
-        fn lifespan(
-            value: Option<i64>,
-            default: i64,
-            field: &str,
-        ) -> Result<SecondsNonZero, issuerd_core::IssuerdError> {
-            SecondsNonZero::try_from(value.unwrap_or(default)).map_err(|e| {
-                issuerd_core::IssuerdError::InvalidRequest(format!("invalid {field}: {e}"))
-            })
-        }
-
         let ssl_required = rep.ssl_required.unwrap_or(SslRequired::External);
         // Computed before any field of `rep` is moved by the consumptions
         // below (omitted fields fall back to the model defaults).
@@ -1181,8 +1201,9 @@ impl TryFrom<RealmRepresentation> for Realm {
 }
 
 /// Build the realm OTP policy from the representation fields. Omitted fields
-/// fall back to the model defaults (PUT resets omitted fields); present
-/// fields are validated and rejected with `InvalidRequest` when out of range.
+/// fall back to `defaults` (the model defaults on create/full-replace, the
+/// stored policy on merge); present fields are validated and rejected with
+/// `InvalidRequest` when out of range.
 fn otp_policy_from_rep(
     rep: &RealmRepresentation,
     defaults: &OtpPolicy,
@@ -1217,6 +1238,168 @@ fn otp_policy_from_rep(
         period_secs,
         look_ahead_window,
     })
+}
+
+/// Merge a realm representation over an existing realm: every field that is
+/// `Some` in the representation is validated and applied; `None` fields keep
+/// the stored value. Backs `PUT /admin/realms/{realm}` in its default
+/// `merge=true` mode so a partial body cannot silently reset security
+/// settings (brute-force protection, token lifespans, events config) to model
+/// defaults.
+///
+/// `id` and `name` always come from `base` (renames are rejected by the
+/// handler). An explicit JSON `null` deserializes to `None` exactly like an
+/// absent field, so merge mode can never clear a nullable field (`loginTheme`,
+/// `default_role`, flow bindings, ...) — that requires `merge=false` with a
+/// full document. A present `attributes` map replaces the whole map (no
+/// per-key deep merge).
+pub fn merge_realm_representation(
+    rep: &RealmRepresentation,
+    base: Realm,
+) -> Result<Realm, issuerd_core::IssuerdError> {
+    let mut realm = base;
+    if let Some(v) = &rep.display_name {
+        realm.display_name = Some(DisplayName::new(v.clone())?);
+    }
+    if let Some(v) = rep.enabled {
+        realm.enabled = v;
+    }
+    if let Some(v) = rep.ssl_required {
+        realm.ssl_required = v;
+    }
+    if let Some(s) = &rep.password_policy {
+        realm.password_policy = serde_json::from_str(s).map_err(|e| {
+            issuerd_core::IssuerdError::InvalidRequest(format!("invalid password_policy: {e}"))
+        })?;
+    }
+    realm.access_token_lifespan = lifespan(
+        rep.access_token_lifespan,
+        realm.access_token_lifespan.get() as i64,
+        "access_token_lifespan",
+    )?;
+    realm.refresh_token_lifespan = lifespan(
+        rep.refresh_token_lifespan,
+        realm.refresh_token_lifespan.get() as i64,
+        "refresh_token_lifespan",
+    )?;
+    realm.sso_session_idle_timeout = lifespan(
+        rep.sso_session_idle_timeout,
+        realm.sso_session_idle_timeout.get() as i64,
+        "sso_session_idle_timeout",
+    )?;
+    realm.sso_session_max_lifespan = lifespan(
+        rep.sso_session_max_lifespan,
+        realm.sso_session_max_lifespan.get() as i64,
+        "sso_session_max_lifespan",
+    )?;
+    realm.offline_session_idle_timeout = lifespan(
+        rep.offline_session_idle_timeout,
+        realm.offline_session_idle_timeout.get() as i64,
+        "offline_session_idle_timeout",
+    )?;
+    if let Some(v) = &rep.login_theme {
+        realm.login_theme = Some(ThemeName::new(v.clone())?);
+    }
+    if let Some(v) = &rep.email_theme {
+        realm.email_theme = Some(ThemeName::new(v.clone())?);
+    }
+    if let Some(v) = &rep.admin_theme {
+        realm.admin_theme = Some(ThemeName::new(v.clone())?);
+    }
+    if let Some(v) = rep.internationalization_enabled {
+        realm.internationalization_enabled = v;
+    }
+    if let Some(v) = &rep.supported_locales {
+        realm.supported_locales = v.clone();
+    }
+    if let Some(v) = &rep.default_locale {
+        realm.default_locale = Some(v.clone());
+    }
+    if let Some(v) = &rep.default_role {
+        realm.default_role = Some(v.clone());
+    }
+    if let Some(v) = &rep.attributes {
+        realm.attributes = v.clone();
+    }
+    if let Some(v) = rep.brute_force_protected {
+        realm.brute_force_protected = v;
+    }
+    if let Some(v) = rep.max_login_failures {
+        realm.max_login_failures = v;
+    }
+    if let Some(v) = rep.wait_increment_secs {
+        realm.wait_increment_secs = v;
+    }
+    if let Some(v) = rep.max_failure_wait_secs {
+        realm.max_failure_wait_secs = v;
+    }
+    if let Some(v) = rep.lockout_duration_secs {
+        realm.lockout_duration_secs = v;
+    }
+    if let Some(v) = rep.registration_enabled {
+        realm.registration_enabled = v;
+    }
+    if let Some(v) = rep.reset_password_allowed {
+        realm.reset_password_allowed = v;
+    }
+    if let Some(v) = rep.remember_me_enabled {
+        realm.remember_me_enabled = v;
+    }
+    if let Some(v) = rep.verify_email_enabled {
+        realm.verify_email_enabled = v;
+    }
+    if let Some(v) = rep.login_with_email_allowed {
+        realm.login_with_email_allowed = v;
+    }
+    if let Some(v) = rep.duplicate_emails_allowed {
+        realm.duplicate_emails_allowed = v;
+    }
+    if let Some(v) = rep.edit_username_allowed {
+        realm.edit_username_allowed = v;
+    }
+    realm.remember_me_session_idle_secs = lifespan(
+        rep.remember_me_session_idle_secs,
+        realm.remember_me_session_idle_secs.get() as i64,
+        "remember_me_session_idle_secs",
+    )?;
+    realm.otp_policy = otp_policy_from_rep(rep, &realm.otp_policy)?;
+    if let Some(v) = rep.events_enabled {
+        realm.events_enabled = v;
+    }
+    if let Some(v) = rep.events_expiration_secs {
+        realm.events_expiration_secs = v;
+    }
+    if let Some(v) = rep.admin_events_enabled {
+        realm.admin_events_enabled = v;
+    }
+    if let Some(v) = rep.include_representations {
+        realm.include_representations = v;
+    }
+    if let Some(v) = &rep.events_listeners {
+        realm.events_listeners = v.clone();
+    }
+    if let Some(v) = rep.not_before {
+        realm.not_before = v;
+    }
+    if let Some(v) = &rep.default_groups {
+        realm.default_groups = v.clone();
+    }
+    if let Some(v) = &rep.browser_flow {
+        realm.browser_flow = Some(v.clone());
+    }
+    if let Some(v) = &rep.direct_grant_flow {
+        realm.direct_grant_flow = Some(v.clone());
+    }
+    if let Some(v) = &rep.reset_credentials_flow {
+        realm.reset_credentials_flow = Some(v.clone());
+    }
+    if let Some(v) = &rep.first_broker_login_flow {
+        realm.first_broker_login_flow = Some(v.clone());
+    }
+    if let Some(v) = &rep.registration_flow {
+        realm.registration_flow = Some(v.clone());
+    }
+    Ok(realm)
 }
 
 impl From<Realm> for RealmRepresentation {
@@ -3440,5 +3623,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn realm_update_params_merge_defaults_to_true() {
+        let params: RealmUpdateParams = serde_json::from_str("{}").unwrap();
+        assert!(params.merge);
+        let params: RealmUpdateParams = serde_json::from_str(r#"{"merge":false}"#).unwrap();
+        assert!(!params.merge);
+    }
+
+    fn secured_realm() -> Realm {
+        let mut attributes = HashMap::new();
+        attributes.insert("a".to_string(), "1".to_string());
+        attributes.insert("b".to_string(), "2".to_string());
+        Realm {
+            id: RealmId::new("realm-1").unwrap(),
+            name: RealmName::new("test").unwrap(),
+            display_name: Some(DisplayName::new("Old").unwrap()),
+            access_token_lifespan: SecondsNonZero::new(42),
+            login_theme: Some(ThemeName::new("dark").unwrap()),
+            attributes,
+            brute_force_protected: true,
+            max_login_failures: 9,
+            otp_policy: OtpPolicy {
+                algorithm: OtpHashAlgorithm::HmacSha256,
+                digits: 8,
+                period_secs: 60,
+                look_ahead_window: 3,
+            },
+            events_enabled: false,
+            not_before: 123,
+            browser_flow: Some("custom".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_realm_representation_keeps_omitted_fields() {
+        let base = secured_realm();
+        let merged = merge_realm_representation(&base_realm_rep(), base.clone()).unwrap();
+        // Every security-relevant setting survives an all-omitted body.
+        assert_eq!(merged.display_name, base.display_name);
+        assert_eq!(merged.access_token_lifespan, base.access_token_lifespan);
+        assert_eq!(merged.login_theme, base.login_theme);
+        assert_eq!(merged.attributes, base.attributes);
+        assert!(merged.brute_force_protected);
+        assert_eq!(merged.max_login_failures, 9);
+        assert_eq!(merged.otp_policy, base.otp_policy);
+        assert!(!merged.events_enabled);
+        assert_eq!(merged.not_before, 123);
+        assert_eq!(merged.browser_flow.as_deref(), Some("custom"));
+        // Identity is always taken from the stored realm.
+        assert_eq!(merged.id, base.id);
+        assert_eq!(merged.name, base.name);
+    }
+
+    #[test]
+    fn merge_realm_representation_applies_present_fields() {
+        let rep = RealmRepresentation {
+            display_name: Some("New".to_string()),
+            brute_force_protected: Some(false),
+            access_token_lifespan: Some(600),
+            otp_policy_digits: Some(6),
+            not_before: Some(456),
+            browser_flow: Some("other".to_string()),
+            ..base_realm_rep()
+        };
+        let merged = merge_realm_representation(&rep, secured_realm()).unwrap();
+        assert_eq!(merged.display_name.unwrap().to_string(), "New");
+        assert!(!merged.brute_force_protected);
+        assert_eq!(merged.access_token_lifespan.get(), 600);
+        assert_eq!(merged.otp_policy.digits, 6);
+        assert_eq!(merged.not_before, 456);
+        assert_eq!(merged.browser_flow.as_deref(), Some("other"));
+        // Untouched fields keep the stored values (none of them coincides
+        // with the model defaults).
+        assert_eq!(merged.max_login_failures, 9);
+        assert_eq!(merged.otp_policy.period_secs, 60);
+        assert_eq!(merged.otp_policy.algorithm, OtpHashAlgorithm::HmacSha256);
+        assert_eq!(merged.login_theme.unwrap().to_string(), "dark");
+    }
+
+    #[test]
+    fn merge_realm_representation_attributes_replaced_wholesale() {
+        let mut attributes = HashMap::new();
+        attributes.insert("c".to_string(), "3".to_string());
+        let rep = RealmRepresentation {
+            attributes: Some(attributes),
+            ..base_realm_rep()
+        };
+        let merged = merge_realm_representation(&rep, secured_realm()).unwrap();
+        assert_eq!(merged.attributes.len(), 1);
+        assert_eq!(merged.attributes.get("c").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn merge_realm_representation_validates_present_fields() {
+        // Zero/negative lifespans are rejected even though the stored value
+        // would be a valid fallback.
+        let rep = RealmRepresentation {
+            access_token_lifespan: Some(0),
+            ..base_realm_rep()
+        };
+        let result = merge_realm_representation(&rep, secured_realm());
+        match result {
+            Err(issuerd_core::IssuerdError::InvalidRequest(msg)) => {
+                assert!(msg.contains("access_token_lifespan"), "{msg}");
+            }
+            other => panic!("zero lifespan must be rejected, got {other:?}"),
+        }
+
+        let rep = RealmRepresentation {
+            otp_policy_digits: Some(7),
+            ..base_realm_rep()
+        };
+        assert!(merge_realm_representation(&rep, secured_realm()).is_err());
+
+        let rep = RealmRepresentation {
+            password_policy: Some("not json".to_string()),
+            ..base_realm_rep()
+        };
+        assert!(merge_realm_representation(&rep, secured_realm()).is_err());
     }
 }

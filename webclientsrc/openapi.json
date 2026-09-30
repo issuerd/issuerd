@@ -1800,7 +1800,7 @@
           "Realms"
         ],
         "summary": "Update a realm",
-        "description": "Updates an existing realm. Requires `manage-realm` role.",
+        "description": "Updates an existing realm. Requires `manage-realm` role. By default (`merge=true`) the body is merged over the stored realm: only the fields present are applied, omitted (or null) fields keep their current values, so a partial body cannot silently reset security settings to model defaults. Pass `merge=false` for a full replacement (omitted fields reset to model defaults) — also the only way to clear a nullable field such as `loginTheme` or `browserFlow` back to unset.",
         "operationId": "update_realm",
         "parameters": [
           {
@@ -1810,6 +1810,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "merge",
+            "in": "query",
+            "description": "Update semantics. With `merge=true` (default) only the fields present\nin the body are applied; omitted (or null) fields keep their stored\nvalues, so a partial body cannot silently reset security settings\n(brute-force protection, token lifespans, events config) to model\ndefaults. With `merge=false` the body fully replaces the realm —\nomitted fields reset to model defaults (legacy behavior), which is\nalso the only way to clear a nullable field such as `loginTheme` or\n`browserFlow` back to unset.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
