@@ -17,6 +17,7 @@
   <a href="https://github.com/rust-secure-code/safety-dance/"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
+  <a href="https://issuerd.org"><img src="https://img.shields.io/badge/docs-issuerd.org-blue" alt="Docs: issuerd.org"></a>
   <a href="https://crates.io/crates/issuerd"><img src="https://img.shields.io/crates/v/issuerd" alt="crates.io"></a>
   <a href="https://hub.docker.com/r/issuerd/issuerd"><img src="https://img.shields.io/docker/pulls/issuerd/issuerd" alt="Docker pulls"></a>
 </p>
@@ -258,6 +259,8 @@ Design contracts (stateless validation, testability rule, typestate auth boundar
 ---
 
 ## Documentation
+
+The full documentation set is also published at **[issuerd.org](https://issuerd.org)** — rendered, searchable, with the same content as the files below.
 
 | File | Purpose |
 |------|---------|
