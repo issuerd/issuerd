@@ -13889,4 +13889,2630 @@ mod tests {
         // The `.times(1)` save_event expectation is verified when the mock
         // drops at the end of the test.
     }
+
+    // ------------------------------------------------------------------
+    // Mutation-coverage tests.
+    // ------------------------------------------------------------------
+
+    /// Authorize GET against the master realm with explicit headers.
+    async fn auth_get_with_headers(
+        state: &Arc<ServerState>,
+        headers: axum::http::HeaderMap,
+        params: std::collections::HashMap<String, String>,
+    ) -> Response {
+        auth_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            headers,
+            Query(params),
+        )
+        .await
+    }
+
+    /// Read back the pending entry created by an authorize redirect and
+    /// return the stored resume stage id.
+    async fn pending_execution_id(state: &Arc<ServerState>, location: &str) -> FlowStageId {
+        let flow_id =
+            extract_query_param(location, "execution_id").expect("execution_id in redirect");
+        let bytes = state
+            .cache
+            .get(&pending_auth_cache_key(&RealmId::new("master").unwrap(), &flow_id))
+            .await
+            .unwrap()
+            .expect("pending entry must exist for the flow");
+        serde_json::from_slice::<PendingAuthData>(&bytes).unwrap().execution_id
+    }
+
+    /// Mutate the master realm in storage and drop the realm-by-name cache
+    /// entry so subsequent `resolve_realm` calls see the change (mirrors the
+    /// admin route's synchronous invalidation).
+    async fn update_master_realm(state: &Arc<ServerState>, f: impl FnOnce(&mut Realm)) {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        f(&mut realm);
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+    }
+
+    /// Create an SSO session for admin with explicit timestamps and return
+    /// the session id plus headers carrying its `issuerd_session` cookie.
+    async fn sso_cookie_with_times(
+        state: &Arc<ServerState>,
+        auth_time: chrono::DateTime<chrono::Utc>,
+        last_refresh: chrono::DateTime<chrono::Utc>,
+    ) -> (SessionId, axum::http::HeaderMap) {
+        let realm_id = RealmId::new("master").unwrap();
+        let user = state
+            .storage
+            .get_user(&realm_id, &issuerd_core::UserId::new("admin").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: auth_time,
+            last_session_refresh: last_refresh,
+            auth_time,
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        let access_token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        (session_id, cookie_headers(&format!("issuerd_session={}", access_token.token)))
+    }
+
+    /// Mint a remember-me cookie value for admin bound to the master realm.
+    async fn remember_me_cookie(state: &Arc<ServerState>) -> String {
+        let realm_id = RealmId::new("master").unwrap();
+        let claims = issuerd_token::action_tokens::action_token_claims(
+            &issuerd_core::UserId::new("admin").unwrap(),
+            &realm_id,
+            issuerd_core::ACTION_TOKEN_PURPOSE_REMEMBER_ME,
+            3600,
+        );
+        issuerd_token::action_tokens::issue_action_token(state.crypto.as_ref(), &claims)
+            .await
+            .unwrap()
+    }
+
+    // -- Literal cache-key / cookie-name builders ------------------------
+
+    #[test]
+    fn default_anonymous_tag_is_the_anonymous_literal() {
+        assert_eq!(default_anonymous_tag(), "anonymous");
+        // ... and it is what a stored pending entry deserializes to when the
+        // tag field is absent (pre-tag cache entries).
+        let value = serde_json::json!({
+            "realm_id": "master",
+            "client_id": "admin-cli",
+            "redirect_uri": "http://localhost:8080/cb",
+            "scope": ["openid"],
+            "response_type": "code",
+            "execution_id": "consent",
+            "acr_values": [],
+        });
+        let pending: PendingAuthData = serde_json::from_value(value).unwrap();
+        assert_eq!(pending._typestate_tag, "anonymous");
+    }
+
+    #[test]
+    fn pending_auth_cache_key_is_realm_and_flow_scoped() {
+        let realm = RealmId::new("realm-a").unwrap();
+        assert_eq!(pending_auth_cache_key(&realm, "flow-1"), "pending_auth:realm-a:flow-1");
+        // Distinct realms or flows must never share a cache slot.
+        let other_realm = RealmId::new("realm-b").unwrap();
+        assert_ne!(
+            pending_auth_cache_key(&realm, "flow-1"),
+            pending_auth_cache_key(&other_realm, "flow-1")
+        );
+        assert_ne!(
+            pending_auth_cache_key(&realm, "flow-1"),
+            pending_auth_cache_key(&realm, "flow-2")
+        );
+    }
+
+    #[test]
+    fn remember_cookie_name_is_realm_scoped() {
+        let realm = RealmId::new("realm-a").unwrap();
+        assert_eq!(remember_cookie_name(&realm), "issuerd_remember_realm-a");
+        assert_eq!(session_cookie_name(&realm), "issuerd_session_realm-a");
+        let other = RealmId::new("realm-b").unwrap();
+        assert_ne!(remember_cookie_name(&realm), remember_cookie_name(&other));
+    }
+
+    // -- Discovery --------------------------------------------------------
+
+    /// When the crypto provider reports NO active signing keys the guard must
+    /// keep the discovery document's built-in defaults instead of overwriting
+    /// them with an empty list.
+    #[tokio::test]
+    async fn discovery_keeps_default_algs_when_provider_lists_none() {
+        let mut mock_crypto = issuerd_core::MockCryptoProvider::new();
+        mock_crypto.expect_active_signing_algorithms().returning(|| Ok(Vec::new()));
+
+        let real_crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig::default()).unwrap(),
+        );
+        let token_manager = Arc::new(issuerd_token::token_manager::TokenManager::new(
+            real_crypto,
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            issuerd_core::JwkSet { keys: vec![] },
+        ));
+        let token_service: Arc<dyn issuerd_core::TokenService> = token_manager.clone();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        storage
+            .create_realm(&Realm {
+                id: RealmId::new("master").unwrap(),
+                name: issuerd_core::RealmName::new("master").unwrap(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            config: ServerConfig::default(),
+            storage,
+            cache: Arc::new(issuerd_cluster::InMemoryCache::new()),
+            crypto: Arc::new(mock_crypto),
+            token_service,
+            token_manager,
+            plugin_registry: Arc::new(crate::state::SimplePluginRegistry::new()),
+            federation_manager: Arc::new(issuerd_federation::NoOpFederationManager),
+            login_failure_tracker: Arc::new(
+                issuerd_auth_flow::login_failures::LoginFailureTracker::new(),
+            ),
+            email_sender: Arc::new(crate::email::NoOpEmailSender),
+            broker_client: Arc::new(issuerd_core::MockBrokerClient::new()),
+            logout_notifier: Arc::new(issuerd_core::NoOpSessionLogoutNotifier),
+            signing_key_reload: Arc::new(|| {}),
+            keyset_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_listeners: std::collections::HashMap::new(),
+        });
+
+        let response = discovery_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = extract_json(response).await;
+        let rs256_only = serde_json::json!(["RS256"]);
+        assert_eq!(json["id_token_signing_alg_values_supported"], rs256_only);
+        assert_eq!(json["authorization_signing_alg_values_supported"], rs256_only);
+    }
+
+    // -- SSO session cookie resolution (idle timeout) ---------------------
+
+    #[tokio::test]
+    async fn session_cookie_resolution_enforces_idle_timeout() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idle = realm.sso_session_idle_timeout.get();
+
+        // Session idle for longer than the realm's SSO idle window: the
+        // cookie must not resolve and the session must be reaped.
+        let stale_refresh = chrono::Utc::now() - chrono::Duration::seconds(idle as i64 + 60);
+        let (stale_sid, stale_headers) =
+            sso_cookie_with_times(&state, stale_refresh, stale_refresh).await;
+        let resolved = resolve_session_from_cookie(&state, &stale_headers, &realm).await;
+        assert!(resolved.is_none(), "idle-expired session must not resolve from the cookie");
+        assert!(
+            state.storage.get_user_session(&realm_id, &stale_sid).await.unwrap().is_none(),
+            "idle-expired session must be deleted"
+        );
+
+        // Control: a freshly refreshed session resolves fine.
+        let now = chrono::Utc::now();
+        let (_fresh_sid, fresh_headers) = sso_cookie_with_times(&state, now, now).await;
+        assert!(resolve_session_from_cookie(&state, &fresh_headers, &realm).await.is_some());
+    }
+
+    // -- Authorization endpoint gates --------------------------------------
+
+    /// RFC 9126 §6: a client pinned to PAR must not start a plain
+    /// authorization request — the error redirects to the (validated)
+    /// redirect_uri instead of falling through to the login flow.
+    #[tokio::test]
+    async fn auth_par_pinned_client_plain_request_rejected() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.attributes.insert(
+            crate::routes::par::CLIENT_REQUIRE_PAR_ATTRIBUTE.to_string(),
+            "true".to_string(),
+        );
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+
+        let response =
+            auth_get_with_headers(&state, axum::http::HeaderMap::new(), valid_code_auth_params())
+                .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("http://localhost:8080/admin/console/callback?"),
+            "PAR violation must redirect to the client, got: {location}"
+        );
+        assert!(location.contains("error=invalid_request"), "location: {location}");
+    }
+
+    /// prompt=none with max_age exactly equal to the elapsed authentication
+    /// age (seconds-truncated) is NOT exceeded — SSO must proceed.
+    #[tokio::test]
+    async fn auth_prompt_none_max_age_boundary_allows_sso() {
+        let state = setup_state().await;
+        let one_second_ago = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let (_sid, headers) =
+            sso_cookie_with_times(&state, one_second_ago, chrono::Utc::now()).await;
+
+        let mut params = valid_code_auth_params();
+        params.insert("prompt".to_string(), "none".to_string());
+        params.insert("max_age".to_string(), "1".to_string());
+        let response = auth_get_with_headers(&state, headers, params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("code="),
+            "max_age == elapsed must not force re-auth, location: {location}"
+        );
+    }
+
+    /// max_age exactly equal to the elapsed authentication age must not force
+    /// re-authentication on the plain SSO path either.
+    #[tokio::test]
+    async fn auth_max_age_boundary_does_not_force_reauth() {
+        let state = setup_state().await;
+        let one_second_ago = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let (_sid, headers) =
+            sso_cookie_with_times(&state, one_second_ago, chrono::Utc::now()).await;
+
+        let mut params = valid_code_auth_params();
+        params.insert("max_age".to_string(), "1".to_string());
+        let response = auth_get_with_headers(&state, headers, params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("code="),
+            "max_age == elapsed must not force re-auth, location: {location}"
+        );
+    }
+
+    /// A valid remember-me cookie must NOT re-authenticate when the realm has
+    /// remember-me disabled — the flow falls through to the login page.
+    #[tokio::test]
+    async fn auth_remember_me_cookie_ignored_when_realm_disables_it() {
+        let state = setup_state().await;
+        update_master_realm(&state, |realm| realm.remember_me_enabled = false).await;
+        let cookie = remember_me_cookie(&state).await;
+        let headers = cookie_headers(&format!("issuerd_remember={cookie}"));
+
+        let response = auth_get_with_headers(&state, headers, valid_code_auth_params()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("execution_id="),
+            "remember-me disabled realm must show the login page, location: {location}"
+        );
+        assert!(!location.contains("code="), "location: {location}");
+    }
+
+    /// prompt=login forces re-authentication: the remember-me cookie must not
+    /// be consulted even when the realm allows remember-me.
+    #[tokio::test]
+    async fn auth_remember_me_cookie_not_consulted_under_prompt_login() {
+        let state = setup_state().await;
+        update_master_realm(&state, |realm| realm.remember_me_enabled = true).await;
+        let cookie = remember_me_cookie(&state).await;
+        let headers = cookie_headers(&format!("issuerd_remember={cookie}"));
+
+        let mut params = valid_code_auth_params();
+        params.insert("prompt".to_string(), "login".to_string());
+        let response = auth_get_with_headers(&state, headers, params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("execution_id="),
+            "prompt=login must force the login page, location: {location}"
+        );
+        assert!(!location.contains("code="), "location: {location}");
+    }
+
+    /// A valid remember-me cookie silently re-authenticates when the realm
+    /// allows it (control for the two rejection tests above).
+    #[tokio::test]
+    async fn auth_remember_me_cookie_reauthenticates_when_enabled() {
+        let state = setup_state().await;
+        update_master_realm(&state, |realm| realm.remember_me_enabled = true).await;
+        let cookie = remember_me_cookie(&state).await;
+        let headers = cookie_headers(&format!("issuerd_remember={cookie}"));
+
+        let response = auth_get_with_headers(&state, headers, valid_code_auth_params()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("code="),
+            "remember-me cookie should silently re-authenticate, location: {location}"
+        );
+    }
+
+    // -- Challenge-arm registration gate -----------------------------------
+
+    /// Bind the master realm's browser flow to a single-stage
+    /// `auth-email-code` flow: the authenticator challenges with a login form
+    /// on the initial GET, exercising the Challenge arm (the default flow's
+    /// missing-credentials path goes through the Failure arm instead).
+    async fn bind_email_code_browser_flow(state: &Arc<ServerState>) {
+        let realm_id = RealmId::new("master").unwrap();
+        let flow = issuerd_core::FlowConfig {
+            alias: issuerd_core::Alias::new("email-login").unwrap(),
+            realm_id: realm_id.clone(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: false,
+            stages: vec![issuerd_core::FlowStage {
+                id: FlowStageId::new("email-code").unwrap(),
+                requirement: issuerd_core::Requirement::Required,
+                authenticator: issuerd_core::Alias::new("auth-email-code").unwrap(),
+                priority: 1,
+                sub_flow_alias: None,
+                authenticator_config: None,
+            }],
+        };
+        state.storage.create_flow_config(&realm_id, &flow).await.unwrap();
+        update_master_realm(state, |realm| {
+            realm.browser_flow = Some("email-login".to_string());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_arm_registration_hint_redirects_to_register_page() {
+        let state = setup_state().await;
+        bind_email_code_browser_flow(&state).await;
+        update_master_realm(&state, |realm| realm.registration_enabled = true).await;
+
+        let mut params = valid_code_auth_params();
+        params.insert("registration".to_string(), "true".to_string());
+        let response = auth_get_with_headers(&state, axum::http::HeaderMap::new(), params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("/realms/master/login/register?execution_id="),
+            "registration hint must divert the challenge to the register page, location: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_arm_registration_hint_ignored_when_disabled() {
+        let state = setup_state().await;
+        bind_email_code_browser_flow(&state).await;
+        update_master_realm(&state, |realm| realm.registration_enabled = false).await;
+
+        let mut params = valid_code_auth_params();
+        params.insert("registration".to_string(), "true".to_string());
+        let response = auth_get_with_headers(&state, axum::http::HeaderMap::new(), params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("/login.html"),
+            "registration-disabled realm must keep the login page, location: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_arm_without_hint_goes_to_login_page() {
+        let state = setup_state().await;
+        bind_email_code_browser_flow(&state).await;
+        update_master_realm(&state, |realm| realm.registration_enabled = true).await;
+
+        let response =
+            auth_get_with_headers(&state, axum::http::HeaderMap::new(), valid_code_auth_params())
+                .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("/login.html"),
+            "no hint must keep the login page, location: {location}"
+        );
+    }
+
+    // -- Challenge-arm broker redirect --------------------------------------
+
+    /// Seed an enabled OIDC identity provider with the given alias.
+    async fn seed_identity_provider(state: &Arc<ServerState>, alias: &str) {
+        let realm_id = RealmId::new("master").unwrap();
+        let idp = issuerd_core::IdentityProviderConfig {
+            id: issuerd_core::IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+            alias: issuerd_core::Alias::new(alias).unwrap(),
+            provider_id: issuerd_core::ProviderId::Oidc,
+            enabled: true,
+            config: std::collections::HashMap::from([
+                ("clientId".to_string(), "broker-client".to_string()),
+                ("clientSecret".to_string(), "broker-secret".to_string()),
+                ("authorizationUrl".to_string(), "https://idp.example.com/authorize".to_string()),
+                ("tokenUrl".to_string(), "https://idp.example.com/token".to_string()),
+            ]),
+        };
+        state.storage.create_identity_provider(&realm_id, &idp).await.unwrap();
+    }
+
+    /// A `kc_idp_hint` redirect challenge anchors the realm-relative
+    /// `/broker/{alias}/login` URL under `/realms/{realm}` and attaches the
+    /// pending flow id — it must NOT fall through to the login page.
+    #[tokio::test]
+    async fn auth_broker_hint_redirects_to_broker_login() {
+        let state = setup_state().await;
+        seed_identity_provider(&state, "test-idp").await;
+
+        let mut params = valid_code_auth_params();
+        params.insert("kc_idp_hint".to_string(), "test-idp".to_string());
+        let response = auth_get_with_headers(&state, axum::http::HeaderMap::new(), params).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("/realms/master/broker/test-idp/login?flow="),
+            "broker challenge must anchor under the realm, location: {location}"
+        );
+    }
+
+    /// Test authenticator pausing the flow with a non-broker redirect
+    /// challenge.
+    struct RedirectElsewhereAuthenticator;
+
+    #[async_trait::async_trait]
+    impl issuerd_core::Authenticator for RedirectElsewhereAuthenticator {
+        fn id(&self) -> &str {
+            "test-redirect-elsewhere"
+        }
+        fn display_name(&self) -> &str {
+            "Test Redirect Elsewhere"
+        }
+        fn requires_user(&self) -> bool {
+            false
+        }
+        fn configured_for(&self, _context: &issuerd_core::AuthContext) -> bool {
+            true
+        }
+        async fn authenticate(
+            &self,
+            _context: &mut issuerd_core::AuthContext,
+        ) -> issuerd_core::AuthStepResult {
+            issuerd_core::AuthStepResult::Challenge(Challenge::Redirect {
+                url: "/somewhere-else".to_string(),
+            })
+        }
+    }
+
+    /// A redirect challenge whose URL is not broker-relative must fall
+    /// through to the plain login page — only `/broker/…` URLs get the
+    /// realm-anchored broker treatment.
+    #[tokio::test]
+    async fn auth_non_broker_redirect_challenge_goes_to_login_page() {
+        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let mut registry = crate::state::SimplePluginRegistry::new();
+        registry.register_authenticator(Arc::new(RedirectElsewhereAuthenticator));
+        state.plugin_registry = Arc::new(registry);
+        let state = Arc::new(state);
+
+        let realm_id = RealmId::new("master").unwrap();
+        let flow = issuerd_core::FlowConfig {
+            alias: issuerd_core::Alias::new("redirect-flow").unwrap(),
+            realm_id: realm_id.clone(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: false,
+            stages: vec![issuerd_core::FlowStage {
+                id: FlowStageId::new("redirect-stage").unwrap(),
+                requirement: issuerd_core::Requirement::Required,
+                authenticator: issuerd_core::Alias::new("test-redirect-elsewhere").unwrap(),
+                priority: 1,
+                sub_flow_alias: None,
+                authenticator_config: None,
+            }],
+        };
+        state.storage.create_flow_config(&realm_id, &flow).await.unwrap();
+        update_master_realm(&state, |realm| {
+            realm.browser_flow = Some("redirect-flow".to_string());
+        })
+        .await;
+
+        let response =
+            auth_get_with_headers(&state, axum::http::HeaderMap::new(), valid_code_auth_params())
+                .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("/login.html"),
+            "non-broker redirect challenge must land on the login page, location: {location}"
+        );
+    }
+
+    // -- Failure(InvalidGrant) arm: resume-stage selection -----------------
+
+    /// Bind a custom top-level browser flow with the given stages (plus any
+    /// sub-flows they reference) so the InvalidGrant resume-position finder
+    /// can be exercised with controlled stage layouts.
+    async fn bind_custom_browser_flow(
+        state: &Arc<ServerState>,
+        alias: &str,
+        stages: Vec<issuerd_core::FlowStage>,
+        sub_flows: Vec<issuerd_core::FlowConfig>,
+    ) {
+        let realm_id = RealmId::new("master").unwrap();
+        let flow = issuerd_core::FlowConfig {
+            alias: issuerd_core::Alias::new(alias).unwrap(),
+            realm_id: realm_id.clone(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: false,
+            stages,
+        };
+        state.storage.create_flow_config(&realm_id, &flow).await.unwrap();
+        for sub in sub_flows {
+            state.storage.create_flow_config(&realm_id, &sub).await.unwrap();
+        }
+        update_master_realm(state, |realm| {
+            realm.browser_flow = Some(alias.to_string());
+        })
+        .await;
+    }
+
+    fn flow_stage(
+        id: &str,
+        requirement: issuerd_core::Requirement,
+        authenticator: &str,
+        priority: i32,
+    ) -> issuerd_core::FlowStage {
+        issuerd_core::FlowStage {
+            id: FlowStageId::new(id).unwrap(),
+            requirement,
+            authenticator: issuerd_core::Alias::new(authenticator).unwrap(),
+            priority,
+            sub_flow_alias: None,
+            authenticator_config: None,
+        }
+    }
+
+    /// Missing credentials fail the default-shape flow with InvalidGrant; the
+    /// resume position must be the flow's password stage, not another stage
+    /// that happens to come first.
+    #[tokio::test]
+    async fn auth_invalid_grant_resume_points_at_password_stage() {
+        let state = setup_state().await;
+        bind_custom_browser_flow(
+            &state,
+            "finder-flow",
+            vec![
+                flow_stage(
+                    "cookie-first",
+                    issuerd_core::Requirement::Alternative,
+                    "auth-cookie",
+                    1,
+                ),
+                flow_stage(
+                    "pwd-stage",
+                    issuerd_core::Requirement::Alternative,
+                    "auth-username-password",
+                    2,
+                ),
+            ],
+            vec![],
+        )
+        .await;
+
+        let location = auth_location(state.clone(), valid_code_auth_params()).await;
+        assert_eq!(
+            pending_execution_id(&state, &location).await,
+            FlowStageId::new("pwd-stage").unwrap(),
+            "resume position must be the username-password stage"
+        );
+    }
+
+    /// A disabled password stage is not a valid resume position: the finder
+    /// must skip it and pick the enabled one.
+    #[tokio::test]
+    async fn auth_invalid_grant_resume_skips_disabled_password_stage() {
+        let state = setup_state().await;
+        bind_custom_browser_flow(
+            &state,
+            "finder-flow-disabled",
+            vec![
+                flow_stage(
+                    "pwd-disabled",
+                    issuerd_core::Requirement::Disabled,
+                    "auth-username-password",
+                    1,
+                ),
+                flow_stage(
+                    "pwd-enabled",
+                    issuerd_core::Requirement::Alternative,
+                    "auth-username-password",
+                    2,
+                ),
+            ],
+            vec![],
+        )
+        .await;
+
+        let location = auth_location(state.clone(), valid_code_auth_params()).await;
+        assert_eq!(
+            pending_execution_id(&state, &location).await,
+            FlowStageId::new("pwd-enabled").unwrap(),
+            "disabled stages must not be selected as resume position"
+        );
+    }
+
+    /// A sub-flow stage is a container, not an executable resume position —
+    /// the finder must skip it even when its `authenticator` field names the
+    /// password authenticator.
+    #[tokio::test]
+    async fn auth_invalid_grant_resume_skips_sub_flow_stages() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let sub_flow = issuerd_core::FlowConfig {
+            alias: issuerd_core::Alias::new("finder-sub").unwrap(),
+            realm_id: realm_id.clone(),
+            provider_id: "basic-flow".to_string(),
+            top_level: false,
+            built_in: false,
+            stages: vec![flow_stage(
+                "sub-inner-pwd",
+                issuerd_core::Requirement::Required,
+                "auth-username-password",
+                1,
+            )],
+        };
+        let mut sub_stage = flow_stage(
+            "sub-pwd",
+            issuerd_core::Requirement::Alternative,
+            "auth-username-password",
+            1,
+        );
+        sub_stage.sub_flow_alias = Some(issuerd_core::Alias::new("finder-sub").unwrap());
+        bind_custom_browser_flow(
+            &state,
+            "finder-flow-sub",
+            vec![
+                sub_stage,
+                flow_stage(
+                    "pwd-main",
+                    issuerd_core::Requirement::Alternative,
+                    "auth-username-password",
+                    2,
+                ),
+            ],
+            vec![sub_flow],
+        )
+        .await;
+
+        let location = auth_location(state.clone(), valid_code_auth_params()).await;
+        assert_eq!(
+            pending_execution_id(&state, &location).await,
+            FlowStageId::new("pwd-main").unwrap(),
+            "sub-flow stages must not be selected as resume position"
+        );
+    }
+
+    // -- finish_sso_login session merge semantics -------------------------
+
+    /// Master realm + admin-cli client + admin user, fetched for direct
+    /// `finish_sso_login` calls.
+    async fn sso_login_fixtures(
+        state: &Arc<ServerState>,
+    ) -> (Realm, issuerd_core::Client, issuerd_core::User) {
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let user = state
+            .storage
+            .get_user(&realm_id, &issuerd_core::UserId::new("admin").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        (realm, client, user)
+    }
+
+    fn pending_code_flow() -> PendingAuthData {
+        PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: None,
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: FlowStageId::new("consent").unwrap(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "challenged".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+        }
+    }
+
+    fn make_session(
+        realm_id: &RealmId,
+        session_id: &SessionId,
+        user: &issuerd_core::User,
+        remember_me: bool,
+        clients: Vec<issuerd_core::ClientSession>,
+    ) -> issuerd_core::UserSession {
+        let now = chrono::Utc::now();
+        issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients,
+        }
+    }
+
+    fn client_session_entry(
+        id: &str,
+        client_uuid: &str,
+        session_id: &SessionId,
+    ) -> issuerd_core::ClientSession {
+        issuerd_core::ClientSession {
+            id: issuerd_core::ClientSessionId::new(id).unwrap(),
+            client_id: issuerd_core::ClientId::new(client_uuid).unwrap(),
+            session_id: session_id.clone(),
+            redirect_uri: None,
+            state: None,
+            auth_method: AuthMethod::Password,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// SSO login over the session the browser actually holds must MERGE into
+    /// it (keeping its remember-me flag and previously registered clients),
+    /// never replace it with a fresh session.
+    #[tokio::test]
+    async fn finish_sso_login_merges_into_matching_existing_session() {
+        let state = setup_state().await;
+        let (realm, client, user) = sso_login_fixtures(&state).await;
+        let realm_id = realm.id.clone();
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let existing = make_session(
+            &realm_id,
+            &session_id,
+            &user,
+            true,
+            vec![client_session_entry(
+                "other-cs",
+                "other-client-uuid",
+                &session_id,
+            )],
+        );
+        state.storage.create_user_session(&realm_id, &existing).await.unwrap();
+
+        let pending = pending_code_flow();
+        let now = chrono::Utc::now();
+        let response = finish_sso_login(
+            &state,
+            &realm,
+            &client,
+            &user,
+            &pending,
+            Some(existing),
+            &session_id,
+            now,
+            now,
+            "127.0.0.1".parse().unwrap(),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let stored = state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        assert!(stored.remember_me, "the merge must keep the existing session's flags");
+        assert_eq!(
+            stored.clients.len(),
+            2,
+            "the merge keeps prior client sessions and adds the new one"
+        );
+        assert!(stored
+            .clients
+            .iter()
+            .any(|cs| cs.client_id == issuerd_core::ClientId::new("other-client-uuid").unwrap()));
+        assert!(stored.clients.iter().any(|cs| cs.client_id == client.id));
+    }
+
+    /// An `existing_session` whose id does not match the flow's session id is
+    /// NOT the session being logged into: it must be left untouched and a
+    /// fresh session created under the flow's id.
+    #[tokio::test]
+    async fn finish_sso_login_ignores_mismatched_existing_session() {
+        let state = setup_state().await;
+        let (realm, client, user) = sso_login_fixtures(&state).await;
+        let realm_id = realm.id.clone();
+        let new_session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let stale_session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let existing = make_session(&realm_id, &stale_session_id, &user, true, vec![]);
+        state.storage.create_user_session(&realm_id, &existing).await.unwrap();
+
+        let pending = pending_code_flow();
+        let now = chrono::Utc::now();
+        let response = finish_sso_login(
+            &state,
+            &realm,
+            &client,
+            &user,
+            &pending,
+            Some(existing),
+            &new_session_id,
+            now,
+            now,
+            "127.0.0.1".parse().unwrap(),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        assert!(
+            state
+                .storage
+                .get_user_session(&realm_id, &new_session_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a fresh session must be created under the flow's session id"
+        );
+        let stale = state
+            .storage
+            .get_user_session(&realm_id, &stale_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.clients.is_empty(), "the unrelated session must not gain client entries");
+        assert!(stale.remember_me, "the unrelated session must not be rewritten");
+    }
+
+    /// When the merged session already has an entry for the logging-in
+    /// client, exactly that entry is replaced — other clients' entries on the
+    /// same SSO session survive.
+    #[tokio::test]
+    async fn finish_sso_login_replaces_only_the_matching_client_entry() {
+        let state = setup_state().await;
+        let (realm, client, user) = sso_login_fixtures(&state).await;
+        let realm_id = realm.id.clone();
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let existing = make_session(
+            &realm_id,
+            &session_id,
+            &user,
+            false,
+            vec![
+                client_session_entry("own-old-cs", client.id.as_ref(), &session_id),
+                client_session_entry("other-cs", "other-client-uuid", &session_id),
+            ],
+        );
+        state.storage.create_user_session(&realm_id, &existing).await.unwrap();
+
+        let pending = pending_code_flow();
+        let now = chrono::Utc::now();
+        let response = finish_sso_login(
+            &state,
+            &realm,
+            &client,
+            &user,
+            &pending,
+            Some(existing),
+            &session_id,
+            now,
+            now,
+            "127.0.0.1".parse().unwrap(),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let stored = state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        assert_eq!(stored.clients.len(), 2, "one entry per client");
+        let own: Vec<_> = stored.clients.iter().filter(|cs| cs.client_id == client.id).collect();
+        assert_eq!(own.len(), 1, "the client's entry must be replaced, not duplicated");
+        assert_ne!(
+            own[0].id,
+            issuerd_core::ClientSessionId::new("own-old-cs").unwrap(),
+            "the replacement gets a fresh client-session id"
+        );
+        assert!(
+            stored
+                .clients
+                .iter()
+                .any(|cs| cs.client_id == issuerd_core::ClientId::new("other-client-uuid").unwrap()),
+            "the other client's entry survives the merge"
+        );
+    }
+
+    // -- Device verification endpoint --------------------------------------
+
+    /// The empty-field guard is a disjunction: every single empty field must
+    /// trigger `invalid_request` (not the downstream expired_token /
+    /// invalid_grant failures).
+    #[tokio::test]
+    async fn device_verify_handler_single_empty_field_rejected() {
+        let state = setup_state().await;
+        let user_code = seed_pending_device_code(&state).await;
+
+        for body in [
+            "user_code=&username=admin&password=admin".to_string(),
+            format!("user_code={user_code}&username=&password=admin"),
+            format!("user_code={user_code}&username=admin&password="),
+        ] {
+            let resp = device_verify_handler(
+                State(state.clone()),
+                axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(extract_json(resp).await["error"], "invalid_request", "body: {body}");
+        }
+    }
+
+    // -- CIBA endpoints -----------------------------------------------------
+
+    fn confidential_client(id: &str, identifier: &str, secret: &str) -> issuerd_core::Client {
+        issuerd_core::Client {
+            id: issuerd_core::ClientId::new(id).unwrap(),
+            realm_id: RealmId::new("master").unwrap(),
+            client_id: ClientIdentifier::new(identifier).unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: Some(secret.to_string()),
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn ciba_auth(state: &Arc<ServerState>, body: &str) -> Response {
+        ciba_auth_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            body.to_string(),
+        )
+        .await
+    }
+
+    async fn token_request(state: &Arc<ServerState>, body: &str) -> Response {
+        token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body.to_string(),
+        )
+        .await
+    }
+
+    /// A disabled client must not start backchannel authentication, even with
+    /// the correct secret.
+    #[tokio::test]
+    async fn ciba_auth_handler_disabled_client_rejected() {
+        let state = setup_state().await;
+        let mut client = confidential_client("ciba-dis-uuid", "ciba-disabled", "s3cr3t");
+        client.enabled = false;
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+
+        let resp = ciba_auth(
+            &state,
+            "client_id=ciba-disabled&client_secret=s3cr3t&login_hint=admin&scope=openid",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+    }
+
+    /// A disabled user named by `login_hint` must not start a CIBA request.
+    #[tokio::test]
+    async fn ciba_auth_handler_disabled_user_rejected() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-disu-uuid", "ciba-disu-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        disable_master_user(&state, "admin").await;
+
+        let resp = ciba_auth(
+            &state,
+            "client_id=ciba-disu-client&client_secret=s3cr3t&login_hint=admin&scope=openid",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "unknown_user_id");
+    }
+
+    /// The approve endpoint's empty-field guard is a disjunction: exactly one
+    /// empty field must still produce `invalid_request`.
+    #[tokio::test]
+    async fn ciba_approve_handler_single_empty_field_rejected() {
+        let state = setup_state().await;
+        let req_data = CibaAuthReqData {
+            auth_req_id: "ciba-req-1".to_string(),
+            client_id: "admin-cli".to_string(),
+            realm_id: "master".to_string(),
+            user_id: Some("admin".to_string()),
+            scope: vec!["openid".to_string()],
+            authorized: false,
+            denied: false,
+            binding_message: None,
+            client_notification_token: None,
+            last_polled_at: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        };
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-req-1"),
+                serde_json::to_vec(&req_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        for body in [
+            "auth_req_id=&action=approve",
+            "auth_req_id=ciba-req-1&action=",
+        ] {
+            let resp = ciba_approve_handler(
+                State(state.clone()),
+                axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                axum::http::HeaderMap::new(),
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(extract_json(resp).await["error"], "invalid_request", "body: {body}");
+        }
+    }
+
+    /// The CIBA approval audit event records the client's internal UUID
+    /// (resolved from the identifier stored on the pending request).
+    #[tokio::test]
+    async fn ciba_approve_records_internal_client_id_on_event() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-ev-uuid", "ciba-ev-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+
+        let auth_resp = ciba_auth(
+            &state,
+            "client_id=ciba-ev-client&client_secret=s3cr3t&login_hint=admin&scope=openid",
+        )
+        .await;
+        assert_eq!(auth_resp.status(), StatusCode::OK);
+        let auth_req_id =
+            extract_json(auth_resp).await["auth_req_id"].as_str().unwrap().to_string();
+
+        let headers = session_cookie_headers(&state, "admin").await;
+        let approve_resp = ciba_approve_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            format!("auth_req_id={auth_req_id}&action=approve"),
+        )
+        .await;
+        assert_eq!(approve_resp.status(), StatusCode::OK);
+
+        let events = query_all_events(&state, "master").await;
+        let approve_event = events
+            .iter()
+            .find(|e| e.event_type == EventType::CibaApprove)
+            .expect("the approval must be audited");
+        assert_eq!(
+            approve_event.client_id,
+            Some(issuerd_core::ClientId::new("ciba-ev-uuid").unwrap()),
+            "the event records the internal client UUID, not the public identifier"
+        );
+    }
+
+    /// A failed CIBA poll (unknown/expired auth_req_id) records a
+    /// `login_error` event carrying the polling client's UUID.
+    #[tokio::test]
+    async fn ciba_poll_unknown_request_records_login_error_event() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-poll-uuid", "ciba-poll-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-poll-client&client_secret=s3cr3t&auth_req_id=no-such-req",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "expired_token");
+
+        let events = query_all_events(&state, "master").await;
+        let poll_error = events
+            .iter()
+            .find(|e| {
+                e.event_type == EventType::LoginError && e.error.as_deref() == Some("expired_token")
+            })
+            .expect("failed CIBA polls must be audited as login_error");
+        assert_eq!(
+            poll_error.client_id,
+            Some(issuerd_core::ClientId::new("ciba-poll-uuid").unwrap())
+        );
+        assert_eq!(poll_error.details.get("method").map(|s| s.as_str()), Some("ciba"));
+    }
+
+    // -- Token endpoint guards ---------------------------------------------
+
+    /// A disabled client must not redeem anything at the token endpoint —
+    /// disabling is the administrative containment action.
+    #[tokio::test]
+    async fn token_handler_disabled_client_rejected() {
+        let state = setup_state().await;
+        let mut client = confidential_client("disabled-tok-uuid", "disabled-tok-client", "s3cr3t");
+        client.enabled = false;
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=password&username=admin&password=admin&client_id=disabled-tok-client&client_secret=s3cr3t&scope=openid",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+    }
+
+    /// RFC 9396 §6: `authorization_details` narrows an underlying grant — a
+    /// grant that carries no RAR entitlement (password) refuses the
+    /// parameter instead of silently ignoring it.
+    #[tokio::test]
+    async fn token_password_grant_rejects_authorization_details() {
+        let state = setup_state().await;
+        // authorization_details=[{"type":"payment"}]
+        let resp = token_request(
+            &state,
+            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid&authorization_details=%5B%7B%22type%22%3A%22payment%22%7D%5D",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_authorization_details");
+    }
+
+    /// A disabled user must not redeem an authorization code.
+    #[tokio::test]
+    async fn token_auth_code_grant_disabled_user_rejected() {
+        let state = setup_state().await;
+        disable_master_user(&state, "admin").await;
+        let resp = redeem_auth_code_with_scope(&state, &["openid"]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// A disabled user must not redeem a password grant.
+    #[tokio::test]
+    async fn token_password_grant_disabled_user_rejected() {
+        let state = setup_state().await;
+        disable_master_user(&state, "admin").await;
+        let resp = token_request(
+            &state,
+            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// A disabled user must not redeem a refresh token.
+    #[tokio::test]
+    async fn token_refresh_grant_disabled_user_rejected() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+        disable_master_user(&state, "admin").await;
+
+        let resp = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// The refresh grant enforces the session idle timeout: an idle-expired
+    /// session is reaped and the refresh fails.
+    #[tokio::test]
+    async fn token_refresh_grant_idle_expired_session_rejected() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idle = realm.sso_session_idle_timeout.get();
+        let mut session = admin_sessions(&state)
+            .await
+            .into_iter()
+            .find(|s| !s.offline)
+            .expect("the password grant created an online session");
+        session.last_session_refresh =
+            chrono::Utc::now() - chrono::Duration::seconds(idle as i64 + 60);
+        let session_id = session.id.clone();
+        state.storage.update_user_session(&realm_id, &session).await.unwrap();
+
+        let resp = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+        assert!(
+            state.storage.get_user_session(&realm_id, &session_id).await.unwrap().is_none(),
+            "an idle-expired session is reaped on refresh"
+        );
+    }
+
+    // -- Auth-code redemption session attach --------------------------------
+
+    /// Seed an auth code bound to `session_id` and redeem it.
+    async fn redeem_code_for_session(state: &Arc<ServerState>, session_id: &SessionId) -> Response {
+        let code = issuerd_core::utils::generate_id();
+        let code_data = AuthCodeData {
+            user_id: "admin".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: None,
+            nonce: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            session_id: Some(session_id.0.clone()),
+            auth_time: None,
+            acr_values: vec![],
+            claims: None,
+            authorization_details: None,
+        };
+        state
+            .cache
+            .set(
+                &format!("auth_code:{code}"),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        token_request(
+            state,
+            &format!(
+                "grant_type=authorization_code&code={code}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli&code_verifier=xyz"
+            ),
+        )
+        .await
+    }
+
+    /// Redeeming a code whose session the login ceremony already persisted
+    /// must ATTACH to that session — preserving its fields (remember-me) and
+    /// previously registered client sessions — never blindly re-create it.
+    #[tokio::test]
+    async fn token_auth_code_redeem_merges_into_ceremony_session() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let (_realm, client, user) = sso_login_fixtures(&state).await;
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let existing = make_session(
+            &realm_id,
+            &session_id,
+            &user,
+            true,
+            vec![client_session_entry(
+                "other-cs",
+                "other-client-uuid",
+                &session_id,
+            )],
+        );
+        state.storage.create_user_session(&realm_id, &existing).await.unwrap();
+
+        let resp = redeem_code_for_session(&state, &session_id).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        assert!(stored.remember_me, "redemption must not clobber the ceremony session's flags");
+        assert_eq!(
+            stored.clients.len(),
+            2,
+            "redemption attaches the redeeming client without dropping prior ones"
+        );
+        assert!(stored
+            .clients
+            .iter()
+            .any(|cs| cs.client_id == issuerd_core::ClientId::new("other-client-uuid").unwrap()));
+        assert!(stored.clients.iter().any(|cs| cs.client_id == client.id));
+    }
+
+    /// Redeeming a code for a client that is ALREADY attached to the session
+    /// must not push a duplicate client entry.
+    #[tokio::test]
+    async fn token_auth_code_redeem_does_not_duplicate_client_entry() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let (_realm, client, user) = sso_login_fixtures(&state).await;
+        let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let existing = make_session(
+            &realm_id,
+            &session_id,
+            &user,
+            false,
+            vec![client_session_entry(
+                "existing-cs",
+                client.id.as_ref(),
+                &session_id,
+            )],
+        );
+        state.storage.create_user_session(&realm_id, &existing).await.unwrap();
+
+        let resp = redeem_code_for_session(&state, &session_id).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        let own: Vec<_> = stored.clients.iter().filter(|cs| cs.client_id == client.id).collect();
+        assert_eq!(own.len(), 1, "the client entry must not be duplicated on redemption");
+    }
+
+    /// The offline session's client entries are re-keyed copies: fresh
+    /// client-session ids, and pointing at the OFFLINE session — not the
+    /// online one they were copied from.
+    #[tokio::test]
+    async fn token_auth_code_offline_session_client_entries_are_rekeyed() {
+        let state = setup_state().await;
+        let resp = redeem_auth_code_with_scope(&state, &["openid", "offline_access"]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let sessions = admin_sessions(&state).await;
+        let online = sessions.iter().find(|s| !s.offline).expect("online session");
+        let offline = sessions.iter().find(|s| s.offline).expect("offline session");
+        assert!(!offline.clients.is_empty(), "the offline session carries the client entries");
+        for cs in &offline.clients {
+            assert_eq!(
+                cs.session_id, offline.id,
+                "offline client entries point at the offline session"
+            );
+            assert!(
+                !online.clients.iter().any(|ocs| ocs.id == cs.id),
+                "offline client entries get fresh ids, not copies of the online entries"
+            );
+        }
+    }
+
+    // -- Auth-code reuse revocation markers ---------------------------------
+
+    /// DistributedCache wrapper recording every `set` call's key + TTL so
+    /// tests can assert the exact lifetimes handed to the cache.
+    #[derive(Default)]
+    struct RecordingCache {
+        inner: issuerd_cluster::InMemoryCache,
+        writes: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
+    }
+
+    impl RecordingCache {
+        /// TTLs of all `set` calls for keys with the given prefix, in order.
+        fn set_ttls(&self, key_prefix: &str) -> Vec<Option<std::time::Duration>> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with(key_prefix))
+                .map(|(_, ttl)| *ttl)
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for RecordingCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.writes.lock().unwrap().push((key.to_string(), ttl));
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    async fn state_with_recording_cache(cache: Arc<RecordingCache>) -> Arc<ServerState> {
+        let config = ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        Arc::new(ServerState::from_components(&config, storage, cache).await.unwrap())
+    }
+
+    /// The `used_auth_code:` marker (code-reuse teardown) must outlive the
+    /// issued tokens: its TTL is sized from the token expiries.
+    #[tokio::test]
+    async fn token_auth_code_used_marker_ttl_covers_token_lifetimes() {
+        let cache = Arc::new(RecordingCache::default());
+        let state = state_with_recording_cache(cache.clone()).await;
+
+        let resp = redeem_auth_code_with_scope(&state, &["openid"]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let realm = state
+            .storage
+            .get_realm(&RealmId::new("master").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let expected =
+            std::cmp::max(realm.access_token_lifespan.get(), realm.refresh_token_lifespan.get());
+        let ttls = cache.set_ttls("used_auth_code:");
+        assert_eq!(ttls.len(), 1, "exactly one used-code marker write");
+        assert_eq!(
+            ttls[0],
+            Some(std::time::Duration::from_secs(expected)),
+            "the marker TTL must cover the longest-lived issued token"
+        );
+    }
+
+    /// Code-reuse teardown skips revocation markers for already-expired
+    /// tokens: the remaining-lifetime gate is strict (`> 0`).
+    #[tokio::test]
+    async fn token_auth_code_reuse_skips_revocation_for_expired_tokens() {
+        let cache = Arc::new(RecordingCache::default());
+        let state = state_with_recording_cache(cache.clone()).await;
+
+        let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+        let used = UsedAuthCode {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("expired-refresh".to_string()),
+            access_exp: now_secs - 100,
+            refresh_exp: Some(now_secs - 100),
+        };
+        state
+            .cache
+            .set(
+                "used_auth_code:burned-code",
+                serde_json::to_vec(&used).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=authorization_code&code=burned-code&redirect_uri=http://localhost:8080/cb&client_id=admin-cli&code_verifier=xyz",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+        assert!(
+            cache.set_ttls("revoked:expired-access").is_empty(),
+            "an expired access token must not be revocation-marked"
+        );
+        assert!(
+            cache.set_ttls("revoked_refresh:expired-refresh").is_empty(),
+            "an expired refresh token must not be revocation-marked"
+        );
+    }
+
+    // -- DPoP proof minting (hand-rolled compact JWS: the header carries the
+    // raw `jwk`, which the server's CryptoProvider cannot produce) -----------
+
+    struct TestDpopKey {
+        pair: ring::signature::EcdsaKeyPair,
+        jwk: serde_json::Value,
+    }
+
+    fn dpop_key() -> TestDpopKey {
+        use base64::Engine as _;
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            doc.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let public = pair.public_key().as_ref();
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let jwk = serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": b64(&public[1..33]), "y": b64(&public[33..65]),
+        });
+        TestDpopKey { pair, jwk }
+    }
+
+    impl TestDpopKey {
+        fn proof(&self, htm: &str, htu: &str, ath: Option<&str>) -> String {
+            use base64::Engine as _;
+            let header = serde_json::json!({"alg": "ES256", "typ": "dpop+jwt", "jwk": self.jwk});
+            let mut claims = serde_json::json!({
+                "jti": issuerd_core::utils::generate_id(),
+                "htm": htm,
+                "htu": htu,
+                "iat": issuerd_core::utils::now_secs() as i64,
+            });
+            if let Some(ath) = ath {
+                claims["ath"] = serde_json::json!(issuerd_token::access_token_hash(ath));
+            }
+            let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let input = format!(
+                "{}.{}",
+                b64(&serde_json::to_vec(&header).unwrap()),
+                b64(&serde_json::to_vec(&claims).unwrap())
+            );
+            let rng = ring::rand::SystemRandom::new();
+            let sig = self.pair.sign(&rng, input.as_bytes()).unwrap();
+            format!("{input}.{}", b64(sig.as_ref()))
+        }
+    }
+
+    fn dpop_htu(state: &Arc<ServerState>, endpoint: &str) -> String {
+        format!(
+            "{}/realms/master/protocol/openid-connect/{endpoint}",
+            state.config.issuer_url.trim_end_matches('/')
+        )
+    }
+
+    async fn token_request_with_headers(
+        state: &Arc<ServerState>,
+        headers: axum::http::HeaderMap,
+        body: &str,
+    ) -> Response {
+        token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            body.to_string(),
+        )
+        .await
+    }
+
+    /// Password grant with a DPoP proof header: the issued tokens are bound
+    /// to the proof key (`cnf.jkt`).
+    async fn dpop_password_grant(state: &Arc<ServerState>, key: &TestDpopKey) -> serde_json::Value {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("dpop", key.proof("POST", &dpop_htu(state, "token"), None).parse().unwrap());
+        let resp = token_request_with_headers(
+            state,
+            headers,
+            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = extract_json(resp).await;
+        assert_eq!(json["token_type"], "DPoP", "the grant must bind the tokens to the proof key");
+        json
+    }
+
+    async fn userinfo_get(state: &Arc<ServerState>, headers: axum::http::HeaderMap) -> Response {
+        userinfo_handler_get(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            headers,
+        )
+        .await
+    }
+
+    /// RFC 9449 §5.1: a DPoP-bound refresh token redeems with a proof from
+    /// the SAME key (the binding slides to the rotated tokens) and rejects a
+    /// proof from any other key.
+    #[tokio::test]
+    async fn token_refresh_grant_dpop_binding_enforced() {
+        let state = setup_state().await;
+        let key = dpop_key();
+
+        // Same-key proof: accepted.
+        let tokens = dpop_password_grant(&state, &key).await;
+        let bound_refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers
+            .insert("dpop", key.proof("POST", &dpop_htu(&state, "token"), None).parse().unwrap());
+        let resp = token_request_with_headers(
+            &state,
+            headers,
+            &format!("grant_type=refresh_token&refresh_token={bound_refresh}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a proof from the bound key redeems the bound refresh token"
+        );
+        let json = extract_json(resp).await;
+        assert_eq!(json["token_type"], "DPoP", "the rotated tokens keep the binding");
+
+        // Different-key proof: rejected.
+        let tokens = dpop_password_grant(&state, &key).await;
+        let bound_refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+        let other_key = dpop_key();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "dpop",
+            other_key.proof("POST", &dpop_htu(&state, "token"), None).parse().unwrap(),
+        );
+        let resp = token_request_with_headers(
+            &state,
+            headers,
+            &format!("grant_type=refresh_token&refresh_token={bound_refresh}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// The `DPoP` authorization scheme on an UNBOUND token makes the proof
+    /// mandatory: without a `DPoP` header the request is rejected as
+    /// `invalid_dpop_proof` (not served as a Bearer request).
+    #[tokio::test]
+    async fn userinfo_dpop_scheme_without_proof_rejected() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let access_token = json["access_token"].as_str().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("DPoP {access_token}").parse().unwrap());
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_dpop_proof");
+    }
+
+    /// Only the `Bearer` and `DPoP` scheme keywords split credentials off the
+    /// Authorization header; an unrecognized scheme is treated as the bare
+    /// token (and fails validation).
+    #[tokio::test]
+    async fn userinfo_unknown_scheme_is_not_treated_as_bearer() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let access_token = json["access_token"].as_str().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Token {access_token}").parse().unwrap());
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_token");
+    }
+
+    /// A DPoP-BOUND token presented as plain Bearer is a downgrade attempt:
+    /// rejected as `invalid_token` (the binding would be silently stripped).
+    #[tokio::test]
+    async fn userinfo_bound_token_presented_as_bearer_rejected() {
+        let state = setup_state().await;
+        let key = dpop_key();
+        let json = dpop_password_grant(&state, &key).await;
+        let access_token = json["access_token"].as_str().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_token");
+    }
+
+    /// The full DPoP userinfo path: bound token + `DPoP` scheme + a fresh
+    /// proof from the bound key with a matching `ath`.
+    #[tokio::test]
+    async fn userinfo_dpop_bound_token_with_matching_proof_accepted() {
+        let state = setup_state().await;
+        let key = dpop_key();
+        let json = dpop_password_grant(&state, &key).await;
+        let access_token = json["access_token"].as_str().unwrap().to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("DPoP {access_token}").parse().unwrap());
+        headers.insert(
+            "dpop",
+            key.proof("GET", &dpop_htu(&state, "userinfo"), Some(&access_token))
+                .parse()
+                .unwrap(),
+        );
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = extract_json(resp).await;
+        assert_eq!(json["sub"], "admin");
+    }
+
+    // -- Consumed-entry revalidation (read/consume race) --------------------
+
+    /// Cache wrapper whose `get_and_delete` on `swap_key` returns
+    /// `swap_value` instead of the stored entry (which is still consumed) —
+    /// simulates a concurrent write landing between a handler's read and its
+    /// atomic consume.
+    struct SwapOnConsumeCache {
+        inner: issuerd_cluster::InMemoryCache,
+        swap_key: String,
+        swap_value: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for SwapOnConsumeCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            if key == self.swap_key {
+                let _ = self.inner.get_and_delete(key).await;
+                return Ok(Some(self.swap_value.clone()));
+            }
+            self.inner.get_and_delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    async fn state_with_swap_cache(swap_key: String, swap_value: Vec<u8>) -> Arc<ServerState> {
+        let config = ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: Arc<dyn issuerd_core::DistributedCache> = Arc::new(SwapOnConsumeCache {
+            inner: issuerd_cluster::InMemoryCache::new(),
+            swap_key,
+            swap_value,
+        });
+        Arc::new(ServerState::from_components(&config, storage, cache).await.unwrap())
+    }
+
+    fn approved_device_code(device_code: &str) -> DeviceCodeData {
+        DeviceCodeData {
+            device_code: device_code.to_string(),
+            user_code: "WXYZ-1234".to_string(),
+            client_id: "admin-cli".to_string(),
+            realm_id: "master".to_string(),
+            scope: vec!["openid".to_string()],
+            user_id: Some("admin".to_string()),
+            authorized: true,
+            last_polled_at: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        }
+    }
+
+    /// The entry read by the poller authorizes admin; the entry actually
+    /// consumed names a different user — the post-consume revalidation must
+    /// reject instead of issuing tokens.
+    #[tokio::test]
+    async fn token_device_grant_rejects_entry_swapped_before_consume() {
+        let legit = approved_device_code("device-race");
+        let mut swapped = legit.clone();
+        swapped.user_id = Some("other-user".to_string());
+        let state = state_with_swap_cache(
+            issuerd_cluster::cache_keys::device_code("device-race"),
+            serde_json::to_vec(&swapped).unwrap(),
+        )
+        .await;
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::device_code("device-race"),
+                serde_json::to_vec(&legit).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=admin-cli&device_code=device-race",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    fn approved_ciba_entry(auth_req_id: &str, client_identifier: &str) -> CibaAuthReqData {
+        CibaAuthReqData {
+            auth_req_id: auth_req_id.to_string(),
+            client_id: client_identifier.to_string(),
+            realm_id: "master".to_string(),
+            scope: vec!["openid".to_string()],
+            user_id: Some("admin".to_string()),
+            authorized: true,
+            denied: false,
+            binding_message: None,
+            client_notification_token: None,
+            last_polled_at: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        }
+    }
+
+    /// CIBA poll where the entry consumed names a different user than the
+    /// entry read: revalidation must reject.
+    #[tokio::test]
+    async fn token_ciba_grant_rejects_entry_with_swapped_user() {
+        let legit = approved_ciba_entry("ciba-race-1", "ciba-race-client");
+        let mut swapped = legit.clone();
+        swapped.user_id = Some("other-user".to_string());
+        let state = state_with_swap_cache(
+            issuerd_cluster::cache_keys::ciba_auth_req("ciba-race-1"),
+            serde_json::to_vec(&swapped).unwrap(),
+        )
+        .await;
+        let client = confidential_client("ciba-race-uuid", "ciba-race-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-race-1"),
+                serde_json::to_vec(&legit).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-race-client&client_secret=s3cr3t&auth_req_id=ciba-race-1",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// CIBA poll where the entry consumed is no longer authorized (a
+    /// concurrent state change landed between read and consume):
+    /// revalidation must reject.
+    #[tokio::test]
+    async fn token_ciba_grant_rejects_entry_unauthorized_before_consume() {
+        let legit = approved_ciba_entry("ciba-race-2", "ciba-race-client-2");
+        let mut swapped = legit.clone();
+        swapped.authorized = false;
+        let state = state_with_swap_cache(
+            issuerd_cluster::cache_keys::ciba_auth_req("ciba-race-2"),
+            serde_json::to_vec(&swapped).unwrap(),
+        )
+        .await;
+        let client = confidential_client("ciba-race-uuid-2", "ciba-race-client-2", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-race-2"),
+                serde_json::to_vec(&legit).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-race-client-2&client_secret=s3cr3t&auth_req_id=ciba-race-2",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// The device grant's offline detection is an exact scope match: without
+    /// `offline_access` the minted session is an online one.
+    #[tokio::test]
+    async fn token_device_grant_without_offline_scope_creates_online_session() {
+        let state = setup_state().await;
+        let code_data = approved_device_code("device-online");
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::device_code("device-online"),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=admin-cli&device_code=device-online",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sessions = admin_sessions(&state).await;
+        assert!(!sessions.is_empty());
+        assert!(
+            sessions.iter().all(|s| !s.offline),
+            "no offline session without the offline_access scope"
+        );
+    }
+
+    /// Same for the CIBA grant: no `offline_access` scope, no offline
+    /// session.
+    #[tokio::test]
+    async fn token_ciba_grant_without_offline_scope_creates_online_session() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-online-uuid", "ciba-online-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        let entry = approved_ciba_entry("ciba-online-1", "ciba-online-client");
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-online-1"),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-online-client&client_secret=s3cr3t&auth_req_id=ciba-online-1",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sessions = admin_sessions(&state).await;
+        assert!(!sessions.is_empty());
+        assert!(
+            sessions.iter().all(|s| !s.offline),
+            "no offline session without the offline_access scope"
+        );
+    }
+
+    /// A user disabled after approving a CIBA request must not redeem it.
+    #[tokio::test]
+    async fn token_ciba_grant_disabled_user_rejected() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-du-uuid", "ciba-du-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        let entry = approved_ciba_entry("ciba-du-1", "ciba-du-client");
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-du-1"),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        disable_master_user(&state, "admin").await;
+
+        let resp = token_request(
+            &state,
+            "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-du-client&client_secret=s3cr3t&auth_req_id=ciba-du-1",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
+    }
+
+    /// CIBA poll pacing: a poll within the 5s interval gets `slow_down`; a
+    /// poll past it proceeds to the authorization state.
+    #[tokio::test]
+    async fn token_ciba_grant_poll_pacing() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-pace-uuid", "ciba-pace-client", "s3cr3t");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+        let mut entry = approved_ciba_entry("ciba-pace-1", "ciba-pace-client");
+        entry.authorized = false;
+        // Last polled well beyond the 5s interval.
+        entry.last_polled_at = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+        state
+            .cache
+            .set(
+                &issuerd_cluster::cache_keys::ciba_auth_req("ciba-pace-1"),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let body = "grant_type=urn:openid:params:grant-type:ciba&client_id=ciba-pace-client&client_secret=s3cr3t&auth_req_id=ciba-pace-1";
+        let resp = token_request(&state, body).await;
+        assert_eq!(
+            extract_json(resp).await["error"],
+            "authorization_pending",
+            "a poll past the interval proceeds to the authorization state"
+        );
+        let resp = token_request(&state, body).await;
+        assert_eq!(
+            extract_json(resp).await["error"],
+            "slow_down",
+            "an immediate re-poll hits the slow-down gate"
+        );
+    }
+
+    // -- Realm not_before cutoff semantics ----------------------------------
+
+    async fn set_master_not_before(state: &Arc<ServerState>, not_before: i64) {
+        update_master_realm(state, |realm| realm.not_before = not_before).await;
+    }
+
+    /// A not_before cutoff in the PAST must not disturb tokens issued after
+    /// it: userinfo, introspection and the refresh grant all keep working.
+    #[tokio::test]
+    async fn not_before_in_the_past_keeps_fresh_tokens_valid() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let access_token = json["access_token"].as_str().unwrap().to_string();
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+
+        set_master_not_before(&state, chrono::Utc::now().timestamp() - 3600).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "userinfo must serve tokens issued after the cutoff"
+        );
+
+        let resp = introspect_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::http::HeaderMap::new(),
+            format!("token={access_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(
+            extract_json(resp).await["active"],
+            true,
+            "introspection must report tokens issued after the cutoff active"
+        );
+
+        let resp = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the refresh grant must accept tokens issued after the cutoff"
+        );
+    }
+
+    /// Tokens issued exactly AT the not_before cutoff are outside the
+    /// revocation window (the comparison is strict).
+    #[tokio::test]
+    async fn not_before_equal_to_token_iat_keeps_tokens_valid() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let access_token = json["access_token"].as_str().unwrap().to_string();
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+
+        let access_iat =
+            state.token_service.validate_access_token(&access_token).unwrap().claims.iat;
+        set_master_not_before(&state, access_iat).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        let resp = userinfo_get(&state, headers).await;
+        assert_eq!(resp.status(), StatusCode::OK, "iat == not_before is not revoked (userinfo)");
+
+        let resp = introspect_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::http::HeaderMap::new(),
+            format!("token={access_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(
+            extract_json(resp).await["active"],
+            true,
+            "iat == not_before is not revoked (introspection)"
+        );
+
+        let refresh_iat =
+            state.token_service.validate_refresh_token(&refresh_token).unwrap().claims.iat;
+        set_master_not_before(&state, refresh_iat).await;
+        let resp = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "iat == not_before is not revoked (refresh)");
+    }
+
+    // -- Session-less client-credentials token shape -------------------------
+
+    /// Seed a client + its `service-account-{client_id}` user pair; returns
+    /// the client and the service-account user.
+    async fn seed_service_account_pair(
+        state: &Arc<ServerState>,
+        identifier: &str,
+        service_accounts_enabled: bool,
+    ) -> (issuerd_core::Client, issuerd_core::User) {
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = confidential_client(&format!("{identifier}-uuid"), identifier, "s3cr3t");
+        client.service_accounts_enabled = service_accounts_enabled;
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+        let username = crate::claims::service_account_username(&client);
+        let now = chrono::Utc::now();
+        let user = issuerd_core::User {
+            id: issuerd_core::UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new(&username).unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: std::collections::HashMap::new(),
+            required_actions: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        (client, user)
+    }
+
+    /// A service-account client-credentials token (sub = the service-account
+    /// user, synthetic never-persisted sid) is session-less by design: the
+    /// missing session must NOT invalidate it.
+    #[tokio::test]
+    async fn session_invalidated_service_account_token_is_not_invalidated() {
+        let state = setup_state().await;
+        let (_client, sa_user) = seed_service_account_pair(&state, "sa-client", true).await;
+        let sid = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let claims = access_claims(sa_user.id.as_ref(), Some(sid), "sa-client");
+        assert!(
+            !session_invalidated(&state, &claims).await,
+            "a service-account token has no stored session by design"
+        );
+    }
+
+    /// A token shaped like a service-account token but naming a client
+    /// WITHOUT service accounts enabled is not a recognized session-less
+    /// shape: the missing session invalidates it.
+    #[tokio::test]
+    async fn session_invalidated_sa_shaped_token_without_sa_client_is_invalidated() {
+        let state = setup_state().await;
+        let (_client, sa_user) = seed_service_account_pair(&state, "nosa-client", false).await;
+        let sid = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let claims = access_claims(sa_user.id.as_ref(), Some(sid), "nosa-client");
+        assert!(
+            session_invalidated(&state, &claims).await,
+            "service_accounts_enabled=false — the shape must not be honored"
+        );
+    }
+
+    // -- Logout revocation TTL ----------------------------------------------
+
+    /// TokenService stub whose refresh-token validation accepts any token and
+    /// reports `exp = now + exp_offset_secs` at validation time —
+    /// deterministic remaining-lifetime values for the logout revocation-TTL
+    /// gate.
+    struct StubTokenService {
+        exp_offset_secs: i64,
+    }
+
+    impl issuerd_core::TokenService for StubTokenService {
+        fn validate_access_token(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::ValidatedAccessToken, IssuerdError> {
+            Err(IssuerdError::InvalidToken)
+        }
+        fn validate_id_token(
+            &self,
+            _token: &str,
+            _client: &issuerd_core::Client,
+            _nonce: Option<&str>,
+        ) -> Result<issuerd_core::IdTokenClaims, IssuerdError> {
+            Err(IssuerdError::InvalidToken)
+        }
+        fn validate_refresh_token(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::ValidatedRefreshToken, IssuerdError> {
+            let now = chrono::Utc::now().timestamp();
+            Ok(issuerd_core::ValidatedRefreshToken {
+                claims: issuerd_core::RefreshTokenClaims {
+                    jti: issuerd_core::JwtId::new("stub-jti").unwrap(),
+                    iss: issuerd_core::Issuer::new("http://localhost:8080/realms/master").unwrap(),
+                    sub: issuerd_core::UserId::new("admin").unwrap(),
+                    aud: issuerd_core::Audience::new("admin-cli").unwrap(),
+                    exp: now + self.exp_offset_secs,
+                    iat: now,
+                    typ: issuerd_core::JwtType::Refresh,
+                    sid: SessionId::new("stub-sid").unwrap(),
+                    scope: Scope::parse("openid"),
+                    cnf: None,
+                    authorization_details: None,
+                },
+                header: issuerd_core::JwsHeader {
+                    alg: issuerd_core::Algorithm::EdDsa,
+                    typ: Some(issuerd_core::JwsType::Jwt),
+                    kid: issuerd_core::KeyId::new("stub-kid").unwrap(),
+                },
+            })
+        }
+        fn validate_id_token_hint(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::IdTokenClaims, IssuerdError> {
+            Err(IssuerdError::InvalidToken)
+        }
+    }
+
+    async fn logout_state_with_stub_tokens(
+        cache: Arc<RecordingCache>,
+        exp_offset_secs: i64,
+    ) -> Arc<ServerState> {
+        let config = ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let mut state = ServerState::from_components(&config, storage, cache).await.unwrap();
+        state.token_service = Arc::new(StubTokenService { exp_offset_secs });
+        Arc::new(state)
+    }
+
+    async fn logout_with_body(state: &Arc<ServerState>, body: String) -> Response {
+        logout_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+    }
+
+    /// The logout blacklist entry for a presented refresh token is sized from
+    /// the token's REMAINING lifetime (exp - now) — no shorter, no longer.
+    #[tokio::test]
+    async fn logout_blacklists_refresh_token_for_its_remaining_lifetime() {
+        let cache = Arc::new(RecordingCache::default());
+        let state = logout_state_with_stub_tokens(cache.clone(), 1000).await;
+
+        let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let ttls = cache.set_ttls("revoked_refresh:");
+        assert_eq!(ttls.len(), 1, "exactly one blacklist write");
+        let ttl = ttls[0].expect("the blacklist write carries a TTL");
+        assert!(
+            (998..=1000).contains(&ttl.as_secs()),
+            "the blacklist TTL must be the token's remaining lifetime (~1000s), got {ttl:?}"
+        );
+    }
+
+    /// A refresh token with zero remaining lifetime is NOT blacklist-written:
+    /// the gate is strict (`> 0`) — the token is already dead.
+    #[tokio::test]
+    async fn logout_skips_blacklist_for_zero_remaining_lifetime() {
+        let cache = Arc::new(RecordingCache::default());
+        let state = logout_state_with_stub_tokens(cache.clone(), 0).await;
+
+        let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            cache.set_ttls("revoked_refresh:").is_empty(),
+            "an already-expired refresh token needs no blacklist entry"
+        );
+    }
+
+    /// Browser logout with an explicit refresh token (session A) AND an SSO
+    /// cookie (session B) destroys BOTH sessions; the cookie session's
+    /// destruction is skipped only when it was already destroyed (same id).
+    #[tokio::test]
+    async fn logout_destroys_both_token_and_cookie_sessions() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let now = chrono::Utc::now();
+
+        let (sid_a, _) = sso_cookie_with_times(&state, now, now).await;
+        let (sid_b, cookie) = sso_cookie_with_times(&state, now, now).await;
+        assert_ne!(sid_a, sid_b);
+
+        let (realm, client, user) = sso_login_fixtures(&state).await;
+        let refresh = state
+            .token_manager
+            .issue_refresh_token(
+                &user,
+                &client,
+                &realm,
+                &sid_a,
+                &["openid".to_string()],
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = logout_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            cookie,
+            format!("refresh_token={}", refresh.token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.storage.get_user_session(&realm_id, &sid_a).await.unwrap().is_none(),
+            "the refresh token's session is destroyed"
+        );
+        assert!(
+            state.storage.get_user_session(&realm_id, &sid_b).await.unwrap().is_none(),
+            "the cookie session is destroyed too"
+        );
+    }
+
+    // -- Revocation endpoint -------------------------------------------------
+
+    /// `token_type_hint=access_token` is honored literally: the marker lands
+    /// in the access-token bucket even when the presented token happens to
+    /// validate as a refresh token.
+    #[tokio::test]
+    async fn revoke_with_access_token_hint_uses_access_bucket() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+
+        let resp = revoke_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!("token={refresh_token}&token_type_hint=access_token&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.cache.get(&format!("revoked:{refresh_token}")).await.unwrap().is_some(),
+            "the access bucket is written"
+        );
+        assert!(
+            state
+                .cache
+                .get(&format!("revoked_refresh:{refresh_token}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the refresh bucket is NOT written when the hint says access_token"
+        );
+    }
+
+    // -- Client authentication for RFC 7009/7662 endpoints -------------------
+
+    async fn revoke_with_client(
+        state: &Arc<ServerState>,
+        identifier: &str,
+        secret: &str,
+    ) -> Response {
+        revoke_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!("token=some-token&client_id={identifier}&client_secret={secret}"),
+        )
+        .await
+    }
+
+    /// A disabled client must not authenticate — on a cold cache (storage
+    /// fallback) nor on a warm one.
+    #[tokio::test]
+    async fn revoke_disabled_client_rejected_cold_and_warm() {
+        let state = setup_state().await;
+        let mut client = confidential_client("rev-dis-uuid", "rev-disabled", "s3cr3t");
+        client.enabled = false;
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &client)
+            .await
+            .unwrap();
+
+        // Cold cache: the first read loads (and caches) the disabled row.
+        let resp = revoke_with_client(&state, "rev-disabled", "s3cr3t").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+        // Warm cache: the cached disabled row must still not authenticate.
+        let resp = revoke_with_client(&state, "rev-disabled", "s3cr3t").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+    }
+
+    /// The claims read-model cache answers client authentication on a hit —
+    /// the direct storage fallback only runs on a miss. A client row deleted
+    /// behind the cache's back (admin deletes precise-delete the entry;
+    /// direct storage writes are bounded by the TTL) keeps authenticating.
+    #[tokio::test]
+    async fn revoke_warm_cache_hit_serves_without_storage() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let client = confidential_client("rev-warm-uuid", "rev-warm", "s3cr3t");
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+
+        let resp = revoke_with_client(&state, "rev-warm", "s3cr3t").await;
+        assert_eq!(resp.status(), StatusCode::OK, "the first call primes the cache");
+
+        state.storage.delete_client(&realm_id, &client.id).await.unwrap();
+        let resp = revoke_with_client(&state, "rev-warm", "s3cr3t").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a warm cache hit must serve without a storage round trip"
+        );
+    }
+
+    /// The storage fallback re-reads the client when the cached copy does not
+    /// authenticate: a client re-enabled behind the cache's back (stale
+    /// disabled entry) authenticates via the fallback.
+    #[tokio::test]
+    async fn revoke_stale_disabled_cache_entry_falls_back_to_storage() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = confidential_client("rev-stale-uuid", "rev-stale", "s3cr3t");
+        client.enabled = false;
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+
+        // Prime the cache with the disabled row.
+        let resp = revoke_with_client(&state, "rev-stale", "s3cr3t").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Re-enable behind the cache's back (no invalidation).
+        client.enabled = true;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+        let resp = revoke_with_client(&state, "rev-stale", "s3cr3t").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the storage fallback re-reads the now-enabled client"
+        );
+    }
 }
