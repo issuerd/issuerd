@@ -4,9 +4,10 @@
 // Dylint log-hygiene lints for the Issuerd workspace (the "Logging
 // Conventions" section of AGENTS.md).
 
-//! Four syntax-only lints over a pre-expansion early pass — no name
-//! resolution, no `clippy_utils`; the pinned nightly (rust-toolchain.toml) is
-//! the only API dependency:
+//! Five lints, in one pre-expansion early pass (syntax-only) and one late
+//! pass (type-aware, on the expanded `tracing` machinery):
+//!
+//! Early pass (no name resolution, no `clippy_utils`):
 //!
 //! - `tracing_error_debug`: an `error`/`err` log field recorded with the `?`
 //!   (Debug) sigil — errors are logged as `error = %e` (Display).
@@ -19,18 +20,27 @@
 //!   `*_secret`, `*_password`, `*_code`, `*_assertion`, `*_key`) are missing
 //!   from `skip(...)`/`skip_all`.
 //!
+//! Late pass (type-aware; `tracing` 0.1.44 expansions all lower field values
+//! to `&expr as &dyn tracing::field::Value` casts, with `%`/`?` going through
+//! `tracing::field::display`/`debug`):
+//!
+//! - `secret_typed_value_in_log`: the value's type (after peeling references
+//!   and the display/debug wrapper) is in the configurable secret-type list.
+//!
 //! Event macros are recognized by the last path segment
 //! (`trace!`/`debug!`/`info!`/`warn!`/`error!` — the workspace logs
 //! exclusively through `tracing`), the attribute by the last segment
-//! `instrument`. Pre-expansion is required: macro calls and the proc-macro
-//! attribute do not survive expansion.
+//! `instrument`. Pre-expansion is required for the early pass: macro calls
+//! and the proc-macro attribute do not survive expansion.
 
 #![feature(rustc_private)]
 #![warn(unused_extern_crates)]
 
 extern crate rustc_ast;
 extern crate rustc_errors;
+extern crate rustc_hir;
 extern crate rustc_lint;
+extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
@@ -38,7 +48,10 @@ use rustc_ast::ast::{self, AssocItem, AssocItemKind, AttrArgs, AttrKind, Item, I
 use rustc_ast::token::TokenKind;
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_errors::DiagDecorator;
-use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
+use rustc_hir as hir;
+use rustc_hir::def::Res;
+use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
+use rustc_middle::ty;
 use rustc_span::{Span, Symbol};
 
 dylint_linting::dylint_library!();
@@ -149,6 +162,34 @@ rustc_session::declare_lint! {
     "sensitive handler arguments must be skipped in #[instrument]"
 }
 
+rustc_session::declare_lint! {
+    /// ### What it does
+    /// Type-aware: checks the TYPE of every value recorded through a
+    /// `tracing` field (all sigils lower to `&dyn tracing::field::Value`
+    /// casts in the macro expansion) against a configurable list of secret
+    /// types (default: the `issuerd_core::models` secret newtypes and
+    /// credential/key structs).
+    ///
+    /// ### Why is this bad?
+    /// Secrets must never be logged at any level (AGENTS.md, "Logging
+    /// Conventions"). The syntactic `secret_field_in_log` lint only sees the
+    /// field NAME; this lint catches secret VALUES under innocuous names
+    /// (`info!(details = ?credential, ...)` — `Credential`'s derived Debug
+    /// prints the hash bytes).
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// info!(credentials = ?user.credential, "loaded"); // Credential!
+    /// ```
+    /// Use instead:
+    /// ```rust,ignore
+    /// info!(credential_id = %credential.id, "loaded");
+    /// ```
+    pub SECRET_TYPED_VALUE_IN_LOG,
+    Deny,
+    "secret values must never be logged (type-aware check of tracing field values)"
+}
+
 rustc_session::declare_lint_pass!(IssuerdLogHygiene => [
     TRACING_ERROR_DEBUG,
     SECRET_FIELD_IN_LOG,
@@ -164,10 +205,17 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         SECRET_FIELD_IN_LOG,
         SESSION_ID_IN_LOG,
         INSTRUMENT_SKIP_SENSITIVE,
+        SECRET_TYPED_VALUE_IN_LOG,
     ]);
     // Pre-expansion: the proc-macro attribute `#[instrument]` and the event
     // macro calls are expanded away before the regular early pass runs.
     lint_store.register_pre_expansion_lint_pass(Box::new(|| Box::new(IssuerdLogHygiene)));
+    // Type-aware lints run on the expanded tracing machinery (the `&dyn
+    // field::Value` casts and `FieldSet` construction only exist there).
+    let config = Config::load();
+    lint_store.register_late_lint_pass(Box::new(move |_| {
+        Box::new(IssuerdLogHygieneLate::new(config.clone()))
+    }));
 }
 
 /// The sigil between the field name and the value: `?` (Debug) or `%`
@@ -690,7 +738,195 @@ impl EarlyLintPass for IssuerdLogHygiene {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Type-aware lints (late pass, on the expanded tracing machinery)
+// ---------------------------------------------------------------------------
+//
+// Ground truth from tracing 0.1.44's macro expansion (verified against
+// `-Zunpretty=hir-tree` dumps):
+//
+// * Every field value becomes an entry of the `&[...]` array handed to
+//   `FieldSet::value_set_all`: `Option::Some(&<expr> as &dyn
+//   tracing::field::Value)`. The `%`/`?` sigils wrap the value in
+//   `tracing::field::display(&x)` / `debug(&x)` first (the fns resolve to
+//   `tracing_core::field::*`). The user's value expression keeps its
+//   original (non-expansion) span.
+// * A message, when present, is prepended as the FIRST value entry —
+//   `format_args!(...)`, whose type is `core::fmt::Arguments` — while the
+//   matching `"message"` name is a bare literal in the field set (no
+//   `FieldName::new` call).
+// * The field names live in the callsite statics, one
+//   `FieldName::new("...")` per user field, in field order.
+// * The event's level appears as a `$crate::Level::WARN` path expression
+//   (type `tracing_core::metadata::Level`); events end in
+//   `Event::dispatch`, spans in `Span::new`/`Span::child_of`.
+
+/// Lint configuration (workspace-root `dylint.toml`, `[issuerd_log_hygiene]`
+/// table; every key optional, these are the defaults).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+struct Config {
+    /// Full def paths of ADTs whose values must never be logged.
+    secret_types: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            secret_types: [
+                "issuerd_core::models::Password",
+                "issuerd_core::models::ClientSecret",
+                "issuerd_core::models::RefreshToken",
+                "issuerd_core::models::Assertion",
+                "issuerd_core::models::AuthorizationCode",
+                "issuerd_core::models::Credential",
+                "issuerd_core::models::StoredSigningKey",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Self {
+        dylint_linting::config_or_default(env!("CARGO_PKG_NAME"))
+    }
+}
+
+rustc_session::impl_lint_pass!(IssuerdLogHygieneLate => [SECRET_TYPED_VALUE_IN_LOG]);
+
+struct IssuerdLogHygieneLate {
+    config: Config,
+}
+
+impl IssuerdLogHygieneLate {
+    fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    /// `expr` casts to `&dyn tracing::field::Value`: run lint A immediately
+    /// and return nothing (lint B's positional pairing collects through
+    /// [`Self::check_value_set_array`] instead).
+    fn check_value_cast(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+        let hir::ExprKind::Cast(inner, _) = &expr.kind else {
+            return;
+        };
+        let ty = cx.typeck_results().expr_ty(expr);
+        if !is_dyn_tracing_value(cx, ty) {
+            return;
+        }
+        let Some(value) = unwrap_field_value(cx, inner) else {
+            return;
+        };
+        let value_ty = cx.typeck_results().expr_ty(value).peel_refs();
+        if let ty::TyKind::Adt(adt, _) = value_ty.kind() {
+            let path = canonical_path(cx.tcx, adt.did());
+            if self.config.secret_types.iter().any(|secret| *secret == path) {
+                cx.emit_span_lint(
+                    SECRET_TYPED_VALUE_IN_LOG,
+                    value.span,
+                    DiagDecorator(move |diag| {
+                        diag.primary_message(format!(
+                            "value of secret type `{path}` recorded in a log field"
+                        ));
+                        diag.help(
+                            "secret values must never be logged; log an identifier, hash, or length instead",
+                        );
+                    }),
+                );
+            }
+        }
+    }
+}
+
+impl<'tcx> LateLintPass<'tcx> for IssuerdLogHygieneLate {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
+        self.check_value_cast(cx, expr);
+    }
+}
+
+/// The canonical `crate::module::Item` path of `did`, built from the
+/// definition path — unlike `tcx.def_path_str`, which renders
+/// re-export-preferred trimmed paths (`tracing::Value` instead of
+/// `tracing_core::field::Value`, `std::fmt::Arguments` instead of
+/// `core::fmt::Arguments`) and omits the crate name for local items.
+fn canonical_path(tcx: ty::TyCtxt<'_>, did: rustc_span::def_id::DefId) -> String {
+    let def_path = tcx.def_path(did);
+    let mut path = tcx.crate_name(did.krate).to_string();
+    for part in &def_path.data {
+        path.push_str("::");
+        path.push_str(&part.data.to_string());
+    }
+    path
+}
+
+/// Is `ty` `&dyn tracing::field::Value` (the trait lives in tracing_core)?
+fn is_dyn_tracing_value(cx: &LateContext<'_>, ty: ty::Ty<'_>) -> bool {
+    let ty::TyKind::Ref(_, inner, _) = ty.kind() else {
+        return false;
+    };
+    let ty::TyKind::Dynamic(preds, ..) = inner.kind() else {
+        return false;
+    };
+    let Some(principal) = preds.principal() else {
+        return false;
+    };
+    canonical_path(cx.tcx, principal.def_id()) == "tracing_core::field::Value"
+}
+
+/// Unwrap a `&dyn Value` cast's inner `&<expr>` to the user's value
+/// expression, removing the `%`/`?` wrapper (`display(&x)`/`debug(&x)`).
+fn unwrap_field_value<'cx, 'tcx>(
+    cx: &LateContext<'cx>,
+    cast_inner: &'tcx hir::Expr<'tcx>,
+) -> Option<&'tcx hir::Expr<'tcx>> {
+    let hir::ExprKind::AddrOf(_, _, pointee) = &cast_inner.kind else {
+        return None;
+    };
+    if let hir::ExprKind::Call(func, [arg]) = &pointee.kind {
+        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &func.kind
+            && let Res::Def(_, did) = path.res
+            && matches!(
+                canonical_path(cx.tcx, did).as_str(),
+                "tracing_core::field::display" | "tracing_core::field::debug"
+            )
+        {
+            // display(&x) / debug(&x) — the argument is `&x`.
+            if let hir::ExprKind::AddrOf(_, _, value) = &arg.kind {
+                return Some(value);
+            }
+            return Some(arg);
+        }
+    }
+    Some(pointee)
+}
+
+impl Level {}
+
 #[test]
 fn ui() {
     dylint_testing::ui_test(env!("CARGO_PKG_NAME"), "ui");
+}
+
+// The type-aware lints need the real `tracing` macros (the `&dyn
+// field::Value` cast shapes only exist post-expansion), so their tests are
+// example targets — `ui_test_example` recovers the `--extern`/`--L` flags
+// from a real `cargo rustc` build, giving the test crate the lint crate's
+// dev-dependencies. `dylint_toml` points the configurable lists at the
+// example-local stub types.
+#[test]
+fn ui_secret_typed_value_in_log() {
+    dylint_testing::ui::Test::example(env!("CARGO_PKG_NAME"), "secret_typed_value_in_log")
+        .dylint_toml(
+            r#"
+                [issuerd_log_hygiene]
+                secret_types = [
+                    "secret_typed_value_in_log::models::Password",
+                    "secret_typed_value_in_log::models::Credential",
+                ]
+            "#,
+        )
+        .run();
 }

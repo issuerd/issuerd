@@ -11,9 +11,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 dylint_linting = "6.1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 dylint_testing = "6.1"
+# Real tracing for the type-aware lints' ui tests (the `&dyn field::Value`
+# cast shapes only exist with the genuine macros).
+tracing = "0.1"
 
 # Detached from the main workspace: the lint library builds with its own
 # pinned nightly (rust-toolchain.toml) and must not leak into `cargo build
