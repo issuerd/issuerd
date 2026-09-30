@@ -4,7 +4,7 @@
 // Dylint log-hygiene lints for the Issuerd workspace (the "Logging
 // Conventions" section of AGENTS.md).
 
-//! Five lints, in one pre-expansion early pass (syntax-only) and one late
+//! Six lints, in one pre-expansion early pass (syntax-only) and one late
 //! pass (type-aware, on the expanded `tracing` machinery):
 //!
 //! Early pass (no name resolution, no `clippy_utils`):
@@ -26,6 +26,14 @@
 //!
 //! - `secret_typed_value_in_log`: the value's type (after peeling references
 //!   and the display/debug wrapper) is in the configurable secret-type list.
+//! - `unsanitized_username_in_log`: a field named `username` (configurable)
+//!   in an INFO+ event or any span carries a raw `&str`/`String`/`Cow<str>`
+//!   that is not a `sanitize_log_str(...)` call. Field names and values are
+//!   paired positionally per macro call: names come from the
+//!   `FieldName::new("...")` literals in the callsite statics, values from
+//!   the `value_set_all(&[...])` array (the auto-`message` entry is detected
+//!   by its `core::fmt::Arguments` type and skipped). See README.md for the
+//!   limitations of positional pairing.
 //!
 //! Event macros are recognized by the last path segment
 //! (`trace!`/`debug!`/`info!`/`warn!`/`error!` — the workspace logs
@@ -53,6 +61,8 @@ use rustc_hir::def::Res;
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
 use rustc_middle::ty;
 use rustc_span::{Span, Symbol};
+
+use std::collections::HashMap;
 
 dylint_linting::dylint_library!();
 
@@ -190,6 +200,33 @@ rustc_session::declare_lint! {
     "secret values must never be logged (type-aware check of tracing field values)"
 }
 
+rustc_session::declare_lint! {
+    /// ### What it does
+    /// Type-aware: a `username` log field (list configurable) in an
+    /// INFO/WARN/ERROR event or any `#[instrument]` span whose value is a raw
+    /// `&str`/`String`/`Cow<str>` must be a call to the configured sanitizer
+    /// (`issuerd_core::utils::sanitize_log_str` by default). Values of the
+    /// validated newtype (`issuerd_core::models::Username` by default) are
+    /// legal.
+    ///
+    /// ### Why is this bad?
+    /// Unsanitized user-controlled text in logs is a log-injection vector
+    /// (forged entries via control characters); AGENTS.md requires
+    /// `sanitize_log_str` on usernames in security-relevant events.
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// warn!(username = %raw_input, "login failed");
+    /// ```
+    /// Use instead:
+    /// ```rust,ignore
+    /// warn!(username = %sanitize_log_str(raw_input), "login failed");
+    /// ```
+    pub UNSANITIZED_USERNAME_IN_LOG,
+    Deny,
+    "user-controlled `username` log fields must be sanitized (sanitize_log_str)"
+}
+
 rustc_session::declare_lint_pass!(IssuerdLogHygiene => [
     TRACING_ERROR_DEBUG,
     SECRET_FIELD_IN_LOG,
@@ -206,6 +243,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         SESSION_ID_IN_LOG,
         INSTRUMENT_SKIP_SENSITIVE,
         SECRET_TYPED_VALUE_IN_LOG,
+        UNSANITIZED_USERNAME_IN_LOG,
     ]);
     // Pre-expansion: the proc-macro attribute `#[instrument]` and the event
     // macro calls are expanded away before the regular early pass runs.
@@ -768,6 +806,12 @@ impl EarlyLintPass for IssuerdLogHygiene {
 struct Config {
     /// Full def paths of ADTs whose values must never be logged.
     secret_types: Vec<String>,
+    /// Log field names whose raw string values must be sanitized.
+    username_fields: Vec<String>,
+    /// Def path of the sanitizing function.
+    username_sanitizer: String,
+    /// Def paths of validated-username types; their values are legal raw.
+    username_safe_types: Vec<String>,
 }
 
 impl Default for Config {
@@ -785,6 +829,9 @@ impl Default for Config {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            username_fields: vec!["username".to_string()],
+            username_sanitizer: "issuerd_core::utils::sanitize_log_str".to_string(),
+            username_safe_types: vec!["issuerd_core::models::Username".to_string()],
         }
     }
 }
@@ -795,15 +842,76 @@ impl Config {
     }
 }
 
-rustc_session::impl_lint_pass!(IssuerdLogHygieneLate => [SECRET_TYPED_VALUE_IN_LOG]);
+/// Whether a value's type is raw text (`&str`/`String`/`Cow<str>`) or a
+/// configured safe username newtype.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextClass {
+    RawText,
+    SafeNewtype,
+    Other,
+}
+
+/// A field value in a `value_set_all` array, pre-digested at collection time
+/// (the typeck results are only valid while visiting the enclosing body).
+struct ValueEntry {
+    /// Span of the user's value expression (diagnostic target).
+    span: Span,
+    class: TextClass,
+    sanitized: bool,
+    /// The auto-prepended `message` entry (`format_args!` result, type
+    /// `core::fmt::Arguments`): it has no `FieldName::new` name, so it is
+    /// dropped before pairing names with values.
+    is_message: bool,
+}
+
+impl ValueEntry {
+    /// A non-`Some(...)` array element: keeps the indices aligned, never
+    /// lints.
+    fn placeholder() -> Self {
+        Self {
+            span: Span::default(),
+            class: TextClass::Other,
+            sanitized: false,
+            is_message: false,
+        }
+    }
+}
+
+/// What one `tracing` macro invocation expanded to (event vs span).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum MacroKind {
+    Event,
+    Span,
+    #[default]
+    Unknown,
+}
+
+/// All expansion artifacts of one `tracing` macro invocation, keyed by the
+/// root call-site span (see [`group_key`]).
+#[derive(Default)]
+struct MacroGroup {
+    names: Vec<String>,
+    level: Option<Level>,
+    kind: MacroKind,
+    arrays: Vec<Vec<ValueEntry>>,
+}
+
+rustc_session::impl_lint_pass!(IssuerdLogHygieneLate => [
+    SECRET_TYPED_VALUE_IN_LOG,
+    UNSANITIZED_USERNAME_IN_LOG,
+]);
 
 struct IssuerdLogHygieneLate {
     config: Config,
+    groups: HashMap<(u32, u32), MacroGroup>,
 }
 
 impl IssuerdLogHygieneLate {
     fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            groups: HashMap::new(),
+        }
     }
 
     /// `expr` casts to `&dyn tracing::field::Value`: run lint A immediately
@@ -839,12 +947,183 @@ impl IssuerdLogHygieneLate {
             }
         }
     }
+
+    /// Collect a `FieldName::new("...")` literal (one per user field, in
+    /// field order; the auto-`message` name is a bare literal and never
+    /// matches this shape).
+    fn check_field_name(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+        let Some((did, "new")) = type_relative_segment(expr) else {
+            return;
+        };
+        if canonical_path(cx.tcx, did) != "tracing::__macro_support::FieldName" {
+            return;
+        }
+        let hir::ExprKind::Call(_, [arg]) = &expr.kind else {
+            return;
+        };
+        let hir::ExprKind::Lit(lit) = &arg.kind else {
+            return;
+        };
+        let rustc_ast::LitKind::Str(sym, _) = lit.node else {
+            return;
+        };
+        self.groups.entry(group_key(arg.span)).or_default().names.push(sym.to_string());
+    }
+
+    /// Collect the field values of a `...value_set_all(&[...])` call, in
+    /// array order.
+    fn check_value_set_array(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+        let hir::ExprKind::MethodCall(seg, _recv, args, _) = &expr.kind else {
+            return;
+        };
+        if seg.ident.as_str() != "value_set_all" {
+            return;
+        }
+        let Some(hir::ExprKind::AddrOf(_, _, array_expr)) = args.first().map(|arg| &arg.kind)
+        else {
+            return;
+        };
+        let hir::ExprKind::Array(elements) = &array_expr.kind else {
+            return;
+        };
+        let mut entries = Vec::with_capacity(elements.len());
+        for element in *elements {
+            let Some(value) = some_ctor_cast_value(cx, element) else {
+                entries.push(ValueEntry::placeholder());
+                continue;
+            };
+            let value_ty = cx.typeck_results().expr_ty(value);
+            entries.push(ValueEntry {
+                span: value.span,
+                class: classify_value_ty(cx, value_ty, &self.config.username_safe_types),
+                sanitized: is_call_to(cx, value, &self.config.username_sanitizer),
+                is_message: is_format_args_ty(cx, value_ty),
+            });
+        }
+        let key = group_key(expr.span);
+        self.groups.entry(key).or_default().arrays.push(entries);
+    }
+
+    /// The macro's level: a `$crate::Level::WARN` path expression — a
+    /// type-relative path through `tracing_core::metadata::Level` (the
+    /// associated-const resolution is not filled in HIR, so match the type
+    /// path, not typeck).
+    fn check_level(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+        let Some((did, name)) = type_relative_segment(expr) else {
+            return;
+        };
+        if canonical_path(cx.tcx, did) != "tracing_core::metadata::Level" {
+            return;
+        }
+        let Some(level) = Level::from_level_name(name) else {
+            return;
+        };
+        self.groups.entry(group_key(expr.span)).or_default().level = Some(level);
+    }
+
+    /// Event vs span: `Event::dispatch` vs `Span::new`/`Span::child_of`.
+    fn check_macro_kind(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+        let hir::ExprKind::Call(func, _) = &expr.kind else {
+            return;
+        };
+        let hir::ExprKind::Path(hir::QPath::TypeRelative(ty, seg)) = &func.kind else {
+            return;
+        };
+        let hir::TyKind::Path(hir::QPath::Resolved(None, path)) = &ty.kind else {
+            return;
+        };
+        let Res::Def(_, did) = path.res else {
+            return;
+        };
+        let kind = match canonical_path(cx.tcx, did).as_str() {
+            "tracing_core::event::Event" | "tracing::event::Event"
+                if seg.ident.as_str() == "dispatch" =>
+            {
+                MacroKind::Event
+            }
+            "tracing::span::Span" if matches!(seg.ident.as_str(), "new" | "child_of") => {
+                MacroKind::Span
+            }
+            _ => return,
+        };
+        self.groups.entry(group_key(expr.span)).or_default().kind = kind;
+    }
 }
 
 impl<'tcx> LateLintPass<'tcx> for IssuerdLogHygieneLate {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         self.check_value_cast(cx, expr);
+        self.check_field_name(cx, expr);
+        self.check_value_set_array(cx, expr);
+        self.check_level(cx, expr);
+        self.check_macro_kind(cx, expr);
     }
+
+    fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
+        // Deterministic diagnostic order (the groups live in a HashMap).
+        let mut groups: Vec<_> = self.groups.iter().collect();
+        groups.sort_by_key(|(key, _)| *key);
+        for (_key, group) in groups {
+            // Events: gate at INFO+; spans: always; unrecognized expansions:
+            // never (a pairing guess here would be a false-positive risk).
+            let active = match group.kind {
+                MacroKind::Event => group.level.is_some_and(Level::at_least_info),
+                MacroKind::Span => true,
+                MacroKind::Unknown => false,
+            };
+            if !active {
+                continue;
+            }
+            for array in &group.arrays {
+                // The auto-`message` entry (format_args) has no FieldName::new
+                // name; drop it before pairing. Any residual length mismatch
+                // means the expansion drifted from the known shape — skip
+                // rather than mis-pair.
+                let values: &[ValueEntry] = match array.first() {
+                    Some(first) if first.is_message => &array[1..],
+                    _ => array,
+                };
+                if values.len() != group.names.len() {
+                    continue;
+                }
+                for (name, entry) in group.names.iter().zip(values) {
+                    if !self.config.username_fields.contains(name)
+                        || entry.class != TextClass::RawText
+                        || entry.sanitized
+                    {
+                        continue;
+                    }
+                    let name = name.clone();
+                    cx.emit_span_lint(
+                        UNSANITIZED_USERNAME_IN_LOG,
+                        entry.span,
+                        DiagDecorator(move |diag| {
+                            diag.primary_message(format!(
+                                "log field `{name}` records a raw, unsanitized string"
+                            ));
+                            diag.help(
+                                "user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type",
+                            );
+                        }),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Climb the expansion stack to the user-written root call site — the one
+/// span shared by every artifact of a single `tracing` macro invocation
+/// (field names in the callsite statics, value arrays in the body, the level
+/// path, the dispatch/new call).
+fn group_key(mut span: Span) -> (u32, u32) {
+    for _ in 0..32 {
+        if !span.from_expansion() {
+            break;
+        }
+        span = span.source_callsite();
+    }
+    (span.lo().0, span.hi().0)
 }
 
 /// The canonical `crate::module::Item` path of `did`, built from the
@@ -876,6 +1155,28 @@ fn is_dyn_tracing_value(cx: &LateContext<'_>, ty: ty::Ty<'_>) -> bool {
     canonical_path(cx.tcx, principal.def_id()) == "tracing_core::field::Value"
 }
 
+/// The def id of the type in a `<Type>::segment` path expression (a call's
+/// callee or an associated-const path), plus the segment name.
+fn type_relative_segment<'a, 'hir>(
+    expr: &'a hir::Expr<'hir>,
+) -> Option<(rustc_span::def_id::DefId, &'a str)> {
+    let func_or_path: &hir::ExprKind<'_> = match &expr.kind {
+        hir::ExprKind::Call(func, _) => &func.kind,
+        kind @ hir::ExprKind::Path(_) => kind,
+        _ => return None,
+    };
+    let hir::ExprKind::Path(hir::QPath::TypeRelative(ty, seg)) = func_or_path else {
+        return None;
+    };
+    let hir::TyKind::Path(hir::QPath::Resolved(None, path)) = &ty.kind else {
+        return None;
+    };
+    let Res::Def(_, did) = path.res else {
+        return None;
+    };
+    Some((did, seg.ident.as_str()))
+}
+
 /// Unwrap a `&dyn Value` cast's inner `&<expr>` to the user's value
 /// expression, removing the `%`/`?` wrapper (`display(&x)`/`debug(&x)`).
 fn unwrap_field_value<'cx, 'tcx>(
@@ -903,7 +1204,88 @@ fn unwrap_field_value<'cx, 'tcx>(
     Some(pointee)
 }
 
-impl Level {}
+/// Unwrap an `Option::Some(&<expr> as &dyn Value)` array element to the
+/// user's value expression.
+fn some_ctor_cast_value<'cx, 'tcx>(
+    cx: &LateContext<'cx>,
+    element: &'tcx hir::Expr<'tcx>,
+) -> Option<&'tcx hir::Expr<'tcx>> {
+    let hir::ExprKind::Call(_, [cast]) = &element.kind else {
+        return None;
+    };
+    let hir::ExprKind::Cast(inner, _) = &cast.kind else {
+        return None;
+    };
+    if !is_dyn_tracing_value(cx, cx.typeck_results().expr_ty(cast)) {
+        return None;
+    }
+    unwrap_field_value(cx, inner)
+}
+
+/// `true` if `expr` is a direct call to the function at `def_path`.
+fn is_call_to(cx: &LateContext<'_>, expr: &hir::Expr<'_>, def_path: &str) -> bool {
+    let hir::ExprKind::Call(func, _) = &expr.kind else {
+        return false;
+    };
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &func.kind else {
+        return false;
+    };
+    let Res::Def(_, did) = path.res else {
+        return false;
+    };
+    canonical_path(cx.tcx, did) == def_path
+}
+
+/// Classify a field value's type for the username rule.
+fn classify_value_ty(cx: &LateContext<'_>, ty: ty::Ty<'_>, safe_types: &[String]) -> TextClass {
+    let peeled = ty.peel_refs();
+    match peeled.kind() {
+        ty::TyKind::Str => TextClass::RawText,
+        ty::TyKind::Adt(adt, args) => {
+            let path = canonical_path(cx.tcx, adt.did());
+            if safe_types.iter().any(|safe| *safe == path) {
+                return TextClass::SafeNewtype;
+            }
+            if path == "alloc::string::String" {
+                return TextClass::RawText;
+            }
+            if path == "alloc::borrow::Cow"
+                && args.iter().filter_map(|arg| arg.as_type()).any(|arg| arg.is_str())
+            {
+                return TextClass::RawText;
+            }
+            TextClass::Other
+        }
+        _ => TextClass::Other,
+    }
+}
+
+/// Is `ty` `core::fmt::Arguments` (the `format_args!` result — the
+/// auto-prepended `message` entry)?
+fn is_format_args_ty(cx: &LateContext<'_>, ty: ty::Ty<'_>) -> bool {
+    let ty::TyKind::Adt(adt, _) = ty.peel_refs().kind() else {
+        return false;
+    };
+    canonical_path(cx.tcx, adt.did()) == "core::fmt::Arguments"
+}
+
+impl Level {
+    fn from_level_name(name: &str) -> Option<Self> {
+        match name {
+            "TRACE" => Some(Level::Trace),
+            "DEBUG" => Some(Level::Debug),
+            "INFO" => Some(Level::Info),
+            "WARN" => Some(Level::Warn),
+            "ERROR" => Some(Level::Error),
+            _ => None,
+        }
+    }
+
+    /// Events below INFO are exempt from the username rule.
+    fn at_least_info(self) -> bool {
+        matches!(self, Level::Info | Level::Warn | Level::Error)
+    }
+}
 
 #[test]
 fn ui() {
@@ -926,6 +1308,20 @@ fn ui_secret_typed_value_in_log() {
                     "secret_typed_value_in_log::models::Password",
                     "secret_typed_value_in_log::models::Credential",
                 ]
+            "#,
+        )
+        .run();
+}
+
+#[test]
+fn ui_unsanitized_username_in_log() {
+    dylint_testing::ui::Test::example(env!("CARGO_PKG_NAME"), "unsanitized_username_in_log")
+        .dylint_toml(
+            r#"
+                [issuerd_log_hygiene]
+                username_fields = ["username"]
+                username_sanitizer = "unsanitized_username_in_log::utils::sanitize_log_str"
+                username_safe_types = ["unsanitized_username_in_log::models::Username"]
             "#,
         )
         .run();

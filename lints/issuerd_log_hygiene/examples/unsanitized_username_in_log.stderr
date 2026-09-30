@@ -1,0 +1,59 @@
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:24:13
+   |
+LL | fn span_raw(raw: &str) {}
+   |             ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+   = note: `#[deny(unsanitized_username_in_log)]` on by default
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:36:32
+   |
+LL |     tracing::warn!(username = %raw, "bad");
+   |                                ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:37:32
+   |
+LL |     tracing::warn!(username = %owned, "bad");
+   |                                ^^^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:38:31
+   |
+LL |     tracing::warn!(username = raw, "plain form, still bad");
+   |                               ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:39:32
+   |
+LL |     tracing::info!(username = %raw, user_id = 3, "with another field");
+   |                                ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:40:32
+   |
+LL |     tracing::warn!(username = %raw);
+   |                                ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: log field `username` records a raw, unsanitized string
+  --> $DIR/unsanitized_username_in_log.rs:41:32
+   |
+LL |     tracing::warn!(username = %cow, "stored Cow is not a sanitizer call");
+   |                                ^^^
+   |
+   = help: user-controlled text must be sanitized before logging: wrap with `sanitize_log_str(...)` or use the validated `Username` type
+
+error: aborting due to 7 previous errors
+
