@@ -85,7 +85,7 @@ async fn load_realm_and_user(
         (status = 500, description = "Email delivery failed", body = crate::error::AdminApiErrorResponse),
     )
 )]
-#[instrument(skip(state, auth, actions), fields(realm = %realm, user_id = %id))]
+#[instrument(skip(state, auth, params, actions), fields(realm = %realm, user_id = %id))]
 pub async fn execute_actions_email(
     State(state): State<Arc<AdminApiState>>,
     Extension(auth): Extension<AdminAuth>,

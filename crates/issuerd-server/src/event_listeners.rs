@@ -28,8 +28,7 @@ impl EventListener for LoggingEventListener {
             event_type = ?event.event_type,
             user_id = ?event.user_id,
             client_id = ?event.client_id,
-            session_id = ?event.session_id,
-            error = ?event.error,
+            error = event.error.as_deref().unwrap_or(""),
             "user event"
         );
         Ok(())
@@ -41,7 +40,7 @@ impl EventListener for LoggingEventListener {
             operation = ?event.operation_type,
             resource_type = ?event.resource_type,
             resource_path = %event.resource_path,
-            error = ?event.error,
+            error = event.error.as_deref().unwrap_or(""),
             "admin event"
         );
         Ok(())

@@ -72,8 +72,8 @@ impl IntoResponse for AdminApiError {
             AdminApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             AdminApiError::Internal(err) => {
                 // 500s reach here with no log anywhere else in the crate —
-                // record the full anyhow chain (`?` prints the causes).
-                error!(error = ?err, "admin API internal error");
+                // record the error per the logging convention (`%`, not `?`).
+                error!(error = %err, "admin API internal error");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };

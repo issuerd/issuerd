@@ -3770,7 +3770,7 @@ pub async fn token_handler(
             };
             let idle = chrono::Duration::seconds(idle_secs as i64);
             if chrono::Utc::now() - session.last_session_refresh > idle {
-                warn!(realm = %realm_id, session_id = %session.id, offline = session.offline, "refresh rejected: session idle timeout exceeded");
+                warn!(realm = %realm_id, offline = session.offline, "refresh rejected: session idle timeout exceeded");
                 let _ = state.storage.delete_user_session(&realm_id, &session.id).await;
                 crate::session_cache::invalidate_session(&state, &realm_id, &session.id).await;
                 return (
@@ -6139,7 +6139,7 @@ pub(crate) async fn persist_session(
         state.storage.create_user_session(realm_id, session).await
     };
     result.map_err(|e| {
-        error!(realm = %realm_id, session_id = %session.id, error = %e, "failed to persist user session");
+        error!(realm = %realm_id, error = %e, "failed to persist user session");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(error_response(&IssuerdError::ServerError(e.to_string()))),

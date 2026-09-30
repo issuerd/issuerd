@@ -313,7 +313,7 @@ async fn import_idp(
         (status = 500, description = "Internal server error", body = crate::error::AdminApiErrorResponse),
     )
 )]
-#[instrument(skip(state, auth, body), fields(realm = %realm))]
+#[instrument(skip(state, auth, params, body), fields(realm = %realm))]
 pub async fn partial_import(
     State(state): State<Arc<AdminApiState>>,
     Extension(auth): Extension<AdminAuth>,

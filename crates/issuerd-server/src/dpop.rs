@@ -250,7 +250,7 @@ async fn issue_nonce(state: &ServerState, realm_id: &RealmId) -> Option<String> 
     use ring::rand::SecureRandom as _;
     let mut bytes = [0u8; 32];
     if let Err(e) = ring::rand::SystemRandom::new().fill(&mut bytes) {
-        tracing::warn!(realm = %realm_id, error = ?e, "DPoP nonce generation failed");
+        tracing::warn!(realm = %realm_id, error = %e, "DPoP nonce generation failed");
         return None;
     }
     let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
