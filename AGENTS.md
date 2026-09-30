@@ -49,6 +49,7 @@ issuerd/
 │   ├── start-issuerd-dev.ps1 # Visible-console daemon start (Windows, see below)
 │   ├── with-native-env.cmd  # Native openssl build env wrapper (Windows, see below)
 │   ├── kani.sh / flux.sh / mirai.sh # Verification tool runners (Linux/WSL, see below)
+│   ├── dylint.sh              # Log-hygiene dylint runner (see below)
 │   ├── package-release.sh       # Release archive packaging (CI + local rehearsal, see below)
 │   ├── cross-linux-arm64.sh     # Cross-compile linux/arm64 on x86_64 Ubuntu — local/rehearsal only; CI builds natively on ubuntu-22.04-arm
 │   ├── publish.py               # crates.io workspace publish (staging + dry-run/real, see below)
@@ -62,6 +63,7 @@ issuerd/
 ├── examples/                # Example server/provision configs (regenerable via `issuerd example`) + local demo stack config (*.demo.*) + runnable examples (agentic-mcp/ — dockerized agentic IAM demo: DPoP + RFC 8693 + CIBA)
 ├── docs/                    # Operations documentation set (index: docs/README.md) + CLUSTERING.md, PERFORMANCE.md, crate graph
 ├── themes/                  # Login theme(s) served at /realms/{realm}/theme/{*path}
+├── lints/                   # Dylint lint libraries (detached workspaces, own pinned nightly toolchains)
 └── webclientsrc/            # Embedded React/Vite admin + account SPA (optional)
 ```
 
@@ -220,13 +222,14 @@ Actions layout:
   "Cutting a release" below).
 - `.github/workflows/verification.yml` (push to `main` + PRs) — the extended
   tools below (flux is `continue-on-error` for now; the MIRAI job is disabled —
-  hard-blocked upstream, see the tool notes).
+  hard-blocked upstream, see the tool notes; the dylint job is blocking).
 
 | Tool | Purpose | Command | Notes |
 |------|---------|---------|-------|
 | cargo-audit | RUSTSEC advisory scan of Cargo.lock | `cargo audit` | justified ignores: `.cargo/audit.toml` |
 | cargo-deny | advisories + licenses + bans + sources | `cargo deny check` | config: `deny.toml` |
 | cargo-geiger | unsafe-code census | `cargo geiger --all-features` | informational report |
+| dylint | log-hygiene policy lints (`lints/issuerd_log_hygiene`) | `scripts/dylint.sh` (or `scripts/test.sh dylint`) | detached workspace + own pinned nightly (must predate rustc's `--env-set` removal — dylint#2078); discovered via `[workspace.metadata.dylint]`; deny-by-default lints |
 | Kani | model checking of proof harnesses | `scripts/kani.sh` | harnesses: `#[cfg(kani)]` module in `issuerd-protocol/src/pkce.rs` — both green |
 | Flux | refinement types | `scripts/flux.sh` | crates opt in via `[package.metadata.flux]`; annotations from the `flux-rs` git shim |
 | MIRAI | abstract interpretation / panic lint | `scripts/mirai.sh` | annotations from `mirai-annotations` (no-op in normal builds) |
@@ -831,7 +834,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 1. Review the conventions in this file (build commands, crate rules, implemented features below).
 2. Create a feature branch: `git checkout -b feat/<feature-name>`.
 3. Implement with tests first (TDD is encouraged).
-4. Ensure `cargo test --workspace` and `cargo clippy --workspace --all-features -- -D warnings` pass.
+4. Ensure `cargo test --workspace` and `cargo clippy --workspace --all-features -- -D warnings` pass, and — when you touched logging/`#[instrument]` call sites — `scripts/dylint.sh --workspace` (the log-hygiene lints are deny-by-default and gate PRs via the `dylint` job in `verification.yml`).
 5. Add a `CHANGELOG.md` entry under `## [Unreleased]` (Keep a Changelog format — see the header of that file). The `changelog.yml` PR gate fails otherwise; label the PR `no-changelog` for changes with no user-visible impact (CI, docs, pure refactorings).
 
 ### Publishing to crates.io

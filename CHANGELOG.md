@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dylint log-hygiene lint gate** (`lints/issuerd_log_hygiene`, deny-by-default, blocking `dylint` job in `verification.yml`): four syntax-only lints enforce the logging conventions at compile time — errors must be recorded as `error = %e` (not `?e`), no secret-named fields (`password`/`token`/`code`/`cookie`/...) in events or `#[instrument]` span fields, `session_id`/`sid` only at DEBUG/TRACE and never in span fields, and `#[instrument]` functions must `skip(...)`/`skip_all` sensitive arguments (state, headers, bodies, query params, client IPs, `*_token`/`*_secret`/...). Run locally with `scripts/dylint.sh --workspace` (or `scripts/test.sh dylint`; needs `cargo install --locked cargo-dylint dylint-link`). The lint crate is a detached workspace with its own pinned nightly (`nightly-2026-08-20` — must predate rustc's `--env-set` removal, see trailofbits/dylint#2078). Pre-existing violations found by the lints were fixed (error sigils, session-id fields, `#[instrument]` skip lists).
+
 ## [0.1.9] - 2026-09-27
 
 ### Fixed
