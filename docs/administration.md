@@ -124,7 +124,7 @@ http://<host>:<port>/admin/console
 
 ### Realm settings
 
-`Realm settings` edits the realm representation directly (`GET/PUT /admin/realms/{realm}`). Tabs:
+`Realm settings` edits the realm representation directly (`GET/PUT /admin/realms/{realm}`). The console always sends the full document with `merge=false`; API callers get merge-by-default semantics — a partial PUT applies only the fields present in the body (`?merge=false` restores full replacement, and is the only way to clear a nullable field). Tabs:
 
 - **General** — display name, enabled flag, SSL-required level, themes (login/email/admin theme dropdowns populated from the server's theme list), flow bindings, and default groups.
 - **Localization** — internationalization toggle, supported locales, default locale.
