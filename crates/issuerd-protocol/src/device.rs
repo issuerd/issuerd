@@ -172,9 +172,6 @@ mod tests {
             client_id: ClientIdentifier::new("client1").unwrap(),
             scope: Scope::parse("admin"),
         };
-        assert!(matches!(
-            req.validate(&client),
-            Err(IssuerdError::InvalidScope)
-        ));
+        assert!(matches!(req.validate(&client), Err(IssuerdError::InvalidScope)));
     }
 }
