@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`examples/agentic-mcp` demo stack: bumped PyJWT 2.14.0 → 2.15.1**, clearing the two Dependabot alerts for [GHSA-42vr-xj54-vc7v](https://github.com/advisories/GHSA-42vr-xj54-vc7v) (unauthenticated `RecursionError` DoS in pre-verification payload parse; the vulnerable paths are `PyJWKClient.get_signing_key_from_jwt` and `jwt.decode(..., options={"verify_signature": False})`, PyJWT ≤ 2.14.0). Both demo apps were pinned on 2.14.0: ChatApp (DPoP proof verification) and McpServer (JWKS client — the component the advisory names). Demo code only: the issuerd server is Rust and has no Python in its dependency tree. Verified against the ChatApp smoke suite (all checks pass on 2.15.1).
+
 ## [0.1.10] - 2026-09-30
 
 ### Changed
