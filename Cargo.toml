@@ -118,11 +118,21 @@ serde_yaml = "0.9"
 
 # Crypto
 ring = "0.17"
+# The `rust_crypto` backend (pure-Rust sign/verify) hard-bundles `rsa` — so the
+# rsa crate stays in the dependency tree via jsonwebtoken regardless of our own
+# usage. The only alternative backend is `aws_lc_rs` (C/assembly, needs
+# cmake/C toolchains on every target incl. Windows vendored and arm64 cross)
+# — a strictly worse build story for zero security gain here.
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.1"
 rustls-pki-types = "1.14"
+# rsa is used by issuerd-token only for RSA key GENERATION and PKCS#1/PKCS#8
+# DER encoding of signing keys (RS256 is the OIDC Core §15.1 mandatory alg) —
+# there is no RSA decryption anywhere, so RUSTSEC-2023-0071 (Marvin, a
+# decryption oracle) is not applicable. Latest 0.9.x, cargo audit/deny green.
+# Not removable: jsonwebtoken's rust_crypto backend pulls rsa anyway (above).
 rsa = "0.9"
 p256 = "0.13"
 p384 = "0.13"
@@ -211,7 +221,21 @@ qrcodegen = "1.8"
 # WebAuthn / passkeys (MFA second factor)
 # webauthn-rs-core depends on openssl without a feature gate; the vendored
 # feature is only referenced from Windows targets (see issuerd-auth-flow), where no
-# system OpenSSL is guaranteed. Unix builds keep linking the system OpenSSL.
+# system OpenSSL is guaranteed. Unix builds keep linking the system OpenSSL,
+# so OpenSSL CVE fixes ship via the base image / host libssl — no issuerd
+# rebuild (only the Windows binary carries a statically linked vendored copy).
+#
+# danger-allow-state-serialisation (justified): the feature unlocks serde on
+# the in-ceremony state types (PasskeyRegistration/PasskeyAuthentication).
+# webauthn-rs marks it "danger-" because persisting ceremony state is unsafe
+# when done wrong (client-side storage, reuse). Issuerd's usage stays within
+# the intended server-side pattern: the state is stored ONLY in the
+# server-side distributed cache (never sent to the client), is single-use
+# (consumed via atomic get_and_delete on ceremony completion — success or
+# failure), and expires after 300 s. Serialization is REQUIRED for horizontal
+# scaling: the request that finishes a ceremony can land on a different node
+# than the one that started it, so the state must live in shared storage
+# (Redis), matching how Keycloak stores WebAuthn state in the auth session.
 openssl = { version = "0.10", features = ["vendored"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 

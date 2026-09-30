@@ -400,6 +400,17 @@ users who own a passkey; registration happens in the account console
 `issuer_url` host and ceremony state is cached for 300 s — see the issuer warning in
 [TLS everywhere](#tls-everywhere).
 
+**`danger-allow-state-serialisation` justification.** The build enables webauthn-rs's
+`danger-` feature that unlocks serde on the in-ceremony state types — flagged "danger" because
+persisting ceremony state is unsafe when stored client-side or reused. Issuerd uses it only
+in the intended server-side pattern: the ceremony state is serialized **only into the
+server-side distributed cache** (never sent to the client), is **single-use** (consumed with an
+atomic `get_and_delete` when the ceremony finishes, whether it succeeds or fails), and expires
+after 300 s. Serialization is required for horizontal scaling: the request finishing a ceremony
+may land on a different node than the one that started it, so the state must live in shared
+storage (Redis) — the same model Keycloak uses for WebAuthn state in the authentication
+session.
+
 ### Passwordless email-code realms
 
 A realm can replace passwords entirely with emailed one-time codes: set the realm attribute
