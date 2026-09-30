@@ -325,7 +325,7 @@ async fn e2e_bruteforce_lockout_shared() {
 
     // Lockout is realm-gated: enable brute-force protection on the
     // demo realm via the admin API. A master-realm token administers every
-    // realm; PUT resets omitted fields to defaults, so round-trip via GET.
+    // realm; round-trip via GET so the full document is sent back.
     let resp = password_grant(&client, &lb, "master", "admin-cli", None, "admin", "admin").await;
     assert_eq!(resp.status(), 200, "admin password grant must succeed");
     let admin_token = response_json(resp).await["access_token"].as_str().unwrap().to_string();
