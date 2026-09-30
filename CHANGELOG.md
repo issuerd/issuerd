@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-30
+
 ### Changed
 
 - **Realm update PUT merges by default (breaking, with opt-out).** `PUT /admin/realms/{realm}` no longer silently resets omitted fields to model defaults: the body is now merged over the stored realm — only the fields present are applied, omitted (or null) fields keep their current values. A partial PUT from automation/IaC can therefore no longer switch brute-force protection back off or reset token lifespans and the events config. The legacy full-replacement semantics remain available via the new `?merge=false` query parameter, which is also the only way to *clear* a nullable field (`loginTheme`, `display_name`, `browserFlow`, ...) back to unset, because merge mode treats an explicit JSON `null` exactly like an absent field. The admin console pins `merge=false` since it always sends the complete document. Deliberate divergence from Keycloak, whose realm PUT always fully replaces (see `tests/KEYCLOAK_DIFFS.md`). **Migration:** API callers that relied on reset-on-omit must append `?merge=false`; callers already sending full GET-round-trip documents need no change.
