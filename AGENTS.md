@@ -229,7 +229,7 @@ Actions layout:
 | cargo-audit | RUSTSEC advisory scan of Cargo.lock | `cargo audit` | justified ignores: `.cargo/audit.toml` |
 | cargo-deny | advisories + licenses + bans + sources | `cargo deny check` | config: `deny.toml` |
 | cargo-geiger | unsafe-code census | `cargo geiger --all-features` | informational report |
-| dylint | log-hygiene policy lints (`lints/issuerd_log_hygiene`) | `scripts/dylint.sh` (or `scripts/test.sh dylint`) | detached workspace + own pinned nightly (must predate rustc's `--env-set` removal — dylint#2078); discovered via `[workspace.metadata.dylint]`; deny-by-default lints |
+| dylint | log-hygiene policy lints (`lints/issuerd_log_hygiene`): 4 syntax-only + 2 type-aware (secret-typed values, unsanitized `username`) | `scripts/dylint.sh` (or `scripts/test.sh dylint`) | detached workspace + own pinned nightly (must predate rustc's `--env-set` removal — dylint#2078); discovered via `[workspace.metadata.dylint]`; deny-by-default lints; `dylint.toml` config knobs documented in the crate README |
 | Kani | model checking of proof harnesses | `scripts/kani.sh` | harnesses: `#[cfg(kani)]` module in `issuerd-protocol/src/pkce.rs` — both green |
 | Flux | refinement types | `scripts/flux.sh` | crates opt in via `[package.metadata.flux]`; annotations from the `flux-rs` git shim |
 | MIRAI | abstract interpretation / panic lint | `scripts/mirai.sh` | annotations from `mirai-annotations` (no-op in normal builds) |
