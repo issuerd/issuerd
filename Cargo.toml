@@ -25,6 +25,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Issuerd: a horizontally scalable, modular IAM server implementing OIDC/OAuth2 (Keycloak-inspired), with embedded admin/account web consoles"
@@ -95,6 +96,7 @@ version = "0.1.9"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/issuerd/issuerd"
+homepage = "https://issuerd.org"
 authors = ["Dmitry Andreev <da@issuerd.org>"]
 rust-version = "1.95"
 
