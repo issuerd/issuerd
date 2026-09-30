@@ -1,0 +1,24 @@
+[package]
+name = "issuerd_log_hygiene"
+version = "0.1.0"
+authors = ["Dmitry Andreev <da@issuerd.org>"]
+description = "Dylint lints enforcing the Issuerd tracing log-hygiene policy (AGENTS.md \"Logging Conventions\")"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "6.1"
+
+[dev-dependencies]
+dylint_testing = "6.1"
+
+# Detached from the main workspace: the lint library builds with its own
+# pinned nightly (rust-toolchain.toml) and must not leak into `cargo build
+# --workspace` / `cargo clippy --workspace` / `cargo package` of the server.
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true

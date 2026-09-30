@@ -1,0 +1,59 @@
+error: log field `error` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:16:12
+   |
+LL |     error!(error = ?e, "failed");
+   |            ^^^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+   = note: `#[deny(tracing_error_debug)]` on by default
+
+error: log field `err` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:17:12
+   |
+LL |     error!(err = ?e, "failed");
+   |            ^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: log field `error` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:18:11
+   |
+LL |     warn!(error = ?e, "failed");
+   |           ^^^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: log field `err` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:19:12
+   |
+LL |     debug!(err = ?e, "failed");
+   |            ^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: log field `error` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:20:12
+   |
+LL |     trace!(error = ?e);
+   |            ^^^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: log field `error` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:21:31
+   |
+LL |     error!(target: "issuerd", error = ?e, "failed");
+   |                               ^^^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: log field `err` records an error with the `?` (Debug) sigil
+  --> $DIR/tracing_error_debug.rs:22:13
+   |
+LL |     error!(?err, "failed");
+   |             ^^^
+   |
+   = help: log errors as `error = %e` (Display); see AGENTS.md "Logging Conventions"
+
+error: aborting due to 7 previous errors
+

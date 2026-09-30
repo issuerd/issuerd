@@ -1,0 +1,43 @@
+error: log field `session_id` records a session identifier at INFO level
+  --> $DIR/session_id_in_log.rs:19:11
+   |
+LL |     info!(session_id = "abc", "login");
+   |           ^^^^^^^^^^
+   |
+   = help: session IDs are DEBUG at most; lower the event level or drop the field
+   = note: `#[deny(session_id_in_log)]` on by default
+
+error: log field `sid` records a session identifier at WARN level
+  --> $DIR/session_id_in_log.rs:20:11
+   |
+LL |     warn!(sid = %sid, "refresh");
+   |           ^^^
+   |
+   = help: session IDs are DEBUG at most; lower the event level or drop the field
+
+error: log field `session_id` records a session identifier at ERROR level
+  --> $DIR/session_id_in_log.rs:21:12
+   |
+LL |     error!(session_id = ?sid, "lookup failed");
+   |            ^^^^^^^^^^
+   |
+   = help: session IDs are DEBUG at most; lower the event level or drop the field
+
+error: span field `session_id` records a session identifier
+  --> $DIR/session_id_in_log.rs:30:30
+   |
+LL | #[tracing::instrument(fields(session_id = "abc"))]
+   |                              ^^^^^^^^^^
+   |
+   = help: session IDs never appear in span fields; drop the field
+
+error: span field `sid` records a session identifier
+  --> $DIR/session_id_in_log.rs:33:40
+   |
+LL | #[tracing::instrument(skip_all, fields(sid = "s1"))]
+   |                                        ^^^
+   |
+   = help: session IDs never appear in span fields; drop the field
+
+error: aborting due to 5 previous errors
+

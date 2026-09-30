@@ -1,0 +1,67 @@
+error: `#[instrument]` records the sensitive argument `state`
+  --> $DIR/instrument_skip_sensitive.rs:15:18
+   |
+LL | async fn no_skip(state: &State) {}
+   |                  ^^^^^
+   |
+   = help: add `state` to the skip list, e.g. `skip(.., state)`, or use `skip_all`
+   = note: `#[deny(instrument_skip_sensitive)]` on by default
+
+error: `#[instrument]` records the sensitive argument `headers`
+  --> $DIR/instrument_skip_sensitive.rs:18:22
+   |
+LL | async fn no_skip_two(headers: Headers, body: String) {}
+   |                      ^^^^^^^
+   |
+   = help: add `headers` to the skip list, e.g. `skip(.., headers)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `body`
+  --> $DIR/instrument_skip_sensitive.rs:18:40
+   |
+LL | async fn no_skip_two(headers: Headers, body: String) {}
+   |                                        ^^^^
+   |
+   = help: add `body` to the skip list, e.g. `skip(.., body)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `access_token`
+  --> $DIR/instrument_skip_sensitive.rs:21:44
+   |
+LL | async fn missing_token_skip(state: &State, access_token: &str) {}
+   |                                            ^^^^^^^^^^^^
+   |
+   = help: add `access_token` to the skip list, e.g. `skip(.., access_token)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `state`
+  --> $DIR/instrument_skip_sensitive.rs:24:31
+   |
+LL | async fn destructured(Wrapper(state): Wrapper) {}
+   |                               ^^^^^
+   |
+   = help: add `state` to the skip list, e.g. `skip(.., state)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `headers`
+  --> $DIR/instrument_skip_sensitive.rs:29:28
+   |
+LL |     async fn method(&self, headers: &Headers) {}
+   |                            ^^^^^^^
+   |
+   = help: add `headers` to the skip list, e.g. `skip(.., headers)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `query`
+  --> $DIR/instrument_skip_sensitive.rs:34:14
+   |
+LL |     fn fetch(query: &str);
+   |              ^^^^^
+   |
+   = help: add `query` to the skip list, e.g. `skip(.., query)`, or use `skip_all`
+
+error: `#[instrument]` records the sensitive argument `signing_key`
+  --> $DIR/instrument_skip_sensitive.rs:38:18
+   |
+LL | async fn key_arg(signing_key: &[u8]) {}
+   |                  ^^^^^^^^^^^
+   |
+   = help: add `signing_key` to the skip list, e.g. `skip(.., signing_key)`, or use `skip_all`
+
+error: aborting due to 8 previous errors
+

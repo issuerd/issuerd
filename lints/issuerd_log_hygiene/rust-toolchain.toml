@@ -1,0 +1,8 @@
+# Dylint's driver passes the (unstable) `--env-set` flag to rustc
+# (trailofbits/dylint#2010). rustc removed that flag in
+# rust-lang/rust#161831 (merged 2026-08-31), so the pinned nightly must
+# predate the removal; 2026-08-20 is the toolchain dylint 6.1.0's own
+# template and CI pin. See README.md ("Updating the pinned toolchain").
+[toolchain]
+channel = "nightly-2026-08-20"
+components = ["cargo", "llvm-tools-preview", "rustc-dev", "rust-src"]
