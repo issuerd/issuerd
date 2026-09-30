@@ -732,7 +732,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 - **Legacy tool:** `cargo-tarpaulin` with LLVM engine.
   - Config: `tarpaulin.toml`
   - Outputs: HTML, XML (Cobertura), LCOV, stdout.
-- Target: >90% unit test coverage per crate (enforced once baseline is established).
+- Gate: the CI coverage job fails when the **workspace-wide** line coverage drops below **90%** (`cargo llvm-cov ... --fail-under-lines 90`; baseline ~95%, current number on the `badges` branch). Per-crate numbers vary — the Docker-backed crates (`issuerd-storage`, `issuerd-cluster`) and the root binary sit below 90% in CI because Docker-dependent suites skip there; keep the other crates at ≥90%.
 
 ---
 

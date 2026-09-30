@@ -129,8 +129,10 @@ jobs:
       # for real in heavy.yml. The lcov export feeds
       # scripts/coverage_badges.py and is kept as an artifact (render locally:
       # `genhtml rust-lcov.info`).
+      # --fail-under-lines is the global coverage gate: the job fails when the
+      # workspace total drops below 90% (baseline ~95%, see the badges branch).
       - name: Rust tests + coverage
-        run: cargo llvm-cov --locked --workspace --lcov --output-path rust-lcov.info
+        run: cargo llvm-cov --locked --workspace --lcov --output-path rust-lcov.info --fail-under-lines 90
       # llvm-cov cannot instrument doctests on stable, so they are not part
       # of the coverage run — execute them uninstrumented instead.
       - name: Rust doc tests
