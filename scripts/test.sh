@@ -46,8 +46,12 @@ case "$MODE" in
     echo "Running cargo-geiger (unsafe code report)..."
     cargo geiger --all-features
     ;;
+  dylint)
+    echo "Running dylint log-hygiene lints..."
+    cargo dylint --all -- --workspace
+    ;;
   *)
-    echo "Usage: $0 [unit|integration|ignored|all|fmt|clippy|doc|deny|audit|geiger]"
+    echo "Usage: $0 [unit|integration|ignored|all|fmt|clippy|doc|deny|audit|geiger|dylint]"
     exit 1
     ;;
 esac

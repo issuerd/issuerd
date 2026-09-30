@@ -12,6 +12,13 @@ members = [
 ]
 resolver = "2"
 
+# Dylint lint libraries (log-hygiene policy). The crates under lints/ are
+# detached workspaces (own [workspace] table + pinned nightly toolchain), so
+# `cargo build/check/test --workspace` never touches them; only
+# `cargo dylint --all` (scripts/dylint.sh) discovers them via this table.
+[workspace.metadata.dylint]
+libraries = [{ path = "lints/*" }]
+
 [package]
 name = "issuerd"
 version.workspace = true

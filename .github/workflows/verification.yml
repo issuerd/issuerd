@@ -65,6 +65,43 @@ jobs:
       # to bare `cargo flux` after a flux bump that resolves #1666.
       - run: cargo flux check -p issuerd-core --only-check="def:models::SecondsNonZero"
 
+  dylint:
+    name: cargo dylint (log-hygiene lints)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The lint library (lints/issuerd_log_hygiene) pins its own dated
+      # nightly in rust-toolchain.toml; cargo-dylint builds the library and
+      # checks the workspace under that toolchain. Keep this install in sync
+      # with the pin (the toolchain must predate the rustc `--env-set`
+      # removal — see the lint crate's README).
+      - name: Install the pinned lint toolchain
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal -c cargo -c rustc-dev -c rust-src -c llvm-tools-preview
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      # Not in taiki-e/install-action's manifest set; install from source.
+      - name: Install cargo-dylint + dylint-link
+        run: cargo install --locked cargo-dylint dylint-link
+      # The driver build (~minutes) lands in ~/.dylint_drivers; the lint
+      # library's own target dir lives outside the workspace root's target/.
+      - name: Cache dylint driver and lint library
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.dylint_drivers
+            lints/issuerd_log_hygiene/target
+          key: ${{ runner.os }}-dylint-${{ hashFiles('lints/issuerd_log_hygiene/rust-toolchain.toml', 'lints/issuerd_log_hygiene/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-dylint-
+      # Separate cache entry: the workspace is checked under the pinned
+      # nightly here, not the stable toolchain of ci.yml.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dylint
+      # Blocking on purpose: the lints are deny-by-default, so a policy
+      # breach (secret in a log field, `?e` error, session id above DEBUG,
+      # unskipped sensitive #[instrument] argument) fails the job.
+      - run: cargo dylint --all -- --workspace
+
   # MIRAI (abstract interpretation) — job disabled: hard-blocked upstream.
   # MIRAI pins nightly-2025-01-10 (~rustc 1.86, baked into the cargo-mirai
   # binary at build time) while this workspace requires rustc >= 1.95, so
