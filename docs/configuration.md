@@ -642,17 +642,11 @@ operational property of the shared signing-key set plus one realm attribute.
   already carry an active RS256 boot key, and additional RSA keys can be
   rotated in (`{"algorithm": "RS256", "key_size": 2048}`); pin the realm
   attribute to `RS256` to use them. Note on the crypto backend: RS256/384/512
-  signing runs through the `rsa` crate (jsonwebtoken's `rust_crypto` backend
-  implements RSA signing with `rsa::SigningKey`; `ring` is used only for Ed25519
-  key generation). `RUSTSEC-2023-0071` (Marvin) covers RSA private-key
-  operations — decryption AND PKCS#1 v1.5 signing — so the advisory's timing
-  surface is reachable on RS256-pinned realms. It is ignored in
-  `.cargo/audit.toml` / `deny.toml` as an **accepted residual risk**, not a
-  non-applicable one: no patched `rsa` release exists (upstream
-  RustCrypto/RSA#626/#680/#702), the sign path applies RNG blinding, and issuerd
-  performs no RSA decryption (the classic Marvin oracle). The residual plan is
-  migrating RSA key generation off `rsa` and evaluating jsonwebtoken's
-  `aws_lc_rs` backend.
+  signing runs through the FIPS-validated `aws-lc-rs` library (jsonwebtoken's
+  `aws_lc_rs` backend), and RSA key generation uses OpenSSL — the pure-Rust
+  `rsa` crate affected by `RUSTSEC-2023-0071` (Marvin; RSA private-key
+  operations incl. PKCS#1 v1.5 signing) is not in the compiled dependency
+  graph at all, so the advisory carries no ignore entry in `deny.toml`.
 - **Upgrading existing deployments.** Stored keys are never touched by an
   upgrade: an existing RS256-only key set keeps signing RS256 for
   un-configured realms (the EdDSA default finds no matching key and falls

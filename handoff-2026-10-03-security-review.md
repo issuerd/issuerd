@@ -14,12 +14,26 @@ This is an uncommitted working artifact. Delete or fold into docs once all batch
 
 | Item | Status |
 |---|---|
-| RUSTSEC-2023-0071 justification corrections | **DONE** (uncommitted, see §1) |
-| Batch 1 — High chain: jwks.url fetch + DCR payload policy + master-only keys + JAR cooldown | PENDING |
-| Batch 2 — SSRF guard explicit range list | PENDING |
-| Batch 3 — Reject PKCE `plain` (breaking-hardening, needs maintainer sign-off) | PENDING decision |
-| Batch 4 — First-broker-login account-linking audit (read-only) | PENDING |
-| Deferred hardening (dpop_jkt, DNS pinning, boot warnings, rotate-loop cap, IdP test-connection) | PENDING / optional |
+| RUSTSEC-2023-0071 justification corrections | **DONE** (committed: `4b6f7fd`) |
+| **EXTRA — both advisory exceptions eliminated** (rsa → aws_lc_rs backend + OpenSSL keygen; rustls-pemfile → redis 0.29; deny zero ignores, audit one scoped tooling-gap entry for the sqlx weak-dep lockfile quirk cargo#10801) | **DONE** (`830bba8`) |
+| **EXTRA — release.yml: Docker Hub publish is the final gated stage** (after heavy suites + platform builds + GitHub Release + crates.io) | **DONE** (`a40fd7f`) |
+| Batch 1a — jwks.url fetch routed through SSRF-guarded path (https-only, IP checks, no redirects, 64 KiB cap) | **DONE** |
+| Batch 1b — DCR open-endpoint payload policy (strip JWKS/logout attrs, force no service account, redirect-scheme allowlist, reject `*` origin) | **DONE** |
+| Batch 1c — master-only keys rotate/disable + audit events always on master realm | **DONE** |
+| Batch 1d — JAR unknown-kid refetch shares the 60 s cooldown | **DONE** |
+| Batch 2 — explicit CIDR blocklist + guarded fetch is a required trait method | **DONE** |
+| Batch 3 — PKCE S256-only at authorize AND token (plain + missing method rejected; breaking-hardening, CHANGELOG migration note) | **DONE** (recommended variant implemented) |
+| Batch 4 — first-broker-login audit | **DONE** — verdict: 2 High + 1 Low findings (see §3 Batch 4 notes below) |
+| Batch 4b — fixes: callback browser-correlation cookie (SameSite=None;Secure on TLS), link-page brute-force wiring + per-entry attempt cap + LOGIN_ERROR events, link-token alias binding (fail-closed for pre-change tokens) | **DONE** |
+| Deferred hardening (dpop_jkt, DNS pinning, boot warnings, rotate-loop cap, IdP test-connection, backchannel-logout client) | PENDING / optional (unchanged) |
+
+Batch 4 audit verdict (summary): the broker callback consumed the single-use state without checking the browser-correlation cookie (login CSRF → session injection; phishing-assisted account linking) — High, fixed in 4b; the link-via-password page verified the existing account's password with no lockout/events/attempt cap (unthrottled guessing oracle bypassing `brute_force_protected`) — High, fixed in 4b; link action tokens were not IdP-alias-bound — Low, fixed in 4b. Everything else (re-auth-by-default linking, trust-email gate, action-token signature/expiry/single-use-via-BrokerState, mapper confinement, kc_idp_hint order, external id_token validation) verified SAFE with code anchors; full report in the session history.
+
+Known residuals recorded for follow-up:
+- RFC 7592 self-management PUT (`clients-registrations/openid-connect/{id}`) can re-add attributes the open-endpoint policy strips (needs registration-provenance tracking to gate cleanly); mitigated in the interim by the SSRF-guarded fetch path (Batch 1a) which is the real boundary for `jwks.url`.
+- 2FA on the link-confirmation page (Keycloak runs the full browser flow) — larger redesign, not started.
+- `__Host-` cookie-prefix rename for flow cookies — noted in `flow_cookie_header`'s doc comment.
+- `PkceCodeChallengeMethod::Plain` core variant retained for parsing stored values; no longer advertised via the admin enum endpoint nor accepted anywhere.
 
 Process rules that apply to every batch (from AGENTS.md):
 - CHANGELOG.md entry per PR under `## [Unreleased]` — **state the class of fix, not an

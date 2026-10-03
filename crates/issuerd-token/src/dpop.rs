@@ -454,13 +454,13 @@ mod tests {
         let expected = b64(sha2::Sha256::digest(
             b"{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"xx\",\"y\":\"yy\"}",
         )
-        .as_slice());
+        .as_ref());
         assert_eq!(jwk_thumbprint(&ec).unwrap(), expected);
 
         let okp = serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": "xx"});
         let expected =
             b64(sha2::Sha256::digest(b"{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"xx\"}")
-                .as_slice());
+                .as_ref());
         assert_eq!(jwk_thumbprint(&okp).unwrap(), expected);
     }
 
