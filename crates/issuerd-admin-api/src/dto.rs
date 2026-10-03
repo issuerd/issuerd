@@ -981,6 +981,12 @@ pub struct AuthenticatorConfigRequest {
 pub struct UserQueryParams {
     /// Search string matched against username, email, first name, and last name.
     pub search: Option<String>,
+    /// Exact-match username filter (Keycloak parity): when present, returns at
+    /// most the one user with exactly this username and ignores `search`.
+    pub username: Option<String>,
+    /// Exact-match email filter (Keycloak parity): when present, returns at
+    /// most the one user with exactly this email and ignores `search`.
+    pub email: Option<String>,
     /// Zero-based index of the first result to return.
     #[serde(default)]
     pub first: i32,

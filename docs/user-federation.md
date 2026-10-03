@@ -54,7 +54,7 @@ Both paths create the same kind of local row and reconcile group memberships the
 | Samba AD DC | `ldap` | `SAMBA` (or `ACTIVE_DIRECTORY`) | Primary test target (`tests/integration/federation_samba.rs`) |
 | OpenLDAP (generic RFC 4519 schema) | `ldap` | `GENERIC` | Tested (`tests/integration/federation_ldap.rs`) |
 | Microsoft Active Directory | `ldap` | `ACTIVE_DIRECTORY` | Tested against an AD DS lab (`tests/integration/federation_ad.rs`) |
-| LLDAP | `ldap` | `GENERIC` | Tested (lab rig; `uid`/`entryUUID` schema, virtual `memberOf`, exact object-class set `inetOrgPerson,posixAccount,mailAccount,person`) |
+| LLDAP | `ldap` | `GENERIC` | Tested (lab rig; `uid`/`entryUUID` schema, virtual `memberOf`, exact object-class set `inetOrgPerson,posixAccount,mailAccount,person`; password writes via plain `userPassword` replace and the RFC 3062 exop) |
 | Kerberos KDC (SPNEGO) | `kerberos` | — | Tested against the Samba DC KDC |
 
 The `vendor` key selects directory-flavor defaults (username/UUID attribute names) and, for `ACTIVE_DIRECTORY`, the password-write encoding (`unicodePwd`). `SAMBA` currently shares the `ACTIVE_DIRECTORY` attribute defaults.
@@ -348,6 +348,8 @@ With `editMode: WRITABLE` (or `UNSYNCED`), password changes are **propagated to 
 - the admin `users/{id}/reset-password` endpoint (a `temporary` reset writes the temporary password to the directory and still forces the UPDATE_PASSWORD rotation at next login).
 
 Rules: the write-through only fires when the user's `federation_link` matches a live provider; the directory write replaces the local credential write entirely, and any stale local password credentials are **deleted** on success (login only consults local credentials when the provider errors — a leftover local password would otherwise act as a dormant fallback during directory outages). With `editMode: READONLY` the write fails with a 400-level "the external directory for this user does not accept password changes" error — keep `READONLY` and manage passwords in the directory if you do not want users changing them through Issuerd. Non-federated users and links pointing at removed providers keep the pure local-credential behavior. Remember the AD caveat above: `unicodePwd` writes need `ldaps://` (or StartTLS).
+
+**LLDAP** accepts the generic write path (a plain `userPassword` replace from the provider's bind connection — LLDAP also offers the RFC 3062 *Password Modify* exop, which Issuerd does not need). The bound account must be authorized for the target in LLDAP terms: `lldap_admin` members can change anyone's password, `lldap_password_manager` members can change regular users' (not other admins'), and any user can change their own. One operational trap: resetting the password of the federated user who **is** the provider's bind account changes the service account's password in LLDAP, so the provider then binds with the stale configured credential until `bindCredential` is updated — prefer a dedicated bind-only service account.
 
 ### Monitoring sync results
 

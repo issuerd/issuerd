@@ -14427,7 +14427,7 @@
           "Users"
         ],
         "summary": "List users in a realm",
-        "description": "Returns a paginated list of users. Supports searching by username, email, first name, or last name. Requires `view-users` or `manage-users` role.",
+        "description": "Returns a paginated list of users. Supports substring searching (`search`) across username, email, first and last name, and Keycloak-parity exact-match filters (`username`, `email`) which take precedence over `search`. Requires `view-users` or `manage-users` role.",
         "operationId": "list_users",
         "parameters": [
           {
@@ -14443,6 +14443,30 @@
             "name": "search",
             "in": "query",
             "description": "Search string matched against username, email, first name, and last name.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "username",
+            "in": "query",
+            "description": "Exact-match username filter (Keycloak parity): when present, returns at\nmost the one user with exactly this username and ignores `search`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "email",
+            "in": "query",
+            "description": "Exact-match email filter (Keycloak parity): when present, returns at\nmost the one user with exactly this email and ignores `search`.",
             "required": false,
             "schema": {
               "type": [

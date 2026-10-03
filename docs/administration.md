@@ -171,7 +171,7 @@ Realm-role CRUD (`.../roles[/{role_name}]`) with composite-role management (`...
 
 ### Users
 
-The user list (`GET .../users?search=...&first=&max=`) searches username, email, first and last name; `GET .../users/count` gives the filtered total. The user detail page has tabs:
+The user list (`GET .../users?search=...&first=&max=`) searches username, email, first and last name; the Keycloak-parity exact-match filters `?username=...` and `?email=...` take precedence over `search` and return at most one user; `GET .../users/count` gives the filtered total. The user detail page has tabs:
 
 - **Details** — username, email (+verified flag), names, enabled, attributes, required actions (`requiredActions` in the representation). Known required-action ids are `VERIFY_EMAIL`, `UPDATE_PASSWORD`, `UPDATE_PROFILE`, `CONFIGURE_TOTP`, `TERMS_AND_CONDITIONS`.
 - **Credentials** — lists credentials **redacted** (no secret material ever leaves the API), rename labels, delete (the user's **last** credential cannot be deleted — 400), reorder via `moveAfter` (renumbers priorities `1..n`). **Reset password** (`PUT .../users/{id}/reset-password`) validates against the realm password policy, keeps superseded passwords as inert history entries per `history_size`, and — when `temporary: true` — assigns `UPDATE_PASSWORD` so the user picks a new password at next login.
