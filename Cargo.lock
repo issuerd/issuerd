@@ -2120,7 +2120,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "issuerd"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-admin-api"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-auth-flow"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-cluster"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-federation"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-protocol"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "issuerd-core",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-server"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-storage"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "issuerd-token"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "aws-lc-rs",

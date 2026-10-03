@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-03
+
 ### Added
 
 - **Configurable LDAP federation mappers (Keycloak-parity).** An LDAP provider's `mappers` config key now wires the full built-in mapper chain instead of the group mapper alone: a JSON array of `{name, mapper_type, config}` entries — the same shape the Admin API mapper sub-resource (`/identity-provider/instances/{alias}/mappers`) and the admin console's mapper dialog manage — supporting `user-attribute-ldap-mapper` (directory attribute → email/first name/last name/custom user attribute, with `is.mandatory.in.ldap` and `attribute.default.value`), `full-name-ldap-mapper` (split one attribute, default `cn`, into first/last name), `group-ldap-mapper` (Keycloak dotted keys `groups.dn`/`memberof.ldap.attribute`/`group.name.ldap.attribute`, plus the Issuerd extension `groups.include`), and `msad-user-account-control-mapper` (AD `userAccountControl` → enabled flag, `pwdLastSet: 0` → `UPDATE_PASSWORD` attribute). Mapper config keys follow Keycloak's dotted spellings so exported Keycloak federation configs translate 1:1. The legacy `groupsDn` shorthand keeps working and is ignored when a `group-ldap-mapper` entry exists; malformed `mappers` JSON is logged and skipped rather than breaking the realm's federation. Provision YAML `identity_providers` entries accept a first-class `mappers:` list, and `GET /admin/enums/idp-mapper-types` advertises the new types to the console. Synced/imported users now carry directory email and names when the mappers are configured — previously each full sync cleared those fields on federated users.
