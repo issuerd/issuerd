@@ -16,7 +16,7 @@ This is an uncommitted working artifact. Delete or fold into docs once all batch
 |---|---|
 | RUSTSEC-2023-0071 justification corrections | **DONE** (committed: `4b6f7fd`) |
 | **EXTRA — both advisory exceptions eliminated** (rsa → aws_lc_rs backend + OpenSSL keygen; rustls-pemfile → redis 0.29; deny zero ignores, audit one scoped tooling-gap entry for the sqlx weak-dep lockfile quirk cargo#10801) | **DONE** (`830bba8`) |
-| **EXTRA — release.yml: Docker Hub publish is the final gated stage** (after heavy suites + platform builds + GitHub Release + crates.io) | **DONE** (`a40fd7f`) |
+| **EXTRA — release.yml: publishing (crates.io + Docker Hub) is the final gated stage** (crates-io, docker, docker-arm64 all run side by side after heavy suites + platform builds + GitHub Release) | **DONE** (`a40fd7f`, final-stage crates-io follow-up below) |
 | Batch 1a — jwks.url fetch routed through SSRF-guarded path (https-only, IP checks, no redirects, 64 KiB cap) | **DONE** |
 | Batch 1b — DCR open-endpoint payload policy (strip JWKS/logout attrs, force no service account, redirect-scheme allowlist, reject `*` origin) | **DONE** |
 | Batch 1c — master-only keys rotate/disable + audit events always on master realm | **DONE** |

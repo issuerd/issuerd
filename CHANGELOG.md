@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Release pipeline: Docker Hub publishing is now the final, fully gated stage.** On release tags, the per-arch image builds and pushes (and the multi-arch manifest + Hub overview sync) run only after the heavy test suites, every platform build/test job, the GitHub Release, and the crates.io publish have all succeeded — a tag with failing tests or a broken publish step no longer publishes images to Docker Hub. Expect `issuerd/issuerd:X.Y.Z` tags to appear on Docker Hub later in the release run than before; a late registry failure is recovered by re-running the failed jobs of the same release run.
+- **Release pipeline: publishing (crates.io + Docker Hub) is now the final, fully gated stage.** On release tags, the crates.io workspace publish and the per-arch Docker image builds/pushes (followed by the multi-arch manifest + Hub overview sync) run side by side, only after the heavy test suites, every platform build/test job, and the GitHub Release have all succeeded — a tag with failing tests no longer publishes crates or images. Expect crates and `issuerd/issuerd:X.Y.Z` tags to appear later in the release run than before; a late failure in any publish job is recovered by re-running the failed jobs of the same release run (crates.io uploads are resumable).
 
 ## [0.1.10] - 2026-09-30
 

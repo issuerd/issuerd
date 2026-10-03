@@ -11,15 +11,16 @@ name: Release
 # verification of the exact released commit. The GitHub Release job waits for
 # it and attaches the packed conformance evidence bundle as a standalone
 # release asset (not inside the binary distros — one copy alongside the
-# SBOMs). The crates.io publish stays isolated (needs only validate): uploads
-# are irreversible either way and scripts/publish.py is resumable.
+# SBOMs).
 #
-# Docker Hub publishing is the FINAL stage of the pipeline — nothing reaches
-# the registry until every verification has passed: the docker / docker-arm64
-# jobs need the heavy suites + all platform builds (via the release job) AND
-# the crates.io publish, so a tag with failing tests or a broken publish step
-# never publishes images. Recovery from a late Docker Hub failure is a
-# job-level re-run of the same release run.
+# Publishing is the FINAL stage of the pipeline — nothing is published until
+# every verification has passed: the crates-io, docker, and docker-arm64 jobs
+# ALL need the release job (which gates on the heavy suites + every platform
+# build/test job), so a tag with failing tests never publishes crates or
+# images. The publish jobs run side by side after the gate; a late failure in
+# any of them is recovered by a job-level re-run of the same release run
+# (crates.io uploads are resumable — scripts/publish.py skips
+# already-uploaded crates, --from CRATE resumes mid-list).
 #
 # Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images
 # (issuerd/issuerd:X.Y.Z-amd64, …-arm64), then docker-manifest assembles the
@@ -132,9 +133,9 @@ jobs:
   docker:
     name: docker image (linux/amd64) → Docker Hub
     # FINAL stage: needs the heavy suites + all platform builds (via the
-    # release job's gate) and the crates.io publish — a tag with failing
-    # tests or a broken publish step never reaches Docker Hub.
-    needs: [validate, release, crates-io]
+    # release job's gate) — a tag with failing tests never reaches Docker
+    # Hub. Runs side by side with the crates-io publish after the gate.
+    needs: [validate, release]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -296,7 +297,7 @@ jobs:
     name: docker image (linux/arm64) → Docker Hub
     # FINAL stage like the amd64 job (same gate), plus the linux-arm64 job
     # for the staged image build context artifact.
-    needs: [validate, release, crates-io, linux-arm64]
+    needs: [validate, release, linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -407,13 +408,13 @@ jobs:
 
   crates-io:
     name: crates.io publish (workspace)
-    needs: validate
+    # FINAL stage, side by side with the Docker Hub jobs: needs the release
+    # job's gate (heavy suites + every platform build/test job), so a tag
+    # with failing tests never publishes crates. A late crates.io failure
+    # blocks nothing else, and the publish is resumable (scripts/publish.py
+    # skips already-uploaded crates; --from CRATE resumes mid-list).
+    needs: [validate, release]
     runs-on: ubuntu-24.04
-    # Isolated from the GitHub Release on purpose: a crates.io hiccup never
-    # blocks the release, and the publish is resumable (scripts/publish.py
-    # skips already-uploaded crates; --from CRATE resumes mid-list). The
-    # Docker Hub jobs DO wait for this publish (final-stage gate) — a broken
-    # publish step means no images either.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
