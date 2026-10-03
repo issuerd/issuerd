@@ -86,7 +86,7 @@ issuerd/
 | Async Runtime | `tokio` (rt-multi-thread) |
 | HTTP Server | `axum` + `tower` + `tower-http` |
 | Serialization | `serde` + `serde_json` + `serde_yaml` |
-| Crypto | `ring`, `jsonwebtoken`, `rustls` |
+| Crypto | `ring` (Ed25519 keygen), `jsonwebtoken` (**aws_lc_rs backend** — FIPS-validated aws-lc for signing/verification; `aws-lc-rs/prebuilt-nasm` so Windows x86_64 needs no NASM; the cc-builder covers standard targets with just a C toolchain, cmake is an exotic-target fallback), OpenSSL (RSA keygen; vendored on Windows), `rustls` |
 | Storage | `sqlx` (PostgreSQL, compile-time checked queries) |
 | Cache | `redis` (cluster-async, tokio-rustls) |
 | Testing | `mockall`, `rstest`, `proptest`, `testcontainers`, `reqwest` |
