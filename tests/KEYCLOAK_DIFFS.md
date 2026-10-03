@@ -127,8 +127,11 @@ every client-authenticated endpoint (token, PAR, revoke, introspect),
 dispatched on the client's `client_authenticator_type` (Keycloak spellings
 `client-secret` / `client-jwt` / `client-secret-jwt`). Client JWKS
 configuration uses Keycloak's attribute spellings: `use.jwks.string` +
-`jwks.string` (inline JWKS) or `use.jwks.url` + `jwks.url` (fetched, cached
-300 s per client, one refetch-on-kid-miss retry). Deliberate divergences:
+`jwks.string` (inline JWKS) or `use.jwks.url` + `jwks.url` (fetched through
+the SSRF-guarded broker client — https only, publicly routable resolved IPs,
+no redirects, 64 KiB body cap — cached 300 s per client, one
+refetch-on-kid-miss retry per 60 s cooldown, the cooldown shared with the
+JAR request-object path). Deliberate divergences:
 
 - **`client_id` is required alongside the assertion**: Issuerd identifies the client from the `client_id` form parameter and then requires `iss` == `sub` == that value. Keycloak additionally tolerates a missing `client_id` and peeks at the unverified assertion's `iss`. All major client libraries send `client_id`, so the stricter reading is interop-safe.
 - **`jti` is required and single-use**: an assertion without a `jti`, or one whose `jti` was seen before (atomic cache counter, TTL = remaining assertion lifetime), is rejected with `invalid_client`. RFC 7523 marks `jti` optional and Keycloak does not enforce replay rejection outside FAPI profiles; Issuerd always enforces it.
@@ -280,7 +283,7 @@ spellings.
 
 - **Attribute spellings follow OIDC Core §8.1 registration metadata**: `subject_type` (`public` default | `pairwise`) and `sector_identifier_uri`, carried in the client's `attributes` map. Keycloak has no equivalent attributes.
 - **Derivation**: `sub = base64url(HMAC-SHA256(sector_key, sector_identifier || user_id))` (no padding). `sector_key` is a per-realm secret stored in the realm attribute `pairwise_sector_key`, generated at realm creation and backfilled for pre-existing realms by storage seeding (stable across restarts and cluster nodes). The key is visible to realm admins via the attributes map (they can read internal user ids directly anyway); rotating it changes every pairwise subject of the realm.
-- **Sector identifier**: host of `sector_identifier_uri` when set — the document is fetched and validated at registration time (admin create/update client, DCR register/update): it must be a JSON array of URI strings listing every registered redirect URI, else 400. Without a sector URI, all registered redirect URIs must share one host; multiple hosts are rejected at registration. Issuance never fetches the document. The §8.1 `https`-scheme requirement **is** enforced (the fetch is unauthenticated-reachable via open DCR, i.e. an SSRF surface): the fetch goes through `BrokerClient::get_json_untrusted` — https only, publicly routable resolved IPs, no redirects, 64 KiB body cap, and one generic `sector_identifier_uri could not be fetched` error for every failure mode (details logged server-side only).
+- **Sector identifier**: host of `sector_identifier_uri` when set — the document is fetched and validated at registration time (admin create/update client, DCR register/update): it must be a JSON array of URI strings listing every registered redirect URI, else 400. Without a sector URI, all registered redirect URIs must share one host; multiple hosts are rejected at registration. Issuance never fetches the document. The §8.1 `https`-scheme requirement **is** enforced (the fetch is unauthenticated-reachable via open DCR, i.e. an SSRF surface): the fetch goes through `BrokerClient::get_json_ssrf_guarded` — https only, publicly routable resolved IPs, no redirects, 64 KiB body cap, and one generic `sector_identifier_uri could not be fetched` error for every failure mode (details logged server-side only).
 - **Refresh and logout tokens are pairwise too** (beyond the minimum list of ID token / access token / userinfo / introspection): refresh tokens are client-readable JWTs, so a public `sub` there would let colluding clients correlate users across sectors; the refresh grant resolves the user through the token's session (`sid`) instead of `sub`. Backchannel logout tokens carry the pairwise sub because the client must correlate the logout with the subject it knows from its ID tokens.
 - **Server-side user resolution is session-first** wherever an access-token `sub` must be mapped back to a user (userinfo, token exchange subject validation): pairwise subjects are keyed HMACs and cannot be reversed. Sessionless tokens (client credentials) still resolve via the public `sub`.
 - **Client-credentials subjects are exempt**: the synthetic subject (`sub = client_id`) and the per-client service-account user (`service-account-{client_id}`) are already unique per client, so derivation is skipped for them.
@@ -299,6 +302,46 @@ spellings.
 - **Resolution**: intentional extension, no parity target. The authenticator
   is used as an `ALTERNATIVE` stage next to `auth-cookie`, mirroring how
   `auth-username-password` sits in the default browser flow.
+
+## Identity Brokering
+
+Issuerd implements Keycloak-style identity brokering (external OIDC/social
+providers, first-broker-login pages, account linking). Deliberate divergences
+and design notes:
+
+- **Browser correlation at the IdP callback (parity)**: like Keycloak's
+  AUTH_SESSION_ID check, the broker callback (`/realms/{realm}/broker/{alias}/endpoint`)
+  requires the flow correlation cookie set when the login flow was paused —
+  on both the GET and the `form_post` POST variants. A callback without it is
+  refused and consumes nothing (the single-use state entry survives, so the
+  browser that actually owns the flow can still complete it). Link-mode
+  callbacks (account-console linking) carry no flow id and correlate via the
+  SSO session cookie instead, as before.
+- **Flow correlation cookie is `SameSite=None; Secure` on TLS deployments**:
+  the `form_post` IdP callback is a cross-site POST that a `Lax` cookie would
+  be stripped from, which would make the correlation check above unpassable
+  for form_post IdPs. `https` issuers therefore mint the cookie as
+  `SameSite=None; Secure` — it is a presence-only marker for an unguessable
+  flow id, so the cross-site allowance grants nothing to a third party.
+  Plain-HTTP development rigs keep `SameSite=Lax` (browsers reject
+  `SameSite=None` without `Secure`); their cross-site form_post broker
+  callbacks consequently arrive without the cookie and are refused — the
+  default query response mode is unaffected. Keycloak's AUTH_SESSION_ID
+  cookie is `SameSite=None` unconditionally for the same reason.
+- **Link-via-password is brute-force guarded (parity)**: the "Link your
+  account" password prompt records failures against the same per-(username,
+  IP) lockout tracker the browser login uses, honors temporary lockout,
+  resets the counter on success, and emits the same LOGIN_ERROR-class event.
+  Keycloak routes the equivalent re-authentication through the normal
+  browser-flow authenticators, which honor lockout the same way. One
+  hardening addition beyond Keycloak: each first-login entry dies after the
+  realm's `max_login_failures` wrong passwords, forcing a fresh IdP
+  round-trip instead of unlimited retries on one execution.
+- **Account-linking kickoff tokens are alias-bound**: the `broker-link`
+  action token embeds the IdP alias it was minted for, and the broker kickoff
+  rejects a token presented under any other provider alias (or with no
+  alias), so one provider's ceremony cannot be started with another
+  provider's token.
 
 ## Registration Hint on the Authorize Endpoint (Issuerd extension)
 

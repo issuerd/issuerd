@@ -405,17 +405,18 @@ fn auth_methods() -> Vec<EnumValueRepresentation> {
 
 fn pkce_code_challenge_methods() -> Vec<EnumValueRepresentation> {
     use issuerd_core::PkceCodeChallengeMethod;
-    vec![
-        (PkceCodeChallengeMethod::S256, "S256", "SHA-256 code challenge method"),
-        (PkceCodeChallengeMethod::Plain, "Plain", "Plain text code challenge method"),
-    ]
-    .into_iter()
-    .map(|(m, name, desc)| EnumValueRepresentation {
-        id: serde_json::to_string(&m).unwrap().trim_matches('"').to_string(),
-        name: name.to_string(),
-        description: Some(desc.to_string()),
-    })
-    .collect()
+    // S256 only: the authorize and token endpoints reject `plain` (and a
+    // challenge with no method) outright, so Plain is not advertised. The
+    // core `PkceCodeChallengeMethod::Plain` variant stays for parsing
+    // stored/pasted values.
+    vec![(PkceCodeChallengeMethod::S256, "S256", "SHA-256 code challenge method")]
+        .into_iter()
+        .map(|(m, name, desc)| EnumValueRepresentation {
+            id: serde_json::to_string(&m).unwrap().trim_matches('"').to_string(),
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+        })
+        .collect()
 }
 
 fn jwk_use() -> Vec<EnumValueRepresentation> {
@@ -1316,7 +1317,8 @@ mod tests {
             (
                 "/admin/enums/pkce-code-challenge-methods",
                 |a| Box::pin(list_pkce_code_challenge_methods(a)),
-                &["S256", "plain"],
+                // S256-only: plain is rejected at authorize/token and not advertised.
+                &["S256"],
             ),
             ("/admin/enums/jwk-use", |a| Box::pin(list_jwk_use(a)), &["sig", "enc"]),
             (

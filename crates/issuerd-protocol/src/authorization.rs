@@ -210,6 +210,18 @@ impl AuthorizationRequest {
             ));
         }
 
+        // PKCE method: S256 only, matching the `code_challenge_methods_supported`
+        // discovery advertisement. RFC 7636 §4.3 defaults a missing
+        // code_challenge_method to plain, so a challenge without a method is
+        // rejected too — accepting either would be plain through the back
+        // door. Requests without a code_challenge are unaffected: PKCE stays
+        // optional for confidential clients.
+        if self.code_challenge.is_some()
+            && self.code_challenge_method != Some(PkceCodeChallengeMethod::S256)
+        {
+            return Err(IssuerdError::InvalidRequest("code_challenge_method must be S256".into()));
+        }
+
         // Prompt: if None is present, no other prompts allowed (defensive check)
         if self.prompt.contains(&Prompt::None) && self.prompt.len() > 1 {
             return Err(IssuerdError::InvalidRequest(
@@ -1079,6 +1091,63 @@ mod tests {
             request_uri: None,
         };
         assert!(req.validate(&Realm::default(), &client).is_err());
+    }
+
+    #[test]
+    fn validate_pkce_method_s256_only() {
+        let client = Client {
+            public_client: false,
+            redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+            default_scopes: Scope::parse("openid"),
+            optional_scopes: Scope::empty(),
+            attributes: std::collections::HashMap::new(),
+            ..make_client_defaults()
+        };
+        let req = |method: Option<PkceCodeChallengeMethod>| AuthorizationRequest {
+            response_type: ResponseType::Code,
+            client_id: ClientIdentifier::new("client1").unwrap(),
+            redirect_uri: "https://client.example.com/cb".parse().unwrap(),
+            scope: Scope::parse("openid"),
+            state: None,
+            nonce: None,
+            response_mode: None,
+            prompt: vec![],
+            max_age: None,
+            code_challenge: Some(Base64Url::new("challenge_123").unwrap()),
+            code_challenge_method: method,
+            login_hint: None,
+            id_token_hint: None,
+            acr_values: vec![],
+            ui_locales: vec![],
+            claims: None,
+            authorization_details: None,
+            registration: false,
+            request: None,
+            request_uri: None,
+        };
+
+        // S256 is the only accepted method.
+        assert!(req(Some(PkceCodeChallengeMethod::S256))
+            .validate(&Realm::default(), &client)
+            .is_ok());
+
+        // `plain` is rejected with invalid_request naming S256...
+        let err = req(Some(PkceCodeChallengeMethod::Plain))
+            .validate(&Realm::default(), &client)
+            .unwrap_err();
+        assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+        assert!(err.to_string().contains("S256"), "{err}");
+
+        // ...and so is a missing method (RFC 7636 §4.3 defaults it to plain).
+        let err = req(None).validate(&Realm::default(), &client).unwrap_err();
+        assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+        assert!(err.to_string().contains("S256"), "{err}");
+
+        // No code_challenge at all stays fine for a confidential client.
+        let mut req = req(Some(PkceCodeChallengeMethod::S256));
+        req.code_challenge = None;
+        req.code_challenge_method = None;
+        assert!(req.validate(&Realm::default(), &client).is_ok());
     }
 
     #[test]

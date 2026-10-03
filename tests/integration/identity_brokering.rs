@@ -261,20 +261,29 @@ async fn external_login(
 }
 
 /// The broker endpoint callback: deliver code+state to the internal realm.
-async fn broker_callback(rig: &BrokerRig, code: &str, broker_state: &str) -> Response {
-    rig.internal
-        .get(&format!(
-            "/realms/{INTERNAL}/broker/{EXT_ALIAS}/endpoint?code={code}&state={broker_state}"
-        ))
-        .await
+/// Login-mode callbacks must carry the flow correlation cookie (the callback
+/// rejects them otherwise); link-mode callbacks correlate via the SSO session
+/// cookie instead and pass `None`.
+async fn broker_callback(
+    rig: &BrokerRig,
+    code: &str,
+    broker_state: &str,
+    flow_cookie: Option<&str>,
+) -> Response {
+    let path =
+        format!("/realms/{INTERNAL}/broker/{EXT_ALIAS}/endpoint?code={code}&state={broker_state}");
+    match flow_cookie {
+        Some(cookie) => get_with_cookie(&rig.internal, &path, cookie).await,
+        None => rig.internal.get(&path).await,
+    }
 }
 
 /// Full roundtrip up to the callback response (which depends on the
 /// first-broker-login decision the test configured).
 async fn drive_to_callback(rig: &BrokerRig, username: &str, password: &str) -> Response {
-    let (ext_auth_url, broker_state, _flow) = begin_broker_login(rig).await;
+    let (ext_auth_url, broker_state, flow) = begin_broker_login(rig).await;
     let code = external_login(&rig.ext, &ext_auth_url, username, password).await;
-    broker_callback(rig, &code, &broker_state).await
+    broker_callback(rig, &code, &broker_state, Some(&TestHarness::flow_cookie(&flow))).await
 }
 
 /// Redeem the code carried by a final app redirect at the internal token
@@ -397,18 +406,41 @@ async fn broker_callback_with_bad_state_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The callback is bound to the browser that started the flow: without the
+/// flow correlation cookie it is refused and the round-trip entry survives,
+/// so the legitimate browser can still complete the login.
+#[tokio::test]
+async fn broker_callback_requires_browser_correlation_cookie() {
+    let rig = broker_rig(&[("trustEmail", "true")]).await;
+    let (ext_auth_url, broker_state, flow_id) = begin_broker_login(&rig).await;
+    let code = external_login(&rig.ext, &ext_auth_url, EXT_USER, EXT_PASSWORD).await;
+
+    let resp = broker_callback(&rig, &code, &broker_state, None).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "callback without flow cookie");
+
+    // The rejection consumed nothing: with the cookie the same code+state
+    // completes the login.
+    let resp =
+        broker_callback(&rig, &code, &broker_state, Some(&TestHarness::flow_cookie(&flow_id)))
+            .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    redeem_app_code(&rig, &location(&resp)).await;
+}
+
 /// An IdP-side error (user cancelled) consumes the state and redirects back
 /// to the login page with an error flag.
 #[tokio::test]
 async fn broker_callback_with_idp_error_redirects_to_login() {
     let rig = broker_rig(&[]).await;
     let (_url, broker_state, flow_id) = begin_broker_login(&rig).await;
-    let resp = rig
-        .internal
-        .get(&format!(
+    let resp = get_with_cookie(
+        &rig.internal,
+        &format!(
             "/realms/{INTERNAL}/broker/{EXT_ALIAS}/endpoint?error=access_denied&state={broker_state}"
-        ))
-        .await;
+        ),
+        &TestHarness::flow_cookie(&flow_id),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = location(&resp);
     assert!(loc.starts_with("/login.html"), "expected login redirect, got {loc}");
@@ -693,7 +725,8 @@ async fn account_linking_ceremony() {
     let code = external_login(&rig.ext, &ext_auth_url, EXT_USER, EXT_PASSWORD).await;
 
     // Without the issuerd_session cookie the linking callback refuses to bind.
-    let resp = broker_callback(&rig, &code, &broker_state).await;
+    // (Link mode carries no flow id, so no flow cookie is required here.)
+    let resp = broker_callback(&rig, &code, &broker_state, None).await;
     let loc = location(&resp);
     assert!(
         loc.contains("error=link-session-mismatch"),

@@ -3035,6 +3035,8 @@ pub const ACTION_TOKEN_PURPOSE_RESET_CREDENTIALS: &str = "reset-credentials";
 pub const ACTION_TOKEN_PURPOSE_REMEMBER_ME: &str = "remember-me";
 /// Purpose value for broker account-linking tokens: authorizes
 /// linking an external IdP identity to the user named by `sub`.
+/// The token is additionally bound to the IdP alias via
+/// [`ActionTokenClaims::idp_alias`].
 pub const ACTION_TOKEN_PURPOSE_BROKER_LINK: &str = "broker-link";
 /// Purpose value for execute-actions-email tokens: authorizes
 /// running the listed required actions for the user named by `sub`.
@@ -3063,6 +3065,11 @@ pub struct ActionTokenClaims {
     /// Original authentication time (remember-me tokens only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_time: Option<i64>,
+    /// Identity provider alias the token is bound to (`broker-link` tokens
+    /// only; the kickoff rejects tokens whose alias does not match the
+    /// request path, and legacy tokens without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idp_alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

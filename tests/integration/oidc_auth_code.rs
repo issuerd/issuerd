@@ -235,7 +235,7 @@ async fn pkce_s256_wrong_verifier_rejected() {
 }
 
 #[tokio::test]
-async fn pkce_plain_success() {
+async fn pkce_plain_rejected() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("test").await;
     let client = harness.create_client("test", false).await;
@@ -244,19 +244,44 @@ async fn pkce_plain_success() {
     let code_verifier = "my-plain-verifier-that-is-long-enough-for-rfc-7636-43-chars";
     let code_challenge = code_verifier;
 
-    let tokens = harness
-        .authenticate_user_with_pkce(
-            "test",
-            &client.client_id,
-            "alice",
-            "password123",
-            code_challenge,
-            "plain",
-            code_verifier,
-        )
-        .await;
+    // S256-only policy: the authorize endpoint rejects `plain` by redirecting
+    // the OAuth2 error back to the registered redirect_uri instead of
+    // starting a login flow.
+    let auth_path = format!(
+        "/realms/test/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http://localhost:8080/cb&scope=openid&state=xyz&code_challenge={}&code_challenge_method=plain",
+        client.client_id, code_challenge
+    );
+    let auth_resp = harness.get(&auth_path).await;
+    assert_eq!(auth_resp.status(), axum::http::StatusCode::SEE_OTHER);
 
-    assert!(!tokens.access_token.is_empty());
+    let location = auth_resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(location.starts_with("http://localhost:8080/cb?"), "location: {location}");
+    assert!(location.contains("error=invalid_request"), "location: {location}");
+    assert!(location.contains("state=xyz"), "location: {location}");
+    assert!(!location.contains("execution_id"), "location: {location}");
+}
+
+#[tokio::test]
+async fn pkce_missing_method_rejected() {
+    let harness = TestHarness::new().await;
+    let _realm = harness.create_realm("test").await;
+    let client = harness.create_client("test", false).await;
+    let _user = harness.create_user("test", "alice", "password123").await;
+
+    // A code_challenge with NO code_challenge_method: RFC 7636 §4.3 defaults
+    // the method to plain, so it is rejected exactly like explicit plain.
+    let code_challenge = "my-plain-verifier-that-is-long-enough-for-rfc-7636-43-chars";
+    let auth_path = format!(
+        "/realms/test/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http://localhost:8080/cb&scope=openid&state=xyz&code_challenge={}",
+        client.client_id, code_challenge
+    );
+    let auth_resp = harness.get(&auth_path).await;
+    assert_eq!(auth_resp.status(), axum::http::StatusCode::SEE_OTHER);
+
+    let location = auth_resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(location.starts_with("http://localhost:8080/cb?"), "location: {location}");
+    assert!(location.contains("error=invalid_request"), "location: {location}");
+    assert!(!location.contains("execution_id"), "location: {location}");
 }
 
 #[tokio::test]

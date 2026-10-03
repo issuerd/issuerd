@@ -763,9 +763,10 @@ fn form_params(action: &str, form: &HashMap<String, String>) -> HashMap<String, 
 /// opened the verification link in a different browser or device than the
 /// one that started the login), the cookie is re-minted on the response so
 /// the follow-up POST from this browser is accepted. This does not weaken
-/// the login-CSRF protection: the cookie is `SameSite=Lax`, so a cross-site
-/// POST never carries it — only a browser that navigated to the continuation
-/// URL (i.e. possesses the execution id) can submit.
+/// the login-CSRF protection: what authorizes a submit is possession of the
+/// unguessable execution id (the URL itself), and the cookie merely binds
+/// that execution to a single browser — re-minting it for a browser that
+/// already learned the execution id grants nothing new.
 pub async fn required_action_page(
     State(state): State<Arc<ServerState>>,
     Path((realm_name, execution)): Path<(String, String)>,

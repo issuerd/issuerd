@@ -15,7 +15,11 @@
 //!    verifier we hold, the flow id) and 302s to the external IdP's
 //!    authorization endpoint.
 //! 2. The IdP returns the browser to `/broker/{alias}/endpoint?code&state`.
-//!    The callback exchanges the code server-to-server
+//!    In login mode the callback first re-verifies the browser-correlation
+//!    cookie for the paused flow (the same check the kickoff ran — without
+//!    it, an attacker could steer a foreign browser onto their own callback
+//!    URL and inject their session); only then is the single-use state entry
+//!    consumed and the code exchanged server-to-server
 //!    ([`crate::broker::exchange_code_for_identity`]), then:
 //!    - a known [`IdentityProviderLink`] → straight to login completion;
 //!    - an unknown identity → first-broker-login decision
@@ -64,6 +68,7 @@ use super::login_api::complete_login_with_method;
 use super::oidc::{flow_cookie_header, has_flow_cookie, pending_auth_cache_key, PendingAuthData};
 use super::required_actions::{error_banner, error_response, page, url_path_segment};
 use crate::broker::{exchange_code_for_identity, resolve_idp_endpoints};
+use crate::middleware::proxy_ip::ClientIp;
 use crate::middleware::realm::ResolvedRealm;
 use crate::state::ServerState;
 
@@ -108,6 +113,11 @@ struct BrokerFirstLoginData {
     /// Link mode: the existing user whose email matched.
     #[serde(default)]
     existing_user_id: Option<String>,
+    /// Link mode: failed password confirmations against this entry. The entry
+    /// is invalidated once the realm's `max_login_failures` is reached,
+    /// forcing a fresh IdP round-trip instead of unlimited retries.
+    #[serde(default)]
+    failed_attempts: u32,
     /// External refresh token, carried only when the IdP stores tokens.
     #[serde(default)]
     external_refresh_token: Option<String>,
@@ -213,8 +223,13 @@ pub async fn broker_login_handler(
             )
             .await
             {
-                Ok(claims) => Some(claims.sub),
-                Err(_) => {
+                // The token must be bound to THIS provider alias — a token
+                // minted for alias A must not start a linking ceremony under
+                // alias B (and pre-binding tokens carry no alias at all).
+                Ok(claims) if claims.idp_alias.as_deref() == Some(alias.as_str()) => {
+                    Some(claims.sub)
+                }
+                Ok(_) | Err(_) => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "the account-linking link is invalid or has expired",
@@ -351,11 +366,13 @@ async fn endpoint_inner(
     };
     let realm_segment = realm_segment.unwrap_or_default();
 
-    // The state key identifies (and authenticates) the round-trip. It is
-    // single-use: consumed here regardless of outcome.
+    // The state key identifies (and authenticates) the round-trip. The entry
+    // is read WITHOUT consuming it first: the browser-correlation check below
+    // must pass before the single-use entry is destroyed, so a callback that
+    // fails the check leaves the legitimate flow completable.
     let state_key = params.get("state").cloned().unwrap_or_default();
     let broker_state: Option<BrokerState> =
-        match state.cache.get_and_delete(&broker_state_cache_key(&realm.id, &state_key)).await {
+        match state.cache.get(&broker_state_cache_key(&realm.id, &state_key)).await {
             Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
             _ => None,
         };
@@ -365,6 +382,34 @@ async fn endpoint_inner(
             "the sign-in session is invalid or has expired — please start again",
         );
     };
+
+    // Login mode: the callback must ride the same browser that started the
+    // flow. The attacker knows their own flow's `state`, so without this
+    // check they could steer a victim's browser onto their callback URL and
+    // inject their own session (login CSRF) or their own linking ceremony —
+    // the same correlation guard the kickoff and the first-login POST
+    // enforce. Link mode has no flow id; it correlates via the SSO session
+    // cookie in `finish_linking` instead.
+    if let Some(flow) = broker_state.flow_id.as_deref() {
+        if !has_flow_cookie(&headers, flow) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "the sign-in session is invalid or has expired — please start again",
+            );
+        }
+    }
+
+    // Correlation verified: consume the entry. It is single-use regardless
+    // of the outcome from here on; a raced-out second callback is rejected.
+    if !matches!(
+        state.cache.get_and_delete(&broker_state_cache_key(&realm.id, &state_key)).await,
+        Ok(Some(_))
+    ) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the sign-in session is invalid or has expired — please start again",
+        );
+    }
 
     // IdP-side failure (user cancelled, access_denied, ...).
     if let Some(error) = params.get("error") {
@@ -679,6 +724,7 @@ async fn finish_login(
                 },
                 existing_user_id: conflicting_user.map(|u| u.id.to_string()),
                 identity,
+                failed_attempts: 0,
                 external_refresh_token: store_tokens.then_some(external_refresh_token).flatten(),
                 error: None,
             };
@@ -1058,6 +1104,7 @@ pub async fn first_broker_login_page(
 pub async fn first_broker_login_submit(
     State(state): State<Arc<ServerState>>,
     axum::extract::Extension(ResolvedRealm(realm_segment)): axum::extract::Extension<ResolvedRealm>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
     Path((_realm, execution)): Path<(String, String)>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
@@ -1103,53 +1150,16 @@ pub async fn first_broker_login_submit(
     match form.get("action").map(String::as_str) {
         // Link mode: prove ownership of the existing account with its password.
         Some("link") => {
-            let Some(existing_id) = entry.existing_user_id.clone() else {
-                return error_response(StatusCode::BAD_REQUEST, "invalid link state");
-            };
             let password = form.get("password").cloned().unwrap_or_default();
-            let existing_id_typed = match UserId::new(existing_id) {
-                Ok(id) => id,
-                Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid link state"),
-            };
-            let user = match state.storage.get_user(&realm.id, &existing_id_typed).await {
-                Ok(Some(u)) if u.enabled => u,
-                Ok(Some(_)) => {
-                    return error_response(StatusCode::FORBIDDEN, "this account is disabled")
-                }
-                _ => return error_response(StatusCode::BAD_REQUEST, "account not found"),
-            };
-            let credentials = state
-                .storage
-                .get_credentials(&realm.id, &user.id, CredentialType::Password)
-                .await
-                .unwrap_or_default();
-            let verified = credentials.iter().any(|cred| verify_password_hash(&password, cred));
-            if !verified {
-                retry!(entry, "invalid password");
-            }
-            let link = IdentityProviderLink {
-                user_id: user.id.clone(),
-                provider_alias: entry.alias.clone(),
-                external_subject: entry.identity.subject.clone(),
-                external_username: entry.identity.username.clone().or(entry.identity.email.clone()),
-                stored_refresh_token: entry.external_refresh_token.clone(),
-                created_at: chrono::Utc::now(),
-            };
-            if let Err(e) = state.storage.create_identity_provider_link(&realm.id, &link).await {
-                warn!(error = %e, "link-via-password failed");
-                return error_response(
-                    StatusCode::CONFLICT,
-                    "this external account is already linked",
-                );
-            }
-            finalize_brokered_login(
+            link_via_password_submit(
                 &state,
                 &realm,
+                &realm_segment,
+                &execution,
+                &ip,
                 &idp,
-                entry.pending,
-                user,
-                &entry.identity,
-                true,
+                entry,
+                password,
             )
             .await
         }
@@ -1230,6 +1240,154 @@ pub async fn first_broker_login_submit(
             }
         }
     }
+}
+
+/// Emit the LOGIN_ERROR-class security event for a failed link-via-password
+/// confirmation — the same event the browser login flow records for a bad
+/// password, keyed on the existing account.
+async fn emit_link_login_error(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    entry: &BrokerFirstLoginData,
+    user: &User,
+    ip: &std::net::IpAddr,
+    error: &str,
+) {
+    let mut details = HashMap::new();
+    details.insert("username".to_string(), user.username.to_string());
+    details.insert("error".to_string(), error.to_string());
+    super::oidc::emit_oidc_event(
+        state,
+        &realm.id,
+        issuerd_core::EventType::LoginError,
+        ip,
+        issuerd_core::ClientId::new(&entry.pending.client_id).ok(),
+        Some(user.id.clone()),
+        None,
+        Some(error.to_string()),
+        details,
+    )
+    .await;
+}
+
+/// The "link" submit: prove ownership of the existing account with its
+/// password. This prompt is subject to the realm's brute-force protection
+/// exactly like the browser login page — failures are counted against the
+/// shared `(username, IP)` tracker (honoring temporary lockout and resetting
+/// on success), a LOGIN_ERROR-class event is recorded, and the entry itself
+/// dies after the realm's failure budget is exhausted, forcing a fresh IdP
+/// round-trip instead of unlimited retries on one execution.
+#[allow(clippy::too_many_arguments)]
+async fn link_via_password_submit(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    realm_segment: &str,
+    execution: &str,
+    ip: &std::net::IpAddr,
+    idp: &IdentityProviderConfig,
+    mut entry: BrokerFirstLoginData,
+    password: String,
+) -> Response {
+    /// Retry: re-store the entry with an error banner and PRG back to GET.
+    macro_rules! retry {
+        ($entry:expr, $msg:expr) => {{
+            let mut e = $entry;
+            e.error = Some($msg.to_string());
+            store_first_login_entry(state, &realm.id, execution, &e).await;
+            return Redirect::to(&first_login_url(realm_segment, execution)).into_response();
+        }};
+    }
+
+    let Some(existing_id) = entry.existing_user_id.clone() else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid link state");
+    };
+    let existing_id_typed = match UserId::new(existing_id) {
+        Ok(id) => id,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid link state"),
+    };
+    let user = match state.storage.get_user(&realm.id, &existing_id_typed).await {
+        Ok(Some(u)) if u.enabled => u,
+        Ok(Some(_)) => return error_response(StatusCode::FORBIDDEN, "this account is disabled"),
+        _ => return error_response(StatusCode::BAD_REQUEST, "account not found"),
+    };
+
+    // Brute-force lockout, keyed exactly like the browser login flow
+    // (canonical username + source IP). Realms without brute-force
+    // protection skip the shared counters but keep the per-entry attempt
+    // cap below.
+    let brute_force = realm
+        .brute_force_protected
+        .then(|| issuerd_auth_flow::login_failures::LoginFailureConfig::from_realm(realm));
+    let ip_key = ip.to_string();
+    if brute_force.is_some() {
+        let locked = state
+            .login_failure_tracker
+            .is_temporarily_locked(&realm.id, user.username.as_str(), &ip_key, state.cache.as_ref())
+            .await
+            .unwrap_or(false);
+        if locked {
+            warn!(realm = %realm.id, username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), ip = %ip, "broker link-via-password rejected: account temporarily locked");
+            emit_link_login_error(state, realm, &entry, &user, ip, "temporarily_locked").await;
+            retry!(entry, "too many failed attempts — the account is temporarily locked");
+        }
+    }
+
+    let credentials = state
+        .storage
+        .get_credentials(&realm.id, &user.id, CredentialType::Password)
+        .await
+        .unwrap_or_default();
+    let verified = credentials.iter().any(|cred| verify_password_hash(&password, cred));
+    if !verified {
+        warn!(realm = %realm.id, username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), ip = %ip, "broker link-via-password failed: invalid password");
+        if let Some(ref config) = brute_force {
+            let _ = state
+                .login_failure_tracker
+                .record_failure(
+                    &realm.id,
+                    user.username.as_str(),
+                    &ip_key,
+                    state.cache.as_ref(),
+                    config,
+                )
+                .await;
+        }
+        emit_link_login_error(state, realm, &entry, &user, ip, "invalid_user_credentials").await;
+        entry.failed_attempts += 1;
+        // One entry allows at most the realm's failure budget; after that it
+        // stays consumed and the sign-in must be restarted (a fresh IdP
+        // round-trip) instead of retrying this execution forever.
+        if entry.failed_attempts >= realm.max_login_failures.max(1) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "too many failed attempts — please start the sign-in again",
+            );
+        }
+        retry!(entry, "invalid password");
+    }
+
+    // A good password clears the shared failure counter, exactly like a
+    // successful browser login.
+    if brute_force.is_some() {
+        let _ = state
+            .login_failure_tracker
+            .reset_failures(&realm.id, user.username.as_str(), &ip_key, state.cache.as_ref())
+            .await;
+    }
+
+    let link = IdentityProviderLink {
+        user_id: user.id.clone(),
+        provider_alias: entry.alias.clone(),
+        external_subject: entry.identity.subject.clone(),
+        external_username: entry.identity.username.clone().or(entry.identity.email.clone()),
+        stored_refresh_token: entry.external_refresh_token.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    if let Err(e) = state.storage.create_identity_provider_link(&realm.id, &link).await {
+        warn!(error = %e, "link-via-password failed");
+        return error_response(StatusCode::CONFLICT, "this external account is already linked");
+    }
+    finalize_brokered_login(state, realm, idp, entry.pending, user, &entry.identity, true).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1532,7 @@ mod tests {
             suggested_username: "extuser".to_string(),
             mode: mode.to_string(),
             existing_user_id,
+            failed_attempts: 0,
             external_refresh_token: None,
             error: None,
         }
@@ -1475,11 +1634,46 @@ mod tests {
         first_broker_login_submit(
             State(state.clone()),
             resolved(MASTER),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
             Path((MASTER.to_string(), execution.to_string())),
             headers,
             Form(form),
         )
         .await
+    }
+
+    /// Flip the master realm's brute-force settings; the realm-name cache
+    /// entry must be dropped after the direct storage mutation (see the
+    /// realm-resolution note in `ServerState`).
+    async fn enable_brute_force(state: &Arc<ServerState>, max_failures: u32) {
+        let realm_id = master_realm_id();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = max_failures;
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name(MASTER))
+            .await
+            .unwrap();
+    }
+
+    async fn query_all_events(state: &Arc<ServerState>, realm: &str) -> Vec<issuerd_core::Event> {
+        state
+            .storage
+            .query_events(
+                &RealmId::new(realm).unwrap(),
+                &issuerd_core::EventQuery {
+                    event_type: None,
+                    client_id: None,
+                    user_id: None,
+                    date_from: None,
+                    date_to: None,
+                    pagination: issuerd_core::Pagination::default(),
+                },
+            )
+            .await
+            .unwrap()
     }
 
     // -- cache key schema ----------------------------------------------------
@@ -1751,6 +1945,100 @@ mod tests {
         assert!(body_text(resp).await.contains("missing sign-in session"));
     }
 
+    // -- broker kickoff: link-token alias binding -------------------------------
+
+    async fn mint_link_token(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        idp_alias: Option<&str>,
+    ) -> String {
+        let user_id = UserId::new(issuerd_core::utils::generate_id()).unwrap();
+        let mut claims = issuerd_token::action_tokens::action_token_claims(
+            &user_id,
+            realm_id,
+            issuerd_core::ACTION_TOKEN_PURPOSE_BROKER_LINK,
+            LINK_TOKEN_TTL_SECS,
+        );
+        claims.idp_alias = idp_alias.map(str::to_string);
+        issuerd_token::action_tokens::issue_action_token(state.crypto.as_ref(), &claims)
+            .await
+            .unwrap()
+    }
+
+    async fn link_kickoff(state: &Arc<ServerState>, alias: &str, token: &str) -> Response {
+        broker_login_handler(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), alias.to_string())),
+            Query(HashMap::from([("link".to_string(), token.to_string())])),
+            HeaderMap::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn broker_login_link_token_matching_alias_redirects_to_idp() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        let token = mint_link_token(&state, &realm_id, Some(IDP_ALIAS)).await;
+
+        let resp = link_kickoff(&state, IDP_ALIAS, &token).await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = location(&resp);
+        assert!(location.starts_with("https://idp.example.com/authorize?"), "{location}");
+        // The round-trip entry records the link-mode subject.
+        let url = url::Url::parse(&location).unwrap();
+        let state_key = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+            .expect("state param present");
+        let stored = cache
+            .get(&broker_state_cache_key(&realm_id, &state_key))
+            .await
+            .unwrap()
+            .expect("broker state cached");
+        let stored: BrokerState = serde_json::from_slice(&stored).unwrap();
+        assert!(stored.linking_user.is_some());
+        assert!(stored.flow_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn broker_login_link_token_alias_mismatch_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // A second, different provider the token was NOT minted for.
+        storage
+            .create_identity_provider(&realm_id, &broker_idp_config("other-idp"))
+            .await
+            .unwrap();
+        let token = mint_link_token(&state, &realm_id, Some(IDP_ALIAS)).await;
+
+        // The token bound to `ext` must not start a ceremony under `other-idp`.
+        let resp = link_kickoff(&state, "other-idp", &token).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("invalid or has expired"));
+    }
+
+    #[tokio::test]
+    async fn broker_login_link_token_without_alias_rejected() {
+        let (state, storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // Legacy shape: a well-formed, correctly signed broker-link token
+        // that carries no alias binding at all — fail closed.
+        let token = mint_link_token(&state, &realm_id, None).await;
+
+        let resp = link_kickoff(&state, IDP_ALIAS, &token).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("invalid or has expired"));
+    }
+
     // -- endpoint_inner -------------------------------------------------------
 
     #[tokio::test]
@@ -1773,6 +2061,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_login_mode_without_flow_cookie_rejected_and_entry_kept() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // A login-mode round-trip (flow id present) whose callback arrives
+        // without the browser-correlation cookie — the login-CSRF shape:
+        // an attacker steering a foreign browser onto their callback URL.
+        seed_broker_state(&cache, &realm_id, "st-csrf", &login_broker_state(Some("flow-csrf")))
+            .await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-csrf".to_string()),
+                ("error".to_string(), "access_denied".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("is invalid or has expired"));
+        // The entry is NOT consumed by the rejected callback: the browser
+        // that actually owns the flow can still complete it.
+        assert!(cache
+            .get(&broker_state_cache_key(&realm_id, "st-csrf"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_login_mode_with_foreign_flow_cookie_rejected() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        seed_broker_state(&cache, &realm_id, "st-foreign", &login_broker_state(Some("flow-a")))
+            .await;
+
+        // A cookie for SOME flow, but not the one this round-trip belongs to.
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-foreign".to_string()),
+                ("error".to_string(), "access_denied".to_string()),
+            ]),
+            flow_cookie_headers("flow-b"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(cache
+            .get(&broker_state_cache_key(&realm_id, "st-foreign"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_link_mode_needs_no_flow_cookie() {
+        let (state, storage, cache) =
+            test_state_with_broker_client(successful_userinfo_client()).await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // Link mode carries no flow id; correlation is the SSO session cookie
+        // in finish_linking, not the flow cookie.
+        let link_state = BrokerState {
+            nonce: "nonce-1".to_string(),
+            pkce_verifier: None,
+            flow_id: None,
+            linking_user: Some(
+                UserId::new(issuerd_core::utils::generate_id()).unwrap().to_string(),
+            ),
+        };
+        seed_broker_state(&cache, &realm_id, "st-link", &link_state).await;
+
+        let resp = endpoint_inner(
+            state,
+            Some(MASTER.to_string()),
+            IDP_ALIAS.to_string(),
+            HashMap::from([
+                ("state".to_string(), "st-link".to_string()),
+                ("code".to_string(), "real-code".to_string()),
+            ]),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // The missing flow cookie must NOT 400 the callback: it reaches
+        // finish_linking, which refuses the bind (no SSO cookie) with the
+        // account-console redirect instead. The entry IS consumed.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            location(&resp),
+            "/realms/master/account/linked-accounts?error=link-session-mismatch"
+        );
+        assert!(cache
+            .get(&broker_state_cache_key(&realm_id, "st-link"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn endpoint_idp_error_redirects_back_to_login() {
         let (state, storage, cache) = test_state().await;
         let realm_id = master_realm_id();
@@ -1787,7 +2183,7 @@ mod tests {
                 ("state".to_string(), "st-1".to_string()),
                 ("error".to_string(), "access_denied".to_string()),
             ]),
-            HeaderMap::new(),
+            flow_cookie_headers("flow-9"),
         )
         .await;
 
@@ -1812,7 +2208,7 @@ mod tests {
             Some(MASTER.to_string()),
             IDP_ALIAS.to_string(),
             HashMap::from([("state".to_string(), "st-2".to_string())]),
-            HeaderMap::new(),
+            flow_cookie_headers("flow-9"),
         )
         .await;
 
@@ -1835,7 +2231,7 @@ mod tests {
                 ("state".to_string(), "st-3".to_string()),
                 ("code".to_string(), String::new()),
             ]),
-            HeaderMap::new(),
+            flow_cookie_headers("flow-9"),
         )
         .await;
 
@@ -1862,7 +2258,7 @@ mod tests {
                 ("state".to_string(), "st-4".to_string()),
                 ("code".to_string(), "real-code".to_string()),
             ]),
-            HeaderMap::new(),
+            flow_cookie_headers("flow-11"),
         )
         .await;
 
@@ -1927,7 +2323,7 @@ mod tests {
                 ("state".to_string(), "st-6".to_string()),
                 ("code".to_string(), "real-code".to_string()),
             ]),
-            HeaderMap::new(),
+            flow_cookie_headers(flow),
         )
         .await;
 
@@ -2200,6 +2596,201 @@ mod tests {
         assert_eq!(link.external_username.as_deref(), Some("extuser"));
         // The continuation entry was consumed by the successful submit.
         assert!(load_first_login_entry(&state, &realm_id, execution).await.is_none());
+    }
+
+    /// Seed a user with the given password and a link-mode entry for them.
+    async fn seed_link_scenario(
+        storage: &TestStorage,
+        cache: &TestCache,
+        execution: &str,
+        password: &str,
+    ) -> User {
+        let realm_id = master_realm_id();
+        let user = broker_user(&realm_id, "existing-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        issuerd_auth_flow::built_in::set_user_password(
+            storage.as_ref(),
+            &realm_id,
+            &user.id,
+            password,
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(cache, &realm_id, execution, &entry).await;
+        user
+    }
+
+    fn link_form(password: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("action".to_string(), "link".to_string()),
+            ("password".to_string(), password.to_string()),
+        ])
+    }
+
+    fn failure_counter_key(realm_id: &RealmId, username: &str) -> String {
+        issuerd_auth_flow::login_failures::failure_count_key(realm_id, username, "127.0.0.1")
+    }
+
+    #[tokio::test]
+    async fn submit_link_wrong_password_records_failure_and_login_error_event() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        enable_brute_force(&state, 5).await;
+        let user = seed_link_scenario(&storage, &cache, "exec-bf-fail", "correct-horse").await;
+
+        let resp = submit_first_login(&state, "exec-bf-fail", link_form("nope"), true).await;
+
+        // Same retry banner as before…
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let stored = load_first_login_entry(&state, &realm_id, "exec-bf-fail")
+            .await
+            .expect("entry re-stored for the retry");
+        assert_eq!(stored.error.as_deref(), Some("invalid password"));
+        assert_eq!(stored.failed_attempts, 1);
+        // …but now the shared failure counter moved…
+        let counter = cache
+            .get(&failure_counter_key(&realm_id, "existing-user"))
+            .await
+            .unwrap()
+            .expect("login-failure counter recorded");
+        assert_eq!(String::from_utf8(counter).unwrap(), "1");
+        // …and the browser-flow-class LOGIN_ERROR event was recorded.
+        let events = query_all_events(&state, MASTER).await;
+        let login_error = events
+            .iter()
+            .find(|e| e.event_type == issuerd_core::EventType::LoginError)
+            .expect("LOGIN_ERROR event recorded");
+        assert_eq!(login_error.error.as_deref(), Some("invalid_user_credentials"));
+        assert_eq!(login_error.user_id, Some(user.id.clone()));
+        assert_eq!(login_error.details.get("username").map(String::as_str), Some("existing-user"));
+    }
+
+    #[tokio::test]
+    async fn submit_link_locked_account_rejects_even_correct_password() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        enable_brute_force(&state, 2).await;
+        let user = seed_link_scenario(&storage, &cache, "exec-lock-1", "correct-horse").await;
+
+        // Two wrong passwords hit both the per-entry cap and the shared
+        // lockout threshold.
+        for _ in 0..2 {
+            let _ = submit_first_login(&state, "exec-lock-1", link_form("nope"), true).await;
+        }
+        assert!(load_first_login_entry(&state, &realm_id, "exec-lock-1").await.is_none());
+        assert!(issuerd_auth_flow::login_failures::LoginFailureTracker::new()
+            .is_temporarily_locked(&realm_id, "existing-user", "127.0.0.1", cache.as_ref())
+            .await
+            .unwrap());
+
+        // A FRESH execution (the attacker minted a new broker flow) is still
+        // refused: the lockout is keyed on the account, not the entry — and
+        // even the correct password does not get verified while locked.
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(&cache, &realm_id, "exec-lock-2", &entry).await;
+        let resp =
+            submit_first_login(&state, "exec-lock-2", link_form("correct-horse"), true).await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let stored = load_first_login_entry(&state, &realm_id, "exec-lock-2")
+            .await
+            .expect("locked retry re-stores the entry");
+        assert_eq!(
+            stored.error.as_deref(),
+            Some("too many failed attempts — the account is temporarily locked")
+        );
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+        let events = query_all_events(&state, MASTER).await;
+        assert!(events.iter().any(|e| e.event_type == issuerd_core::EventType::LoginError
+            && e.error.as_deref() == Some("temporarily_locked")));
+    }
+
+    #[tokio::test]
+    async fn submit_link_attempt_cap_invalidates_entry_without_brute_force_realm() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        // Brute-force protection stays OFF; only the failure budget shrinks.
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.max_login_failures = 3;
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name(MASTER))
+            .await
+            .unwrap();
+        seed_link_scenario(&storage, &cache, "exec-cap", "correct-horse").await;
+
+        // Budget - 1 failures still retry with the banner…
+        for _ in 0..2 {
+            let resp = submit_first_login(&state, "exec-cap", link_form("nope"), true).await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        }
+        // …the budget-th failure kills the entry instead of re-storing it.
+        let resp = submit_first_login(&state, "exec-cap", link_form("nope"), true).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("too many failed attempts"));
+        assert!(load_first_login_entry(&state, &realm_id, "exec-cap").await.is_none());
+        // A dead entry rejects every further submit, correct password or not.
+        let resp = submit_first_login(&state, "exec-cap", link_form("correct-horse"), true).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // No shared counters without brute-force protection.
+        assert!(cache
+            .get(&failure_counter_key(&realm_id, "existing-user"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_link_correct_password_resets_failure_counter() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        seed_broker_idp(&storage, &realm_id).await;
+        enable_brute_force(&state, 5).await;
+        let user = seed_link_scenario(&storage, &cache, "exec-reset", "correct-horse").await;
+
+        let _ = submit_first_login(&state, "exec-reset", link_form("nope"), true).await;
+        let _ = submit_first_login(&state, "exec-reset", link_form("nope"), true).await;
+        assert!(cache
+            .get(&failure_counter_key(&realm_id, "existing-user"))
+            .await
+            .unwrap()
+            .is_some());
+
+        let resp = submit_first_login(&state, "exec-reset", link_form("correct-horse"), true).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("http://localhost:8080/cb?"));
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .expect("link created");
+        assert_eq!(link.user_id, user.id);
+        // The success cleared the counter, exactly like a browser login.
+        assert!(cache
+            .get(&failure_counter_key(&realm_id, "existing-user"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .get(&issuerd_auth_flow::login_failures::lockout_key(
+                &realm_id,
+                "existing-user",
+                "127.0.0.1"
+            ))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

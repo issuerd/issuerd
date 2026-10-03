@@ -201,9 +201,21 @@ pub(crate) fn flow_cookie_name(flow_id: &str) -> String {
 }
 
 /// `Set-Cookie` value for the flow correlation cookie (matches the pending
-/// entry's 10-minute TTL). `secure` appends the `Secure` attribute — pass
-/// [`crate::config::ServerConfig::secure_cookies`] so TLS deployments get it
-/// while plain-HTTP development rigs keep working.
+/// entry's 10-minute TTL).
+///
+/// `secure` (pass [`crate::config::ServerConfig::secure_cookies`]) selects the
+/// SameSite posture:
+///
+/// - TLS deployments get `SameSite=None; Secure`: the cookie must ride the
+///   external IdP's `form_post` broker callback, which is a cross-site POST a
+///   `Lax` cookie would be stripped from — without it the callback's
+///   browser-correlation check could never pass for form_post IdPs. The
+///   cookie is a presence-only marker for an unguessable flow id, so the
+///   cross-site allowance does not weaken the CSRF binding.
+/// - Plain-HTTP development rigs keep `SameSite=Lax` (browsers reject
+///   `SameSite=None` without `Secure`). Their cross-site form_post broker
+///   callbacks therefore arrive without the cookie and are refused — the
+///   default query response mode is unaffected.
 ///
 /// Deliberately NOT renamed to a `__Host-` prefix: that would harden against
 /// cookie injection from sibling domains, but renaming any cookie breaks
@@ -211,11 +223,12 @@ pub(crate) fn flow_cookie_name(flow_id: &str) -> String {
 /// names — deferred as follow-up work (same conclusion for the SSO and
 /// remember-me cookies).
 pub(crate) fn flow_cookie_header(flow_id: &str, secure: bool) -> String {
-    let secure_attr = if secure { "; Secure" } else { "" };
-    format!(
-        "{}=1; Path=/; HttpOnly; SameSite=Lax; Max-Age=600{secure_attr}",
-        flow_cookie_name(flow_id)
-    )
+    let same_site = if secure {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    };
+    format!("{}=1; Path=/; HttpOnly; {same_site}; Max-Age=600", flow_cookie_name(flow_id))
 }
 
 /// Check whether the request carries the correlation cookie for `flow_id`.
@@ -6880,6 +6893,7 @@ mod tests {
         );
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
         let response = auth_handler(
             State(state.clone()),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
@@ -6920,11 +6934,14 @@ mod tests {
         let secure = flow_cookie_header("flow-1", true);
         assert!(secure.contains("issuerd_flow_flow-1=1"), "cookie: {secure}");
         assert!(secure.contains("HttpOnly"), "cookie: {secure}");
-        assert!(secure.contains("SameSite=Lax"), "cookie: {secure}");
+        // TLS rigs: cross-site form_post broker callbacks must carry the
+        // cookie, so SameSite=None (which requires Secure).
+        assert!(secure.contains("SameSite=None"), "cookie: {secure}");
         assert!(secure.contains("; Secure"), "cookie: {secure}");
 
         let plain = flow_cookie_header("flow-1", false);
         assert!(plain.contains("issuerd_flow_flow-1=1"), "cookie: {plain}");
+        assert!(plain.contains("SameSite=Lax"), "cookie: {plain}");
         assert!(!plain.contains("Secure"), "http rigs must not get the flag: {plain}");
     }
 
@@ -6939,6 +6956,7 @@ mod tests {
         params.insert("redirect_uri".to_string(), redirect_uri.to_string());
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
         let response = auth_handler(
             State(state),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
@@ -6985,7 +7003,7 @@ mod tests {
     #[tokio::test]
     async fn auth_handler_post_succeeds() {
         let state = setup_state().await;
-        let body = "response_type=code&client_id=admin-cli&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fadmin%2Fconsole%2Fcallback&scope=openid&code_challenge=challenge";
+        let body = "response_type=code&client_id=admin-cli&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fadmin%2Fconsole%2Fcallback&scope=openid&code_challenge=challenge&code_challenge_method=S256";
         let response = auth_handler_post(
             State(state),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
@@ -7027,7 +7045,7 @@ mod tests {
         query.insert("state".to_string(), "from_query".to_string());
 
         let body =
-            "response_type=code&client_id=admin-cli&state=from_body&code_challenge=challenge";
+            "response_type=code&client_id=admin-cli&state=from_body&code_challenge=challenge&code_challenge_method=S256";
         let response = auth_handler_post(
             State(state),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
@@ -9731,7 +9749,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("state".to_string(), "my_state".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -9829,7 +9847,7 @@ mod tests {
         );
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -9953,7 +9971,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("prompt".to_string(), "none".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10143,7 +10161,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("state".to_string(), "xyz".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10243,7 +10261,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("prompt".to_string(), "login".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10290,6 +10308,81 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert!(location.contains("execution_id="), "location: {}", location);
+    }
+
+    #[tokio::test]
+    async fn auth_handler_pkce_plain_method_rejected() {
+        let state = setup_state().await;
+        let mut params = std::collections::HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "admin-cli".to_string());
+        params.insert(
+            "redirect_uri".to_string(),
+            "http://localhost:8080/admin/console/callback".to_string(),
+        );
+        params.insert("scope".to_string(), "openid".to_string());
+        params.insert("state".to_string(), "xyz".to_string());
+        params.insert("code_challenge".to_string(), "challenge".to_string());
+        params.insert("code_challenge_method".to_string(), "plain".to_string());
+
+        let response = auth_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await;
+        // S256-only policy: the error redirects to the registered redirect_uri
+        // (RFC 6749 §4.1.2.1) instead of starting a login flow.
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("http://localhost:8080/admin/console/callback?"),
+            "location: {}",
+            location
+        );
+        assert!(location.contains("error=invalid_request"), "location: {}", location);
+        assert!(location.contains("S256"), "location: {}", location);
+        assert!(location.contains("state=xyz"), "location: {}", location);
+        assert!(!location.contains("execution_id="), "location: {}", location);
+    }
+
+    #[tokio::test]
+    async fn auth_handler_pkce_missing_method_rejected() {
+        let state = setup_state().await;
+        let mut params = std::collections::HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "admin-cli".to_string());
+        params.insert(
+            "redirect_uri".to_string(),
+            "http://localhost:8080/admin/console/callback".to_string(),
+        );
+        params.insert("scope".to_string(), "openid".to_string());
+        params.insert("code_challenge".to_string(), "challenge".to_string());
+        // No code_challenge_method: RFC 7636 §4.3 defaults it to plain, so it
+        // is rejected exactly like an explicit plain method.
+        let response = auth_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            axum::http::HeaderMap::new(),
+            Query(params),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("http://localhost:8080/admin/console/callback?"),
+            "location: {}",
+            location
+        );
+        assert!(location.contains("error=invalid_request"), "location: {}", location);
+        assert!(!location.contains("execution_id="), "location: {}", location);
     }
 
     #[tokio::test]
@@ -10611,7 +10704,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("nonce".to_string(), "abc123".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10647,7 +10740,7 @@ mod tests {
         );
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10728,7 +10821,7 @@ mod tests {
         params.insert("prompt".to_string(), "none".to_string());
         params.insert("max_age".to_string(), "1".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10808,7 +10901,7 @@ mod tests {
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("max_age".to_string(), "1".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -10898,7 +10991,7 @@ mod tests {
         );
         params.insert("scope".to_string(), "openid".to_string());
         params.insert("code_challenge".to_string(), "challenge".to_string());
-        params.insert("code_challenge_method".to_string(), "plain".to_string());
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
 
         let response = auth_handler(
             State(state),
@@ -11682,7 +11775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_code_pkce_plain_success() {
+    async fn auth_code_pkce_plain_rejected() {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let verifier = "a".repeat(43);
@@ -11722,9 +11815,59 @@ mod tests {
             body,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        // S256-only policy: a plain-method code cannot be redeemed even when
+        // verifier and challenge match exactly.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = extract_json(resp).await;
-        assert!(json["access_token"].as_str().unwrap().len() > 10);
+        assert_eq!(json["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn auth_code_pkce_missing_method_rejected() {
+        let state = setup_state().await;
+        let code = issuerd_core::utils::generate_id();
+        let verifier = "a".repeat(43);
+        // A challenge with NO method: RFC 7636 §4.3 defaults it to plain, so
+        // it is rejected exactly like an explicit plain method.
+        let code_data = AuthCodeData {
+            user_id: "admin".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: None,
+            nonce: None,
+            code_challenge: Some(issuerd_core::Base64Url::new(&verifier).unwrap()),
+            code_challenge_method: None,
+            session_id: None,
+            auth_time: None,
+            acr_values: vec![],
+            claims: None,
+            authorization_details: None,
+        };
+        state
+            .cache
+            .set(
+                &format!("auth_code:{code}"),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let body = format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli&code_verifier={verifier}"
+        );
+        let resp = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = extract_json(resp).await;
+        assert_eq!(json["error"], "invalid_grant");
     }
 
     #[tokio::test]

@@ -1549,6 +1549,7 @@ async fn reset_credentials_expired_token_is_rejected() {
         iat: now - 3700,
         jti: issuerd_core::utils::generate_id(),
         auth_time: None,
+        idp_alias: None,
     };
     let payload = serde_json::to_string(&claims).unwrap();
     let jwks = crypto.get_public_keys().await.unwrap();

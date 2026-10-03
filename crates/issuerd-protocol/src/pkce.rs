@@ -21,6 +21,13 @@ use sha2::{Digest, Sha256};
 pub struct PkceVerifier;
 
 impl PkceVerifier {
+    /// Verify a code verifier against the stored challenge. S256 only —
+    /// matching the `code_challenge_methods_supported` discovery
+    /// advertisement: `plain` is never accepted, and neither is a missing
+    /// method (RFC 7636 §4.3 defaults it to plain, so accepting it would be
+    /// plain through the back door). The authorize endpoint refuses to issue
+    /// codes for non-S256 challenges, so a non-S256 method reaching the
+    /// token endpoint cannot be redeemed either.
     pub fn verify(
         code_verifier: &str,
         code_challenge: &str,
@@ -47,11 +54,7 @@ impl PkceVerifier {
                 }
             }
             Some(PkceCodeChallengeMethod::Plain) | None => {
-                if code_verifier == code_challenge {
-                    Ok(())
-                } else {
-                    Err(IssuerdError::InvalidRequest("pkce verification failed".into()))
-                }
+                Err(IssuerdError::InvalidRequest("code_challenge_method must be S256".into()))
             }
         }
     }
@@ -77,17 +80,11 @@ mod tests {
     }
 
     #[test]
-    fn pkce_plain_match() {
+    fn pkce_s256_match() {
         let verifier = "a".repeat(43);
-        assert!(PkceVerifier::verify(&verifier, &verifier, Some(PkceCodeChallengeMethod::Plain))
+        let challenge = PkceVerifier::s256_challenge(&verifier);
+        assert!(PkceVerifier::verify(&verifier, &challenge, Some(PkceCodeChallengeMethod::S256))
             .is_ok());
-    }
-
-    #[test]
-    fn pkce_plain_mismatch() {
-        let v1 = "a".repeat(43);
-        let v2 = "b".repeat(43);
-        assert!(PkceVerifier::verify(&v1, &v2, Some(PkceCodeChallengeMethod::Plain)).is_err());
     }
 
     #[test]
@@ -102,33 +99,51 @@ mod tests {
     }
 
     #[test]
-    fn pkce_unsupported_method() {
+    fn pkce_plain_rejected() {
+        // `plain` is never accepted — not even when verifier and challenge
+        // match exactly (S256-only, matching the discovery advertisement).
         let verifier = "a".repeat(43);
-        assert!(PkceVerifier::verify(&verifier, "challenge", None).is_err());
+        assert!(PkceVerifier::verify(&verifier, &verifier, Some(PkceCodeChallengeMethod::Plain))
+            .is_err());
+    }
+
+    #[test]
+    fn pkce_missing_method_rejected() {
+        // RFC 7636 §4.3 defaults a missing method to plain — rejected too.
+        let verifier = "a".repeat(43);
+        assert!(PkceVerifier::verify(&verifier, &verifier, None).is_err());
     }
 
     #[test]
     fn pkce_verifier_too_short() {
         let short = "a".repeat(42);
-        assert!(PkceVerifier::verify(&short, &short, Some(PkceCodeChallengeMethod::Plain)).is_err());
+        let challenge = PkceVerifier::s256_challenge(&short);
+        assert!(
+            PkceVerifier::verify(&short, &challenge, Some(PkceCodeChallengeMethod::S256)).is_err()
+        );
     }
 
     #[test]
     fn pkce_verifier_min_length() {
         let min = "a".repeat(43);
-        assert!(PkceVerifier::verify(&min, &min, Some(PkceCodeChallengeMethod::Plain)).is_ok());
+        let challenge = PkceVerifier::s256_challenge(&min);
+        assert!(PkceVerifier::verify(&min, &challenge, Some(PkceCodeChallengeMethod::S256)).is_ok());
     }
 
     #[test]
     fn pkce_verifier_max_length() {
         let max = "a".repeat(128);
-        assert!(PkceVerifier::verify(&max, &max, Some(PkceCodeChallengeMethod::Plain)).is_ok());
+        let challenge = PkceVerifier::s256_challenge(&max);
+        assert!(PkceVerifier::verify(&max, &challenge, Some(PkceCodeChallengeMethod::S256)).is_ok());
     }
 
     #[test]
     fn pkce_verifier_too_long() {
         let long = "a".repeat(129);
-        assert!(PkceVerifier::verify(&long, &long, Some(PkceCodeChallengeMethod::Plain)).is_err());
+        let challenge = PkceVerifier::s256_challenge(&long);
+        assert!(
+            PkceVerifier::verify(&long, &challenge, Some(PkceCodeChallengeMethod::S256)).is_err()
+        );
     }
 }
 
@@ -184,14 +199,16 @@ mod kani_proofs {
             .is_err());
     }
 
-    /// Plain method: acceptance is exactly string equality, gated on the
-    /// RFC 7636 length guard.
+    /// Plain and missing methods are never accepted (S256-only policy).
+    /// With the 8-byte harness inputs the RFC 7636 length guard dominates;
+    /// the method-rejection arm for valid-length verifiers is pinned by the
+    /// `pkce_plain_rejected` / `pkce_missing_method_rejected` unit tests.
     #[kani::proof]
     #[kani::unwind(16)]
-    fn plain_method_is_exact_equality() {
+    fn non_s256_methods_always_rejected() {
         any_verifier!(abytes, a);
         any_verifier!(bbytes, b);
-        let result = PkceVerifier::verify(a, b, Some(PkceCodeChallengeMethod::Plain));
-        assert_eq!(result.is_ok(), (43..=128).contains(&a.len()) && a == b);
+        assert!(PkceVerifier::verify(a, b, Some(PkceCodeChallengeMethod::Plain)).is_err());
+        assert!(PkceVerifier::verify(a, b, None).is_err());
     }
 }

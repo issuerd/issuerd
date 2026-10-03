@@ -108,6 +108,7 @@ pub fn action_token_claims(
         iat: now,
         jti: issuerd_core::utils::generate_id(),
         auth_time: None,
+        idp_alias: None,
     }
 }
 
@@ -242,5 +243,42 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn idp_alias_roundtrips_when_set() {
+        let crypto = test_crypto();
+        let mut claims = action_token_claims(&test_user_id(), &test_realm_id(), "broker-link", 300);
+        claims.idp_alias = Some("corporate-idp".to_string());
+
+        let token = issue_action_token(&crypto, &claims).await.unwrap();
+        let verified = verify_action_token(&crypto, &token, "broker-link", &test_realm_id())
+            .await
+            .unwrap();
+        assert_eq!(verified.idp_alias.as_deref(), Some("corporate-idp"));
+        assert_eq!(verified, claims);
+    }
+
+    #[test]
+    fn idp_alias_defaults_to_none_for_legacy_payloads() {
+        // Payloads signed before the alias field existed carry no `idp_alias`
+        // key; they must still deserialize (as `None`) so signature
+        // verification keeps working and the caller decides the policy.
+        let claims = action_token_claims(&test_user_id(), &test_realm_id(), "broker-link", 300);
+        let mut payload = serde_json::to_value(&claims).unwrap();
+        payload.as_object_mut().unwrap().remove("idp_alias");
+        let parsed: ActionTokenClaims = serde_json::from_value(payload).unwrap();
+        assert_eq!(parsed.idp_alias, None);
+    }
+
+    #[test]
+    fn idp_alias_is_omitted_from_serialization_when_none() {
+        let claims =
+            action_token_claims(&test_user_id(), &test_realm_id(), "reset-credentials", 900);
+        let payload = serde_json::to_value(&claims).unwrap();
+        assert!(
+            !payload.as_object().unwrap().contains_key("idp_alias"),
+            "non-broker tokens must not grow the claim: {payload}"
+        );
     }
 }

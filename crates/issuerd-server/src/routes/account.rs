@@ -1486,12 +1486,15 @@ pub async fn account_link_identity_handler(
     // The link token is deliberately NOT single-use: the guard is the
     // BrokerState entry plus the issuerd_session cookie match at the callback, so
     // a browser restart during the ceremony does not strand the user.
-    let claims = action_token_claims(
+    let mut claims = action_token_claims(
         &guard.user_id,
         &guard.realm_id,
         ACTION_TOKEN_PURPOSE_BROKER_LINK,
         super::broker::LINK_TOKEN_TTL_SECS,
     );
+    // Bind the token to this alias: the broker kickoff refuses a link token
+    // presented under any other provider alias.
+    claims.idp_alias = Some(alias.clone());
     let token = match issue_action_token(state.crypto.as_ref(), &claims).await {
         Ok(t) => t,
         Err(e) => {
@@ -2862,6 +2865,18 @@ mod tests {
             url.starts_with("/realms/master/broker/github/login?link="),
             "unexpected url: {url}"
         );
+
+        // The embedded link token is bound to the requested alias.
+        let token = url.rsplit("?link=").next().unwrap();
+        let claims = issuerd_token::action_tokens::verify_action_token(
+            state.crypto.as_ref(),
+            token,
+            ACTION_TOKEN_PURPOSE_BROKER_LINK,
+            &RealmId::new("master").unwrap(),
+        )
+        .await
+        .expect("link token must verify");
+        assert_eq!(claims.idp_alias.as_deref(), Some("github"));
     }
 
     #[tokio::test]
