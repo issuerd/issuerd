@@ -122,19 +122,22 @@ serde_yaml = "0.9"
 ring = "0.17"
 # The `rust_crypto` backend (pure-Rust sign/verify) hard-bundles `rsa` — so the
 # rsa crate stays in the dependency tree via jsonwebtoken regardless of our own
-# usage. The only alternative backend is `aws_lc_rs` (C/assembly, needs
-# cmake/C toolchains on every target incl. Windows vendored and arm64 cross)
-# — a strictly worse build story for zero security gain here.
+# usage, and RS256/384/512 signing runs through it (see the RUSTSEC-2023-0071
+# ignore in deny.toml). The only alternative backend is `aws_lc_rs` (C/assembly,
+# needs cmake/C toolchains on every target incl. Windows vendored and arm64) —
+# a heavier build story; evaluating it is part of the rsa residual plan.
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.1"
 rustls-pki-types = "1.14"
-# rsa is used by issuerd-token only for RSA key GENERATION and PKCS#1/PKCS#8
-# DER encoding of signing keys (RS256 is the OIDC Core §15.1 mandatory alg) —
-# there is no RSA decryption anywhere, so RUSTSEC-2023-0071 (Marvin, a
-# decryption oracle) is not applicable. Latest 0.9.x, cargo audit/deny green.
-# Not removable: jsonwebtoken's rust_crypto backend pulls rsa anyway (above).
+# Direct usage in issuerd-token is RSA key GENERATION and PKCS#1/PKCS#8 DER
+# encoding of signing keys only (RS256 is the OIDC Core §15.1 mandatory alg).
+# RUSTSEC-2023-0071 (Marvin) is NOT limited to a decryption oracle: it covers RSA
+# private-key operations incl. PKCS#1 v1.5 signing, which runs through this crate
+# via jsonwebtoken's rust_crypto backend — tracked as an accepted residual risk
+# in deny.toml / .cargo/audit.toml. Latest 0.9.x; no patched release exists.
+# Not removable while the rust_crypto backend is in use (pulls rsa anyway, above).
 rsa = "0.9"
 p256 = "0.13"
 p384 = "0.13"

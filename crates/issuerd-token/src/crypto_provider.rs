@@ -435,7 +435,10 @@ fn generate_hmac_key(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issu
     Ok((bytes, jwk))
 }
 
-/// [`CryptoProvider`] implementation backed by `jsonwebtoken` + `ring`.
+/// [`CryptoProvider`] implementation backed by `jsonwebtoken` (RustCrypto
+/// `rust_crypto` backend: `rsa`/`p256`/`p384`/`ed25519-dalek` for signing and
+/// verification), with `ring` used only for Ed25519 key generation and the
+/// `p521` crate for the manual ES512 path.
 pub struct RingCryptoProvider {
     key_store: Arc<std::sync::RwLock<KeyStore>>,
     config: CryptoConfig,
