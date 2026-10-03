@@ -380,23 +380,19 @@ mod tests {
         }
     }
 
-    /// RSA key pair via the `rsa` crate; RS256 = PKCS#1 v1.5 over SHA-256.
+    /// RSA key pair via OpenSSL; RS256 = PKCS#1 v1.5 over SHA-256.
     struct RsaKey {
-        private: rsa::RsaPrivateKey,
+        private: openssl::pkey::PKey<openssl::pkey::Private>,
         n: String,
         e: String,
     }
 
     fn gen_rsa() -> RsaKey {
-        let mut rng = rand::thread_rng();
-        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public = private.to_public_key();
-        use rsa::traits::PublicKeyParts;
-        RsaKey {
-            private,
-            n: b64(&public.n().to_bytes_be()),
-            e: b64(&public.e().to_bytes_be()),
-        }
+        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let n = b64(&rsa.n().to_vec());
+        let e = b64(&rsa.e().to_vec());
+        let private = openssl::pkey::PKey::from_rsa(rsa).unwrap();
+        RsaKey { private, n, e }
     }
 
     impl RsaKey {
@@ -411,19 +407,14 @@ mod tests {
                 "jwk": self.public_jwk(),
             });
             assemble(header, claims, &|input| {
-                let digest = sha2::Sha256::digest(input);
-                // RS256 PKCS#1 v1.5 DigestInfo prefix for SHA-256 (the
-                // `sha2/oid` feature is off, so spell the constant out).
-                let padding = rsa::Pkcs1v15Sign {
-                    hash_len: Some(32),
-                    prefix: [
-                        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
-                        0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
-                    ]
-                    .into(),
-                };
-                let mut rng = rand::thread_rng();
-                self.private.sign_with_rng(&mut rng, padding, &digest).unwrap()
+                // EVP one-shot: hashes with SHA-256 and applies PKCS#1 v1.5
+                // padding including the DigestInfo prefix — exactly RS256.
+                let mut signer = openssl::sign::Signer::new(
+                    openssl::hash::MessageDigest::sha256(),
+                    &self.private,
+                )
+                .unwrap();
+                signer.sign_oneshot_to_vec(input).unwrap()
             })
         }
     }

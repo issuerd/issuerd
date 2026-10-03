@@ -120,25 +120,21 @@ serde_yaml = "0.9"
 
 # Crypto
 ring = "0.17"
-# The `rust_crypto` backend (pure-Rust sign/verify) hard-bundles `rsa` — so the
-# rsa crate stays in the dependency tree via jsonwebtoken regardless of our own
-# usage, and RS256/384/512 signing runs through it (see the RUSTSEC-2023-0071
-# ignore in deny.toml). The only alternative backend is `aws_lc_rs` (C/assembly,
-# needs cmake/C toolchains on every target incl. Windows vendored and arm64) —
-# a heavier build story; evaluating it is part of the rsa residual plan.
-jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
+# aws_lc_rs backend (FIPS-validated aws-lc C/assembly): RS256/384/512 signing
+# runs through aws-lc-rs, so the pure-Rust `rsa` crate (RUSTSEC-2023-0071,
+# Marvin — no patched release) is out of the dependency tree entirely. Build
+# cost: a C toolchain on every target (the aws-lc-sys cc-builder covers all
+# standard targets — cmake is only a fallback for exotic/FIPS builds).
+# default-features = false drops `use_pem` — no PEM parsing entry points are
+# used.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
+# Feature-only pin (same major line jsonwebtoken requires): issuerd-token
+# enables `prebuilt-nasm` so Windows x86_64 builds use aws-lc-sys' shipped
+# pre-assembled .obj files — no NASM install needed.
+aws-lc-rs = "1.15"
 rustls = "0.23"
 tokio-rustls = "0.26"
-rustls-pemfile = "2.1"
 rustls-pki-types = "1.14"
-# Direct usage in issuerd-token is RSA key GENERATION and PKCS#1/PKCS#8 DER
-# encoding of signing keys only (RS256 is the OIDC Core §15.1 mandatory alg).
-# RUSTSEC-2023-0071 (Marvin) is NOT limited to a decryption oracle: it covers RSA
-# private-key operations incl. PKCS#1 v1.5 signing, which runs through this crate
-# via jsonwebtoken's rust_crypto backend — tracked as an accepted residual risk
-# in deny.toml / .cargo/audit.toml. Latest 0.9.x; no patched release exists.
-# Not removable while the rust_crypto backend is in use (pulls rsa anyway, above).
-rsa = "0.9"
 p256 = "0.13"
 p384 = "0.13"
 p521 = "0.13"
@@ -148,7 +144,9 @@ rand = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "migrate", "uuid", "chrono", "json"] }
 
 # Cache / Cluster
-redis = { version = "0.27", features = ["tokio-rustls-comp", "cluster-async"] }
+# 0.29: drops rustls-pemfile (RUSTSEC-2025-0134) from the tree — native-certs
+# moved to 0.8 (rustls-pki-types). Same feature names as 0.27.
+redis = { version = "0.29", features = ["tokio-rustls-comp", "cluster-async"] }
 
 # Observability
 tracing = "0.1"
@@ -223,12 +221,13 @@ tracing-journald = "0.3"
 # QR code generation (TOTP enrollment)
 qrcodegen = "1.8"
 
-# WebAuthn / passkeys (MFA second factor)
-# webauthn-rs-core depends on openssl without a feature gate; the vendored
-# feature is only referenced from Windows targets (see issuerd-auth-flow), where no
-# system OpenSSL is guaranteed. Unix builds keep linking the system OpenSSL,
-# so OpenSSL CVE fixes ship via the base image / host libssl — no issuerd
-# rebuild (only the Windows binary carries a statically linked vendored copy).
+# WebAuthn / passkeys (MFA second factor) + RSA signing-key generation
+# (issuerd-token). The workspace declaration carries NO features: `vendored`
+# is enabled per crate under cfg(windows) only (issuerd-auth-flow,
+# issuerd-token), where no system OpenSSL is guaranteed. Unix builds keep
+# linking the system OpenSSL, so OpenSSL CVE fixes ship via the base image /
+# host libssl — no issuerd rebuild (only the Windows binary carries a
+# statically linked vendored copy).
 #
 # danger-allow-state-serialisation (justified): the feature unlocks serde on
 # the in-ceremony state types (PasskeyRegistration/PasskeyAuthentication).
@@ -241,7 +240,7 @@ qrcodegen = "1.8"
 # scaling: the request that finishes a ceremony can land on a different node
 # than the one that started it, so the state must live in shared storage
 # (Redis), matching how Keycloak stores WebAuthn state in the auth session.
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = "0.10"
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 
 # Internal crates (version pinned to workspace; version required for crates.io publish)

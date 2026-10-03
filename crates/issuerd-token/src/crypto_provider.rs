@@ -14,11 +14,9 @@ use issuerd_core::{
     StoredSigningKey,
 };
 use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+use p256::pkcs8::EncodePrivateKey as _;
 use rand::RngCore;
 use ring::signature::KeyPair;
-use rsa::pkcs1::EncodeRsaPrivateKey;
-use rsa::pkcs8::EncodePrivateKey;
-use rsa::traits::PublicKeyParts;
 
 /// Configuration for cryptographic operations.
 #[derive(Debug, Clone)]
@@ -260,18 +258,18 @@ fn generate_rsa_key(
     alg: Algorithm,
     bits: u32,
 ) -> Result<(Vec<u8>, Jwk), IssuerdError> {
-    let mut rng = rand::thread_rng();
-    let priv_key = rsa::RsaPrivateKey::new(&mut rng, bits as usize)
+    // OpenSSL RSA key generation (the `rsa` crate left the tree over
+    // RUSTSEC-2023-0071; signing itself runs through aws-lc-rs). PKCS#1 DER is
+    // the long-standing storage format — existing signing_keys rows keep
+    // loading unchanged.
+    let priv_key = openssl::rsa::Rsa::generate(bits)
         .map_err(|e| IssuerdError::ServerError(format!("RSA key generation failed: {e}")))?;
     let pkcs1_der = priv_key
-        .to_pkcs1_der()
-        .map_err(|e| IssuerdError::ServerError(format!("PKCS#1 DER encoding failed: {e}")))?
-        .as_bytes()
-        .to_vec();
+        .private_key_to_der()
+        .map_err(|e| IssuerdError::ServerError(format!("PKCS#1 DER encoding failed: {e}")))?;
 
-    let pub_key = priv_key.to_public_key();
-    let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
-    let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+    let n = URL_SAFE_NO_PAD.encode(priv_key.n().to_vec());
+    let e = URL_SAFE_NO_PAD.encode(priv_key.e().to_vec());
 
     let jwk = Jwk {
         kty: JwkKty::Rsa,
@@ -435,10 +433,10 @@ fn generate_hmac_key(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issu
     Ok((bytes, jwk))
 }
 
-/// [`CryptoProvider`] implementation backed by `jsonwebtoken` (RustCrypto
-/// `rust_crypto` backend: `rsa`/`p256`/`p384`/`ed25519-dalek` for signing and
-/// verification), with `ring` used only for Ed25519 key generation and the
-/// `p521` crate for the manual ES512 path.
+/// [`CryptoProvider`] implementation backed by `jsonwebtoken` (FIPS-validated
+/// `aws_lc_rs` backend for signing and verification), with `ring` used only
+/// for Ed25519 key generation, OpenSSL for RSA key generation, and the `p521`
+/// crate for the manual ES512 path.
 pub struct RingCryptoProvider {
     key_store: Arc<std::sync::RwLock<KeyStore>>,
     config: CryptoConfig,

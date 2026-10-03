@@ -1,24 +1,35 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
+#
+# deny.toml is EMPTY: cargo-deny checks the feature-resolved dependency graph,
+# which is genuinely free of flagged crates. This file carries ONE entry that
+# exists purely because cargo-audit scans the raw Cargo.lock without feature
+# resolution:
+#
+# - RUSTSEC-2025-0134 (rustls-pemfile unmaintained): resolved for real — the
+#   redis 0.29 upgrade moved to rustls-native-certs 0.8 (rustls-pki-types);
+#   the crate is in neither the lockfile nor the build graph. No ignore.
+#
+# - RUSTSEC-2023-0071 (rsa/Marvin): resolved in the BUILD graph — jsonwebtoken
+#   uses the aws_lc_rs backend and RSA key generation uses OpenSSL, so rsa is
+#   never compiled (verifiable: `cargo tree -i rsa --target all` prints
+#   nothing). rsa still appears in Cargo.lock as an *inactivated weak optional
+#   edge*: any sqlx feature that touches its driver crates (migrate, uuid,
+#   chrono, json) records `sqlx-mysql` in the lock via `sqlx-mysql?/...` weak
+#   dependencies, and sqlx-mysql lists rsa. This is the upstream
+#   rust-lang/cargo#10801 lockfile quirk; the lock entry is never downloaded,
+#   compiled, or linked into issuerd (postgres-only sqlx feature set — the
+#   `mysql` feature is never enabled, including under --all-features, which
+#   applies to workspace crates only). cargo-deny's feature-resolved
+#   `cargo deny check advisories` passes with zero ignores. The ignore below
+#   exists solely to stop cargo-audit's feature-blind lockfile scan from
+#   flagging a crate the build never sees; drop it if sqlx removes the weak
+#   edges or cargo fixes lockfile pruning.
 
 [advisories]
 ignore = [
-    # rsa crate: timing side-channel in RSA PRIVATE-KEY operations (Marvin Attack)
-    # — decryption AND PKCS#1 v1.5 signing; verification (public-key) is unaffected.
-    # Issuerd never decrypts RSA, but RS256/384/512 JWT signing runs through the rsa
-    # crate: jsonwebtoken's `rust_crypto` backend implements RSA signing with
-    # rsa::SigningKey (ring is only used for Ed25519 key generation). Every fresh
-    # install persists an active RS256 key, and realms pinned via the
-    # `default_signature_algorithm` attribute sign every token through this path, so
-    # the network-observable timing surface is reachable in supported configurations.
-    # Accepted residual risk (NOT non-applicable): no patched rsa release exists
-    # (still open against 0.9.10; upstream RustCrypto/RSA#626/#680/#702), the sign
-    # path applies RNG blinding, and new deployments default to EdDSA (RS256 signing
-    # is per-realm opt-in). Residual plan: migrate RSA key generation off rsa
-    # (openssl is already in-tree) and evaluate jsonwebtoken's aws_lc_rs backend;
-    # drop this ignore once rsa leaves the tree entirely.
+    # Not an accepted risk: rsa is absent from the compiled graph (cargo tree
+    # --target all); lockfile-only entry via sqlx's inactivated
+    # `sqlx-mysql?/...` weak optional deps (cargo#10801). See header comment.
     "RUSTSEC-2023-0071",
-    # rustls-pemfile is unmaintained but still a transitive dependency of redis
-    # and rustls-native-certs. Direct usage migrated to rustls-pki-types.
-    "RUSTSEC-2025-0134",
 ]

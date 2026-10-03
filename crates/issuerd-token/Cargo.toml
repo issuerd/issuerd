@@ -21,7 +21,11 @@ jsonwebtoken = { workspace = true }
 chrono = { workspace = true }
 mockall = { workspace = true }
 async-trait = { workspace = true }
-rsa = { workspace = true }
+openssl = { workspace = true }
+# Feature-only dependency: turns on aws-lc-sys' pre-assembled .obj path on
+# Windows x86_64 (prebuilt-nasm), so the jsonwebtoken aws_lc_rs backend needs
+# no NASM install — MSVC alone suffices. No-op off Windows.
+aws-lc-rs = { workspace = true, features = ["prebuilt-nasm"] }
 p256 = { workspace = true }
 p384 = { workspace = true }
 p521 = { workspace = true }
@@ -31,6 +35,12 @@ sha2 = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
+
+# RSA signing-key generation (RS256 is the OIDC Core §15.1 mandatory alg):
+# system OpenSSL on Unix; on Windows build vendored from source (same story
+# as issuerd-auth-flow's webauthn openssl — native perl + MSVC, see AGENTS.md).
+[target.'cfg(windows)'.dependencies]
+openssl = { workspace = true, features = ["vendored"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
