@@ -135,6 +135,50 @@ pub async fn emit_admin_event_error(
     }
 }
 
+/// Emit the admin event for a SERVER-GLOBAL mutation (signing-key
+/// rotation/disable), attributed to the master realm.
+///
+/// Design: the event is recorded against the master realm — and only the
+/// master realm — because [`require_master_token`](crate::auth::require_master_token)
+/// restricts these mutations to master-realm tokens: the master realm is both
+/// the actor's home realm and the realm that governs server-global state.
+/// Persistence is therefore gated on the MASTER realm's events config,
+/// exactly as for every other master-scoped mutation, and the path realm's
+/// `admin_events_enabled` flag — irrelevant to a mutation that merely passes
+/// through its namespace — can never suppress the audit trail. Emitting to
+/// both realms was rejected: the keys are server-global, not path-realm
+/// resources, and a second row would only duplicate the record.
+pub async fn emit_global_admin_event(
+    state: &Arc<AdminApiState>,
+    auth: &AdminAuth,
+    operation_type: OperationType,
+    resource_type: ResourceType,
+    resource_path: &str,
+    representation: Option<String>,
+) {
+    let Some(realm_id) = issuing_realm_id(state, auth).await else {
+        // Unreachable by design: the middleware rejects tokens whose issuer
+        // carries no realm, and a master token only passes the binding when
+        // the master realm row exists. A `None` here means a mid-request
+        // realm deletion or a storage outage (which the event insert would
+        // very likely fail on anyway); the mutation's own `info!` log line
+        // remains as the record.
+        warn!(resource_path = %resource_path,
+            "issuing realm unresolvable; server-global admin event not recorded");
+        return;
+    };
+    emit_admin_event(
+        state,
+        auth,
+        &realm_id,
+        operation_type,
+        resource_type,
+        resource_path,
+        representation,
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -414,5 +458,52 @@ mod tests {
         .await;
         // `times(1)` + `withf` prove the event was recorded with the
         // representation stripped despite the realm lookup failure.
+    }
+
+    #[tokio::test]
+    async fn emit_global_admin_event_records_against_issuing_master_realm() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        configure_admin_events(&state, true, true).await;
+        let auth = admin_auth_with_issuer("http://localhost:8080/realms/master");
+
+        emit_global_admin_event(
+            &state,
+            &auth,
+            OperationType::Action,
+            ResourceType::Realm,
+            "keys/rotate",
+            Some("{}".to_string()),
+        )
+        .await;
+
+        // The event is attributed to the master realm (resolved from the
+        // token's issuer) and gated on the master realm's events config.
+        let realm_id = RealmId::new("master").unwrap();
+        let events = recorded_events(&state, &realm_id).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, OperationType::Action);
+        assert_eq!(events[0].resource_path, "keys/rotate");
+        assert_eq!(events[0].representation, Some("{}".to_string()));
+        assert_eq!(events[0].auth_realm_id, Some(realm_id));
+    }
+
+    #[tokio::test]
+    async fn emit_global_admin_event_dropped_when_issuer_unresolvable() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        configure_admin_events(&state, true, true).await;
+        // `https://iss` carries no `/realms/` segment and names no realm.
+        let auth = admin_auth();
+
+        emit_global_admin_event(
+            &state,
+            &auth,
+            OperationType::Action,
+            ResourceType::Realm,
+            "keys/rotate",
+            Some("{}".to_string()),
+        )
+        .await;
+
+        assert!(recorded_events(&state, &RealmId::new("master").unwrap()).await.is_empty());
     }
 }

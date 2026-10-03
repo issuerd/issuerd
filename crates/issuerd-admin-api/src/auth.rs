@@ -177,16 +177,42 @@ pub fn require_roles(auth: &AdminAuth, allowed: &[&str]) -> Result<(), AdminApiE
     }
 }
 
+/// Require the admin token to be issued by the master realm.
+///
+/// Server-global mutations (signing-key rotation/disable) are not scoped to
+/// the path realm, so the middleware's realm binding — which lets any realm
+/// administer itself — is not enough on its own. This mirrors the
+/// realm-less-path master rule in [`enforce_realm_binding`]. The middleware
+/// has already validated the issuer before the handler runs: the realm
+/// segment is present, the issuing realm row was loaded from storage
+/// (fail-closed on error), and its `not_before` cutoff was enforced, so a
+/// plain issuer-segment comparison is sufficient here.
+pub fn require_master_token(auth: &AdminAuth) -> Result<(), AdminApiError> {
+    let iss: &str = auth.claims.iss.as_ref();
+    match issuerd_core::typestate::extract_realm_from_issuer(iss) {
+        Some(realm) if realm == MASTER_REALM => Ok(()),
+        Some(realm) => {
+            warn!(realm = %realm,
+                "admin API authorization denied: server-global operation requires a master realm token");
+            Err(AdminApiError::Forbidden)
+        }
+        None => {
+            warn!("admin API authorization denied: token issuer carries no realm");
+            Err(AdminApiError::Forbidden)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use issuerd_core::{AccessTokenClaims, Audience, Issuer, JwtId, JwtType, RealmAccess};
 
-    fn auth_with_roles(roles: Vec<issuerd_core::RoleName>) -> AdminAuth {
+    fn auth_with_issuer_and_roles(iss: &str, roles: Vec<issuerd_core::RoleName>) -> AdminAuth {
         AdminAuth {
             claims: AccessTokenClaims {
                 jti: JwtId::new("jti").unwrap(),
-                iss: Issuer::new("https://iss").unwrap(),
+                iss: Issuer::new(iss).unwrap(),
                 sub: issuerd_core::UserId::new("admin").unwrap(),
                 aud: Audience::new("aud").unwrap(),
                 exp: 9999999999,
@@ -204,6 +230,10 @@ mod tests {
                 authorization_details: None,
             },
         }
+    }
+
+    fn auth_with_roles(roles: Vec<issuerd_core::RoleName>) -> AdminAuth {
+        auth_with_issuer_and_roles("https://iss", roles)
     }
 
     fn auth_without_realm_access() -> AdminAuth {
@@ -252,6 +282,32 @@ mod tests {
     fn require_roles_no_realm_access() {
         let auth = auth_without_realm_access();
         assert!(matches!(require_roles(&auth, &["view-realm"]), Err(AdminApiError::Forbidden)));
+    }
+
+    #[test]
+    fn require_master_token_accepts_master_issuer() {
+        let auth = auth_with_issuer_and_roles(
+            "http://localhost:8080/realms/master",
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+        );
+        assert!(require_master_token(&auth).is_ok());
+    }
+
+    #[test]
+    fn require_master_token_rejects_non_master_issuer() {
+        // A delegated realm admin's token — even one carrying manage-realm —
+        // fails the master-realm binding.
+        let auth = auth_with_issuer_and_roles(
+            "http://localhost:8080/realms/tenant",
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+        );
+        assert!(matches!(require_master_token(&auth), Err(AdminApiError::Forbidden)));
+    }
+
+    #[test]
+    fn require_master_token_rejects_realm_less_issuer() {
+        let auth = auth_with_roles(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        assert!(matches!(require_master_token(&auth), Err(AdminApiError::Forbidden)));
     }
 
     // -- Realm binding (Watchlist W1) ----------------------------------------

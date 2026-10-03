@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 //
 // Signing-key administration: metadata listing, rotation, and disable.
+// The keys live in the server-global `signing_keys` table shared by all
+// realms and cluster nodes, so the mutating endpoints (rotate/disable) are
+// restricted to master-realm tokens; listing stays available to any realm's
+// view-realm/manage-realm admins.
 
 use axum::{
     extract::{Extension, State},
@@ -12,7 +16,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::{
-    auth::{require_roles, AdminAuth},
+    auth::{require_master_token, require_roles, AdminAuth},
     dto::{KeyMetadataRepresentation, KeysMetadataRepresentation, RotateKeyRequest},
     error::AdminApiError,
     state::AdminApiState,
@@ -124,7 +128,7 @@ pub async fn get_keys(
     path = "/admin/realms/{realm}/keys/rotate",
     tag = "Keys",
     summary = "Rotate the active signing key",
-    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists, and on creation-timestamp ties). On an EMPTY key set the rotation establishes the fresh-deployment pair — the requested key plus, unless it is RS256 itself, an active RS256 key — so the OIDC Core mandatory-to-implement RS256 is advertised in discovery from the start. The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires `manage-realm` role.",
+    description = "Generates a new active signing key and demotes the other active keys OF THE SAME ALGORITHM (rotation keeps exactly one active key per algorithm, so realms pinned to other algorithms via their `default_signature_algorithm` attribute keep their signing key). The optional body selects the algorithm and RSA key size; both default to the newest active key's parameters (the server-default algorithm EdDSA when no key exists, and on creation-timestamp ties). On an EMPTY key set the rotation establishes the fresh-deployment pair — the requested key plus, unless it is RS256 itself, an active RS256 key — so the OIDC Core mandatory-to-implement RS256 is advertised in discovery from the start. The endpoint reloads this node's keystore and returns the resulting key metadata. Signing keys are server-global (shared by all realms and cluster nodes via the `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Peer cluster nodes pick the rotation up via JWKS polling. Requires a master-realm token with the `manage-realm` role; delegated realm admins cannot rotate the server-global keys.",
     params(("realm" = String, Path, description = "Realm name")),
     request_body(content = Option<RotateKeyRequest>, description = "Optional algorithm/size for the new key"),
     responses(
@@ -142,8 +146,12 @@ pub async fn rotate_keys(
     axum::extract::Path(realm): axum::extract::Path<String>,
     body: Option<Json<RotateKeyRequest>>,
 ) -> Result<Json<KeysMetadataRepresentation>, AdminApiError> {
+    // The key set is server-global, so rotation is bound to a master-realm
+    // token — a delegated realm admin must not retune every realm's signing.
+    require_master_token(&auth)?;
     require_roles(&auth, &["manage-realm"])?;
-    let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
+    // The path realm is namespace parity only; it must still exist (404).
+    state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
 
     let existing = state.storage.list_signing_keys().await?;
     // Default rotation parameters come from the newest active key; fall back
@@ -226,10 +234,12 @@ pub async fn rotate_keys(
 
     let keys = state.storage.list_signing_keys().await?;
     let metadata = keys_metadata_from_stored(keys);
-    crate::audit::emit_admin_event(
+    // The audit event is attributed to the master realm (see
+    // emit_global_admin_event): the path realm's events config cannot
+    // suppress the trail of a server-global mutation.
+    crate::audit::emit_global_admin_event(
         &state,
         &auth,
-        &realm.id,
         issuerd_core::OperationType::Action,
         issuerd_core::ResourceType::Realm,
         "keys/rotate",
@@ -244,7 +254,7 @@ pub async fn rotate_keys(
     path = "/admin/realms/{realm}/keys/{kid}/disable",
     tag = "Keys",
     summary = "Disable a signing key",
-    description = "Marks a key inactive. A disabled key is passive in Issuerd's model: it still validates previously issued tokens but never signs new ones. Fails with 400 when the target is the only active key (rotate first). Signing keys are server-global (shared `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Requires `manage-realm` role.",
+    description = "Marks a key inactive. A disabled key is passive in Issuerd's model: it still validates previously issued tokens but never signs new ones. Fails with 400 when the target is the only active key (rotate first). Signing keys are server-global (shared `signing_keys` table); the realm path segment is namespace parity with Keycloak only. Requires a master-realm token with the `manage-realm` role; delegated realm admins cannot disable the server-global keys.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("kid" = String, Path, description = "Key ID"),
@@ -263,8 +273,11 @@ pub async fn disable_key(
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path((realm, kid)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, AdminApiError> {
+    // Server-global key set: bound to a master-realm token (see rotate_keys).
+    require_master_token(&auth)?;
     require_roles(&auth, &["manage-realm"])?;
-    let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
+    // The path realm is namespace parity only; it must still exist (404).
+    state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let kid = issuerd_core::KeyId::new(kid)?;
 
     let keys = state.storage.list_signing_keys().await?;
@@ -280,10 +293,9 @@ pub async fn disable_key(
     (state.signing_key_reload)();
     info!(kid = %kid, alg = %target.alg, "signing key disabled");
 
-    crate::audit::emit_admin_event(
+    crate::audit::emit_global_admin_event(
         &state,
         &auth,
-        &realm.id,
         issuerd_core::OperationType::Update,
         issuerd_core::ResourceType::Realm,
         &format!("keys/{kid}/disable"),
@@ -326,11 +338,23 @@ mod tests {
         storage: Arc<issuerd_storage::InMemoryStorage>,
         reload: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<AdminApiState> {
-        Arc::new(AdminApiState {
+        test_state_with_token_service(
             storage,
-            token_service: Arc::new(crate::test_utils::tests::MockTokenService {
+            reload,
+            Arc::new(crate::test_utils::tests::MockTokenService {
                 roles: vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
             }),
+        )
+    }
+
+    fn test_state_with_token_service(
+        storage: Arc<issuerd_storage::InMemoryStorage>,
+        reload: Arc<dyn Fn() + Send + Sync>,
+        token_service: Arc<dyn issuerd_core::TokenService>,
+    ) -> Arc<AdminApiState> {
+        Arc::new(AdminApiState {
+            storage,
+            token_service,
             crypto: Arc::new(issuerd_core::MockCryptoProvider::new()),
             federation_manager: Arc::new(issuerd_federation::NoOpFederationManager),
             plugin_registry: Arc::new(crate::test_utils::tests::stub_plugin_registry()),
@@ -343,6 +367,69 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             signing_key_reload: reload,
         })
+    }
+
+    /// Token service issuing a NON-master realm token (issuer realm `test`)
+    /// carrying manage-realm — a delegated admin of the path realm.
+    struct TenantTokenService;
+
+    impl issuerd_core::TokenService for TenantTokenService {
+        fn validate_access_token(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::ValidatedAccessToken, issuerd_core::IssuerdError> {
+            Ok(issuerd_core::ValidatedAccessToken {
+                claims: issuerd_core::AccessTokenClaims {
+                    jti: issuerd_core::JwtId::new("jti").unwrap(),
+                    iss: issuerd_core::Issuer::new("http://localhost:8080/realms/test").unwrap(),
+                    sub: issuerd_core::UserId::new("admin").unwrap(),
+                    aud: issuerd_core::Audience::new("aud").unwrap(),
+                    exp: 9999999999,
+                    iat: 0,
+                    nbf: 0,
+                    scope: issuerd_core::Scope::parse("openid"),
+                    typ: issuerd_core::JwtType::Bearer,
+                    azp: None,
+                    session_state: None,
+                    realm_access: Some(issuerd_core::RealmAccess {
+                        roles: vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+                    }),
+                    resource_access: None,
+                    sid: None,
+                    claims: None,
+                    cnf: None,
+                    authorization_details: None,
+                },
+                header: issuerd_core::JwsHeader {
+                    alg: Algorithm::Rs256,
+                    typ: Some(issuerd_core::JwsType::Jwt),
+                    kid: issuerd_core::KeyId::new("key-1").unwrap(),
+                },
+            })
+        }
+
+        fn validate_id_token(
+            &self,
+            _token: &str,
+            _client: &issuerd_core::Client,
+            _nonce: Option<&str>,
+        ) -> Result<issuerd_core::IdTokenClaims, issuerd_core::IssuerdError> {
+            unimplemented!()
+        }
+
+        fn validate_refresh_token(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::ValidatedRefreshToken, issuerd_core::IssuerdError> {
+            unimplemented!()
+        }
+
+        fn validate_id_token_hint(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::IdTokenClaims, issuerd_core::IssuerdError> {
+            unimplemented!()
+        }
     }
 
     async fn seed_key_with_alg(
@@ -429,6 +516,42 @@ mod tests {
         seed_key_with_alg(storage, Algorithm::Rs256, active).await
     }
 
+    /// Enable admin-event recording and representation storage on the master
+    /// realm (the realm key-administration events are attributed to).
+    async fn configure_master_audit(
+        storage: &Arc<issuerd_storage::InMemoryStorage>,
+        include_representations: bool,
+    ) {
+        let mut master = issuerd_core::Storage::get_realm_by_name(storage.as_ref(), "master")
+            .await
+            .unwrap()
+            .unwrap();
+        master.admin_events_enabled = true;
+        master.include_representations = include_representations;
+        issuerd_core::Storage::update_realm(storage.as_ref(), &master).await.unwrap();
+    }
+
+    async fn admin_events(
+        state: &Arc<AdminApiState>,
+        realm_id: &str,
+    ) -> Vec<issuerd_core::AdminEvent> {
+        state
+            .storage
+            .query_admin_events(
+                &issuerd_core::RealmId::new(realm_id).unwrap(),
+                &issuerd_core::AdminEventQuery {
+                    operation_type: None,
+                    resource_type: None,
+                    auth_user_id: None,
+                    date_from: None,
+                    date_to: None,
+                    pagination: issuerd_core::Pagination::default(),
+                },
+            )
+            .await
+            .unwrap()
+    }
+
     fn flag_reload() -> (Arc<dyn Fn() + Send + Sync>, Arc<std::sync::atomic::AtomicBool>) {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let captured = flag.clone();
@@ -484,6 +607,7 @@ mod tests {
     async fn rotate_keys_generates_new_active_and_demotes_old() {
         let storage = crate::test_utils::tests::storage_with_master_realm();
         create_test_realm(&storage, true).await;
+        configure_master_audit(&storage, true).await;
         let old = seed_key(&storage, true).await;
 
         let (reload, called) = flag_reload();
@@ -514,26 +638,15 @@ mod tests {
         // The same-node reload hook fired.
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
 
-        // Audit event recorded (realm has admin events + representations on).
-        let events = state
-            .storage
-            .query_admin_events(
-                &issuerd_core::RealmId::new("realm-1").unwrap(),
-                &issuerd_core::AdminEventQuery {
-                    operation_type: None,
-                    resource_type: None,
-                    auth_user_id: None,
-                    date_from: None,
-                    date_to: None,
-                    pagination: issuerd_core::Pagination::default(),
-                },
-            )
-            .await
-            .unwrap();
+        // The audit event is attributed to the MASTER realm (the keys are
+        // server-global; the path realm only provides namespace parity).
+        let events = admin_events(&state, "master").await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation_type, issuerd_core::OperationType::Action);
         assert_eq!(events[0].resource_path, "keys/rotate");
         assert!(events[0].representation.as_ref().unwrap().contains(&new_kid));
+        assert_eq!(events[0].auth_realm_id, Some(issuerd_core::RealmId::new("master").unwrap()));
+        assert!(admin_events(&state, "realm-1").await.is_empty());
     }
 
     #[tokio::test]
@@ -796,6 +909,8 @@ mod tests {
     #[tokio::test]
     async fn disable_key_marks_it_passive() {
         let storage = crate::test_utils::tests::storage_with_master_realm();
+        // The path realm has admin-event recording DISABLED — it must not
+        // suppress the audit trail of a server-global mutation.
         create_test_realm(&storage, false).await;
         seed_key(&storage, true).await;
         let target = seed_key(&storage, true).await;
@@ -816,6 +931,14 @@ mod tests {
         assert!(!disabled.active);
         assert_eq!(stored.iter().filter(|k| k.active).count(), 1);
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The audit event landed on the master realm despite the path
+        // realm's disabled recording.
+        let events = admin_events(&state, "master").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, issuerd_core::OperationType::Update);
+        assert_eq!(events[0].resource_path, format!("keys/{}/disable", target.kid));
+        assert!(admin_events(&state, "realm-1").await.is_empty());
     }
 
     #[tokio::test]
@@ -855,6 +978,85 @@ mod tests {
                 .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ------------------------------------------------------------------
+    // Master-realm authorization (server-global key set)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_keys_rejects_non_master_token() {
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        create_test_realm(&storage, false).await;
+        seed_key(&storage, true).await;
+
+        let (reload, called) = flag_reload();
+        // A delegated admin of the path realm (manage-realm, issuer `test`).
+        let state = test_state_with_token_service(storage, reload, Arc::new(TenantTokenService));
+
+        let (status, _) =
+            call(key_routes(state.clone()), "POST", "/admin/realms/test/keys/rotate").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // No mutation, no reload, no audit event anywhere.
+        let stored = state.storage.list_signing_keys().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].active);
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(admin_events(&state, "master").await.is_empty());
+        assert!(admin_events(&state, "realm-1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disable_key_rejects_non_master_token() {
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        create_test_realm(&storage, false).await;
+        seed_key(&storage, true).await;
+        let target = seed_key(&storage, true).await;
+
+        let (reload, called) = flag_reload();
+        let state = test_state_with_token_service(storage, reload, Arc::new(TenantTokenService));
+
+        let (status, _) = call(
+            key_routes(state.clone()),
+            "PUT",
+            &format!("/admin/realms/test/keys/{}/disable", target.kid),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Both keys stay active; no reload, no audit event anywhere.
+        let stored = state.storage.list_signing_keys().await.unwrap();
+        assert_eq!(stored.iter().filter(|k| k.active).count(), 2);
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(admin_events(&state, "master").await.is_empty());
+        assert!(admin_events(&state, "realm-1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotate_keys_audit_event_survives_path_realm_events_disabled() {
+        let storage = crate::test_utils::tests::storage_with_master_realm();
+        // Path realm with admin-event recording DISABLED: before the
+        // master-realm attribution, this suppressed the audit trail of the
+        // global mutation entirely.
+        create_test_realm(&storage, false).await;
+        seed_key(&storage, true).await;
+
+        let (reload, _) = flag_reload();
+        let state = test_state(storage, reload);
+
+        let (status, _) =
+            call(key_routes(state.clone()), "POST", "/admin/realms/test/keys/rotate").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The event is recorded against the master realm (master config
+        // defaults: admin events on, representations off).
+        let events = admin_events(&state, "master").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, issuerd_core::OperationType::Action);
+        assert_eq!(events[0].resource_path, "keys/rotate");
+        assert_eq!(events[0].representation, None);
+        assert!(admin_events(&state, "realm-1").await.is_empty());
     }
 
     #[test]
