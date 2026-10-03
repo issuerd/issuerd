@@ -27,7 +27,10 @@ between builds; the OP image builds the full Issuerd release binary),
 generates the local PKI, bootstraps the realm, runs all three test plans
 and exports the reports. Watch for `Conformance test run complete: all
 plans OK` in the log, then Ctrl+C (or `docker compose down --volumes` from
-another shell). Subsequent runs reuse the build cache and take ~3 minutes.
+another shell). Subsequent runs reuse the build cache: a full warm `run.sh`
+(build + PKI + bootstrap + all three plans + report export) measured ~6 min
+wall-clock (2026-10-03; the three plans themselves total ~3.5 min of suite
+time).
 
 Results land in `tests/conformance/results/`:
 
