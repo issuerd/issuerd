@@ -21,7 +21,12 @@
 //! Client payloads are the admin API's `ClientRepresentation` and run through
 //! the exact validation of the admin create/update paths (extracted helpers
 //! in `issuerd_admin_api::clients`), so registered and admin-managed clients are
-//! indistinguishable afterwards.
+//! indistinguishable afterwards. The open endpoint additionally vets the
+//! payload first (`enforce_open_registration_policy`): caller-controlled JWKS
+//! and logout-URI attributes are stripped, service accounts are forced off,
+//! redirect-URI schemes are allowlisted, and the `"*"` web origin is
+//! rejected. The token-gated path trusts its admin-minted initial access
+//! token and honors every field.
 
 use std::sync::Arc;
 
@@ -152,13 +157,152 @@ fn parse_client_representation(body: &serde_json::Value) -> Result<ClientReprese
     serde_json::from_value(value).map_err(|e| format!("invalid client metadata: {e}"))
 }
 
+/// Payload vetting for registration creates. The open (unauthenticated)
+/// endpoint applies [`RegistrationPolicy::Open`]; the initial-access-token
+/// gated endpoint trusts the caller (an admin minted the token) and keeps
+/// honoring every field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationPolicy {
+    Open,
+    Trusted,
+}
+
+/// Client attribute keys an anonymous registrant must never set, stripped by
+/// the open-registration policy. The JWKS quartet selects the client's
+/// `private_key_jwt` key material: `jwks.url` points the token endpoint's
+/// outbound JWKS fetch at a caller-controlled URL, and the inline
+/// `jwks.string` would make the registrant its own key authority — anonymous
+/// clients authenticate with `client_secret`. The logout URIs are
+/// server-initiated POST/redirect targets dispatched at session teardown.
+const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 6] = [
+    crate::client_assertion::ATTR_JWKS_URL,
+    crate::client_assertion::ATTR_USE_JWKS_URL,
+    crate::client_assertion::ATTR_JWKS_STRING,
+    crate::client_assertion::ATTR_USE_JWKS_STRING,
+    crate::routes::logout::CLIENT_ATTR_BACKCHANNEL_LOGOUT_URI,
+    crate::routes::logout::CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI,
+];
+
+/// Apply the payload policy of the open (unauthenticated) client
+/// registration endpoint to a parsed representation.
+///
+/// THIS IS THE CLIENT-REGISTRATION POLICY FOR THE ANONYMOUS ENDPOINT
+/// (`POST /realms/{realm}/clients-registrations/default`). Keycloak gates
+/// the same decisions behind its ClientRegistrationPolicy SPI; this is
+/// Issuerd's fixed equivalent. Write-path only: clients that already exist
+/// are unaffected, and the token-gated and admin registration paths keep
+/// honoring every field.
+///
+/// - the attributes in [`OPEN_REGISTRATION_STRIPPED_ATTRIBUTES`] are
+///   STRIPPED;
+/// - `service_accounts_enabled` is FORCED to false (Keycloak anonymous
+///   registration parity: no service account without admin approval);
+/// - `redirect_uris` are scheme-vetted (see
+///   [`validate_open_registration_redirect_uri`]); a forbidden URI REJECTS
+///   the whole registration with `invalid_redirect_uri` naming the URI — no
+///   partial filtering that would silently register a different client than
+///   the caller sent;
+/// - `web_origins` REJECTS the literal `"*"` (CORS wildcard) with
+///   `invalid_client_metadata`.
+#[allow(clippy::result_large_err)]
+fn enforce_open_registration_policy(
+    realm_id: &RealmId,
+    rep: &mut ClientRepresentation,
+) -> Result<(), Response> {
+    if let Some(attributes) = &mut rep.attributes {
+        let before = attributes.len();
+        for key in OPEN_REGISTRATION_STRIPPED_ATTRIBUTES {
+            attributes.remove(key);
+        }
+        if attributes.len() != before {
+            debug!(
+                realm = %realm_id,
+                client_id = %rep.client_id,
+                "stripped JWKS/logout attributes on open registration"
+            );
+        }
+    }
+    if rep.service_accounts_enabled == Some(true) {
+        debug!(
+            realm = %realm_id,
+            client_id = %rep.client_id,
+            "forcing service_accounts_enabled off on open registration"
+        );
+    }
+    rep.service_accounts_enabled = Some(false);
+    if let Some(uris) = &rep.redirect_uris {
+        for uri in uris {
+            validate_open_registration_redirect_uri(uri)?;
+        }
+    }
+    if let Some(origins) = &rep.web_origins {
+        if origins.iter().any(|origin| origin == "*") {
+            return Err(registration_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                "web_origins value \"*\" is not allowed on open registration",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The open-registration redirect-URI scheme allowlist. `https` is always
+/// allowed; plain `http` only for loopback/localhost hosts (local
+/// development and the RFC 8252 native-app loopback flow); custom schemes
+/// (`myapp://…`) are allowed as OIDC native-app practice requires.
+/// `javascript:`, `data:` and `vbscript:` are REJECTED explicitly — they
+/// parse as valid URLs (so `RedirectUri::new` accepts them), but a stored
+/// scriptable scheme would execute in the end user's browser whenever the
+/// authorization endpoint redirects to it.
+#[allow(clippy::result_large_err)]
+fn validate_open_registration_redirect_uri(uri: &str) -> Result<(), Response> {
+    let reject = |description: String| {
+        registration_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", &description)
+    };
+    let parsed = match url::Url::parse(uri) {
+        Ok(parsed) => parsed,
+        Err(e) => return Err(reject(format!("invalid redirect_uri {uri:?}: {e}"))),
+    };
+    // `Url::parse` ASCII-lowercases the scheme, so `JAVASCRIPT:…` arrives
+    // here as `javascript`.
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_redirect_host(&parsed) => Ok(()),
+        "http" => Err(reject(format!(
+            "redirect_uri {uri:?} is not allowed on open registration: \
+             plain http is only accepted for loopback hosts"
+        ))),
+        "javascript" | "data" | "vbscript" => Err(reject(format!(
+            "redirect_uri {uri:?} is not allowed on open registration: \
+             the {} scheme is forbidden",
+            parsed.scheme()
+        ))),
+        // Custom schemes (`myapp://…`) — OIDC native-app practice.
+        _ => Ok(()),
+    }
+}
+
+/// Whether `url`'s host is `localhost` or a loopback IP literal — the only
+/// hosts allowed on plain-http redirect URIs from open registration.
+fn is_loopback_redirect_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Create the client described by `body` in `realm`, mint its registration
 /// access token, and render the 201 response. Shared by the open and the
-/// token-gated registration endpoints.
+/// token-gated registration endpoints; `policy` selects how much of the
+/// caller-supplied payload is honored (see [`RegistrationPolicy`]).
 async fn register_client(
     state: &Arc<ServerState>,
     realm: &Realm,
     body: serde_json::Value,
+    policy: RegistrationPolicy,
 ) -> Response {
     let mut rep = match parse_client_representation(&body) {
         Ok(rep) => rep,
@@ -170,6 +314,15 @@ async fn register_client(
             );
         }
     };
+    // The client-registration policy for the anonymous endpoint lives in
+    // `enforce_open_registration_policy` — it strips/forces/rejects the
+    // fields an unauthenticated registrant must not control. The
+    // token-gated path is Trusted and skips it entirely.
+    if policy == RegistrationPolicy::Open {
+        if let Err(resp) = enforce_open_registration_policy(&realm.id, &mut rep) {
+            return resp;
+        }
+    }
     // There is no client-registration policy engine (Keycloak's
     // ClientRegistrationPolicy) to vet caller-supplied protocol mappers — an
     // audience mapper would let an anonymous registrant mint tokens naming
@@ -443,7 +596,7 @@ pub async fn register_open_handler(
             );
         }
     };
-    register_client(&state, &realm, body).await
+    register_client(&state, &realm, body, RegistrationPolicy::Open).await
 }
 
 /// `POST /realms/{realm}/clients-registrations/openid-connect` —
@@ -486,7 +639,7 @@ pub async fn register_token_gated_handler(
             );
         }
     };
-    register_client(&state, &realm, body).await
+    register_client(&state, &realm, body, RegistrationPolicy::Trusted).await
 }
 
 /// `GET /realms/{realm}/clients-registrations/openid-connect/{client_id}` —
@@ -827,14 +980,26 @@ mod tests {
         })
     }
 
-    /// Register a client through the shared create path; returns the stored
-    /// client and its registration access token.
+    /// Register a client through the shared create path with the open
+    /// endpoint's policy; returns the stored client and its registration
+    /// access token.
     async fn register_test_client(
         state: &Arc<ServerState>,
         realm: &Realm,
         body: serde_json::Value,
     ) -> (Client, String) {
-        let resp = register_client(state, realm, body).await;
+        register_test_client_with_policy(state, realm, body, RegistrationPolicy::Open).await
+    }
+
+    /// Same as [`register_test_client`] with an explicit policy, to exercise
+    /// the token-gated (trusted) create path.
+    async fn register_test_client_with_policy(
+        state: &Arc<ServerState>,
+        realm: &Realm,
+        body: serde_json::Value,
+        policy: RegistrationPolicy,
+    ) -> (Client, String) {
+        let resp = register_client(state, realm, body, policy).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1050,5 +1215,182 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         assert!(recorded_admin_events(&state, &realm.id).await.is_empty());
+    }
+
+    #[test]
+    fn open_policy_redirect_uri_scheme_allowlist() {
+        // https is always allowed.
+        assert!(validate_open_registration_redirect_uri("https://app.example.com/cb").is_ok());
+        // Plain http only on loopback hosts (dev + RFC 8252 native apps).
+        assert!(validate_open_registration_redirect_uri("http://localhost:8080/cb").is_ok());
+        assert!(validate_open_registration_redirect_uri("http://127.0.0.1:3000/cb").is_ok());
+        assert!(validate_open_registration_redirect_uri("http://[::1]:3000/cb").is_ok());
+        assert!(validate_open_registration_redirect_uri("http://app.example.com/cb").is_err());
+        assert!(validate_open_registration_redirect_uri("http://192.168.1.10/cb").is_err());
+        assert!(
+            validate_open_registration_redirect_uri("http://localhost.evil.example/cb").is_err()
+        );
+        // Scriptable schemes are rejected; Url::parse lowercases the scheme.
+        for uri in [
+            "javascript:alert(1)",
+            "JAVASCRIPT:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+        ] {
+            assert!(validate_open_registration_redirect_uri(uri).is_err(), "{uri}");
+        }
+        // Custom schemes are OIDC native-app practice.
+        assert!(validate_open_registration_redirect_uri("myapp://callback").is_ok());
+        assert!(validate_open_registration_redirect_uri("com.example.app:/oauth2redirect").is_ok());
+    }
+
+    #[test]
+    fn open_policy_strips_attributes_and_forces_no_service_account() {
+        let realm_id = RealmId::new("policy-test").unwrap();
+        let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
+            "client_id": "policy-test",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "service_accounts_enabled": true,
+            "attributes": {
+                "jwks.url": "http://169.254.169.254/latest/meta-data",
+                "use.jwks.url": "true",
+                "jwks.string": "{\"keys\":[]}",
+                "use.jwks.string": "true",
+                "backchannel_logout_uri": "https://attacker.example.com/hook",
+                "frontchannel_logout_uri": "https://attacker.example.com/logout",
+                "custom": "kept"
+            }
+        }))
+        .unwrap();
+        enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+        let attributes = rep.attributes.unwrap();
+        assert_eq!(
+            attributes.len(),
+            1,
+            "all JWKS/logout attributes stripped, only the custom one kept: {attributes:?}"
+        );
+        assert_eq!(attributes.get("custom").map(String::as_str), Some("kept"));
+        assert_eq!(rep.service_accounts_enabled, Some(false));
+    }
+
+    #[test]
+    fn open_policy_rejects_wildcard_web_origin() {
+        let realm_id = RealmId::new("policy-test").unwrap();
+        let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
+            "client_id": "policy-test",
+            "web_origins": ["https://app.example.com", "*"]
+        }))
+        .unwrap();
+        assert!(enforce_open_registration_policy(&realm_id, &mut rep).is_err());
+        // Non-wildcard origins pass untouched.
+        let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
+            "client_id": "policy-test",
+            "web_origins": ["https://app.example.com"]
+        }))
+        .unwrap();
+        enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+        assert_eq!(rep.web_origins.unwrap(), vec!["https://app.example.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn open_registration_applies_payload_policy() {
+        let (state, realm) = registration_state().await;
+        let (client, _token) = register_test_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-open-policy",
+                "redirect_uris": ["http://localhost/cb"],
+                "service_accounts_enabled": true,
+                "web_origins": ["https://app.example.com"],
+                "attributes": {
+                    "jwks.url": "http://169.254.169.254/jwks.json",
+                    "use.jwks.url": "true",
+                    "jwks.string": "{\"keys\":[]}",
+                    "use.jwks.string": "true",
+                    "backchannel_logout_uri": "https://attacker.example.com/hook",
+                    "frontchannel_logout_uri": "https://attacker.example.com/logout",
+                    "custom": "kept"
+                }
+            }),
+        )
+        .await;
+        assert!(!client.service_accounts_enabled);
+        for key in [
+            "jwks.url",
+            "use.jwks.url",
+            "jwks.string",
+            "use.jwks.string",
+            "backchannel_logout_uri",
+            "frontchannel_logout_uri",
+        ] {
+            assert!(!client.attributes.contains_key(key), "{key} must be stripped");
+        }
+        assert_eq!(client.attributes.get("custom").map(String::as_str), Some("kept"));
+        assert!(client.web_origins.iter().any(|o| o.as_str() == "https://app.example.com"));
+    }
+
+    #[tokio::test]
+    async fn open_registration_rejects_forbidden_redirect_scheme() {
+        let (state, realm) = registration_state().await;
+        let resp = register_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-js-uri",
+                "redirect_uris": ["https://app.example.com/cb", "javascript:alert(1)"],
+            }),
+            RegistrationPolicy::Open,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "invalid_redirect_uri");
+        assert!(
+            json["error_description"].as_str().unwrap().contains("javascript:alert(1)"),
+            "the offending URI must be named: {json}"
+        );
+        // The whole registration is rejected: no client was created.
+        let client_id = issuerd_core::ClientIdentifier::new("dcr-js-uri").unwrap();
+        let stored = state.storage.get_client_by_client_id(&realm.id, &client_id).await.unwrap();
+        assert!(stored.is_none(), "no partial registration on policy rejection");
+    }
+
+    #[tokio::test]
+    async fn trusted_registration_honors_full_payload() {
+        let (state, realm) = registration_state().await;
+        let (client, _token) = register_test_client_with_policy(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-trusted",
+                "redirect_uris": ["http://dev.internal.example/cb"],
+                "service_accounts_enabled": true,
+                "web_origins": ["*"],
+                "attributes": {
+                    "jwks.url": "https://idp.example.com/jwks.json",
+                    "use.jwks.url": "true",
+                    "backchannel_logout_uri": "https://app.example.com/logout/backchannel",
+                    "frontchannel_logout_uri": "https://app.example.com/logout/frontchannel"
+                }
+            }),
+            RegistrationPolicy::Trusted,
+        )
+        .await;
+        assert!(client.service_accounts_enabled);
+        assert_eq!(
+            client.attributes.get("jwks.url").map(String::as_str),
+            Some("https://idp.example.com/jwks.json")
+        );
+        assert_eq!(
+            client.attributes.get("backchannel_logout_uri").map(String::as_str),
+            Some("https://app.example.com/logout/backchannel")
+        );
+        assert!(client.web_origins.iter().any(|o| o.as_str() == "*"));
+        assert!(client
+            .redirect_uris
+            .iter()
+            .any(|u| u.as_str() == "http://dev.internal.example/cb"));
     }
 }

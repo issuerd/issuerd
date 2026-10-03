@@ -10,8 +10,11 @@
 //! open registration (roundtrip, validation errors, rate limiting),
 //! initial-access-token-gated registration (mint/list/revoke via the admin
 //! API, count exhaustion), registration-access-token CRUD with rotation on
-//! update, and an end-to-end check that a registered client works at the
-//! token endpoint.
+//! update, an end-to-end check that a registered client works at the
+//! token endpoint, and the open-endpoint payload policy (stripped
+//! attributes, forced service-account-off, redirect-URI scheme allowlist,
+//! web-origin wildcard rejection — all still honored on the token-gated
+//! and admin paths).
 
 use axum::http::StatusCode;
 
@@ -725,4 +728,277 @@ async fn registration_lifecycle_writes_admin_events() {
             "missing {op} client admin event: {events:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Open-endpoint payload policy (2026-10 security review)
+// ---------------------------------------------------------------------------
+
+/// The payload an anonymous registrant would use to grab the capabilities
+/// the open-endpoint policy denies: caller-controlled JWKS attributes,
+/// server-initiated logout URIs, and a service account.
+fn policy_probe_body(client_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_id": client_id,
+        "redirect_uris": ["https://app.example.com/cb"],
+        "service_accounts_enabled": true,
+        "web_origins": ["https://app.example.com"],
+        "attributes": {
+            "jwks.url": "http://169.254.169.254/latest/meta-data",
+            "use.jwks.url": "true",
+            "jwks.string": "{\"keys\":[]}",
+            "use.jwks.string": "true",
+            "backchannel_logout_uri": "https://attacker.example.com/hook",
+            "frontchannel_logout_uri": "https://attacker.example.com/logout",
+            "custom": "kept"
+        }
+    })
+}
+
+/// Fetch a client by its public client_id straight from storage.
+async fn stored_client(
+    harness: &TestHarness,
+    realm: &issuerd_core::Realm,
+    client_id: &str,
+) -> Option<issuerd_core::Client> {
+    harness
+        .storage
+        .get_client_by_client_id(
+            &realm.id,
+            &issuerd_core::ClientIdentifier::new(client_id).unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// On the open endpoint the JWKS/logout attributes are stripped,
+/// `service_accounts_enabled` is forced off, and benign attributes survive.
+#[tokio::test]
+async fn open_registration_strips_jwks_and_logout_attributes_and_forces_no_service_account() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-strip").await;
+    enable_registration(&harness, &realm).await;
+
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            policy_probe_body("policy-strip"),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let client = stored_client(&harness, &realm, "policy-strip")
+        .await
+        .expect("registered client persisted");
+    assert!(!client.service_accounts_enabled, "service account must be forced off");
+    for key in [
+        "jwks.url",
+        "use.jwks.url",
+        "jwks.string",
+        "use.jwks.string",
+        "backchannel_logout_uri",
+        "frontchannel_logout_uri",
+    ] {
+        assert!(!client.attributes.contains_key(key), "{key} must be stripped");
+    }
+    assert_eq!(
+        client.attributes.get("custom").map(String::as_str),
+        Some("kept"),
+        "benign attributes are kept"
+    );
+}
+
+/// Scriptable redirect-URI schemes and non-loopback plain http are rejected
+/// on the open endpoint; the whole registration fails (no partial filtering)
+/// and the error names the offending URI.
+#[tokio::test]
+async fn open_registration_rejects_dangerous_redirect_uri_schemes() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-scheme").await;
+    enable_registration(&harness, &realm).await;
+
+    for (idx, uri) in [
+        "javascript:alert(1)",
+        "JAVASCRIPT:alert(1)",
+        "data:text/html;base64,PHNjcmlwdD4=",
+        "vbscript:msgbox(1)",
+        "http://app.example.com/cb",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let client_id = format!("policy-scheme-{idx}");
+        let resp = harness
+            .post_json(
+                &registrations_path(realm.name.as_ref(), "default"),
+                serde_json::json!({
+                    "client_id": client_id,
+                    "redirect_uris": ["https://app.example.com/cb", uri],
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let json = json_body(resp).await;
+        assert_eq!(json["error"], "invalid_redirect_uri", "{uri}");
+        assert!(
+            json["error_description"].as_str().unwrap().contains(uri),
+            "the offending URI must be named: {json}"
+        );
+        // Rejection is all-or-nothing: the benign URI in the same request
+        // must not leave a registered client behind.
+        assert!(
+            stored_client(&harness, &realm, &client_id).await.is_none(),
+            "no partial registration for {uri}"
+        );
+    }
+}
+
+/// https, loopback plain http, and custom-scheme redirect URIs (OIDC
+/// native-app practice) all register fine on the open endpoint.
+#[tokio::test]
+async fn open_registration_allows_https_loopback_http_and_custom_schemes() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-allow").await;
+    enable_registration(&harness, &realm).await;
+
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({
+                "client_id": "policy-allow",
+                "redirect_uris": [
+                    "https://app.example.com/cb",
+                    "http://localhost:8080/cb",
+                    "http://127.0.0.1:3000/cb",
+                    "http://[::1]:3000/cb",
+                    "myapp://callback",
+                    "com.example.app:/oauth2redirect"
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let client = stored_client(&harness, &realm, "policy-allow")
+        .await
+        .expect("registered client persisted");
+    assert_eq!(
+        client.redirect_uris.len(),
+        6,
+        "all allowed URIs are kept: {:?}",
+        client.redirect_uris
+    );
+    assert!(client.redirect_uris.iter().any(|u| u.as_str() == "https://app.example.com/cb"));
+    assert!(client.redirect_uris.iter().any(|u| u.as_str() == "http://localhost:8080/cb"));
+    assert!(client.redirect_uris.iter().any(|u| u.as_str() == "http://127.0.0.1:3000/cb"));
+    assert!(client.redirect_uris.iter().any(|u| u.as_str() == "http://[::1]:3000/cb"));
+    assert!(client.redirect_uris.iter().any(|u| u.as_str() == "myapp://callback"));
+}
+
+/// The CORS wildcard web origin is rejected on the open endpoint; a concrete
+/// origin list is honored.
+#[tokio::test]
+async fn open_registration_rejects_wildcard_web_origin() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-origin").await;
+    enable_registration(&harness, &realm).await;
+
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({
+                "client_id": "policy-origin",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "web_origins": ["https://app.example.com", "*"],
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(resp).await;
+    assert_eq!(json["error"], "invalid_client_metadata");
+    assert!(stored_client(&harness, &realm, "policy-origin").await.is_none());
+
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({
+                "client_id": "policy-origin-ok",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "web_origins": ["https://app.example.com"],
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let client = stored_client(&harness, &realm, "policy-origin-ok")
+        .await
+        .expect("registered client persisted");
+    assert!(client.web_origins.iter().any(|o| o.as_str() == "https://app.example.com"));
+}
+
+/// The token-gated (initial access token) registration path is trusted: it
+/// keeps honoring every field the open endpoint strips/forces/rejects.
+#[tokio::test]
+async fn token_gated_registration_honors_full_payload() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-trusted").await;
+    enable_registration(&harness, &realm).await;
+
+    let minted = mint_initial_access(&harness, realm.name.as_ref(), 3600, 1).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+
+    let mut body = policy_probe_body("policy-trusted");
+    body["web_origins"] = serde_json::json!(["*"]);
+    body["redirect_uris"] = serde_json::json!(["http://dev.internal.example/cb"]);
+    let resp = harness
+        .post_json_auth(&registrations_path(realm.name.as_ref(), "openid-connect"), &token, body)
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let client = stored_client(&harness, &realm, "policy-trusted")
+        .await
+        .expect("registered client persisted");
+    assert!(client.service_accounts_enabled, "token-gated path honors the flag");
+    assert_eq!(
+        client.attributes.get("jwks.url").map(String::as_str),
+        Some("http://169.254.169.254/latest/meta-data")
+    );
+    assert_eq!(
+        client.attributes.get("backchannel_logout_uri").map(String::as_str),
+        Some("https://attacker.example.com/hook")
+    );
+    assert!(client.web_origins.iter().any(|o| o.as_str() == "*"));
+    assert!(client
+        .redirect_uris
+        .iter()
+        .any(|u| u.as_str() == "http://dev.internal.example/cb"));
+}
+
+/// The admin client-creation path is likewise unaffected by the
+/// open-endpoint payload policy.
+#[tokio::test]
+async fn admin_client_creation_honors_full_payload() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-pol-admin").await;
+    let admin_token = harness.get_admin_token("master", "admin", "admin").await;
+
+    let mut body = policy_probe_body("policy-admin");
+    body["web_origins"] = serde_json::json!(["*"]);
+    let resp = harness
+        .post_json_auth(&format!("/admin/realms/{}/clients", realm.name), &admin_token, body)
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let client = stored_client(&harness, &realm, "policy-admin")
+        .await
+        .expect("admin-created client persisted");
+    assert!(client.service_accounts_enabled, "admin path honors the flag");
+    assert_eq!(
+        client.attributes.get("jwks.url").map(String::as_str),
+        Some("http://169.254.169.254/latest/meta-data")
+    );
+    assert_eq!(
+        client.attributes.get("backchannel_logout_uri").map(String::as_str),
+        Some("https://attacker.example.com/hook")
+    );
+    assert!(client.web_origins.iter().any(|o| o.as_str() == "*"));
 }
