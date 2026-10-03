@@ -179,6 +179,7 @@ impl ProvisionConfig {
                 provider_id: "ldap".to_string(),
                 enabled: true,
                 config: idp_config,
+                mappers: vec![],
             }],
             flow_configs: vec![ProvisionFlowConfig {
                 realm: "myrealm".to_string(),
@@ -371,6 +372,13 @@ pub struct ProvisionIdentityProvider {
     pub enabled: bool,
     #[serde(default)]
     pub config: HashMap<String, String>,
+    /// Mapper rules stored in the IdP's `mappers` config key (same shape as
+    /// the Admin API mapper sub-resource): broker claim mappers on external
+    /// OIDC/social providers, LDAP mappers (`user-attribute-ldap-mapper`,
+    /// `full-name-ldap-mapper`, `group-ldap-mapper`,
+    /// `msad-user-account-control-mapper`) on `ldap` providers.
+    #[serde(default)]
+    pub mappers: Vec<crate::broker::IdpMapper>,
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use issuerd_core::{FederatedUser, FederationError};
 
+use crate::mapper::user_attribute::config_value;
 use crate::mapper::LdapMapper;
 
 /// Maps LDAP group memberships to Issuerd group names.
@@ -59,35 +60,53 @@ impl GroupMapper {
     /// - `memberOfLdapAttribute` (default `memberOf`).
     /// - `groupsInclude` (optional): comma-separated group-name allowlist.
     pub fn from_config(config: &HashMap<String, String>) -> Option<Self> {
-        let groups_dn = config.get("groupsDn")?.trim().to_string();
-        if groups_dn.is_empty() {
-            return None;
-        }
-        let groups_include = config.get("groupsInclude").and_then(|raw| {
+        let groups_dn = config_value(config, "groupsDn")?;
+        Some(Self::build(
+            groups_dn,
+            config_value(config, "groupNameLdapAttribute"),
+            config_value(config, "memberOfLdapAttribute"),
+            config_value(config, "groupsInclude"),
+        ))
+    }
+
+    /// Build from a `group-ldap-mapper` entry of the IdP `mappers` list
+    /// (Keycloak's dotted config keys): `groups.dn` (required),
+    /// `group.name.ldap.attribute` (default `cn`), `memberof.ldap.attribute`
+    /// (default `memberOf`), plus the Issuerd extension `groups.include`
+    /// (comma-separated group-name allowlist).
+    pub fn from_mapper_config(config: &HashMap<String, String>) -> Option<Self> {
+        let groups_dn = config_value(config, "groups.dn")?;
+        Some(Self::build(
+            groups_dn,
+            config_value(config, "group.name.ldap.attribute"),
+            config_value(config, "memberof.ldap.attribute"),
+            config_value(config, "groups.include"),
+        ))
+    }
+
+    fn build(
+        groups_dn: String,
+        group_name_attribute: Option<String>,
+        member_of_attribute: Option<String>,
+        groups_include_raw: Option<String>,
+    ) -> Self {
+        let groups_include = groups_include_raw.and_then(|raw| {
             let names: Vec<String> =
                 raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             (!names.is_empty()).then_some(names)
         });
-        Some(Self {
+        Self {
             groups_dn,
-            group_name_attribute: config
-                .get("groupNameLdapAttribute")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "cn".to_string()),
+            group_name_attribute: group_name_attribute.unwrap_or_else(|| "cn".to_string()),
             group_object_classes: vec!["group".to_string()],
             membership_attribute: "member".to_string(),
             membership_type: MembershipType::Dn,
             mode: GroupSyncMode::ReadOnly,
             preserve_group_inheritance: false,
             user_roles_retrieve_strategy: UserRolesRetrieveStrategy::GetGroupsFromUserMemberOf,
-            member_of_attribute: config
-                .get("memberOfLdapAttribute")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "memberOf".to_string()),
+            member_of_attribute: member_of_attribute.unwrap_or_else(|| "memberOf".to_string()),
             groups_include,
-        })
+        }
     }
 
     fn extract_group_name(&self, dn: &str) -> Option<String> {
@@ -183,15 +202,16 @@ impl LdapMapper for GroupMapper {
 
     fn map_memberships(&self, ldap_attrs: &HashMap<String, Vec<String>>) -> Vec<String> {
         match self.user_roles_retrieve_strategy {
-            UserRolesRetrieveStrategy::GetGroupsFromUserMemberOf => ldap_attrs
-                .get(&self.member_of_attribute)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|dn| self.is_under_groups_dn(dn))
-                .filter_map(|dn| self.extract_group_name(&dn))
-                .filter(|name| self.is_included(name))
-                .collect(),
+            UserRolesRetrieveStrategy::GetGroupsFromUserMemberOf => {
+                crate::mapper::get_attr(ldap_attrs, &self.member_of_attribute)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|dn| self.is_under_groups_dn(dn))
+                    .filter_map(|dn| self.extract_group_name(&dn))
+                    .filter(|name| self.is_included(name))
+                    .collect()
+            }
             UserRolesRetrieveStrategy::LoadGroupsByMemberAttribute => {
                 // NOTE: LoadGroupsByMemberAttribute is not implemented in MVP.
                 // It requires an extra LDAP search: (&(objectClass=group)(member={userDn}))

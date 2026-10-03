@@ -344,6 +344,13 @@ pub fn merge_userinfo_claims(
 // ---------------------------------------------------------------------------
 
 /// What an [`IdpMapper`] does with external claims.
+///
+/// The first three variants are **broker** mapper types (external OIDC/social
+/// login, evaluated on the claims of the brokered identity). The `*-ldap-mapper`
+/// variants are **user-federation** mapper types, effective only on `ldap`
+/// providers and named after Keycloak's mapper type ids so exported Keycloak
+/// configs translate 1:1. Each consumer ignores the variants of the other
+/// family, so both can share the same `mappers` config list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IdpMapperType {
@@ -354,6 +361,24 @@ pub enum IdpMapperType {
     /// Derive the username from a template (`template`), e.g.
     /// `${ALIAS}.${CLAIM.sub}`. Applied only when a user is created.
     UsernameTemplate,
+    /// LDAP: map one LDAP attribute onto a user field/custom attribute
+    /// (`user.attribute`, `ldap.attribute`; optional `is.mandatory.in.ldap`,
+    /// `attribute.default.value`).
+    #[serde(rename = "user-attribute-ldap-mapper")]
+    UserAttributeLdap,
+    /// LDAP: split one LDAP attribute (default `cn`) into first/last name
+    /// (`ldap.full.name.attribute`).
+    #[serde(rename = "full-name-ldap-mapper")]
+    FullNameLdap,
+    /// LDAP: sync group memberships from the user's `memberOf` DNs
+    /// (`groups.dn`; optional `group.name.ldap.attribute`,
+    /// `memberof.ldap.attribute`, Issuerd extension `groups.include`).
+    #[serde(rename = "group-ldap-mapper")]
+    GroupLdap,
+    /// LDAP (MSAD): derive the enabled flag from `userAccountControl` and arm
+    /// `UPDATE_PASSWORD` when `pwdLastSet` is 0. No config keys.
+    #[serde(rename = "msad-user-account-control-mapper")]
+    MsadAccountControlLdap,
 }
 
 /// A single claim-mapping rule stored on the IdP config (in the `mappers`
@@ -478,6 +503,9 @@ pub fn apply_mappers(
                     effects.username = render_username_template(template, alias, claims);
                 }
             }
+            // LDAP federation mapper types share the `mappers` list but are
+            // evaluated by the LDAP provider, not on broker logins.
+            _ => {}
         }
     }
     effects

@@ -3,7 +3,6 @@
 //
 // Dynamic federation manager: loads providers from realm identity-provider configuration.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use issuerd_core::{
@@ -47,7 +46,7 @@ impl DynamicFederationManager {
                 FederationProviderType::Ldap => {
                     let config = crate::ldap::config::LdapConfig::from_hashmap(&idp.config)
                         .map_err(|e| IssuerdError::ServerError(e.to_string()))?;
-                    let mappers = build_default_mappers(&idp.config);
+                    let mappers = crate::mapper::mappers_from_config(&idp.config);
                     Arc::new(
                         crate::ldap::provider::LdapFederationProvider::new(
                             idp.id.to_string(),
@@ -132,20 +131,6 @@ impl FederationManager for DynamicFederationManager {
         }
         Ok(None)
     }
-}
-
-/// Build the LDAP mapper chain from the identity-provider config.
-///
-/// Currently supported: the group mapper (`group-ldap-mapper`), enabled when
-/// the config carries `groupsDn` (see [`crate::mapper::GroupMapper::from_config`]).
-fn build_default_mappers(
-    config: &HashMap<String, String>,
-) -> Vec<Box<dyn crate::mapper::LdapMapper>> {
-    let mut mappers: Vec<Box<dyn crate::mapper::LdapMapper>> = Vec::new();
-    if let Some(group_mapper) = crate::mapper::GroupMapper::from_config(config) {
-        mappers.push(Box::new(group_mapper));
-    }
-    mappers
 }
 
 /// No-op federation manager for use in tests or when federation is disabled.
@@ -321,21 +306,77 @@ mod tests {
     }
 
     #[test]
-    fn build_default_mappers_returns_empty() {
-        let mappers = build_default_mappers(&HashMap::new());
+    fn mappers_from_config_returns_empty() {
+        let mappers = crate::mapper::mappers_from_config(&HashMap::new());
         assert!(mappers.is_empty());
     }
 
     #[test]
-    fn build_default_mappers_wires_group_mapper_from_config() {
+    fn mappers_from_config_wires_group_mapper_from_shorthand() {
         let config = HashMap::from([(
             "groupsDn".to_string(),
             "OU=IssuerdGroups,DC=test,DC=issuerd,DC=local".to_string(),
         )]);
-        let mappers = build_default_mappers(&config);
+        let mappers = crate::mapper::mappers_from_config(&config);
         assert_eq!(mappers.len(), 1);
         assert_eq!(mappers[0].id(), "group-ldap-mapper");
         assert_eq!(mappers[0].requested_attributes(), vec!["memberOf".to_string()]);
+    }
+
+    #[test]
+    fn mappers_from_config_wires_ldap_mapper_list() {
+        let config = HashMap::from([(
+            "mappers".to_string(),
+            r#"[
+                {"name":"email","mapper_type":"user-attribute-ldap-mapper",
+                 "config":{"user.attribute":"email","ldap.attribute":"mail"}},
+                {"name":"full name","mapper_type":"full-name-ldap-mapper","config":{}},
+                {"name":"groups","mapper_type":"group-ldap-mapper",
+                 "config":{"groups.dn":"ou=groups,dc=example,dc=com"}},
+                {"name":"uac","mapper_type":"msad-user-account-control-mapper","config":{}},
+                {"name":"broker-side","mapper_type":"attribute",
+                 "config":{"claim":"email","attribute":"ext_email"}}
+            ]"#
+            .to_string(),
+        )]);
+        let mappers = crate::mapper::mappers_from_config(&config);
+        let ids: Vec<&str> = mappers.iter().map(|m| m.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "user-attribute-ldap-mapper",
+                "full-name-ldap-mapper",
+                "group-ldap-mapper",
+                "msad-user-account-control-mapper"
+            ],
+            "LDAP types in list order; the broker `attribute` mapper is ignored"
+        );
+    }
+
+    #[test]
+    fn mappers_from_config_list_group_mapper_replaces_shorthand() {
+        let config = HashMap::from([
+            ("groupsDn".to_string(), "OU=Legacy,DC=example,DC=com".to_string()),
+            (
+                "mappers".to_string(),
+                r#"[{"name":"groups","mapper_type":"group-ldap-mapper",
+                    "config":{"groups.dn":"ou=groups,dc=example,dc=com"}}]"#
+                    .to_string(),
+            ),
+        ]);
+        let mappers = crate::mapper::mappers_from_config(&config);
+        assert_eq!(mappers.len(), 1, "no double group mapper");
+    }
+
+    #[test]
+    fn mappers_from_config_malformed_json_falls_back_to_shorthand() {
+        let config = HashMap::from([
+            ("groupsDn".to_string(), "OU=Legacy,DC=example,DC=com".to_string()),
+            ("mappers".to_string(), "not-json".to_string()),
+        ]);
+        let mappers = crate::mapper::mappers_from_config(&config);
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].id(), "group-ldap-mapper");
     }
 
     #[tokio::test]

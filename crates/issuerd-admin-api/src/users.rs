@@ -36,7 +36,7 @@ use tracing::{info, instrument};
     path = "/admin/realms/{realm}/users",
     tag = "Users",
     summary = "List users in a realm",
-    description = "Returns a paginated list of users. Supports searching by username, email, first name, or last name. Requires `view-users` or `manage-users` role.",
+    description = "Returns a paginated list of users. Supports substring searching (`search`) across username, email, first and last name, and Keycloak-parity exact-match filters (`username`, `email`) which take precedence over `search`. Requires `view-users` or `manage-users` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         UserQueryParams
@@ -62,6 +62,15 @@ pub async fn list_users(
         .await?
         .ok_or(AdminApiError::NotFound)?
         .id;
+    // Keycloak-parity exact filters take precedence over the substring search.
+    if let Some(username) = params.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let user = state.storage.get_user_by_username(&realm_id, username).await?;
+        return Ok(Json(user.into_iter().map(Into::into).collect()));
+    }
+    if let Some(email) = params.email.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let user = state.storage.get_user_by_email(&realm_id, email).await?;
+        return Ok(Json(user.into_iter().map(Into::into).collect()));
+    }
     let users = state
         .storage
         .list_users(
@@ -1828,6 +1837,86 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let reps: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
         assert_eq!(reps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_users_exact_username_filter() {
+        let state = test_state(vec![issuerd_core::RoleName::new("view-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+
+        // Exact match returns exactly that user.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users?username=alice"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let reps: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].username.as_str(), "alice");
+
+        // A substring is NOT an exact match — empty list, no fall-through to search.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users?username=ali"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let reps: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert!(reps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_users_exact_email_filter() {
+        let state = test_state(vec![issuerd_core::RoleName::new("view-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users?email=alice%40example.com"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let reps: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].username.as_str(), "alice");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/realms/{realm_name}/users?email=nobody%40example.com"))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let reps: Vec<UserRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert!(reps.is_empty());
     }
 
     #[tokio::test]

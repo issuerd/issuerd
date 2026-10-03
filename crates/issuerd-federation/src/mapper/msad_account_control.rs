@@ -19,7 +19,10 @@ impl LdapMapper for MsadAccountControlMapper {
     }
 
     fn map_enabled(&self, ldap_attrs: &HashMap<String, Vec<String>>) -> Option<bool> {
-        let uac = ldap_attrs.get("userAccountControl")?.first()?.parse::<u32>().ok()?;
+        let uac = crate::mapper::get_attr(ldap_attrs, "userAccountControl")?
+            .first()?
+            .parse::<u32>()
+            .ok()?;
         // ACCOUNTDISABLE bit = 0x0002
         Some((uac & 0x0002) == 0)
     }
@@ -33,7 +36,9 @@ impl LdapMapper for MsadAccountControlMapper {
             user.enabled = enabled;
         }
         // pwdLastSet == 0 means "must change password at next logon"
-        if let Some(pwd_last_set) = ldap_attrs.get("pwdLastSet").and_then(|v| v.first()) {
+        if let Some(pwd_last_set) =
+            crate::mapper::get_attr(ldap_attrs, "pwdLastSet").and_then(|v| v.first())
+        {
             if pwd_last_set == "0" {
                 user.attributes.insert("UPDATE_PASSWORD".to_string(), vec!["true".to_string()]);
             }

@@ -271,6 +271,32 @@ identity_providers:
       pagination: "true"
       batchSize: "2000"
       priority: "1"
+    # Mapper chain (Keycloak-parity types; see docs/user-federation.md "LDAP
+    # mappers"): directory attributes onto user fields, group sync. The legacy
+    # `groupsDn` shorthand in `config` does the same as the group entry below;
+    # when a group-ldap-mapper entry exists the shorthand is ignored.
+    mappers:
+      - name: email
+        mapper_type: user-attribute-ldap-mapper
+        config:
+          user.attribute: email
+          ldap.attribute: mail
+      - name: first name
+        mapper_type: user-attribute-ldap-mapper
+        config:
+          user.attribute: firstName
+          ldap.attribute: givenName
+      - name: last name
+        mapper_type: user-attribute-ldap-mapper
+        config:
+          user.attribute: lastName
+          ldap.attribute: sn
+      - name: groups
+        mapper_type: group-ldap-mapper
+        config:
+          groups.dn: ou=groups,dc=test,dc=issuerd,dc=local
+          memberof.ldap.attribute: memberOf
+          groups.include: developers
 
   - realm: kerberos
     alias: samba-kerberos
