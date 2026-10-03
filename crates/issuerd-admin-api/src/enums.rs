@@ -597,6 +597,32 @@ fn idp_mapper_types() -> Vec<EnumValueRepresentation> {
             "Username Template",
             "Derive the username from a template at user creation (template)",
         ),
+        (
+            "user-attribute-ldap-mapper",
+            "User Attribute (LDAP)",
+            "LDAP providers: map one LDAP attribute onto a user field or custom attribute \
+             (user.attribute, ldap.attribute; optional is.mandatory.in.ldap, \
+             attribute.default.value)",
+        ),
+        (
+            "full-name-ldap-mapper",
+            "Full Name (LDAP)",
+            "LDAP providers: split one LDAP attribute into first/last name \
+             (ldap.full.name.attribute, default cn)",
+        ),
+        (
+            "group-ldap-mapper",
+            "Group Sync (LDAP)",
+            "LDAP providers: sync group memberships from the user's memberOf DNs \
+             (groups.dn; optional group.name.ldap.attribute, memberof.ldap.attribute, \
+             groups.include allowlist)",
+        ),
+        (
+            "msad-user-account-control-mapper",
+            "MSAD Account Control (LDAP)",
+            "LDAP providers (MS AD/Samba): derive the enabled flag from userAccountControl \
+             and arm UPDATE_PASSWORD when pwdLastSet is 0 (no config keys)",
+        ),
     ]
     .into_iter()
     .map(|(id, name, desc)| EnumValueRepresentation {

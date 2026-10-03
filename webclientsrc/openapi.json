@@ -19746,11 +19746,15 @@
       },
       "IdpMapperType": {
         "type": "string",
-        "description": "What an [`IdpMapper`] does with external claims.",
+        "description": "What an [`IdpMapper`] does with external claims.\n\nThe first three variants are **broker** mapper types (external OIDC/social\nlogin, evaluated on the claims of the brokered identity). The `*-ldap-mapper`\nvariants are **user-federation** mapper types, effective only on `ldap`\nproviders and named after Keycloak's mapper type ids so exported Keycloak\nconfigs translate 1:1. Each consumer ignores the variants of the other\nfamily, so both can share the same `mappers` config list.",
         "enum": [
           "attribute",
           "role",
-          "username_template"
+          "username_template",
+          "user-attribute-ldap-mapper",
+          "full-name-ldap-mapper",
+          "group-ldap-mapper",
+          "msad-user-account-control-mapper"
         ]
       },
       "IdpPreset": {

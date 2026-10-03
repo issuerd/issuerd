@@ -39,6 +39,22 @@ const MAPPER_CONFIG_KEYS: Record<IdpMapperType, { key: string; label: string; pl
   username_template: [
     { key: 'template', label: 'Template', placeholder: '${ALIAS}.${CLAIM.email}' },
   ],
+  'user-attribute-ldap-mapper': [
+    { key: 'user.attribute', label: 'User Attribute', placeholder: 'email | firstName | lastName | <custom>' },
+    { key: 'ldap.attribute', label: 'LDAP Attribute', placeholder: 'mail' },
+    { key: 'is.mandatory.in.ldap', label: 'Mandatory in LDAP (true/false)', placeholder: 'false' },
+    { key: 'attribute.default.value', label: 'Default Value (optional)', placeholder: '' },
+  ],
+  'full-name-ldap-mapper': [
+    { key: 'ldap.full.name.attribute', label: 'LDAP Full Name Attribute', placeholder: 'cn' },
+  ],
+  'group-ldap-mapper': [
+    { key: 'groups.dn', label: 'Groups DN', placeholder: 'ou=groups,dc=example,dc=com' },
+    { key: 'group.name.ldap.attribute', label: 'Group Name Attribute', placeholder: 'cn' },
+    { key: 'memberof.ldap.attribute', label: 'MemberOf Attribute', placeholder: 'memberOf' },
+    { key: 'groups.include', label: 'Groups Include (comma-separated allowlist)', placeholder: 'developers,ops' },
+  ],
+  'msad-user-account-control-mapper': [],
 }
 
 export default function IdpMappersSection({ realm, alias }: IdpMappersSectionProps) {

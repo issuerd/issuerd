@@ -19,6 +19,96 @@ pub use msad_account_control::MsadAccountControlMapper;
 pub use role::RoleMapper;
 pub use user_attribute::UserAttributeMapper;
 
+/// Build the LDAP mapper chain from an identity-provider config map.
+///
+/// Two shapes are supported, both additive:
+///
+/// 1. The **`mappers` list** — a JSON array of [`issuerd_core::IdpMapper`]
+///    entries (`name`, `mapper_type`, `config`), the same storage convention
+///    the Admin API mapper sub-resource
+///    (`/identity-provider/instances/{alias}/mappers`) writes. Recognized
+///    types: `user-attribute-ldap-mapper`, `full-name-ldap-mapper`,
+///    `group-ldap-mapper`, `msad-user-account-control-mapper`; entries are
+///    evaluated in list order. Broker mapper types and unknown values are
+///    ignored (they evaluate elsewhere or nowhere). A malformed `mappers`
+///    JSON value is logged and skipped: broken mapper config must not take
+///    the realm's whole federation offline.
+/// 2. The **legacy shorthand keys** (`groupsDn`, `groupNameLdapAttribute`,
+///    `memberOfLdapAttribute`, `groupsInclude`), which enable a group mapper —
+///    applied only when the `mappers` list carries no group mapper of its
+///    own, so the two never double up.
+pub fn mappers_from_config(config: &HashMap<String, String>) -> Vec<Box<dyn LdapMapper>> {
+    let mut mappers: Vec<Box<dyn LdapMapper>> = Vec::new();
+    let mut has_group_mapper = false;
+
+    if let Some(raw) = config.get("mappers") {
+        match serde_json::from_str::<Vec<issuerd_core::IdpMapper>>(raw) {
+            Ok(entries) => {
+                for entry in &entries {
+                    match entry.mapper_type {
+                        issuerd_core::IdpMapperType::UserAttributeLdap => {
+                            match UserAttributeMapper::from_config(&entry.config) {
+                                Some(m) => mappers.push(Box::new(m)),
+                                None => tracing::warn!(
+                                    mapper = %entry.name,
+                                    "skipping user-attribute-ldap-mapper: \
+                                     user.attribute/ldap.attribute missing"
+                                ),
+                            }
+                        }
+                        issuerd_core::IdpMapperType::FullNameLdap => {
+                            mappers.push(Box::new(FullNameMapper::from_config(&entry.config)));
+                        }
+                        issuerd_core::IdpMapperType::GroupLdap => {
+                            match GroupMapper::from_mapper_config(&entry.config) {
+                                Some(m) => {
+                                    has_group_mapper = true;
+                                    mappers.push(Box::new(m));
+                                }
+                                None => tracing::warn!(
+                                    mapper = %entry.name,
+                                    "skipping group-ldap-mapper: groups.dn missing"
+                                ),
+                            }
+                        }
+                        issuerd_core::IdpMapperType::MsadAccountControlLdap => {
+                            mappers.push(Box::new(MsadAccountControlMapper));
+                        }
+                        // Broker mapper types are evaluated on broker logins,
+                        // not by LDAP providers.
+                        _ => {}
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring malformed `mappers` JSON on LDAP provider");
+            }
+        }
+    }
+
+    if !has_group_mapper {
+        if let Some(group_mapper) = GroupMapper::from_config(config) {
+            mappers.push(Box::new(group_mapper));
+        }
+    }
+    mappers
+}
+
+/// Case-insensitive attribute lookup: LDAP attribute *type names* are
+/// case-insensitive (RFC 4512 §2.5), and directories disagree on response
+/// casing (LLDAP's `"*"` expansion returns its schema attributes lowercased,
+/// AD preserves its schema case). Exact match first, then an
+/// `eq_ignore_ascii_case` scan — entry attribute lists are tiny, so the
+/// fallback scan is cheap.
+pub(crate) fn get_attr<'a>(
+    attrs: &'a HashMap<String, Vec<String>>,
+    name: &str,
+) -> Option<&'a Vec<String>> {
+    attrs
+        .get(name)
+        .or_else(|| attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
+}
+
 /// Transform LDAP attributes into `FederatedUser` fields.
 pub trait LdapMapper: Send + Sync {
     fn id(&self) -> &str;

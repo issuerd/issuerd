@@ -360,9 +360,7 @@ impl FederationProvider for LdapFederationProvider {
         let mut users = Vec::new();
         let mut mapper_errors = 0usize;
         for entry in entries {
-            let username = entry
-                .attrs
-                .get(&self.config.username_attribute)
+            let username = crate::mapper::get_attr(&entry.attrs, &self.config.username_attribute)
                 .and_then(|v| v.first())
                 .cloned()
                 .unwrap_or_default();

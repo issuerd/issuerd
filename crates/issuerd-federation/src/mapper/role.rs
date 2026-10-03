@@ -38,8 +38,7 @@ impl LdapMapper for RoleMapper {
     }
 
     fn map_memberships(&self, ldap_attrs: &HashMap<String, Vec<String>>) -> Vec<String> {
-        ldap_attrs
-            .get("memberOf")
+        crate::mapper::get_attr(ldap_attrs, "memberOf")
             .cloned()
             .unwrap_or_default()
             .into_iter()

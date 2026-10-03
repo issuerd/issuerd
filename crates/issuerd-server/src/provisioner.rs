@@ -497,12 +497,23 @@ impl Provisioner {
                 continue;
             }
 
+            let mut config = p.config.clone();
+            if !p.mappers.is_empty() {
+                let raw = serde_json::to_string(&p.mappers).map_err(|e| {
+                    issuerd_core::IssuerdError::ServerError(format!(
+                        "idp '{}': mapper serialization failed: {e}",
+                        p.alias
+                    ))
+                })?;
+                config.insert("mappers".to_string(), raw);
+            }
+
             let idp = IdentityProviderConfig {
                 id: IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
                 alias,
                 provider_id: parse_provider_id(&p.provider_id),
                 enabled: p.enabled,
-                config: p.config.clone(),
+                config,
             };
 
             storage.create_identity_provider(&realm_id, &idp).await?;
@@ -651,6 +662,12 @@ impl Provisioner {
             idp.provider_id = substitute(&idp.provider_id, &mut errors);
             for v in idp.config.values_mut() {
                 *v = substitute(v, &mut errors);
+            }
+            for mapper in &mut idp.mappers {
+                mapper.name = substitute(&mapper.name, &mut errors);
+                for v in mapper.config.values_mut() {
+                    *v = substitute(v, &mut errors);
+                }
             }
         }
 
@@ -868,6 +885,7 @@ mod tests {
                     m.insert("url".to_string(), "ldap://localhost:389".to_string());
                     m
                 },
+                mappers: vec![],
             }],
             flow_configs: vec![ProvisionFlowConfig {
                 realm: "testrealm".to_string(),
@@ -1067,6 +1085,48 @@ mod tests {
         assert!(flow.top_level);
         assert_eq!(flow.stages.len(), 1);
         assert_eq!(flow.stages[0].authenticator.as_str(), "auth-cookie");
+    }
+
+    #[tokio::test]
+    async fn identity_provider_mappers_land_in_config() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.identity_providers[0].mappers = vec![
+            issuerd_core::IdpMapper {
+                name: "email".to_string(),
+                mapper_type: issuerd_core::IdpMapperType::UserAttributeLdap,
+                config: HashMap::from([
+                    ("user.attribute".to_string(), "email".to_string()),
+                    ("ldap.attribute".to_string(), "mail".to_string()),
+                ]),
+            },
+            issuerd_core::IdpMapper {
+                name: "full name".to_string(),
+                mapper_type: issuerd_core::IdpMapperType::FullNameLdap,
+                config: HashMap::new(),
+            },
+        ];
+        Provisioner { config }
+            .apply_once(&storage, "http://localhost:8080")
+            .await
+            .unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().expect("realm missing");
+        let idp = storage
+            .get_identity_provider_by_alias(&realm.id, "ldap-test")
+            .await
+            .unwrap()
+            .expect("idp missing");
+        // The mappers round-trip through the `mappers` config key as the same
+        // JSON shape the Admin API mapper sub-resource reads and writes.
+        let stored: Vec<issuerd_core::IdpMapper> =
+            serde_json::from_str(idp.config.get("mappers").expect("mappers key missing")).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].mapper_type, issuerd_core::IdpMapperType::UserAttributeLdap);
+        // ...and the federation layer builds working LDAP mappers from them.
+        let built = issuerd_federation::mapper::mappers_from_config(&idp.config);
+        let ids: Vec<&str> = built.iter().map(|m| m.id()).collect();
+        assert_eq!(ids, vec!["user-attribute-ldap-mapper", "full-name-ldap-mapper"]);
     }
 
     #[tokio::test]
