@@ -17,12 +17,17 @@
 //! [`issuerd_token::client_assertion`]; this module adds the stateful parts:
 //! - resolving the client's verification JWKS from its attributes (Keycloak
 //!   spellings `use.jwks.string`+`jwks.string` for an inline set, or
-//!   `use.jwks.url`+`jwks.url` fetched over HTTP, cached per client for
-//!   [`JWKS_CACHE_TTL_SECS`] with one refetch-on-kid-miss retry — the
-//!   broker JWKS cache pattern — rate-limited per client by the
+//!   `use.jwks.url`+`jwks.url` fetched over HTTPS through the SSRF-guarded
+//!   broker fetch ([`issuerd_core::BrokerClient::get_json_ssrf_guarded`] —
+//!   the URL is registrant/admin-configured and this path is reachable
+//!   unauthenticated), cached per client for [`JWKS_CACHE_TTL_SECS`] with
+//!   one refetch-on-kid-miss retry — the broker JWKS cache pattern —
+//!   rate-limited per client by the
 //!   `client_jwks_kid_miss:{realm_id}:{client_id}` cooldown marker so an
 //!   unauthenticated unknown-`kid` flood cannot force an outbound fetch on
-//!   every request), and
+//!   every request; the cooldown helpers are shared with the JAR validator
+//!   (`routes::jar`), which applies the same refetch retry to request
+//!   objects), and
 //! - `jti` single-use enforcement in the distributed cache
 //!   (`client_assertion_jti:{realm_id}:{client_id}:{jti}`, TTL = remaining
 //!   assertion lifetime + [`ASSERTION_LEEWAY_SECS`], so the marker outlives
@@ -59,14 +64,64 @@ const MAX_ASSERTION_LIFETIME_SECS: u64 = 300;
 /// trigger a live outbound GET to the client's `jwks.url`.
 const KID_MISS_REFETCH_COOLDOWN_SECS: u64 = 60;
 
-fn jwks_cache_key(realm_id: &RealmId, client_id: &issuerd_core::ClientId) -> String {
+/// `pub(crate)`: the JAR validator's tests seed the same cache namespace.
+pub(crate) fn jwks_cache_key(realm_id: &RealmId, client_id: &issuerd_core::ClientId) -> String {
     format!("client_jwks:{}:{}", realm_id.0, client_id.0)
 }
 
 /// Cooldown marker for the kid-miss forced JWKS refetch (one refetch per
-/// client per [`KID_MISS_REFETCH_COOLDOWN_SECS`]).
-fn jwks_kid_miss_key(realm_id: &RealmId, client_id: &issuerd_core::ClientId) -> String {
+/// client per [`KID_MISS_REFETCH_COOLDOWN_SECS`]). `pub(crate)`: the JAR
+/// validator's tests inspect the same marker namespace.
+pub(crate) fn jwks_kid_miss_key(realm_id: &RealmId, client_id: &issuerd_core::ClientId) -> String {
     format!("client_jwks_kid_miss:{}:{}", realm_id.0, client_id.0)
+}
+
+/// Whether the kid-miss forced JWKS refetch for (realm, client) is currently
+/// in cooldown. Shared with the JAR validator (`routes::jar`): both the
+/// client-assertion and the request-object paths refetch a URL-sourced JWKS
+/// once when the cached set does not cover the presented `kid`, and both
+/// must rate-limit that retry — without it, any unauthenticated request
+/// carrying an unknown `kid` would trigger a live outbound GET to the
+/// client's `jwks.url` on every request. On any cache error, fails toward
+/// fewer fetches (`true`).
+pub(crate) async fn kid_miss_refetch_in_cooldown(
+    state: &ServerState,
+    realm_id: &RealmId,
+    client_id: &issuerd_core::ClientId,
+) -> bool {
+    match state.cache.get(&jwks_kid_miss_key(realm_id, client_id)).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            warn!(
+                realm = %realm_id,
+                error = %e,
+                "kid-miss cooldown lookup failed; suppressing client JWKS refetch"
+            );
+            true
+        }
+    }
+}
+
+/// Arm the kid-miss refetch cooldown after a forced refetch ran (see
+/// [`kid_miss_refetch_in_cooldown`]). Best-effort: a lost marker only means
+/// the next miss refetches again.
+pub(crate) async fn arm_kid_miss_refetch_cooldown(
+    state: &ServerState,
+    realm_id: &RealmId,
+    client_id: &issuerd_core::ClientId,
+) {
+    if let Err(e) = state
+        .cache
+        .set(
+            &jwks_kid_miss_key(realm_id, client_id),
+            vec![1],
+            Some(std::time::Duration::from_secs(KID_MISS_REFETCH_COOLDOWN_SECS)),
+        )
+        .await
+    {
+        warn!(realm = %realm_id, error = %e, "kid-miss cooldown marker not stored");
+    }
 }
 
 /// `jti` replay markers are scoped per client: RFC 7523 §3 requires `jti`
@@ -260,42 +315,20 @@ async fn validate_private_key(
                 }
                 // Rate-limit forced refetches per client: an unauthenticated
                 // unknown kid must not trigger an outbound GET on every
-                // request. On any cache error, fail toward fewer fetches.
-                let miss_key = jwks_kid_miss_key(realm_id, &client.id);
-                match state.cache.get(&miss_key).await {
-                    Ok(Some(_)) => {
-                        debug!(
-                            client_id = %client.client_id,
-                            "client JWKS kid-miss refetch still in cooldown; rejecting"
-                        );
-                        return Err(first_err);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(
-                            realm = %realm_id,
-                            error = %e,
-                            "kid-miss cooldown lookup failed; skipping client JWKS refetch"
-                        );
-                        return Err(first_err);
-                    }
+                // request (shared with the JAR validator).
+                if kid_miss_refetch_in_cooldown(state, realm_id, &client.id).await {
+                    debug!(
+                        client_id = %client.client_id,
+                        "client JWKS kid-miss refetch still in cooldown; rejecting"
+                    );
+                    return Err(first_err);
                 }
                 debug!(
                     client_id = %client.client_id,
                     "cached client JWKS does not cover the assertion kid; refetching"
                 );
                 let fresh = fetch_client_jwks(state, realm_id, &client.id, &url, true).await?;
-                if let Err(e) = state
-                    .cache
-                    .set(
-                        &miss_key,
-                        vec![1],
-                        Some(std::time::Duration::from_secs(KID_MISS_REFETCH_COOLDOWN_SECS)),
-                    )
-                    .await
-                {
-                    warn!(realm = %realm_id, error = %e, "kid-miss cooldown marker not stored");
-                }
+                arm_kid_miss_refetch_cooldown(state, realm_id, &client.id).await;
                 issuerd_token::validate_private_key_assertion(assertion, &fresh, requirements)
                     .map_err(|e| {
                         debug!(client_id = %client.client_id, error = %e, "client assertion validation against refetched JWKS failed");
@@ -310,8 +343,11 @@ async fn validate_private_key(
 
 /// Fetch the client JWKS through the per-(realm, client) cache.
 /// `force_refresh` bypasses the cached copy (the one-shot kid-miss retry).
-/// The HTTP GET rides the broker client abstraction so tests can
-/// stub it and production gets the short-timeout reqwest client.
+/// The HTTP GET rides the SSRF-guarded broker fetch
+/// ([`issuerd_core::BrokerClient::get_json_ssrf_guarded`]): the URL is
+/// registrant/admin-configured and the paths reaching it are unauthenticated,
+/// so it is treated as hostile — https-only, publicly routable resolved IPs,
+/// no redirects, capped body, one generic error.
 pub(crate) async fn fetch_client_jwks(
     state: &ServerState,
     realm_id: &RealmId,
@@ -327,7 +363,7 @@ pub(crate) async fn fetch_client_jwks(
             }
         }
     }
-    let json = state.broker_client.get_json(jwks_url).await?;
+    let json = state.broker_client.get_json_ssrf_guarded(jwks_url).await?;
     if let Ok(bytes) = serde_json::to_vec(&json) {
         let _ = state
             .cache
@@ -648,8 +684,8 @@ mod tests {
     #[tokio::test]
     async fn private_key_jwt_url_source_uses_broker_client() {
         // MockBrokerClient stubs the JWKS GET — proves fetch+cache wiring
-        // without real HTTP (the loopback HTTP path is covered by the
-        // integration tests).
+        // without real HTTP (production fetches through the SSRF-guarded
+        // broker method: https-only, public IPs only).
         let crypto = issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig {
             default_alg: issuerd_core::Algorithm::Rs256,
             rsa_key_size: 2048,
@@ -659,7 +695,7 @@ mod tests {
         let kid = jwks["keys"][0]["kid"].as_str().unwrap().to_string();
 
         let mut broker = issuerd_core::MockBrokerClient::new();
-        broker.expect_get_json().returning(move |_| Ok(jwks.clone()));
+        broker.expect_get_json_ssrf_guarded().returning(move |_| Ok(jwks.clone()));
 
         let cfg = ServerConfig::default();
         let base = ServerState::from_config(&cfg).await.unwrap();
@@ -793,7 +829,10 @@ mod tests {
         // Exactly one outbound fetch is allowed across both requests; mockall
         // verifies the call count when the mock drops.
         let mut broker = issuerd_core::MockBrokerClient::new();
-        broker.expect_get_json().times(1).returning(move |_| Ok(served_jwks.clone()));
+        broker
+            .expect_get_json_ssrf_guarded()
+            .times(1)
+            .returning(move |_| Ok(served_jwks.clone()));
 
         let base = ServerState::from_config(&ServerConfig::default()).await.unwrap();
         let state = ServerState {

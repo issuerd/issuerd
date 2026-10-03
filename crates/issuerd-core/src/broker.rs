@@ -111,24 +111,26 @@ pub trait BrokerClient: Send + Sync {
     ) -> Result<serde_json::Value, IssuerdError>;
 
     /// GET a JSON document from an **untrusted, attacker-influenced** URL —
-    /// currently the pairwise `sector_identifier_uri` a registrant supplies
-    /// via dynamic client registration (OIDC Core §8.1), which is reachable
-    /// without authentication when a realm has DCR enabled.
+    /// e.g. the pairwise `sector_identifier_uri` a registrant supplies via
+    /// dynamic client registration (OIDC Core §8.1, reachable without
+    /// authentication when a realm has DCR enabled), or a client's
+    /// configured `jwks.url` (reachable unauthenticated via client
+    /// assertions and JAR request objects).
     ///
     /// Unlike the IdP-facing methods above — which call admin-configured,
     /// legitimately-internal endpoints — implementations MUST treat `url` as
-    /// hostile: require `https`, resolve the host and reject any non-public
-    /// IP, disable redirect following, cap the body size, and collapse every
-    /// failure mode (DNS, connect, status, redirect, oversize, parse) into
-    /// one generic error so the endpoint cannot be abused as a blind
-    /// host/port oracle into the server's internal network (SSRF).
+    /// hostile (SSRF hardening): require `https`, resolve the host and
+    /// reject any non-public IP, disable redirect following, cap the body
+    /// size, and collapse every failure mode (DNS, connect, status,
+    /// redirect, oversize, parse) into one generic error so the endpoint
+    /// cannot be abused as a blind host/port oracle into the server's
+    /// internal network.
     ///
-    /// The default implementation delegates to [`BrokerClient::get_json`] so
-    /// existing test doubles and mocks keep compiling; the production
-    /// implementation overrides it with the hardened fetch.
-    async fn get_json_untrusted(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
-        self.get_json(url).await
-    }
+    /// Required method, deliberately without a default body: a default that
+    /// delegated to the unguarded [`BrokerClient::get_json`] would silently
+    /// strip every protection from any implementor that forgot to override
+    /// it.
+    async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -820,38 +822,46 @@ mod tests {
         assert_eq!(resp.access_token, None);
     }
 
-    /// Hand-written stub: mockall's `MockBrokerClient` overrides EVERY method,
-    /// so the `get_json_untrusted` default body never runs through the mock.
-    struct StubBrokerClient;
-
-    #[async_trait::async_trait]
-    impl BrokerClient for StubBrokerClient {
-        async fn get_json(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
-            Ok(serde_json::json!({"fetched": url}))
-        }
-
-        async fn post_form(
-            &self,
-            _url: &str,
-            _form: &[(String, String)],
-            _basic_auth: Option<(String, String)>,
-        ) -> Result<serde_json::Value, IssuerdError> {
-            unimplemented!("StubBrokerClient implements only what the default-method tests use")
-        }
-
-        async fn get_json_bearer(
-            &self,
-            _url: &str,
-            _access_token: &str,
-        ) -> Result<serde_json::Value, IssuerdError> {
-            unimplemented!("StubBrokerClient implements only what the default-method tests use")
-        }
-    }
-
     #[tokio::test]
-    async fn default_get_json_untrusted_delegates_to_get_json() {
+    async fn stub_broker_client_implements_the_required_guarded_method() {
+        /// Hand-written stub: mockall's `MockBrokerClient` covers the trait
+        /// surface already; this proves a manual implementor must provide
+        /// the guarded fetch (it no longer has a default body).
+        struct StubBrokerClient;
+
+        #[async_trait::async_trait]
+        impl BrokerClient for StubBrokerClient {
+            async fn get_json(&self, _url: &str) -> Result<serde_json::Value, IssuerdError> {
+                unimplemented!("StubBrokerClient implements only the guarded fetch")
+            }
+
+            async fn post_form(
+                &self,
+                _url: &str,
+                _form: &[(String, String)],
+                _basic_auth: Option<(String, String)>,
+            ) -> Result<serde_json::Value, IssuerdError> {
+                unimplemented!("StubBrokerClient implements only the guarded fetch")
+            }
+
+            async fn get_json_bearer(
+                &self,
+                _url: &str,
+                _access_token: &str,
+            ) -> Result<serde_json::Value, IssuerdError> {
+                unimplemented!("StubBrokerClient implements only the guarded fetch")
+            }
+
+            async fn get_json_ssrf_guarded(
+                &self,
+                url: &str,
+            ) -> Result<serde_json::Value, IssuerdError> {
+                Ok(serde_json::json!({"fetched": url}))
+            }
+        }
+
         let client = StubBrokerClient;
-        let value = client.get_json_untrusted("https://idp.example.com/jwks").await.unwrap();
+        let value = client.get_json_ssrf_guarded("https://idp.example.com/jwks").await.unwrap();
         assert_eq!(value, serde_json::json!({"fetched": "https://idp.example.com/jwks"}));
     }
 

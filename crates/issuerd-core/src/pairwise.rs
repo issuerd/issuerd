@@ -161,7 +161,7 @@ pub fn validate_sector_document(
 ///
 /// `http` is the server's generic JSON fetcher (the broker client), keeping
 /// this crate free of a concrete HTTP dependency. The fetch goes through
-/// [`crate::BrokerClient::get_json_untrusted`]: the URI can be supplied by
+/// [`crate::BrokerClient::get_json_ssrf_guarded`]: the URI can be supplied by
 /// an unauthenticated registrant when dynamic client registration is open,
 /// so it must be treated as hostile (SSRF hardening).
 pub async fn validate_pairwise_subject_config(
@@ -188,7 +188,7 @@ pub async fn validate_pairwise_subject_config(
         // Uniform, leak-free failure message: the underlying cause (DNS vs
         // connect vs status vs body) is logged server-side by the fetcher,
         // never reflected to the registrant (blind-oracle hardening).
-        let document = http.get_json_untrusted(uri).await.map_err(|_| {
+        let document = http.get_json_ssrf_guarded(uri).await.map_err(|_| {
             IssuerdError::InvalidRequest("sector_identifier_uri could not be fetched".into())
         })?;
         validate_sector_document(&document, &client.redirect_uris)?;
@@ -372,7 +372,7 @@ mod tests {
         let mut http = crate::MockBrokerClient::new();
         // Whatever the underlying failure mode (here a DNS-flavoured one),
         // the registrant must see one generic message — no host/port oracle.
-        http.expect_get_json_untrusted().returning(|_| {
+        http.expect_get_json_ssrf_guarded().returning(|_| {
             Err(IssuerdError::ServerError("dns lookup failed: NXDOMAIN".to_string()))
         });
         let err = validate_pairwise_subject_config(&c, &http).await.unwrap_err();
@@ -392,7 +392,7 @@ mod tests {
             ],
         );
         let mut http = crate::MockBrokerClient::new();
-        http.expect_get_json_untrusted()
+        http.expect_get_json_ssrf_guarded()
             .returning(|_| Ok(serde_json::json!(["https://app.example.com/cb"])));
         assert!(validate_pairwise_subject_config(&c, &http).await.is_ok());
     }

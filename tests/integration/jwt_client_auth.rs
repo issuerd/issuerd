@@ -10,9 +10,9 @@
 //! Covered: valid assertions at all client-authenticated endpoints (token,
 //! PAR, introspect, revoke), the rejection matrix (bad signature, wrong
 //! iss/sub, wrong/missing aud, expired exp, replayed jti, both-methods),
-//! configured-method enforcement, the JWKS-URL fetch path with a
-//! refetch-on-rotation retry against a loopback HTTP server, and discovery
-//! advertisement.
+//! configured-method enforcement, the SSRF-guarded JWKS-URL fetch path
+//! (plain-http rejection; refetch-on-rotation retry against a stubbed
+//! broker client), and discovery advertisement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -506,28 +506,27 @@ async fn configured_method_is_enforced() {
 // JWKS URL fetch + refetch on key rotation
 // ---------------------------------------------------------------------------
 
-/// A loopback JWKS HTTP server whose served document can be swapped,
-/// counting requests.
+/// A loopback JWKS HTTP server counting requests (the document is static:
+/// since the SSRF-guarded fetch refuses loopback http, this rig only proves
+/// the guard never dials out — the refetch-on-rotation test stubs the
+/// broker client instead).
 struct LoopbackJwks {
     url: String,
-    current: Arc<tokio::sync::RwLock<serde_json::Value>>,
     hits: Arc<AtomicUsize>,
 }
 
 async fn start_loopback_jwks(initial: serde_json::Value) -> LoopbackJwks {
     use axum::routing::get;
-    let current = Arc::new(tokio::sync::RwLock::new(initial));
     let hits = Arc::new(AtomicUsize::new(0));
-    let cur = current.clone();
     let hit = hits.clone();
     let app = axum::Router::new().route(
         "/jwks",
         get(move || {
-            let cur = cur.clone();
+            let initial = initial.clone();
             let hit = hit.clone();
             async move {
                 hit.fetch_add(1, Ordering::SeqCst);
-                axum::Json(cur.read().await.clone())
+                axum::Json(initial)
             }
         }),
     );
@@ -538,25 +537,46 @@ async fn start_loopback_jwks(initial: serde_json::Value) -> LoopbackJwks {
     });
     LoopbackJwks {
         url: format!("http://{addr}/jwks"),
-        current,
         hits,
     }
 }
 
 #[tokio::test]
 async fn private_key_jwt_jwks_url_refetches_on_rotation() {
-    let harness = TestHarness::new().await;
-    harness.create_realm("jwt-ca-url").await;
+    use issuerd_server::{config::ServerConfig, state::ServerState};
 
+    // The JWKS GET goes through the SSRF-guarded broker fetch (https-only,
+    // public IPs only), so a loopback HTTP server is no longer fetchable;
+    // the fetch is stubbed with a mock broker client serving a swappable
+    // document and counting hits.
     let client_key = rsa_key().await;
     let stale_key = rsa_key().await;
-    let server = start_loopback_jwks(stale_key.jwks.clone()).await;
+
+    let current = Arc::new(std::sync::RwLock::new(stale_key.jwks.clone()));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let cur = current.clone();
+    let hit = hits.clone();
+    let mut broker = issuerd_core::MockBrokerClient::new();
+    broker.expect_get_json_ssrf_guarded().returning(move |_| {
+        hit.fetch_add(1, Ordering::SeqCst);
+        Ok(cur.read().unwrap().clone())
+    });
+
+    let base = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+    let harness = TestHarness::with_state(Arc::new(ServerState {
+        broker_client: Arc::new(broker),
+        ..base
+    }));
+    harness.create_realm("jwt-ca-url").await;
 
     let client = create_jwt_client(
         &harness,
         "jwt-ca-url",
         ClientAuthenticatorType::ClientJwt,
-        &[("use.jwks.url", "true"), ("jwks.url", &server.url)],
+        &[
+            ("use.jwks.url", "true"),
+            ("jwks.url", "https://client.example.com/jwks"),
+        ],
     )
     .await;
 
@@ -568,7 +588,7 @@ async fn private_key_jwt_jwks_url_refetches_on_rotation() {
         cc_grant_with_assertion(&harness, "jwt-ca-url", client.client_id.as_ref(), &assertion)
             .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(server.hits.load(Ordering::SeqCst), 2, "initial fetch + one refetch retry");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "initial fetch + one refetch retry");
 
     // The kid-miss refetch armed the 60 s per-client cooldown (2026-09 DoS
     // hardening: an unauthenticated unknown-kid flood must not force an
@@ -583,14 +603,14 @@ async fn private_key_jwt_jwks_url_refetches_on_rotation() {
     // The client "rotates" keys: the JWKS endpoint now serves the key that
     // signed the assertions. The cached stale set still does not cover the
     // kid, so the server refetches once and then validates successfully.
-    *server.current.write().await = client_key.jwks.clone();
+    *current.write().unwrap() = client_key.jwks.clone();
     let claims = assertion_claims(&harness, "jwt-ca-url", client.client_id.as_ref());
     let assertion = client_key.sign(&claims).await;
     let resp =
         cc_grant_with_assertion(&harness, "jwt-ca-url", client.client_id.as_ref(), &assertion)
             .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(server.hits.load(Ordering::SeqCst), 3, "one more refetch after the kid-miss");
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "one more refetch after the kid-miss");
 
     // The fresh JWKS is cached now: no further fetches.
     let claims = assertion_claims(&harness, "jwt-ca-url", client.client_id.as_ref());
@@ -599,11 +619,35 @@ async fn private_key_jwt_jwks_url_refetches_on_rotation() {
         cc_grant_with_assertion(&harness, "jwt-ca-url", client.client_id.as_ref(), &assertion)
             .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        server.hits.load(Ordering::SeqCst),
-        3,
-        "cached JWKS serves subsequent validations"
-    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "cached JWKS serves subsequent validations");
+}
+
+#[tokio::test]
+async fn private_key_jwt_http_jwks_url_rejected_by_ssrf_guard() {
+    // The JWKS fetch is SSRF-guarded: plain http (and non-public IPs) are
+    // refused before any network I/O, so a loopback HTTP server must see
+    // zero requests and the grant must fail with invalid_client (400).
+    let harness = TestHarness::new().await;
+    harness.create_realm("jwt-ca-http").await;
+
+    let client_key = rsa_key().await;
+    let server = start_loopback_jwks(client_key.jwks.clone()).await;
+
+    let client = create_jwt_client(
+        &harness,
+        "jwt-ca-http",
+        ClientAuthenticatorType::ClientJwt,
+        &[("use.jwks.url", "true"), ("jwks.url", &server.url)],
+    )
+    .await;
+
+    let claims = assertion_claims(&harness, "jwt-ca-http", client.client_id.as_ref());
+    let assertion = client_key.sign(&claims).await;
+    let resp =
+        cc_grant_with_assertion(&harness, "jwt-ca-http", client.client_id.as_ref(), &assertion)
+            .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0, "the SSRF guard must refuse the fetch");
 }
 
 // ---------------------------------------------------------------------------

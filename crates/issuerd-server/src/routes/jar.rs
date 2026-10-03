@@ -61,7 +61,8 @@ pub(crate) async fn extract_request_object_params(
 
     // Verification material: the client's inline JWKS wins over the fetched
     // one (Keycloak's OIDCAdvancedConfigWrapper precedence). A URL-sourced
-    // JWKS is refetchable on a kid miss (client key rotation).
+    // JWKS is refetchable on a kid miss (client key rotation), rate-limited
+    // by the shared kid-miss cooldown.
     let (jwks, jwks_url) = match crate::client_assertion::inline_client_jwks(client)? {
         Some(j) => (Some(j), None),
         None => match crate::client_assertion::client_jwks_url(client)? {
@@ -102,6 +103,21 @@ pub(crate) async fn extract_request_object_params(
             });
             match (&jwks_url, rotated) {
                 (Some(url), true) => {
+                    // Same kid-miss cooldown as the client-assertion path
+                    // (shared `client_jwks_kid_miss:{realm}:{client}` marker):
+                    // without it, every unauthenticated request object with
+                    // an unknown kid would force an outbound GET.
+                    if crate::client_assertion::kid_miss_refetch_in_cooldown(
+                        state, &realm.id, &client.id,
+                    )
+                    .await
+                    {
+                        debug!(
+                            client_id = %client.client_id,
+                            "client JWKS kid-miss refetch still in cooldown; rejecting"
+                        );
+                        return Err(first_err);
+                    }
                     debug!(
                         client_id = %client.client_id,
                         "cached client JWKS does not cover the request object kid; refetching"
@@ -110,6 +126,10 @@ pub(crate) async fn extract_request_object_params(
                         state, &realm.id, &client.id, url, true,
                     )
                     .await?;
+                    crate::client_assertion::arm_kid_miss_refetch_cooldown(
+                        state, &realm.id, &client.id,
+                    )
+                    .await;
                     issuerd_token::validate_request_object(
                         request_object,
                         Some(&fresh),
@@ -475,6 +495,96 @@ mod tests {
                 &serde_json::to_string(&object_claims()).unwrap(),
                 issuerd_core::Algorithm::Rs256,
                 &issuerd_core::KeyId::new(kid_b).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(extract_request_object_params(&state, &realm, &client, &query_params(&jwt))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn kid_miss_jwks_refetch_rate_limited_like_client_assertions() {
+        // The JAR forced-refetch retry shares the client-assertion cooldown:
+        // two request objects with an unknown kid may force at most ONE
+        // outbound JWKS fetch (mockall verifies the call count on drop).
+        let signer = issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig {
+            default_alg: issuerd_core::Algorithm::Rs256,
+            rsa_key_size: 2048,
+        })
+        .unwrap();
+        let kid = signer.get_public_keys().await.unwrap().keys[0].kid.to_string();
+        // The served JWKS comes from a different key pair, so the object's
+        // kid is never covered and every presentation is a kid-miss.
+        let other = issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig {
+            default_alg: issuerd_core::Algorithm::Rs256,
+            rsa_key_size: 2048,
+        })
+        .unwrap();
+        let served_jwks = serde_json::to_value(other.get_public_keys().await.unwrap()).unwrap();
+        let served_bytes = serde_json::to_vec(&served_jwks).unwrap();
+
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        broker
+            .expect_get_json_ssrf_guarded()
+            .times(1)
+            .returning(move |_| Ok(served_jwks.clone()));
+
+        let base = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let state = Arc::new(ServerState {
+            broker_client: Arc::new(broker),
+            ..base
+        });
+        let realm = state.resolve_realm("master").await.unwrap().unwrap();
+
+        let mut client = make_client();
+        client.attributes.insert("use.jwks.url".to_string(), "true".to_string());
+        client
+            .attributes
+            .insert("jwks.url".to_string(), "https://client.example.com/jwks".to_string());
+
+        // Pre-seed the JWKS cache so the only possible fetch is the kid-miss
+        // refetch itself.
+        state
+            .cache
+            .set(
+                &crate::client_assertion::jwks_cache_key(&realm.id, &client.id),
+                served_bytes,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // First unknown kid: validation fails against the cached set, the one
+        // allowed refetch runs, and validation still fails.
+        let jwt = signer
+            .sign(
+                &serde_json::to_string(&object_claims()).unwrap(),
+                issuerd_core::Algorithm::Rs256,
+                &issuerd_core::KeyId::new(kid.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(extract_request_object_params(&state, &realm, &client, &query_params(&jwt))
+            .await
+            .is_err());
+        assert!(
+            state
+                .cache
+                .get(&crate::client_assertion::jwks_kid_miss_key(&realm.id, &client.id))
+                .await
+                .unwrap()
+                .is_some(),
+            "the refetch must arm the shared cooldown marker"
+        );
+
+        // Second unknown kid inside the cooldown: rejected with no further
+        // outbound fetch (the mock's times(1) would fail otherwise).
+        let jwt = signer
+            .sign(
+                &serde_json::to_string(&object_claims()).unwrap(),
+                issuerd_core::Algorithm::Rs256,
+                &issuerd_core::KeyId::new(kid).unwrap(),
             )
             .await
             .unwrap();

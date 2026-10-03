@@ -11,9 +11,10 @@
 //! [`ReqwestBrokerClient`]. Endpoint discovery and the IdP's JWKS are cached
 //! in the distributed cache per (realm, alias) so a brokered login costs at
 //! most one server-to-server call (the code exchange) in the steady state.
-//! The fourth call, [`BrokerClient::get_json_untrusted`], fetches
-//! attacker-influenced URLs (pairwise `sector_identifier_uri`) behind an
-//! SSRF guard: https-only, public-IP-only, no redirects, capped body, and a
+//! The fourth call, [`BrokerClient::get_json_ssrf_guarded`], fetches
+//! attacker-influenced URLs (pairwise `sector_identifier_uri`, client
+//! `jwks.url`) behind an SSRF guard: https-only, public-IP-only against an
+//! explicit non-public CIDR blocklist, no redirects, capped body, and a
 //! single generic error for every failure mode.
 
 use issuerd_core::{
@@ -39,14 +40,15 @@ const EXTERNAL_TOKEN_LEEWAY_SECS: u64 = 60;
 /// a hung IdP must not stall login requests.
 pub struct ReqwestBrokerClient {
     client: reqwest::Client,
-    /// Separate client for attacker-influenced URLs (`get_json_untrusted`):
+    /// Separate client for attacker-influenced URLs (`get_json_ssrf_guarded`):
     /// redirect following is disabled so a public URL cannot bounce the
     /// fetch into the internal network (SSRF hardening).
     untrusted_client: reqwest::Client,
 }
 
-/// Body-size cap for documents fetched from untrusted URLs (64 KiB) — a
-/// `sector_identifier_uri` document is a small JSON array of redirect URIs.
+/// Body-size cap for documents fetched from untrusted URLs (64 KiB) — both
+/// current consumers are small JSON documents (a `sector_identifier_uri`
+/// array of redirect URIs, a client JWKS).
 const MAX_UNTRUSTED_BODY_BYTES: usize = 64 * 1024;
 
 impl ReqwestBrokerClient {
@@ -67,31 +69,83 @@ impl ReqwestBrokerClient {
     }
 }
 
-/// Whether `ip` is publicly routable — i.e. not loopback, private (RFC1918),
-/// link-local, unspecified, multicast, or a documentation range (v4); not
-/// loopback, unspecified, unique-local (fc00::/7), link-local (fe80::/10),
-/// multicast, or a non-public v4-mapped address (v6). Pure function so the
-/// SSRF guard is unit-testable without network access.
+/// Non-public IPv4 ranges the SSRF-guarded fetch refuses to dial: "this
+/// network" (0.0.0.0/8), RFC 1918 private (10/8, 172.16/12, 192.168/16),
+/// CGNAT shared address space (100.64.0.0/10, RFC 6598 — carrier metadata
+/// endpoints live here), loopback (127/8), link-local (169.254/16 — cloud
+/// metadata), IETF protocol assignments (192.0.0.0/24), documentation
+/// (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24), benchmarking
+/// (198.18.0.0/15, RFC 2544), multicast (224/4), and the reserved 240/4
+/// block (includes the 255.255.255.255 broadcast).
+fn blocked_v4_ranges() -> &'static [ipnet::Ipv4Net] {
+    static RANGES: std::sync::OnceLock<Vec<ipnet::Ipv4Net>> = std::sync::OnceLock::new();
+    RANGES.get_or_init(|| {
+        [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ]
+        .iter()
+        .map(|cidr| cidr.parse().expect("static CIDR literal must parse"))
+        .collect()
+    })
+}
+
+/// Non-public IPv6 ranges (see [`blocked_v4_ranges`]): unspecified (::/128)
+/// and loopback (::1/128), NAT64 (64:ff9b::/96, RFC 6052 — translator
+/// prefix, the embedded v4 address is not validated), Teredo (2001::/32,
+/// RFC 4380), documentation (2001:db8::/32, RFC 3849), 6to4 (2002::/16,
+/// RFC 3056), unique-local (fc00::/7), link-local (fe80::/10), and multicast
+/// (ff00::/8). v4-mapped addresses (::ffff:0:0/96) are deliberately NOT
+/// listed here: [`is_publicly_routable`] recurses into the v4 rules for
+/// them, so a mapped public address stays fetchable.
+fn blocked_v6_ranges() -> &'static [ipnet::Ipv6Net] {
+    static RANGES: std::sync::OnceLock<Vec<ipnet::Ipv6Net>> = std::sync::OnceLock::new();
+    RANGES.get_or_init(|| {
+        [
+            "::/128",
+            "::1/128",
+            "64:ff9b::/96",
+            "2001::/32",
+            "2001:db8::/32",
+            "2002::/16",
+            "fc00::/7",
+            "fe80::/10",
+            "ff00::/8",
+        ]
+        .iter()
+        .map(|cidr| cidr.parse().expect("static CIDR literal must parse"))
+        .collect()
+    })
+}
+
+/// Whether `ip` is publicly routable — i.e. outside every explicitly listed
+/// non-public range above. An explicit CIDR blocklist, not the `std`
+/// `is_private`/`is_documentation`/... convenience methods, so coverage does
+/// not shift with std implementation details (and ranges std does not model
+/// at all — CGNAT, benchmarking, reserved 240/4, NAT64/Teredo/6to4 — are
+/// covered). v4-mapped IPv6 addresses inherit the v4 rules. Pure function so
+/// the SSRF guard is unit-testable without network access.
 fn is_publicly_routable(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_documentation())
-        }
+        std::net::IpAddr::V4(v4) => !blocked_v4_ranges().iter().any(|net| net.contains(v4)),
         std::net::IpAddr::V6(v6) => {
             // v4-mapped addresses (::ffff:a.b.c.d) inherit the v4 rules.
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_publicly_routable(&std::net::IpAddr::V4(mapped));
             }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast())
+            !blocked_v6_ranges().iter().any(|net| net.contains(v6))
         }
     }
 }
@@ -173,7 +227,9 @@ impl BrokerClient for ReqwestBrokerClient {
     }
 
     /// Hardened fetch for attacker-influenced URLs (the pairwise
-    /// `sector_identifier_uri` from open dynamic client registration).
+    /// `sector_identifier_uri` from open dynamic client registration, a
+    /// client's configured `jwks.url` presented to unauthenticated client
+    /// assertions / JAR request objects).
     ///
     /// Every failure mode — scheme, DNS, non-public address, connect,
     /// redirect, non-success status, oversize body, JSON parse — collapses
@@ -185,15 +241,16 @@ impl BrokerClient for ReqwestBrokerClient {
     /// differ from the one the connector re-resolves when dialing. The full
     /// mitigation would be a pinning connector that dials the validated IP
     /// directly.
-    async fn get_json_untrusted(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
+    async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
         // One generic, leak-free error for every failure mode.
         let fail = |why: &str| {
-            warn!(url, why, "untrusted sector document fetch rejected/failed");
-            IssuerdError::InvalidRequest("sector_identifier_uri could not be fetched".to_string())
+            warn!(url, why, "SSRF-guarded fetch rejected/failed");
+            IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
         };
 
-        // Defensive second gate — the pairwise validator already enforces
-        // https (OIDC Core §8.1); never fetch untrusted URLs over plain http.
+        // Never fetch untrusted URLs over plain http. (For
+        // `sector_identifier_uri` the pairwise validator enforces https too,
+        // OIDC Core §8.1 — this gate protects every caller.)
         let parsed = url::Url::parse(url).map_err(|e| fail(&format!("url parse: {e}")))?;
         if parsed.scheme() != "https" {
             return Err(fail("non-https scheme"));
@@ -511,33 +568,141 @@ mod tests {
         assert!(ReqwestBrokerClient::new().is_ok());
     }
 
+    #[tokio::test]
+    async fn guarded_fetch_rejects_non_https_before_any_network_io() {
+        let client = ReqwestBrokerClient::new().unwrap();
+        let err = client.get_json_ssrf_guarded("http://app.example.com/jwks").await.unwrap_err();
+        assert!(
+            matches!(err, IssuerdError::InvalidRequest(_)),
+            "plain http must be refused up front: {err}"
+        );
+    }
+
+    /// Every blocklisted range: at least one address inside (both range
+    /// edges where meaningful) must be blocked.
     #[test]
-    fn rejects_non_public_ips() {
-        for rejected in [
-            "127.0.0.1",        // v4 loopback
-            "10.0.0.1",         // RFC1918
-            "172.16.0.1",       // RFC1918
-            "192.168.1.1",      // RFC1918
-            "169.254.1.1",      // v4 link-local
-            "0.0.0.0",          // v4 unspecified
-            "239.0.0.1",        // v4 multicast
-            "203.0.113.7",      // v4 documentation (TEST-NET-3)
-            "::1",              // v6 loopback
-            "::",               // v6 unspecified
-            "fc00::1",          // v6 unique-local
-            "fe80::1",          // v6 link-local
-            "ff02::1",          // v6 multicast
-            "::ffff:127.0.0.1", // v4-mapped loopback
-            "::ffff:10.0.0.1",  // v4-mapped private
-        ] {
-            let ip = IpAddr::from_str(rejected).unwrap();
-            assert!(!is_publicly_routable(&ip), "{rejected} must be rejected");
+    fn ssrf_blocklist_blocks_every_listed_range() {
+        let blocked: &[(&str, &[&str])] = &[
+            ("0.0.0.0/8", &["0.0.0.0", "0.1.2.3", "0.255.255.255"]),
+            ("10.0.0.0/8", &["10.0.0.0", "10.0.0.1", "10.255.255.255"]),
+            ("100.64.0.0/10", &["100.64.0.0", "100.100.100.200", "100.127.255.255"]),
+            ("127.0.0.0/8", &["127.0.0.0", "127.0.0.1", "127.255.255.255"]),
+            ("169.254.0.0/16", &["169.254.0.0", "169.254.1.1", "169.254.255.255"]),
+            ("172.16.0.0/12", &["172.16.0.0", "172.16.0.1", "172.31.255.255"]),
+            ("192.0.0.0/24", &["192.0.0.0", "192.0.0.1", "192.0.0.255"]),
+            ("192.0.2.0/24", &["192.0.2.0", "192.0.2.1", "192.0.2.255"]),
+            ("192.168.0.0/16", &["192.168.0.0", "192.168.1.1", "192.168.255.255"]),
+            ("198.18.0.0/15", &["198.18.0.0", "198.18.0.1", "198.19.255.255"]),
+            ("198.51.100.0/24", &["198.51.100.0", "198.51.100.1", "198.51.100.255"]),
+            ("203.0.113.0/24", &["203.0.113.0", "203.0.113.7", "203.0.113.255"]),
+            ("224.0.0.0/4", &["224.0.0.0", "224.0.0.1", "239.255.255.255"]),
+            ("240.0.0.0/4", &["240.0.0.0", "240.0.0.1", "255.255.255.255"]),
+            ("::/128", &["::"]),
+            ("::1/128", &["::1"]),
+            ("64:ff9b::/96", &["64:ff9b::", "64:ff9b::808:808", "64:ff9b::ffff:ffff"]),
+            ("2001::/32", &["2001::", "2001::1", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff"]),
+            ("2001:db8::/32", &["2001:db8::", "2001:db8::1"]),
+            ("2002::/16", &["2002::", "2002::1", "2002:ffff::1"]),
+            (
+                "fc00::/7",
+                &[
+                    "fc00::",
+                    "fc00::1",
+                    "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+            ),
+            (
+                "fe80::/10",
+                &[
+                    "fe80::",
+                    "fe80::1",
+                    "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+            ),
+            (
+                "ff00::/8",
+                &[
+                    "ff00::",
+                    "ff02::1",
+                    "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+            ),
+            // v4-mapped IPv6 recurses into the v4 rules: a mapped address is
+            // blocked exactly when its embedded v4 address is.
+            (
+                "::ffff:0:0/96 (recursed)",
+                &[
+                    "::ffff:0.0.0.0",
+                    "::ffff:10.0.0.1",
+                    "::ffff:100.64.0.1",
+                    "::ffff:127.0.0.1",
+                    "::ffff:169.254.1.1",
+                    "::ffff:172.16.0.1",
+                    "::ffff:192.0.0.1",
+                    "::ffff:192.0.2.1",
+                    "::ffff:192.168.1.1",
+                    "::ffff:198.18.0.1",
+                    "::ffff:198.51.100.1",
+                    "::ffff:203.0.113.7",
+                    "::ffff:224.0.0.1",
+                    "::ffff:240.0.0.1",
+                ],
+            ),
+        ];
+        for (range, addrs) in blocked {
+            for addr in *addrs {
+                let ip = IpAddr::from_str(addr).unwrap();
+                assert!(!is_publicly_routable(&ip), "{addr} ({range}) must be blocked");
+            }
         }
     }
 
+    /// Every blocklisted range: at least one address just outside it must
+    /// pass (plus generally-known public addresses).
     #[test]
-    fn accepts_public_ips() {
-        for accepted in ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+    fn ssrf_blocklist_passes_public_neighbors_of_every_range() {
+        let passing: &[(&str, &[&str])] = &[
+            ("0.0.0.0/8", &["1.0.0.1"]),
+            ("10.0.0.0/8", &["9.255.255.255", "11.0.0.0"]),
+            ("100.64.0.0/10", &["100.63.255.255", "100.128.0.0"]),
+            ("127.0.0.0/8", &["126.255.255.255", "128.0.0.1"]),
+            ("169.254.0.0/16", &["169.253.255.255", "169.255.0.1"]),
+            ("172.16.0.0/12", &["172.15.255.255", "172.32.0.0"]),
+            ("192.0.0.0/24", &["191.255.255.255", "192.0.1.1"]),
+            ("192.0.2.0/24", &["192.0.1.255", "192.0.3.1"]),
+            ("192.168.0.0/16", &["192.167.255.255", "192.169.0.1"]),
+            ("198.18.0.0/15", &["198.17.255.255", "198.20.0.1"]),
+            ("198.51.100.0/24", &["198.51.99.255", "198.51.101.1"]),
+            ("203.0.113.0/24", &["203.0.112.255", "203.0.114.1"]),
+            ("224.0.0.0/4", &["223.255.255.255"]),
+            // 240/4 tops the address space and its lower neighbor 224/4 is
+            // also blocked, so its nearest passing address is below 224/4.
+            ("240.0.0.0/4", &["223.255.255.255"]),
+            ("::/128", &["::2"]),
+            ("::1/128", &["::2"]),
+            ("64:ff9b::/96", &["64:ff9b:0:0:0:1::", "64:ff9c::1"]),
+            ("2001::/32", &["2001:1::1"]),
+            ("2001:db8::/32", &["2001:db9::1"]),
+            ("2002::/16", &["2003::1"]),
+            ("fc00::/7", &["fe00::1"]),
+            ("fe80::/10", &["fec0::1"]),
+            ("ff00::/8", &["feff::1"]),
+            // v4-mapped recursion: a mapped PUBLIC v4 address stays fetchable.
+            ("::ffff:0:0/96 (recursed)", &["::ffff:8.8.8.8", "::ffff:1.0.0.1"]),
+        ];
+        for (range, addrs) in passing {
+            for addr in *addrs {
+                let ip = IpAddr::from_str(addr).unwrap();
+                assert!(is_publicly_routable(&ip), "{addr} (outside {range}) must be accepted");
+            }
+        }
+
+        for accepted in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
             let ip = IpAddr::from_str(accepted).unwrap();
             assert!(is_publicly_routable(&ip), "{accepted} must be accepted");
         }
