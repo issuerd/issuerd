@@ -20,9 +20,9 @@ env:
 jobs:
   geiger:
     name: cargo geiger (unsafe census)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -37,9 +37,9 @@ jobs:
 
   kani:
     name: cargo kani (model checking)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Kani
         run: |
@@ -49,12 +49,12 @@ jobs:
 
   flux:
     name: cargo flux (refinement types)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Informational: flux builds its compiler fork from its main branch, so an
     # upstream change can break this job independently of our code.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Flux (z3 + liquid-fixpoint + cargo-flux)
         run: curl -fsSL https://raw.githubusercontent.com/flux-rs/flux/main/install.sh | bash
@@ -67,9 +67,9 @@ jobs:
 
   dylint:
     name: cargo dylint (log-hygiene lints)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The lint library (lints/issuerd_log_hygiene) pins its own dated
       # nightly in rust-toolchain.toml; cargo-dylint builds the library and
       # checks the workspace under that toolchain. Keep this install in sync
@@ -85,7 +85,7 @@ jobs:
       # The driver build (~minutes) lands in ~/.dylint_drivers; the lint
       # library's own target dir lives outside the workspace root's target/.
       - name: Cache dylint driver and lint library
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.dylint_drivers

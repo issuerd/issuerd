@@ -26,9 +26,9 @@ env:
 jobs:
   federation:
     name: federation (Samba AD DC + OpenLDAP)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -51,9 +51,9 @@ jobs:
 
   cluster-e2e:
     name: cluster E2E (two nodes behind nginx)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -79,9 +79,9 @@ jobs:
 
   keycloak-parity:
     name: dual-target parity vs Keycloak
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -96,10 +96,10 @@ jobs:
 
   release-build:
     name: release binary (embedded web UI)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -119,12 +119,12 @@ jobs:
 
   conformance:
     name: OIDF conformance suite (evidence)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Fresh-runner builds are the slow path: the suite JAR (maven) and the
     # Issuerd release binary are both compiled inside Docker. Bound hangs.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The suite sources are gitignored (tests/conformance/conformance-suite)
       # — clone fresh at the pinned, validated release tag.
       - name: Clone the OIDF conformance suite
@@ -136,7 +136,7 @@ jobs:
       # tests/conformance/results/, tears the stack down, and propagates the
       # conformance-run exit code. It exports DOCKER_HOST_UID/GID=$(id -u/g)
       # on Linux so the runner containers can write into the bind-mounted
-      # ./pki and ./results (the ubuntu-latest user is 1001, not the compose
+      # ./pki and ./results (the ubuntu-24.04 user is 1001, not the compose
       # default 1000 — without this pki-init exits 1 on Permission denied).
       - name: Run the conformance suite (hermetic stack)
         working-directory: tests/conformance
@@ -160,7 +160,7 @@ jobs:
           ls -lh conformance-evidence.tar.gz
       - name: Upload evidence artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-evidence
           path: tests/conformance/conformance-evidence.tar.gz

@@ -19,9 +19,9 @@ env:
 jobs:
   fmt:
     name: cargo fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,9 +29,9 @@ jobs:
 
   check:
     name: cargo check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -40,9 +40,9 @@ jobs:
 
   clippy:
     name: cargo clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -53,9 +53,9 @@ jobs:
 
   doc:
     name: cargo doc
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
@@ -64,9 +64,9 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo audit is a cargo subcommand — needs cargo on PATH, which bare
       # (self-hosted / container) runners do not provide out of the box.
       - uses: dtolnay/rust-toolchain@stable
@@ -75,22 +75,22 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
 
   webclient:
     name: web client (test + build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: webclientsrc
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -104,12 +104,12 @@ jobs:
 
   coverage:
     name: coverage (rust + webclient)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       # The badge-publish step pushes the badge JSONs to the `badges` branch.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           # cargo-llvm-cov shells out to llvm-profdata/llvm-cov from this component.
@@ -118,7 +118,7 @@ jobs:
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -157,7 +157,7 @@ jobs:
                   out.write(f"| {name.capitalize()} | {badge['message']} |\n")
           EOF
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # rust-lcov.info is renderable locally (genhtml); webclientsrc's
           # coverage/ includes the browsable lcov-report/ HTML.
@@ -187,9 +187,9 @@ jobs:
 
   openapi-sync:
     name: openapi.json in sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies (libgssapi, openssl)
