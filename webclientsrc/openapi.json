@@ -11,7 +11,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "0.1.11"
+    "version": "0.1.12"
   },
   "paths": {
     "/admin/enums/algorithms": {
@@ -17043,7 +17043,7 @@
           "Server Info"
         ],
         "summary": "Get server metadata and available enum values.",
-        "description": "Returns a comprehensive list of constants, enum values, and supported\nconfiguration options used by the admin console dropdowns and forms.",
+        "description": "Returns a comprehensive list of constants, enum values, and supported\nconfiguration options used by the admin console dropdowns and forms.\nServer-global and realm-agnostic: readable by any authenticated admin\ntoken (master or realm-bound) carrying `view-realm`/`manage-realm`.",
         "operationId": "get_serverinfo",
         "responses": {
           "200": {

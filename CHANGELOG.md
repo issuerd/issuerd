@@ -20,9 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-10-06
+
 ### Fixed
 
 - **Realm-scoped admin tokens can now read `GET /admin/serverinfo` (Keycloak console parity).** The endpoint serves server-global capability metadata only (enum/value lists, provider ids, server version — no realm-scoped data), but it answered 403 for any non-master token because realm-less admin paths were master-only, so a delegated realm admin's console rendered every serverinfo-derived Realm Health chip on the dashboard as "Degraded" and enum-driven forms stayed empty. Any authenticated admin token carrying `view-realm` or `manage-realm` may now read it — including tokens issued by a non-master realm; realm revocation cutoffs (`not_before`) still apply, and all other realm-less paths (realm creation/listing, signing-key administration) remain master-only.
+
+### Changed
+
+- **README/marketing assets:** the `acme` admin-console dashboard screenshot (`30-dashboard-acme.png`) was reshot against a healthy demo realm — the previous frame showed spurious "Degraded" Realm Health chips (a side effect of the serverinfo restriction fixed above) and a seeded failed-logins warning.
 
 ## [0.1.11] - 2026-10-03
 
