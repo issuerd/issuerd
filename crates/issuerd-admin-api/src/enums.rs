@@ -747,6 +747,8 @@ async fn build_server_info(state: &AdminApiState) -> ServerInfoRepresentation {
 ///
 /// Returns a comprehensive list of constants, enum values, and supported
 /// configuration options used by the admin console dropdowns and forms.
+/// Server-global and realm-agnostic: readable by any authenticated admin
+/// token (master or realm-bound) carrying `view-realm`/`manage-realm`.
 #[utoipa::path(
     get,
     path = "/admin/serverinfo",
@@ -1057,6 +1059,29 @@ mod tests {
         assert!(locale_ids.contains(&"en") && locale_ids.contains(&"de"));
         let theme_ids: Vec<&str> = info.themes.iter().map(|v| v.id.as_str()).collect();
         assert!(theme_ids.contains(&"issuerd"));
+    }
+
+    #[tokio::test]
+    async fn serverinfo_requires_view_or_manage_realm() {
+        // The middleware admits realm-bound admin tokens for this realm-less
+        // read, so the view-realm/manage-realm guard stays the handler's job.
+        let state = crate::test_utils::tests::test_state(vec![
+            issuerd_core::RoleName::new("view-realm").unwrap(),
+            issuerd_core::RoleName::new("manage-realm").unwrap(),
+        ]);
+        let Json(info) =
+            get_serverinfo(State(state.clone()), Extension(auth_with_role("view-realm")))
+                .await
+                .unwrap();
+        assert!(!info.protocols.is_empty());
+        let Json(info) =
+            get_serverinfo(State(state.clone()), Extension(auth_with_role("manage-realm")))
+                .await
+                .unwrap();
+        assert!(!info.response_types.is_empty());
+        let result =
+            get_serverinfo(State(state), Extension(auth_with_role("manage-clients"))).await;
+        assert!(matches!(result, Err(AdminApiError::Forbidden)));
     }
 
     #[test]

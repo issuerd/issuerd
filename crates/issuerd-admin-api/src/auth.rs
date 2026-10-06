@@ -50,7 +50,12 @@ pub async fn admin_auth_middleware(
 ///
 /// Keycloak model: a token issued by the `master` realm administers every
 /// realm; any other token administers only the realm that issued it. Paths
-/// without a `{realm}` segment (realm creation/listing) are master-only.
+/// without a `{realm}` segment (realm creation/listing) are master-only, with
+/// one exception: `GET /admin/serverinfo` serves server-global capability
+/// metadata (enum lists, provider ids, version — no realm-scoped data) and is
+/// readable by any authenticated admin token, because every realm's admin
+/// console loads it (Keycloak console parity). The handler still requires
+/// `view-realm`/`manage-realm`.
 ///
 /// When a realm's `not_before` is set (non-zero), tokens with `iat` before
 /// the cutoff are rejected with 401. Both the issuing realm (parsed from the
@@ -104,6 +109,12 @@ async fn enforce_realm_binding(
         return Ok(());
     }
     let Some(path_realm) = path_realm_segment(path) else {
+        // Server metadata is server-global and realm-agnostic; every realm's
+        // admin console reads it, so it is exempt from the master-only rule
+        // (the handler enforces view-realm/manage-realm on top).
+        if path == "/admin/serverinfo" {
+            return Ok(());
+        }
         warn!("admin API authorization denied: realm-less path requires a master realm token");
         return Err(AdminApiError::Forbidden);
     };
@@ -434,6 +445,7 @@ mod tests {
         Router::new()
             .route("/admin/realms", get(|| async { StatusCode::OK }))
             .route("/admin/realms/{realm}/users", get(|| async { StatusCode::OK }))
+            .route("/admin/serverinfo", get(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn_with_state(state.clone(), admin_auth_middleware))
             .with_state(state)
     }
@@ -486,6 +498,47 @@ mod tests {
         let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
         let app = binding_app(state);
         assert_eq!(call(app, "/admin/realms").await, StatusCode::FORBIDDEN);
+    }
+
+    // -- Server metadata: realm-less but readable by any admin token ---------
+
+    #[tokio::test]
+    async fn realm_token_reads_serverinfo() {
+        // Keycloak console parity: every realm's admin console loads
+        // serverinfo, and the payload is server-global capability metadata
+        // only, so a realm-bound admin token may read it.
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/serverinfo").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn master_token_reads_serverinfo() {
+        let state = state_with_tenant("http://localhost:8080/realms/master").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/serverinfo").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn anonymous_serverinfo_read_is_unauthorized() {
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        let status = app
+            .oneshot(Request::builder().uri("/admin/serverinfo").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn not_before_still_applies_to_serverinfo_reads() {
+        // The relaxation does not bypass realm revocation: a token issued
+        // before its issuing realm's cutoff is still rejected.
+        let state = state_with_tenant_and_iat("http://localhost:8080/realms/tenant", 500).await;
+        set_not_before(&state, "tenant", 1000).await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/serverinfo").await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
