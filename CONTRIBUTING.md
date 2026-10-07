@@ -20,6 +20,16 @@ Everyone participating is expected to follow the
 - **Documentation** — the operations set under `docs/` and the guides are as
   much part of the product as the code.
 
+## Contributor License Agreement
+
+Your first pull request gets a comment from the CLA Assistant bot asking you
+to sign the [Contributor License Agreement](CLA.md) — signing is a single
+comment in the PR thread, no accounts or emails. The CLA is an adapted Project
+Harmony individual agreement: you keep the copyright in your contribution;
+§2.3 lets the maintainer relicense it (including commercially) while
+guaranteeing it always remains available under the project's license at
+submission time (Apache-2.0).
+
 ## Development setup
 
 - **Rust 1.95+** (workspace MSRV), edition 2021.
