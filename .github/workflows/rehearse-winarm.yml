@@ -20,6 +20,10 @@ jobs:
   windows-arm64-binary:
     name: windows arm64 binary (rehearsal)
     runs-on: windows-11-arm
+    # Keep in sync with the windows jobs in release.yml: silence the LNK4099
+    # wall from the vendored OpenSSL objects (they ship no PDB).
+    env:
+      RUSTFLAGS: "-C link-args=/ignore:4099"
     defaults:
       run:
         shell: bash

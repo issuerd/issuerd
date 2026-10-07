@@ -451,6 +451,10 @@ jobs:
     # this host (no Windows containers), so the same steps are rehearsed
     # natively instead (see .act/run-release.sh).
     runs-on: windows-latest
+    # The vendored OpenSSL objects ship no PDB, so every MSVC link prints a
+    # wall of LNK4099 warnings (harmless: strip = true ships no debug info).
+    env:
+      RUSTFLAGS: "-C link-args=/ignore:4099"
     defaults:
       run:
         shell: bash
@@ -518,6 +522,9 @@ jobs:
     # windows-binary: no Windows containers under act, so every step is gated
     # on env.ACT != 'true'.
     runs-on: windows-11-arm
+    # Same LNK4099 silencing as windows-binary (vendored OpenSSL ships no PDB).
+    env:
+      RUSTFLAGS: "-C link-args=/ignore:4099"
     defaults:
       run:
         shell: bash
