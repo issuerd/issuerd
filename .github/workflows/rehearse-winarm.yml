@@ -50,6 +50,10 @@ jobs:
         run: cargo auditable build --locked --release --bin issuerd
       - name: Smoke-run the binary
         run: ./target/release/issuerd.exe --version
+      # Release profile reuses the deps compiled for the binary; --lib
+      # excludes the Docker-backed integration suites.
+      - name: Unit tests (native)
+        run: cargo test --locked --release --workspace --lib
       - name: Install syft (SBOM)
         run: |
           mkdir -p "$HOME/bin"

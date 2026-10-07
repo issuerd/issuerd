@@ -556,6 +556,14 @@ jobs:
       - if: ${{ env.ACT != 'true' }}
         name: Smoke-run the binary
         run: ./target/release/issuerd.exe --version
+      # Native unit suite on the ARM64 runner, release profile so the deps
+      # compiled for the binary are reused (dev profile would rebuild the
+      # whole tree). --lib excludes the Docker-backed integration suites —
+      # same philosophy as the linux-arm64 unit run; crypto paths (aws-lc-rs,
+      # ring) get real ARM64 coverage here.
+      - if: ${{ env.ACT != 'true' }}
+        name: Unit tests (native)
+        run: cargo test --locked --release --workspace --lib
       - if: ${{ env.ACT != 'true' }}
         name: Install syft (SBOM)
         run: |
