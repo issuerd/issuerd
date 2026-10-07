@@ -1,0 +1,65 @@
+# TEMPORARY branch-rehearsal workflow for the windows-11-arm release job.
+# DELETE before merging feat/release-windows-arm64-macos-amd64.
+# The real job lives in release.yml (tag-gated); this file exists to iterate
+# the ARM64 Windows build on a live runner without pushing tags. It mirrors
+# the windows-arm64-binary job step for step — keep them in sync while it lives.
+name: rehearse-winarm
+on:
+  push:
+    branches: [feat/release-windows-arm64-macos-amd64]
+  workflow_dispatch:
+
+permissions: contents: read
+
+concurrency:
+  group: rehearse-winarm
+  cancel-in-progress: true
+
+jobs:
+  windows-arm64-binary:
+    name: windows arm64 binary (rehearsal)
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs panics
+      # without webclientsrc/dist).
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      # Vendored openssl (WebAuthn) needs a native perl on PATH; x64 Strawberry
+      # Perl runs under emulation on windows-11-arm.
+      - name: Strawberry Perl (vendored openssl build)
+        run: choco install strawberryperl --no-progress -y
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary so the SBOM
+      # scan sees every crate.
+      - uses: taiki-e/install-action@cargo-auditable
+      - name: Build the release binary
+        env:
+          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+        run: cargo auditable build --locked --release --bin issuerd
+      - name: Smoke-run the binary
+        run: ./target/release/issuerd.exe --version
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o syft.zip https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_windows_amd64.zip
+          powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w syft.zip)' -DestinationPath '$(cygpath -w "$HOME/bin")'"
+          rm syft.zip
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Package the archive
+        run: bash scripts/package-release.sh windows-arm64 0.0.0-rehearsal target/release/issuerd.exe ./dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-dist
+          path: dist/
+          if-no-files-found: error

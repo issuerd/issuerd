@@ -507,6 +507,73 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  windows-arm64-binary:
+    name: windows arm64 binary
+    needs: validate
+    # Native build on the ARM64 Windows runner (free for public repos) — same
+    # native-build philosophy as linux-arm64 (ubuntu-22.04-arm) and macos
+    # (macos-15). Kerberos stays cfg(unix)-gated off on Windows; the vendored
+    # openssl (WebAuthn) builds via Strawberry Perl under x64 emulation + the
+    # ARM64 MSVC toolchain from the runner image. Same act treatment as
+    # windows-binary: no Windows containers under act, so every step is gated
+    # on env.ACT != 'true'.
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/checkout@v7
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs).
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      # Vendored openssl (WebAuthn) needs a native perl on PATH; the committed
+      # .cargo/config.toml points at a dev-host path, so override via env.
+      - if: ${{ env.ACT != 'true' }}
+        name: Strawberry Perl (vendored openssl build)
+        run: choco install strawberryperl --no-progress -y
+      - if: ${{ env.ACT != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+      - if: ${{ env.ACT != 'true' }}
+        uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary (same as the
+      # Dockerfile) so the SBOM scan sees every crate.
+      - if: ${{ env.ACT != 'true' }}
+        uses: taiki-e/install-action@cargo-auditable
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the release binary
+        env:
+          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+        run: cargo auditable build --locked --release --bin issuerd
+      - if: ${{ env.ACT != 'true' }}
+        name: Smoke-run the binary
+        run: ./target/release/issuerd.exe --version
+      - if: ${{ env.ACT != 'true' }}
+        name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o syft.zip https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_windows_amd64.zip
+          powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w syft.zip)' -DestinationPath '$(cygpath -w "$HOME/bin")'"
+          rm syft.zip
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - if: ${{ env.ACT != 'true' }}
+        name: Package the archive
+        run: bash scripts/package-release.sh windows-arm64 "${{ needs.validate.outputs.version }}" target/release/issuerd.exe ./dist
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-dist
+          path: dist/
+          if-no-files-found: error
+
   macos-binary:
     name: macOS arm64 binary (build + test + package)
     needs: validate
@@ -571,7 +638,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, linux-arm64, windows-binary, macos-binary, heavy]
+    needs: [validate, linux-binary, linux-arm64, windows-binary, windows-arm64-binary, macos-binary, heavy]
     # Gate on every need, tolerating ONLY skips (act leaves out the heavy
     # call and the macos-binary job): a failed suite or packaging job means
     # no GitHub Release.
@@ -602,7 +669,7 @@ jobs:
         with:
           name: conformance-evidence
           path: conformance-evidence
-      # Real runs must ship all four platforms; rehearsal (act) has no macOS
+      # Real runs must ship all five platforms; rehearsal (act) has no macOS
       # job, so macos-dist is only required by this check, never under act.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
@@ -610,6 +677,7 @@ jobs:
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
              linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
+             windows-arm64-dist/*.zip windows-arm64-dist/*.sbom.cyclonedx.json \
              macos-dist/*.tar.gz macos-dist/*.sbom.cyclonedx.json \
              conformance-evidence/conformance-evidence.tar.gz
       - name: SHA256SUMS.txt
@@ -617,7 +685,7 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist linux-arm64-dist windows-dist macos-dist; do
+          for d in linux-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           # Standalone conformance evidence asset (absent under act).
@@ -635,6 +703,7 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            windows-arm64-dist/*
             macos-dist/*
             issuerd_*_conformance-evidence.tar.gz
       - name: Create the GitHub Release
@@ -648,6 +717,7 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            windows-arm64-dist/*
             macos-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
