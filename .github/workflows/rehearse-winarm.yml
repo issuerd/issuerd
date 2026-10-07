@@ -1,9 +1,11 @@
-# TEMPORARY branch-rehearsal workflow for the windows-11-arm release job.
-# DELETE before merging feat/release-windows-arm64-macos-amd64.
-# The real job lives in release.yml (tag-gated); this file exists to iterate
-# the ARM64 Windows build on a live runner without pushing tags. It mirrors
-# the windows-arm64-binary job step for step — keep them in sync while it lives.
-name: rehearse-winarm
+# TEMPORARY branch-rehearsal workflow for the new platform release jobs
+# (windows-11-arm, macOS x86_64). DELETE before merging
+# feat/release-windows-arm64-macos-amd64.
+# The real jobs live in release.yml (tag-gated); this file exists to iterate
+# the new builds on live runners without pushing tags. It mirrors the
+# windows-arm64-binary job step for step plus the x86_64 half of macos-binary
+# — keep them in sync while it lives.
+name: rehearse-new-platforms
 on:
   push:
     branches: [feat/release-windows-arm64-macos-amd64]
@@ -13,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rehearse-winarm
+  group: rehearse-new-platforms
   cancel-in-progress: true
 
 jobs:
@@ -71,4 +73,54 @@ jobs:
         with:
           name: windows-arm64-dist
           path: dist/
+          if-no-files-found: error
+
+  macos-amd64-binary:
+    name: macOS amd64 binary (rehearsal)
+    runs-on: macos-15
+    env:
+      # Same deployment-target pin as the real macos-binary job.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs panics
+      # without webclientsrc/dist).
+      - name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary so the SBOM
+      # scan sees every crate.
+      - uses: taiki-e/install-action@cargo-auditable
+      # openssl is vendored for this target (Homebrew's openssl@3 is
+      # arm64-only) — system perl + Xcode clang build it from source.
+      - name: Rosetta 2 (x86_64 run support)
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Build the x86_64 release binary
+        run: cargo auditable build --locked --release --bin issuerd --target x86_64-apple-darwin
+      - name: Smoke-run the x86_64 binary (Rosetta)
+        run: ./target/x86_64-apple-darwin/release/issuerd --version
+      # Release profile reuses the deps compiled for the binary; --lib
+      # excludes the Docker-backed suites (no Docker on macOS runners anyway).
+      - name: Unit tests (x86_64, Rosetta)
+        run: cargo test --locked --release --workspace --lib --target x86_64-apple-darwin
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_darwin_arm64.tar.gz | tar -xz -C "$HOME/bin" syft
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Package the x86_64 archive
+        run: bash scripts/package-release.sh macos-amd64 0.0.0-rehearsal target/x86_64-apple-darwin/release/issuerd ./dist-amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-amd64-dist
+          path: dist-amd64/
           if-no-files-found: error

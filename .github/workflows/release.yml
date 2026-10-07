@@ -590,19 +590,21 @@ jobs:
           if-no-files-found: error
 
   macos-binary:
-    name: macOS arm64 binary (build + test + package)
+    name: macOS binaries (arm64 + amd64 build + test + package)
     needs: validate
-    # Native build + full workspace tests on an Apple Silicon runner (macos-13
-    # is Intel — avoid), then packages the shipped macOS arm64 archive like the
-    # other platform jobs. Not part of per-commit CI. Skipped under act like
+    # Native arm64 build + full workspace tests on an Apple Silicon runner
+    # (macos-13 is Intel — avoid), then packages the shipped macOS arm64
+    # archive like the other platform jobs. The x86_64 archive is
+    # cross-compiled on the same runner and smoke-tested + unit-tested under
+    # Rosetta 2. Not part of per-commit CI. Skipped under act like
     # the heavy call (no macOS runners there; vars.ACT because job-level `if`
-    # has no env context) — the release job tolerates the missing macos-dist
-    # artifact in rehearsal.
+    # has no env context) — the release job tolerates the missing macOS
+    # artifacts in rehearsal.
     if: ${{ vars.ACT != 'true' }}
     runs-on: macos-15
     env:
-      # Pin the deployment target to the aarch64-apple-darwin std minimum
-      # instead of letting the host SDK raise the floor to the runner's macOS.
+      # Pin the deployment target instead of letting the host SDK raise the
+      # floor to the runner's macOS (11.0 covers both arm64 and x86_64 std).
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v7
@@ -617,6 +619,8 @@ jobs:
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       # cargo-auditable embeds the dependency tree in the binary (same as the
       # Dockerfile) so the SBOM scan sees every crate.
@@ -649,6 +653,28 @@ jobs:
         with:
           name: macos-dist
           path: dist/
+          if-no-files-found: error
+      # x86_64 (Intel) build: cross-compile from the arm64 host, then run the
+      # binary and the unit suite under Rosetta 2 (executing an x86_64 binary
+      # invokes it automatically). openssl is vendored for this target —
+      # Homebrew's openssl@3 on the runner is arm64-only (see the cfg block in
+      # crates/issuerd-auth-flow/Cargo.toml).
+      - name: Rosetta 2 (x86_64 run support)
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Build the x86_64 release binary
+        run: cargo auditable build --locked --release --bin issuerd --target x86_64-apple-darwin
+      - name: Smoke-run the x86_64 binary (Rosetta)
+        run: ./target/x86_64-apple-darwin/release/issuerd --version
+      # Release profile reuses the deps compiled for the binary; --lib excludes
+      # the Docker-backed suites (no Docker on macOS runners anyway).
+      - name: Unit tests (x86_64, Rosetta)
+        run: cargo test --locked --release --workspace --lib --target x86_64-apple-darwin
+      - name: Package the x86_64 archive
+        run: bash scripts/package-release.sh macos-amd64 "${{ needs.validate.outputs.version }}" target/x86_64-apple-darwin/release/issuerd ./dist-amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-amd64-dist
+          path: dist-amd64/
           if-no-files-found: error
 
   release:
@@ -684,8 +710,9 @@ jobs:
         with:
           name: conformance-evidence
           path: conformance-evidence
-      # Real runs must ship all five platforms; rehearsal (act) has no macOS
-      # job, so macos-dist is only required by this check, never under act.
+      # Real runs must ship all six platforms; rehearsal (act) has no macOS
+      # job, so the macOS artifacts are only required by this check, never
+      # under act.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
@@ -694,13 +721,14 @@ jobs:
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
              windows-arm64-dist/*.zip windows-arm64-dist/*.sbom.cyclonedx.json \
              macos-dist/*.tar.gz macos-dist/*.sbom.cyclonedx.json \
+             macos-amd64-dist/*.tar.gz macos-amd64-dist/*.sbom.cyclonedx.json \
              conformance-evidence/conformance-evidence.tar.gz
       - name: SHA256SUMS.txt
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist; do
+          for d in linux-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           # Standalone conformance evidence asset (absent under act).
@@ -720,6 +748,7 @@ jobs:
             windows-dist/*
             windows-arm64-dist/*
             macos-dist/*
+            macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
@@ -734,6 +763,7 @@ jobs:
             windows-dist/*
             windows-arm64-dist/*
             macos-dist/*
+            macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
       - name: Release contents (always logged — this is what rehearsal inspects)
