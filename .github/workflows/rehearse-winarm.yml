@@ -9,7 +9,8 @@ on:
     branches: [feat/release-windows-arm64-macos-amd64]
   workflow_dispatch:
 
-permissions: contents: read
+permissions:
+  contents: read
 
 concurrency:
   group: rehearse-winarm
