@@ -11,6 +11,21 @@ use issuerd_core::{
 use issuerd_token::TokenIssuer;
 use std::sync::Arc;
 
+/// i18n message-bundle resolver for outbound email copy: maps
+/// (realm, recipient user) to the flat key→text bundle of the recipient's
+/// locale. Wired by the composition root (issuerd-server).
+///
+/// Bundle text is trusted operator content: values are inserted into the
+/// templates verbatim, and any `{{double-brace}}` sequences they contain are
+/// NOT re-substituted (or are, depending on placeholder order) — bundle files
+/// must use the documented single-brace `{realm}`/`{user}`/`{minutes}`
+/// placeholders only.
+pub type EmailBundleResolver = Arc<
+    dyn Fn(&issuerd_core::Realm, &issuerd_core::User) -> std::collections::HashMap<String, String>
+        + Send
+        + Sync,
+>;
+
 pub struct AdminApiState {
     pub storage: Arc<dyn Storage>,
     pub token_service: Arc<dyn TokenService>,
@@ -47,4 +62,12 @@ pub struct AdminApiState {
     /// Public base URL of the server (the configured issuer URL without a
     /// trailing slash); used to build absolute links in outbound email.
     pub base_url: String,
+    /// Optional i18n message-bundle resolver for outbound email copy, keyed by
+    /// (realm, recipient user). Wired by the composition root (issuerd-server);
+    /// `None` keeps the built-in English copy.
+    pub email_bundle: Option<EmailBundleResolver>,
+    /// Locales offered by the locales enum endpoint and serverinfo: the
+    /// shipped built-ins plus every theme-supplied `messages_<locale>.json`
+    /// discovered in the themes directory at boot.
+    pub available_locales: Vec<String>,
 }

@@ -19,6 +19,11 @@
 //! 3. theme `en` override (`{themes_dir}/{theme}/messages_en.json`)
 //! 4. theme `{locale}` override (`{themes_dir}/{theme}/messages_{locale}.json`)
 //!
+//! A `None` theme falls back to the default theme
+//! ([`crate::routes::theme::DEFAULT_THEME`]), matching the theme asset
+//! handler: operators can drop `messages_<locale>.json` into the default
+//! theme directory without setting `login_theme`/`email_theme` on the realm.
+//!
 //! The login page receives its resolved bundle through the (unauthenticated)
 //! login-context endpoint; server-rendered pages and emails consume the same
 //! bundles server-side.
@@ -167,7 +172,9 @@ pub fn user_locale(realm: &Realm, user: &User) -> String {
 
 /// Load the layered message bundle for `locale` (with per-key English
 /// fallback). `themes_dir`/`theme` add the theme override layers when the
-/// realm has a login theme and the files exist on disk.
+/// files exist on disk; a `None` theme reads the default theme
+/// ([`crate::routes::theme::DEFAULT_THEME`]), the same fallback the theme
+/// asset handler applies.
 pub fn message_bundle(
     themes_dir: Option<&Path>,
     theme: Option<&str>,
@@ -180,7 +187,14 @@ pub fn message_bundle(
             bundle.extend(overlay);
         }
     }
-    if let (Some(dir), Some(theme_name)) = (themes_dir, theme) {
+    if let Some(dir) = themes_dir {
+        // A malformed stored theme name must never become a path component
+        // (same guard as the theme asset handler).
+        let theme_name = match theme {
+            Some(t) if !t.contains('/') && !t.contains('\\') && t != ".." => t,
+            Some(_) => crate::routes::theme::DEFAULT_THEME,
+            None => crate::routes::theme::DEFAULT_THEME,
+        };
         for layer in [DEFAULT_LOCALE, lang] {
             let path = dir.join(theme_name).join(format!("messages_{layer}.json"));
             // A missing override file for a layer is normal; malformed JSON is not.
@@ -200,6 +214,136 @@ pub fn message_bundle(
 /// Look up `key` in the bundle, falling back to `default` when absent.
 pub fn msg<'a>(bundle: &'a MessageBundle, key: &str, default: &'a str) -> String {
     bundle.get(key).cloned().unwrap_or_else(|| default.to_string())
+}
+
+/// Prefix of the `Display` rendering of
+/// [`issuerd_core::PasswordPolicyError`], which wraps every violation as
+/// `[code] message` segments joined by `"; "`.
+const POLICY_ENVELOPE_PREFIX: &str = "password policy violation: ";
+
+/// Localize one password-policy violation message, identified by its stable
+/// machine-readable `code` when the caller has it (the `[code] message`
+/// envelope segments), or by the bare message shape otherwise. Unknown codes
+/// and shapes pass through unchanged.
+fn localize_policy_text(bundle: &MessageBundle, code: Option<&str>, message: &str) -> String {
+    let key = match code {
+        Some("min_length") => Some("error.passwordMinLength"),
+        Some("max_length") => Some("error.passwordMaxLength"),
+        Some("require_digits") => Some("error.passwordRequireDigits"),
+        Some("require_lower") => Some("error.passwordRequireLower"),
+        Some("require_upper") => Some("error.passwordRequireUpper"),
+        Some("require_special") => Some("error.passwordRequireSpecial"),
+        Some("not_username") => Some("error.passwordNotUsername"),
+        Some("not_email") => Some("error.passwordNotEmail"),
+        Some(_) => None,
+        None => match message {
+            "password must contain at least one digit" => Some("error.passwordRequireDigits"),
+            "password must contain at least one lowercase letter" => {
+                Some("error.passwordRequireLower")
+            }
+            "password must contain at least one uppercase letter" => {
+                Some("error.passwordRequireUpper")
+            }
+            "password must contain at least one special character" => {
+                Some("error.passwordRequireSpecial")
+            }
+            "password must not be equal to the username" => Some("error.passwordNotUsername"),
+            "password must not be equal to the email address" => Some("error.passwordNotEmail"),
+            _ if message.starts_with("password must be at least ")
+                && message.ends_with(" characters long") =>
+            {
+                Some("error.passwordMinLength")
+            }
+            _ if message.starts_with("password must be at most ")
+                && message.ends_with(" characters long") =>
+            {
+                Some("error.passwordMaxLength")
+            }
+            _ => None,
+        },
+    };
+    match key {
+        Some("error.passwordMinLength") => {
+            // Off-shape message with a known code (cannot happen with today's
+            // policy): never substitute an empty count — fall back to raw.
+            match message
+                .strip_prefix("password must be at least ")
+                .and_then(|s| s.strip_suffix(" characters long"))
+            {
+                Some(count) => msg(
+                    bundle,
+                    "error.passwordMinLength",
+                    "password must be at least {count} characters long",
+                )
+                .replace("{count}", count),
+                None => message.to_string(),
+            }
+        }
+        Some("error.passwordMaxLength") => {
+            match message
+                .strip_prefix("password must be at most ")
+                .and_then(|s| s.strip_suffix(" characters long"))
+            {
+                Some(count) => msg(
+                    bundle,
+                    "error.passwordMaxLength",
+                    "password must be at most {count} characters long",
+                )
+                .replace("{count}", count),
+                None => message.to_string(),
+            }
+        }
+        Some(key) => msg(bundle, key, message),
+        None => message.to_string(),
+    }
+}
+
+/// Map a known, stable error string produced by the flow engine
+/// (`issuerd-auth-flow`: registration validation, required-action failures)
+/// or by password-policy validation to its localized bundle equivalent.
+///
+/// Known strings map to `error.*` keys; the `{field}`/`{count}`-style
+/// placeholders carry through the dynamic parts of the source string.
+/// Password-policy errors arrive either as bare violation messages or wrapped
+/// in the `password policy violation: [code] message; ...` display envelope —
+/// both shapes are handled. Unknown strings pass through unchanged.
+pub fn localize_error(bundle: &MessageBundle, raw: &str) -> String {
+    let key = match raw {
+        "passwords do not match" => Some("error.passwordsDoNotMatch"),
+        "email already in use" => Some("error.emailInUse"),
+        "username already in use" => Some("error.usernameInUse"),
+        "First name is required." => Some("error.firstNameRequired"),
+        "Last name is required." => Some("error.lastNameRequired"),
+        "missing authenticator code" => Some("error.missingAuthenticatorCode"),
+        "Invalid authenticator code" => Some("error.invalidAuthenticatorCode"),
+        "the external directory for this user does not accept password changes" => {
+            Some("error.directoryReadOnly")
+        }
+        _ => None,
+    };
+    if let Some(key) = key {
+        return msg(bundle, key, raw);
+    }
+    // Registration form fields embed the field name: "{field} is required".
+    if let Some(field) = raw.strip_suffix(" is required") {
+        if !field.is_empty() {
+            return msg(bundle, "error.fieldRequired", "{field} is required")
+                .replace("{field}", field);
+        }
+    }
+    if let Some(envelope) = raw.strip_prefix(POLICY_ENVELOPE_PREFIX) {
+        return envelope
+            .split("; ")
+            .map(|segment| match segment.split_once(']') {
+                Some((code, message)) if code.starts_with('[') => {
+                    localize_policy_text(bundle, Some(code[1..].trim()), message.trim())
+                }
+                _ => segment.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+    }
+    localize_policy_text(bundle, None, raw)
 }
 
 #[cfg(test)]
@@ -283,6 +427,92 @@ mod tests {
     fn unknown_locale_falls_back_to_english_bundle() {
         let bundle = message_bundle(None, None, "fr-FR");
         assert_eq!(bundle.get("login.title").map(String::as_str), Some("Sign In"));
+    }
+
+    #[test]
+    fn message_bundle_without_theme_reads_default_theme_dir() {
+        // A `None` theme falls back to the default theme directory, matching
+        // the theme asset handler: `themes/issuerd/messages_fr.json` applies
+        // without any realm theme setting.
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd-i18n-test-{}", issuerd_core::utils::generate_id()));
+        let theme_dir = dir.join(crate::routes::theme::DEFAULT_THEME);
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(theme_dir.join("messages_fr.json"), r#"{"login.title":"Connexion FR"}"#)
+            .unwrap();
+
+        let bundle = message_bundle(Some(&dir), None, "fr");
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Connexion FR"));
+        // Untouched keys still fall back to the built-in English text.
+        assert_eq!(bundle.get("consent.allow").map(String::as_str), Some("Allow"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn message_bundle_named_theme_still_wins() {
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd-i18n-test-{}", issuerd_core::utils::generate_id()));
+        let default_dir = dir.join(crate::routes::theme::DEFAULT_THEME);
+        let custom_dir = dir.join("custom");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        std::fs::write(default_dir.join("messages_en.json"), r#"{"login.title":"Default"}"#)
+            .unwrap();
+        std::fs::write(custom_dir.join("messages_en.json"), r#"{"login.title":"Custom"}"#).unwrap();
+
+        let bundle = message_bundle(Some(&dir), Some("custom"), "en");
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Custom"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn localize_error_maps_known_flow_engine_strings() {
+        let mut bundle = MessageBundle::new();
+        bundle.insert("error.passwordsDoNotMatch".to_string(), "PASS-MISMATCH".to_string());
+        bundle.insert("error.fieldRequired".to_string(), "{field} fehlt".to_string());
+
+        assert_eq!(localize_error(&bundle, "passwords do not match"), "PASS-MISMATCH");
+        // Placeholder: the dynamic field name is carried into the template.
+        assert_eq!(localize_error(&bundle, "username is required"), "username fehlt");
+        assert_eq!(localize_error(&bundle, "first name is required"), "first name fehlt");
+        // Unknown strings pass through unchanged.
+        assert_eq!(localize_error(&bundle, "something else entirely"), "something else entirely");
+    }
+
+    #[test]
+    fn localize_error_defaults_to_the_english_text() {
+        // Without a bundle override the known English text comes back as-is.
+        let bundle = builtin_bundle("en").unwrap();
+        assert_eq!(localize_error(&bundle, "passwords do not match"), "passwords do not match");
+        assert_eq!(localize_error(&bundle, "email already in use"), "email already in use");
+        assert_eq!(localize_error(&bundle, "username is required"), "username is required");
+    }
+
+    #[test]
+    fn localize_error_maps_password_policy_messages() {
+        let mut bundle = MessageBundle::new();
+        bundle.insert("error.passwordRequireDigits".to_string(), "DIGITS".to_string());
+        bundle.insert(
+            "error.passwordMinLength".to_string(),
+            "mindestens {count} Zeichen".to_string(),
+        );
+
+        // Bare violation messages (the reset page joins them directly).
+        assert_eq!(localize_error(&bundle, "password must contain at least one digit"), "DIGITS");
+        assert_eq!(
+            localize_error(&bundle, "password must be at least 8 characters long"),
+            "mindestens 8 Zeichen"
+        );
+
+        // The PasswordPolicyError display envelope keeps its shape, with each
+        // `[code] message` segment localized; unknown segments pass through.
+        let wrapped = "password policy violation: [min_length] password must be at least 12 \
+                       characters long; [require_digits] password must contain at least one digit";
+        assert_eq!(localize_error(&bundle, wrapped), "mindestens 12 Zeichen; DIGITS");
+        let mixed = "password policy violation: [custom_rule] bespoke rule text";
+        assert_eq!(localize_error(&bundle, mixed), "bespoke rule text");
     }
 
     #[test]

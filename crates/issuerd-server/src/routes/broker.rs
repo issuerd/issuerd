@@ -66,7 +66,9 @@ use tracing::{info, instrument, warn};
 
 use super::login_api::complete_login_with_method;
 use super::oidc::{flow_cookie_header, has_flow_cookie, pending_auth_cache_key, PendingAuthData};
-use super::required_actions::{error_banner, error_response, page, url_path_segment};
+use super::required_actions::{
+    accept_language, error_banner, error_response, page, url_path_segment, PageCopy,
+};
 use crate::broker::{exchange_code_for_identity, resolve_idp_endpoints};
 use crate::middleware::proxy_ip::ClientIp;
 use crate::middleware::realm::ResolvedRealm;
@@ -149,38 +151,73 @@ async fn load_broker_target(
     state: &Arc<ServerState>,
     realm_segment: &Option<String>,
     alias: &str,
+    accept_language: Option<&str>,
 ) -> Result<(Realm, IdentityProviderConfig), Response> {
     let realm_name = match realm_segment.as_deref() {
         Some(r) => r,
-        None => return Err(error_response(StatusCode::BAD_REQUEST, "missing realm")),
+        None => {
+            let copy = PageCopy::fallback(state);
+            return Err(error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.missingRealm", "missing realm"),
+            ));
+        }
     };
     let realm = match state.resolve_realm(realm_name).await {
         Ok(Some(r)) if r.enabled => r,
-        _ => return Err(error_response(StatusCode::BAD_REQUEST, "unknown realm")),
+        _ => {
+            let copy = PageCopy::fallback(state);
+            return Err(error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.unknownRealm", "unknown realm"),
+            ));
+        }
     };
+    let copy = PageCopy::for_realm(state, &realm, None, accept_language);
     let idp = match state.storage.get_identity_provider_by_alias(&realm.id, alias).await {
         Ok(Some(idp)) => idp,
-        _ => return Err(error_response(StatusCode::NOT_FOUND, "unknown identity provider")),
+        _ => {
+            return Err(error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("broker.unknownIdp", "unknown identity provider"),
+            ))
+        }
     };
     let settings = BrokerIdpSettings::new(&idp);
     if !idp.enabled || !settings.is_broker_provider() {
         return Err(error_response(
+            &copy,
             StatusCode::BAD_REQUEST,
-            "this identity provider is not available for sign-in",
+            &copy.msg(
+                "broker.idpNotAvailable",
+                "this identity provider is not available for sign-in",
+            ),
         ));
     }
     let problems = settings.validate();
     if !problems.is_empty() {
         warn!(realm = %realm.id, alias, problems = ?problems, "identity provider is misconfigured");
         return Err(error_response(
+            &copy,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "this identity provider is not configured correctly",
+            &copy.msg(
+                "broker.idpMisconfigured",
+                "this identity provider is not configured correctly",
+            ),
         ));
     }
     Ok((realm, idp))
 }
 
-fn error_redirect_to_login(realm_segment: &str, flow_id: Option<&str>, error: &str) -> Response {
+fn error_redirect_to_login(
+    copy: &PageCopy,
+    realm_segment: &str,
+    flow_id: Option<&str>,
+    error: &str,
+) -> Response {
     if let Some(flow) = flow_id {
         let url = format!(
             "/login.html?execution_id={}&realm={}&error={}",
@@ -190,7 +227,7 @@ fn error_redirect_to_login(realm_segment: &str, flow_id: Option<&str>, error: &s
         );
         return Redirect::to(&url).into_response();
     }
-    error_response(StatusCode::BAD_REQUEST, error)
+    error_response(copy, StatusCode::BAD_REQUEST, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -205,11 +242,13 @@ pub async fn broker_login_handler(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (realm, idp) = match load_broker_target(&state, &realm_segment, &alias).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let (realm, idp) =
+        match load_broker_target(&state, &realm_segment, &alias, accept_language(&headers)).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let realm_segment = realm_segment.unwrap_or_default();
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
 
     // Mode selection: pending login flow, or an account-linking token.
     let flow_id = params.get("flow").cloned();
@@ -231,8 +270,12 @@ pub async fn broker_login_handler(
                 }
                 Ok(_) | Err(_) => {
                     return error_response(
+                        &copy,
                         StatusCode::BAD_REQUEST,
-                        "the account-linking link is invalid or has expired",
+                        &copy.msg(
+                            "broker.linkTokenInvalid",
+                            "the account-linking link is invalid or has expired",
+                        ),
                     )
                 }
             }
@@ -248,15 +291,23 @@ pub async fn broker_login_handler(
                 let exists = matches!(state.cache.get(&key).await, Ok(Some(_)));
                 if !exists || !has_flow_cookie(&headers, flow) {
                     return error_response(
+                        &copy,
                         StatusCode::BAD_REQUEST,
-                        "the sign-in session has expired — please start again",
+                        &copy.msg(
+                            "broker.sessionExpired",
+                            "the sign-in session has expired — please start again",
+                        ),
                     );
                 }
             }
             None => {
                 return error_response(
+                    &copy,
                     StatusCode::BAD_REQUEST,
-                    "missing sign-in session (flow) or linking token (link)",
+                    &copy.msg(
+                        "broker.sessionMissing",
+                        "missing sign-in session (flow) or linking token (link)",
+                    ),
                 );
             }
         }
@@ -267,8 +318,9 @@ pub async fn broker_login_handler(
         Err(e) => {
             warn!(realm = %realm.id, alias, error = %e, "cannot resolve IdP endpoints");
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "the identity provider could not be reached",
+                &copy.msg("broker.idpUnreachable", "the identity provider could not be reached"),
             );
         }
     };
@@ -302,8 +354,9 @@ pub async fn broker_login_handler(
         Ok(u) => u,
         Err(_) => {
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "the identity provider is misconfigured",
+                &copy.msg("broker.idpUrlMisconfigured", "the identity provider is misconfigured"),
             );
         }
     };
@@ -360,11 +413,13 @@ async fn endpoint_inner(
     params: HashMap<String, String>,
     headers: HeaderMap,
 ) -> Response {
-    let (realm, idp) = match load_broker_target(&state, &realm_segment, &alias).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let (realm, idp) =
+        match load_broker_target(&state, &realm_segment, &alias, accept_language(&headers)).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let realm_segment = realm_segment.unwrap_or_default();
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
 
     // The state key identifies (and authenticates) the round-trip. The entry
     // is read WITHOUT consuming it first: the browser-correlation check below
@@ -378,8 +433,12 @@ async fn endpoint_inner(
         };
     let Some(broker_state) = broker_state else {
         return error_response(
+            &copy,
             StatusCode::BAD_REQUEST,
-            "the sign-in session is invalid or has expired — please start again",
+            &copy.msg(
+                "broker.sessionInvalid",
+                "the sign-in session is invalid or has expired — please start again",
+            ),
         );
     };
 
@@ -393,8 +452,12 @@ async fn endpoint_inner(
     if let Some(flow) = broker_state.flow_id.as_deref() {
         if !has_flow_cookie(&headers, flow) {
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "the sign-in session is invalid or has expired — please start again",
+                &copy.msg(
+                    "broker.sessionInvalid",
+                    "the sign-in session is invalid or has expired — please start again",
+                ),
             );
         }
     }
@@ -406,8 +469,12 @@ async fn endpoint_inner(
         Ok(Some(_))
     ) {
         return error_response(
+            &copy,
             StatusCode::BAD_REQUEST,
-            "the sign-in session is invalid or has expired — please start again",
+            &copy.msg(
+                "broker.sessionInvalid",
+                "the sign-in session is invalid or has expired — please start again",
+            ),
         );
     }
 
@@ -416,14 +483,19 @@ async fn endpoint_inner(
         let description = params.get("error_description").cloned().unwrap_or_else(|| error.clone());
         info!(realm = %realm.id, alias, error = %issuerd_core::utils::sanitize_log_str(&description), "identity provider returned an error");
         return error_redirect_to_login(
+            &copy,
             &realm_segment,
             broker_state.flow_id.as_deref(),
-            "identity_provider_error",
+            &copy.msg("broker.idpError", "identity_provider_error"),
         );
     }
 
     let Some(code) = params.get("code").cloned().filter(|c| !c.is_empty()) else {
-        return error_response(StatusCode::BAD_REQUEST, "the provider sent no authorization code");
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.noAuthCode", "the provider sent no authorization code"),
+        );
     };
 
     let endpoints = match resolve_idp_endpoints(&state, &realm.id, &idp).await {
@@ -431,8 +503,9 @@ async fn endpoint_inner(
         Err(e) => {
             warn!(realm = %realm.id, alias, error = %e, "cannot resolve IdP endpoints");
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "the identity provider could not be reached",
+                &copy.msg("broker.idpUnreachable", "the identity provider could not be reached"),
             );
         }
     };
@@ -453,9 +526,10 @@ async fn endpoint_inner(
         Err(e) => {
             warn!(realm = %realm.id, alias, error = %e, "brokered code exchange failed");
             return error_redirect_to_login(
+                &copy,
                 &realm_segment,
                 broker_state.flow_id.as_deref(),
-                "identity_provider_error",
+                &copy.msg("broker.idpError", "identity_provider_error"),
             );
         }
     };
@@ -478,6 +552,7 @@ async fn endpoint_inner(
         &state,
         &realm,
         &idp,
+        &copy,
         &realm_segment,
         broker_state,
         identity,
@@ -585,13 +660,18 @@ async fn finish_login(
     state: &Arc<ServerState>,
     realm: &Realm,
     idp: &IdentityProviderConfig,
+    copy: &PageCopy,
     realm_segment: &str,
     broker_state: BrokerState,
     identity: BrokeredIdentity,
     external_refresh_token: Option<String>,
 ) -> Response {
     let Some(flow_id) = broker_state.flow_id.clone() else {
-        return error_response(StatusCode::BAD_REQUEST, "missing sign-in session");
+        return error_response(
+            copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.missingSession", "missing sign-in session"),
+        );
     };
     // Consume the pending browser flow: a completed broker callback ends it.
     let key = pending_auth_cache_key(&realm.id, &flow_id);
@@ -601,9 +681,22 @@ async fn finish_login(
     };
     let Some(pending) = pending else {
         return error_response(
+            copy,
             StatusCode::BAD_REQUEST,
-            "the sign-in session has expired — please start again",
+            &copy.msg(
+                "broker.sessionExpired",
+                "the sign-in session has expired — please start again",
+            ),
         );
+    };
+    // The locale pinned on the flow at the authorize endpoint beats the
+    // caller's header-derived copy for everything rendered from here on.
+    let pinned_copy;
+    let copy = if pending.locale.is_some() {
+        pinned_copy = PageCopy::for_realm(state, realm, pending.locale.as_deref(), None);
+        &pinned_copy
+    } else {
+        copy
     };
     let alias = idp.alias.to_string();
 
@@ -619,13 +712,21 @@ async fn finish_login(
                 _ => {
                     warn!(realm = %realm.id, alias, "identity provider link points at a missing user");
                     return error_response(
+                        copy,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "account link is broken — please contact an administrator",
+                        &copy.msg(
+                            "broker.brokenLink",
+                            "account link is broken — please contact an administrator",
+                        ),
                     );
                 }
             };
             if !user.enabled {
-                return error_response(StatusCode::FORBIDDEN, "this account is disabled");
+                return error_response(
+                    copy,
+                    StatusCode::FORBIDDEN,
+                    &copy.msg("broker.accountDisabled", "this account is disabled"),
+                );
             }
             // Mappers re-apply per the sync mode; the stored token (if any)
             // is written at link-creation time only.
@@ -637,7 +738,11 @@ async fn finish_login(
         Ok(None) => {}
         Err(e) => {
             warn!(error = %e, "link lookup failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed");
+            return error_response(
+                copy,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &copy.msg("broker.signInFailed", "sign-in failed"),
+            );
         }
     }
 
@@ -647,7 +752,11 @@ async fn finish_login(
             Ok(u) => u,
             Err(e) => {
                 warn!(error = %e, "email lookup failed");
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed");
+                return error_response(
+                    copy,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &copy.msg("broker.signInFailed", "sign-in failed"),
+                );
             }
         },
         None => None,
@@ -664,7 +773,11 @@ async fn finish_login(
         FirstBrokerLoginDecision::AutoLink => {
             let existing = conflicting_user.expect("conflict implies an existing user");
             if !existing.enabled {
-                return error_response(StatusCode::FORBIDDEN, "this account is disabled");
+                return error_response(
+                    copy,
+                    StatusCode::FORBIDDEN,
+                    &copy.msg("broker.accountDisabled", "this account is disabled"),
+                );
             }
             let link = IdentityProviderLink {
                 user_id: existing.id.clone(),
@@ -676,7 +789,11 @@ async fn finish_login(
             };
             if let Err(e) = state.storage.create_identity_provider_link(&realm.id, &link).await {
                 warn!(error = %e, "auto-link failed");
-                return error_response(StatusCode::CONFLICT, "account link failed");
+                return error_response(
+                    copy,
+                    StatusCode::CONFLICT,
+                    &copy.msg("broker.linkFailed", "account link failed"),
+                );
             }
             finalize_brokered_login(state, realm, idp, pending, existing, &identity, true).await
         }
@@ -697,12 +814,24 @@ async fn finish_login(
                 Ok(u) => u,
                 Err(e) => {
                     warn!(error = %e, "brokered user creation failed");
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed");
+                    return error_response(
+                        copy,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &copy.msg("broker.signInFailed", "sign-in failed"),
+                    );
                 }
             };
             let stored_token = store_tokens.then_some(external_refresh_token).flatten();
-            match create_link_for_new_user(state, realm, &alias, &identity, &user, stored_token)
-                .await
+            match create_link_for_new_user(
+                state,
+                realm,
+                &alias,
+                &identity,
+                &user,
+                stored_token,
+                copy,
+            )
+            .await
             {
                 Ok(()) => {
                     finalize_brokered_login(state, realm, idp, pending, user, &identity, false)
@@ -965,6 +1094,7 @@ async fn create_brokered_user(
 /// `external_refresh_token` argument must already have the `storeTokens`
 /// config applied by the caller (None = not stored).
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn create_link_for_new_user(
     state: &Arc<ServerState>,
     realm: &Realm,
@@ -972,6 +1102,7 @@ async fn create_link_for_new_user(
     identity: &BrokeredIdentity,
     user: &User,
     external_refresh_token: Option<String>,
+    copy: &PageCopy,
 ) -> Result<(), Response> {
     let link = IdentityProviderLink {
         user_id: user.id.clone(),
@@ -986,7 +1117,11 @@ async fn create_link_for_new_user(
         Err(e) => {
             warn!(error = %e, "link creation for new user failed; rolling back user");
             let _ = state.storage.delete_user(&realm.id, &user.id).await;
-            Err(error_response(StatusCode::CONFLICT, "this external account is already linked"))
+            Err(error_response(
+                copy,
+                StatusCode::CONFLICT,
+                &copy.msg("broker.alreadyLinked", "this external account is already linked"),
+            ))
         }
     }
 }
@@ -1035,18 +1170,44 @@ pub async fn first_broker_login_page(
     State(state): State<Arc<ServerState>>,
     axum::extract::Extension(ResolvedRealm(realm_segment)): axum::extract::Extension<ResolvedRealm>,
     Path((_realm, execution)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(realm_segment) = realm_segment else {
-        return error_response(StatusCode::BAD_REQUEST, "missing realm");
+        let copy = PageCopy::fallback(&state);
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.missingRealm", "missing realm"),
+        );
     };
     let realm = match state.resolve_realm(&realm_segment).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::BAD_REQUEST, "unknown realm"),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.unknownRealm", "unknown realm"),
+            );
+        }
     };
-    let Some(entry) = load_first_login_entry(&state, &realm.id, &execution).await else {
+    // The flow-pinned locale (set at the authorize endpoint) wins over the
+    // browser header when the entry exists.
+    let entry = load_first_login_entry(&state, &realm.id, &execution).await;
+    let copy = PageCopy::for_realm(
+        &state,
+        &realm,
+        entry.as_ref().and_then(|e| e.pending.locale.as_deref()),
+        accept_language(&headers),
+    );
+    let Some(entry) = entry else {
         return error_response(
+            &copy,
             StatusCode::BAD_REQUEST,
-            "the sign-in session has expired — please start again",
+            &copy.msg(
+                "broker.sessionExpired",
+                "the sign-in session has expired — please start again",
+            ),
         );
     };
     let banner = error_banner(entry.error.as_deref());
@@ -1055,23 +1216,33 @@ pub async fn first_broker_login_page(
 
     if entry.mode == "link" {
         let email = crate::email::html_escape(id.email.as_deref().unwrap_or_default());
+        let title = copy.msg("broker.linkTitle", "Link your account");
+        let lead = copy
+            .msg(
+                "broker.linkLead",
+                "An account with the email address <b>{email}</b> already exists. \
+                 To link your <b>{provider}</b> identity to it, confirm the account password.",
+            )
+            .replace("{email}", &email)
+            .replace("{provider}", &crate::email::html_escape(&entry.alias));
+        let password_label = copy.msg("register.passwordLabel", "Password");
+        let link_submit = copy.msg("broker.linkSubmit", "Link account");
+        let create_instead = copy.msg("broker.createInstead", "Create a separate account instead");
         let body = format!(
-            "<h1>Link your account</h1>\
-             <p>An account with the email address <b>{email}</b> already exists. \
-             To link your <b>{}</b> identity to it, confirm the account password.</p>\
+            "<h1>{title}</h1>\
+             <p>{lead}</p>\
              {banner}\
              <form method=\"post\" action=\"{action}\">\
-             <label for=\"password\">Password</label>\
+             <label for=\"password\">{password_label}</label>\
              <input type=\"password\" id=\"password\" name=\"password\" required autofocus>\
-             <button type=\"submit\" name=\"action\" value=\"link\">Link account</button>\
+             <button type=\"submit\" name=\"action\" value=\"link\">{link_submit}</button>\
              </form>\
              <form method=\"post\" action=\"{action}\">\
              <button type=\"submit\" name=\"action\" value=\"create\" class=\"secondary\">\
-             Create a separate account instead</button>\
+             {create_instead}</button>\
              </form>",
-            crate::email::html_escape(&entry.alias),
         );
-        return page("Link your account", &body).into_response();
+        return page(&title, &body, &copy.lang).into_response();
     }
 
     // Review mode: prefilled, editable profile.
@@ -1079,25 +1250,36 @@ pub async fn first_broker_login_page(
     let email = crate::email::html_escape(id.email.as_deref().unwrap_or_default());
     let first = crate::email::html_escape(id.first_name.as_deref().unwrap_or_default());
     let last = crate::email::html_escape(id.last_name.as_deref().unwrap_or_default());
+    let title = copy.msg("broker.reviewTitle", "Review your profile");
+    let lead = copy
+        .msg(
+            "broker.reviewLead",
+            "You are signing in via <b>{provider}</b>. Review and complete your profile to finish.",
+        )
+        .replace("{provider}", &crate::email::html_escape(&entry.alias));
+    let username_label = copy.msg("register.usernameLabel", "Username");
+    let email_label = copy.msg("register.emailLabel", "Email");
+    let first_label = copy.msg("register.firstNameLabel", "First name");
+    let last_label = copy.msg("register.lastNameLabel", "Last name");
+    let submit = copy.msg("broker.reviewSubmit", "Continue");
     let body = format!(
-        "<h1>Review your profile</h1>\
-         <p>You are signing in via <b>{}</b>. Review and complete your profile to finish.</p>\
+        "<h1>{title}</h1>\
+         <p>{lead}</p>\
          {banner}\
          <form method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"action\" value=\"review\">\
-         <label for=\"username\">Username</label>\
+         <label for=\"username\">{username_label}</label>\
          <input type=\"text\" id=\"username\" name=\"username\" value=\"{username}\" required>\
-         <label for=\"email\">Email</label>\
+         <label for=\"email\">{email_label}</label>\
          <input type=\"email\" id=\"email\" name=\"email\" value=\"{email}\">\
-         <label for=\"first_name\">First name</label>\
+         <label for=\"first_name\">{first_label}</label>\
          <input type=\"text\" id=\"first_name\" name=\"first_name\" value=\"{first}\">\
-         <label for=\"last_name\">Last name</label>\
+         <label for=\"last_name\">{last_label}</label>\
          <input type=\"text\" id=\"last_name\" name=\"last_name\" value=\"{last}\">\
-         <button type=\"submit\">Continue</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>",
-        crate::email::html_escape(&entry.alias),
     );
-    page("Review your profile", &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 /// POST /realms/{realm}/broker/first-login/{execution}
@@ -1110,14 +1292,31 @@ pub async fn first_broker_login_submit(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let Some(realm_segment) = realm_segment else {
-        return error_response(StatusCode::BAD_REQUEST, "missing realm");
+        let copy = PageCopy::fallback(&state);
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.missingRealm", "missing realm"),
+        );
     };
     let realm = match state.resolve_realm(&realm_segment).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::BAD_REQUEST, "unknown realm"),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.unknownRealm", "unknown realm"),
+            );
+        }
     };
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
     if !has_flow_cookie(&headers, &execution) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid sign-in session");
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.invalidSession", "invalid sign-in session"),
+        );
     }
     // Consume atomically; any retryable failure re-stores the entry.
     let entry: Option<BrokerFirstLoginData> =
@@ -1127,14 +1326,32 @@ pub async fn first_broker_login_submit(
         };
     let Some(mut entry) = entry else {
         return error_response(
+            &copy,
             StatusCode::BAD_REQUEST,
-            "the sign-in session has expired — please start again",
+            &copy.msg(
+                "broker.sessionExpired",
+                "the sign-in session has expired — please start again",
+            ),
         );
     };
+    // The flow-pinned locale (set at the authorize endpoint) wins over the
+    // browser header.
+    let copy = PageCopy::for_realm(
+        &state,
+        &realm,
+        entry.pending.locale.as_deref(),
+        accept_language(&headers),
+    );
 
     let idp = match state.storage.get_identity_provider_by_alias(&realm.id, &entry.alias).await {
         Ok(Some(idp)) if idp.enabled => idp,
-        _ => return error_response(StatusCode::BAD_REQUEST, "unknown identity provider"),
+        _ => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.unknownIdp", "unknown identity provider"),
+            )
+        }
     };
 
     /// Retry: re-store the entry with an error banner and PRG back to GET.
@@ -1154,6 +1371,7 @@ pub async fn first_broker_login_submit(
             link_via_password_submit(
                 &state,
                 &realm,
+                &copy,
                 &realm_segment,
                 &execution,
                 &ip,
@@ -1175,16 +1393,19 @@ pub async fn first_broker_login_submit(
             let username = form.get("username").cloned().unwrap_or_default();
             let username = username.trim().to_string();
             if Username::new(&username).is_err() {
-                retry!(entry, "a valid username is required");
+                retry!(entry, copy.msg("broker.usernameRequired", "a valid username is required"));
             }
             if matches!(state.storage.get_user_by_username(&realm.id, &username).await, Ok(Some(_)))
             {
-                retry!(entry, "that username is already taken");
+                retry!(entry, copy.msg("broker.usernameTaken", "that username is already taken"));
             }
             let email = form.get("email").map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
             if let Some(ref email) = email {
                 if Email::new(email).is_err() {
-                    retry!(entry, "a valid email address is required");
+                    retry!(
+                        entry,
+                        copy.msg("broker.emailRequired", "a valid email address is required")
+                    );
                 }
                 if !realm.duplicate_emails_allowed
                     && matches!(
@@ -1192,7 +1413,10 @@ pub async fn first_broker_login_submit(
                         Ok(Some(_))
                     )
                 {
-                    retry!(entry, "that email address is already in use");
+                    retry!(
+                        entry,
+                        copy.msg("broker.emailTaken", "that email address is already in use")
+                    );
                 }
             }
             let user = match create_brokered_user(
@@ -1210,7 +1434,11 @@ pub async fn first_broker_login_submit(
                 Ok(u) => u,
                 Err(e) => {
                     warn!(error = %e, "brokered user creation failed");
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed");
+                    return error_response(
+                        &copy,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &copy.msg("broker.signInFailed", "sign-in failed"),
+                    );
                 }
             };
             // The entry's token already encodes the storeTokens decision.
@@ -1221,6 +1449,7 @@ pub async fn first_broker_login_submit(
                 &entry.identity,
                 &user,
                 entry.external_refresh_token.clone(),
+                &copy,
             )
             .await
             {
@@ -1281,6 +1510,7 @@ async fn emit_link_login_error(
 async fn link_via_password_submit(
     state: &Arc<ServerState>,
     realm: &Realm,
+    copy: &PageCopy,
     realm_segment: &str,
     execution: &str,
     ip: &std::net::IpAddr,
@@ -1299,16 +1529,38 @@ async fn link_via_password_submit(
     }
 
     let Some(existing_id) = entry.existing_user_id.clone() else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid link state");
+        return error_response(
+            copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("broker.invalidLinkState", "invalid link state"),
+        );
     };
     let existing_id_typed = match UserId::new(existing_id) {
         Ok(id) => id,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid link state"),
+        Err(_) => {
+            return error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.invalidLinkState", "invalid link state"),
+            )
+        }
     };
     let user = match state.storage.get_user(&realm.id, &existing_id_typed).await {
         Ok(Some(u)) if u.enabled => u,
-        Ok(Some(_)) => return error_response(StatusCode::FORBIDDEN, "this account is disabled"),
-        _ => return error_response(StatusCode::BAD_REQUEST, "account not found"),
+        Ok(Some(_)) => {
+            return error_response(
+                copy,
+                StatusCode::FORBIDDEN,
+                &copy.msg("broker.accountDisabled", "this account is disabled"),
+            )
+        }
+        _ => {
+            return error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("broker.accountNotFound", "account not found"),
+            )
+        }
     };
 
     // Brute-force lockout, keyed exactly like the browser login flow
@@ -1328,7 +1580,13 @@ async fn link_via_password_submit(
         if locked {
             warn!(realm = %realm.id, username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), ip = %ip, "broker link-via-password rejected: account temporarily locked");
             emit_link_login_error(state, realm, &entry, &user, ip, "temporarily_locked").await;
-            retry!(entry, "too many failed attempts — the account is temporarily locked");
+            retry!(
+                entry,
+                copy.msg(
+                    "broker.temporarilyLocked",
+                    "too many failed attempts — the account is temporarily locked"
+                )
+            );
         }
     }
 
@@ -1359,11 +1617,15 @@ async fn link_via_password_submit(
         // round-trip) instead of retrying this execution forever.
         if entry.failed_attempts >= realm.max_login_failures.max(1) {
             return error_response(
+                copy,
                 StatusCode::BAD_REQUEST,
-                "too many failed attempts — please start the sign-in again",
+                &copy.msg(
+                    "broker.tooManyAttempts",
+                    "too many failed attempts — please start the sign-in again",
+                ),
             );
         }
-        retry!(entry, "invalid password");
+        retry!(entry, copy.msg("broker.invalidPassword", "invalid password"));
     }
 
     // A good password clears the shared failure counter, exactly like a
@@ -1385,7 +1647,11 @@ async fn link_via_password_submit(
     };
     if let Err(e) = state.storage.create_identity_provider_link(&realm.id, &link).await {
         warn!(error = %e, "link-via-password failed");
-        return error_response(StatusCode::CONFLICT, "this external account is already linked");
+        return error_response(
+            copy,
+            StatusCode::CONFLICT,
+            &copy.msg("broker.alreadyLinked", "this external account is already linked"),
+        );
     }
     finalize_brokered_login(state, realm, idp, entry.pending, user, &entry.identity, true).await
 }
@@ -1717,7 +1983,7 @@ mod tests {
         let realm_id = master_realm_id();
         seed_broker_idp(&storage, &realm_id).await;
 
-        let (realm, idp) = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+        let (realm, idp) = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS, None)
             .await
             .expect("enabled realm + enabled broker IdP must load");
         assert_eq!(realm.name.as_str(), MASTER);
@@ -1727,7 +1993,7 @@ mod tests {
     #[tokio::test]
     async fn load_broker_target_missing_realm_segment_rejected() {
         let (state, _storage, _cache) = test_state().await;
-        let err = load_broker_target(&state, &None, IDP_ALIAS)
+        let err = load_broker_target(&state, &None, IDP_ALIAS, None)
             .await
             .expect_err("missing realm segment must fail");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -1737,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn load_broker_target_unknown_realm_rejected() {
         let (state, _storage, _cache) = test_state().await;
-        let err = load_broker_target(&state, &Some("no-such-realm".to_string()), IDP_ALIAS)
+        let err = load_broker_target(&state, &Some("no-such-realm".to_string()), IDP_ALIAS, None)
             .await
             .expect_err("unknown realm must fail");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -1756,7 +2022,7 @@ mod tests {
         };
         storage.create_realm(&locked).await.unwrap();
 
-        let err = load_broker_target(&state, &Some("locked".to_string()), IDP_ALIAS)
+        let err = load_broker_target(&state, &Some("locked".to_string()), IDP_ALIAS, None)
             .await
             .expect_err("disabled realm must fail");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -1766,7 +2032,7 @@ mod tests {
     #[tokio::test]
     async fn load_broker_target_unknown_alias_rejected() {
         let (state, _storage, _cache) = test_state().await;
-        let err = load_broker_target(&state, &Some(MASTER.to_string()), "no-such-idp")
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), "no-such-idp", None)
             .await
             .expect_err("unknown alias must fail");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -1781,7 +2047,7 @@ mod tests {
         idp.enabled = false;
         storage.create_identity_provider(&realm_id, &idp).await.unwrap();
 
-        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS, None)
             .await
             .expect_err("disabled IdP must fail");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -1796,7 +2062,7 @@ mod tests {
         idp.provider_id = ProviderId::Ldap;
         storage.create_identity_provider(&realm_id, &idp).await.unwrap();
 
-        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS, None)
             .await
             .expect_err("user-federation provider must fail as a broker target");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -1811,7 +2077,7 @@ mod tests {
         idp.config.remove("clientSecret");
         storage.create_identity_provider(&realm_id, &idp).await.unwrap();
 
-        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS)
+        let err = load_broker_target(&state, &Some(MASTER.to_string()), IDP_ALIAS, None)
             .await
             .expect_err("invalid IdP config must fail");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -3300,6 +3566,7 @@ mod tests {
             &state,
             &realm,
             &idp,
+            &PageCopy::builtin("en"),
             MASTER,
             login_broker_state(Some("flow-disabled")),
             broker_identity(),
@@ -3340,6 +3607,7 @@ mod tests {
             &state,
             &realm,
             &idp,
+            &PageCopy::builtin("en"),
             MASTER,
             login_broker_state(Some("flow-force")),
             identity,
@@ -3371,6 +3639,7 @@ mod tests {
             &state,
             &realm,
             &idp,
+            &PageCopy::builtin("en"),
             MASTER,
             login_broker_state(Some("flow-autolink-disabled")),
             broker_identity(),
@@ -3403,6 +3672,7 @@ mod tests {
             &state,
             &realm,
             &idp,
+            &PageCopy::builtin("en"),
             MASTER,
             login_broker_state(Some("flow-autolink-ok")),
             broker_identity(),
@@ -3543,6 +3813,7 @@ mod tests {
             State(state.clone()),
             resolved(MASTER),
             Path((MASTER.to_string(), "exec-page-review".to_string())),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3560,6 +3831,7 @@ mod tests {
             State(state.clone()),
             resolved(MASTER),
             Path((MASTER.to_string(), "exec-page-link".to_string())),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3574,10 +3846,63 @@ mod tests {
             State(state),
             resolved(MASTER),
             Path((MASTER.to_string(), "gone".to_string())),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(body_text(resp).await.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn first_login_page_localizes_via_accept_language() {
+        let (state, _storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        // Realm with i18n enabled and German supported; the direct storage
+        // mutation must drop the realm-name resolution cache (see
+        // `enable_brute_force`).
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.internationalization_enabled = true;
+        realm.supported_locales = vec!["en".to_string(), "de".to_string()];
+        state.storage.update_realm(&realm).await.unwrap();
+        let _ = state.cache.delete(&issuerd_cluster::cache_keys::realm_by_name(MASTER)).await;
+
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, "exec-de", &entry).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ACCEPT_LANGUAGE, "de".parse().unwrap());
+        let resp = first_broker_login_page(
+            State(state.clone()),
+            resolved(MASTER),
+            Path((MASTER.to_string(), "exec-de".to_string())),
+            headers,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        // Built-in German bundle: register.usernameLabel + broker.reviewTitle.
+        assert!(body.contains("<h1>Prüfen Sie Ihr Profil</h1>"), "body: {body}");
+        assert!(body.contains("<label for=\"username\">Benutzername</label>"), "body: {body}");
+
+        // The same request without i18n enabled on the realm stays English.
+        let entry = first_login_entry(&realm_id, "review", None);
+        seed_first_login_entry(&cache, &realm_id, "exec-de-off", &entry).await;
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.internationalization_enabled = false;
+        state.storage.update_realm(&realm).await.unwrap();
+        let _ = state.cache.delete(&issuerd_cluster::cache_keys::realm_by_name(MASTER)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ACCEPT_LANGUAGE, "de".parse().unwrap());
+        let resp = first_broker_login_page(
+            State(state),
+            resolved(MASTER),
+            Path((MASTER.to_string(), "exec-de-off".to_string())),
+            headers,
+        )
+        .await;
+        let body = body_text(resp).await;
+        assert!(body.contains("<html lang=\"en\">"), "body: {body}");
+        assert!(body.contains("<h1>Review your profile</h1>"), "body: {body}");
     }
 
     #[tokio::test]

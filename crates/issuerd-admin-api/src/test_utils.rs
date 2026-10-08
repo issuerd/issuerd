@@ -128,10 +128,39 @@ pub mod tests {
         test_state_with_components(storage_with_master_realm(), roles, broker_client)
     }
 
+    /// Same as [`test_state`] but with a caller-supplied available-locales
+    /// list, so tests can exercise theme-supplied locales in the enum and
+    /// serverinfo payloads.
+    pub fn test_state_with_locales(
+        roles: Vec<issuerd_core::RoleName>,
+        available_locales: Vec<String>,
+    ) -> Arc<AdminApiState> {
+        test_state_full(
+            storage_with_master_realm(),
+            roles,
+            Arc::new(issuerd_core::MockBrokerClient::new()),
+            available_locales,
+        )
+    }
+
     fn test_state_with_components(
         storage: Arc<dyn issuerd_core::Storage>,
         roles: Vec<issuerd_core::RoleName>,
         broker_client: Arc<dyn issuerd_core::BrokerClient>,
+    ) -> Arc<AdminApiState> {
+        test_state_full(
+            storage,
+            roles,
+            broker_client,
+            issuerd_core::i18n::SHIPPED_LOCALES.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    fn test_state_full(
+        storage: Arc<dyn issuerd_core::Storage>,
+        roles: Vec<issuerd_core::RoleName>,
+        broker_client: Arc<dyn issuerd_core::BrokerClient>,
+        available_locales: Vec<String>,
     ) -> Arc<AdminApiState> {
         let mut mock = issuerd_core::MockCryptoProvider::new();
         mock.expect_get_public_keys()
@@ -150,6 +179,8 @@ pub mod tests {
             token_issuer: Arc::new(StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
             base_url: "http://localhost:8080".to_string(),
+            email_bundle: None,
+            available_locales,
         })
     }
 

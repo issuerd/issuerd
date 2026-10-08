@@ -52,3 +52,6 @@ tests/conformance/conformance-suite/
 
 # Python
 __pycache__/
+
+# Theme message bundles are deployment-local content, not repo code
+themes/*/messages_*.json

@@ -36,7 +36,7 @@ use crate::state::ServerState;
 
 use super::login_api::LoginResponse;
 use super::oidc::{flow_cookie_header, has_flow_cookie, PendingAuthData};
-use super::required_actions::{error_banner, error_response, page, url_path_segment};
+use super::required_actions::{error_banner, error_response, page, url_path_segment, PageCopy};
 
 /// Cache TTL for a paused consent continuation (matches pending auth).
 const PENDING_CONSENT_TTL_SECS: u64 = 600;
@@ -191,11 +191,17 @@ async fn load_consent_context(
     state: &Arc<ServerState>,
     realm_name: &str,
     execution: &str,
+    accept_language: Option<&str>,
 ) -> Result<(Realm, PendingConsentData, Client), Response> {
     let realm = match state.resolve_realm(realm_name).await {
         Ok(Some(r)) => r,
         _ => {
-            return Err(error_response(StatusCode::NOT_FOUND, "realm not found"));
+            let copy = PageCopy::fallback(state);
+            return Err(error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("consent.error.realmNotFound", "realm not found"),
+            ));
         }
     };
     let key = pending_consent_cache_key(&realm.id, execution);
@@ -203,26 +209,46 @@ async fn load_consent_context(
         Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
             Ok(e) => e,
             Err(_) => {
-                return Err(error_response(StatusCode::BAD_REQUEST, "invalid consent state"));
+                let copy = PageCopy::for_realm(state, &realm, None, accept_language);
+                return Err(error_response(
+                    &copy,
+                    StatusCode::BAD_REQUEST,
+                    &copy.msg("consent.error.invalidState", "invalid consent state"),
+                ));
             }
         },
         _ => {
+            let copy = PageCopy::for_realm(state, &realm, None, accept_language);
             return Err(error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "consent request expired — please restart the login",
+                &copy.msg(
+                    "consent.error.expired",
+                    "consent request expired — please restart the login",
+                ),
             ));
         }
     };
     let identifier = match issuerd_core::ClientIdentifier::new(&entry.pending.client_id) {
         Ok(id) => id,
         Err(_) => {
-            return Err(error_response(StatusCode::BAD_REQUEST, "invalid client"));
+            let copy = PageCopy::for_realm(state, &realm, entry.pending.locale.as_deref(), None);
+            return Err(error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.invalidClient", "invalid client"),
+            ));
         }
     };
     let client = match state.storage.get_client_by_client_id(&realm.id, &identifier).await {
         Ok(Some(c)) => c,
         _ => {
-            return Err(error_response(StatusCode::BAD_REQUEST, "unknown client"));
+            let copy = PageCopy::for_realm(state, &realm, entry.pending.locale.as_deref(), None);
+            return Err(error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.unknownClient", "unknown client"),
+            ));
         }
     };
     Ok((realm, entry, client))
@@ -232,8 +258,16 @@ async fn load_consent_context(
 pub async fn consent_page(
     State(state): State<Arc<ServerState>>,
     Path((realm_name, execution)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    let (realm, entry, client) = match load_consent_context(&state, &realm_name, &execution).await {
+    let (realm, entry, client) = match load_consent_context(
+        &state,
+        &realm_name,
+        &execution,
+        super::required_actions::accept_language(&headers),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -302,7 +336,7 @@ async fn render_consent_page(
         html_escape(client_display),
         html_escape(&lead),
     );
-    page(&title, &body).into_response()
+    page(&title, &body, &locale).into_response()
 }
 
 /// `POST /realms/{realm}/login/consent/{execution}` — apply the decision.
@@ -315,12 +349,24 @@ pub async fn consent_submit(
     // Login-CSRF: the correlation cookie minted by `begin_consent` must be
     // present (same model as the required-action POST).
     if !has_flow_cookie(&headers, &execution) {
-        return error_response(StatusCode::FORBIDDEN, "missing flow correlation cookie");
+        let copy = PageCopy::fallback(&state);
+        return error_response(
+            &copy,
+            StatusCode::FORBIDDEN,
+            &copy.msg("consent.error.missingFlowCookie", "missing flow correlation cookie"),
+        );
     }
 
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "realm not found"),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("consent.error.realmNotFound", "realm not found"),
+            );
+        }
     };
     let realm_id = realm.id.clone();
 
@@ -330,13 +376,23 @@ pub async fn consent_submit(
         Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
             Ok(e) => e,
             Err(_) => {
-                return error_response(StatusCode::BAD_REQUEST, "invalid consent state");
+                let copy = PageCopy::for_realm(&state, &realm, None, None);
+                return error_response(
+                    &copy,
+                    StatusCode::BAD_REQUEST,
+                    &copy.msg("consent.error.invalidState", "invalid consent state"),
+                );
             }
         },
         _ => {
+            let copy = PageCopy::for_realm(&state, &realm, None, None);
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "consent request expired — please restart the login",
+                &copy.msg(
+                    "consent.error.expired",
+                    "consent request expired — please restart the login",
+                ),
             );
         }
     };
@@ -360,13 +416,25 @@ pub async fn consent_submit(
 
     // Approval: persist the grant (upsert), then resume the paused login. The
     // Consent record keys on the client's INTERNAL id.
-    let (_user, client) = match load_user_and_client(&state, &realm_id, &entry).await {
+    let copy = PageCopy::for_realm(
+        &state,
+        &realm,
+        entry.pending.locale.as_deref(),
+        super::required_actions::accept_language(&headers),
+    );
+    let (_user, client) = match load_user_and_client(&state, &realm_id, &entry, &copy).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     let user_id = match UserId::new(entry.user_id.clone()) {
         Ok(id) => id,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid user"),
+        Err(_) => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.invalidUser", "invalid user"),
+            )
+        }
     };
     let now = chrono::Utc::now();
     let consent = issuerd_core::Consent {
@@ -380,7 +448,11 @@ pub async fn consent_submit(
     };
     if let Err(e) = state.storage.create_consent(&realm_id, &consent).await {
         error!(realm = %realm_id, error = %e, "failed to persist consent grant");
-        entry.error = Some("could not record your choice — please try again".to_string());
+        entry.error =
+            Some(copy.msg(
+                "consent.error.persistFailed",
+                "could not record your choice — please try again",
+            ));
         store_entry(&state, &realm_id, &execution, &entry).await;
         return axum::response::Redirect::to(&continuation_url(&realm_name, &execution))
             .into_response();
@@ -400,10 +472,17 @@ async fn resume_after_consent(
 ) -> Response {
     entry.pending.prompt_consent = false;
     let realm_id = realm.id.clone();
+    let copy = PageCopy::for_realm(state, realm, entry.pending.locale.as_deref(), None);
     let (user_id, session_id) =
         match (UserId::new(entry.user_id.clone()), SessionId::new(entry.session_id.clone())) {
             (Ok(u), Ok(s)) => (u, s),
-            _ => return error_response(StatusCode::BAD_REQUEST, "invalid consent state"),
+            _ => {
+                return error_response(
+                    &copy,
+                    StatusCode::BAD_REQUEST,
+                    &copy.msg("consent.error.invalidState", "invalid consent state"),
+                )
+            }
         };
 
     if !entry.sso_resume {
@@ -424,7 +503,7 @@ async fn resume_after_consent(
     // SSO resume: merge into the (possibly still live) SSO session. If the
     // session expired while the user was deciding, `finish_sso_login` simply
     // creates a fresh one.
-    let (user, client) = match load_user_and_client(state, &realm_id, &entry).await {
+    let (user, client) = match load_user_and_client(state, &realm_id, &entry, &copy).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -450,22 +529,47 @@ async fn load_user_and_client(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     entry: &PendingConsentData,
+    copy: &PageCopy,
 ) -> Result<(User, Client), Response> {
     let user_id = match UserId::new(entry.user_id.clone()) {
         Ok(id) => id,
-        Err(_) => return Err(error_response(StatusCode::BAD_REQUEST, "invalid user")),
+        Err(_) => {
+            return Err(error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.invalidUser", "invalid user"),
+            ))
+        }
     };
     let user = match state.storage.get_user(realm_id, &user_id).await {
         Ok(Some(u)) => u,
-        _ => return Err(error_response(StatusCode::BAD_REQUEST, "invalid user")),
+        _ => {
+            return Err(error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.invalidUser", "invalid user"),
+            ))
+        }
     };
     let identifier = match issuerd_core::ClientIdentifier::new(&entry.pending.client_id) {
         Ok(id) => id,
-        Err(_) => return Err(error_response(StatusCode::BAD_REQUEST, "invalid client")),
+        Err(_) => {
+            return Err(error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.invalidClient", "invalid client"),
+            ))
+        }
     };
     let client = match state.storage.get_client_by_client_id(realm_id, &identifier).await {
         Ok(Some(c)) => c,
-        _ => return Err(error_response(StatusCode::BAD_REQUEST, "unknown client")),
+        _ => {
+            return Err(error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("consent.error.unknownClient", "unknown client"),
+            ))
+        }
     };
     Ok((user, client))
 }
@@ -821,9 +925,12 @@ mod tests {
         ));
         seed_entry(&state, execution, &entry).await;
 
-        let resp =
-            consent_page(State(state.clone()), Path(("master".to_string(), execution.to_string())))
-                .await;
+        let resp = consent_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution.to_string())),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();

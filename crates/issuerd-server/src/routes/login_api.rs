@@ -394,6 +394,14 @@ pub async fn login_handler(
                                     == issuerd_auth_flow::email_code::AUTHENTICATOR_ID
                             },
                         );
+                    // Page copy: the locale pinned at the authorize endpoint,
+                    // else the request's Accept-Language header.
+                    let copy = super::required_actions::PageCopy::for_realm(
+                        &state,
+                        &realm,
+                        pending.locale.as_deref(),
+                        super::required_actions::accept_language(&headers),
+                    );
                     if is_email_code {
                         if is_browser_form {
                             // A resubmitted code that still challenges was
@@ -401,7 +409,9 @@ pub async fn login_handler(
                             let error = if body.resend.is_some() {
                                 None
                             } else {
-                                body.otp.as_ref().map(|_| "Invalid or expired code.")
+                                body.otp.as_ref().map(|_| {
+                                    copy.msg("emailCode.invalidCode", "Invalid or expired code.")
+                                })
                             };
                             let masked = masked_email_for_pending(
                                 &state,
@@ -410,10 +420,11 @@ pub async fn login_handler(
                             )
                             .await;
                             super::required_actions::email_code_challenge_page(
+                                &copy,
                                 &realm_name,
                                 &body.execution_id.0,
                                 masked.as_deref(),
-                                error,
+                                error.as_deref(),
                                 issuerd_auth_flow::email_code::code_length(&realm),
                             )
                         } else {
@@ -428,11 +439,15 @@ pub async fn login_handler(
                         }
                     } else if is_browser_form {
                         // A resubmitted code that still challenges was wrong.
-                        let error = body.otp.as_ref().map(|_| "Invalid one-time code.");
+                        let error = body
+                            .otp
+                            .as_ref()
+                            .map(|_| copy.msg("otp.invalidCode", "Invalid one-time code."));
                         super::required_actions::otp_challenge_page(
+                            &copy,
                             &realm_name,
                             &body.execution_id.0,
-                            error,
+                            error.as_deref(),
                         )
                     } else {
                         (
@@ -449,15 +464,21 @@ pub async fn login_handler(
                     if is_browser_form {
                         // A resubmitted assertion that still challenges failed
                         // verification; re-render the page with an error.
-                        let error = body
-                            .webauthn_assertion
-                            .as_ref()
-                            .map(|_| "Passkey authentication failed. Try again.");
+                        let copy = super::required_actions::PageCopy::for_realm(
+                            &state,
+                            &realm,
+                            pending.locale.as_deref(),
+                            super::required_actions::accept_language(&headers),
+                        );
+                        let error = body.webauthn_assertion.as_ref().map(|_| {
+                            copy.msg("webauthn.failed", "Passkey authentication failed. Try again.")
+                        });
                         super::required_actions::webauthn_challenge_page(
+                            &copy,
                             &realm_name,
                             &body.execution_id.0,
                             ch.challenge(),
-                            error,
+                            error.as_deref(),
                         )
                     } else {
                         // JSON clients get the raw request options to drive

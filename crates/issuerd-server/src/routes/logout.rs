@@ -277,7 +277,7 @@ pub fn frontchannel_logout_page(continue_url: Option<&str>, iframe_urls: &[Strin
              <noscript><meta http-equiv=\"refresh\" content=\"3;url={escaped}\"></noscript>"
         ));
     }
-    super::required_actions::page("Sign-out", &body).into_response()
+    super::required_actions::page("Sign-out", &body, crate::i18n::DEFAULT_LOCALE).into_response()
 }
 
 /// The token issuer URL for a realm — must match `iss` in issued tokens

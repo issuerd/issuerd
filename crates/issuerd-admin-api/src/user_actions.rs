@@ -156,12 +156,24 @@ pub async fn execute_actions_email(
         .as_ref()
         .map(|d| d.to_string())
         .unwrap_or_else(|| realm.name.to_string());
-    let rendered = crate::email::render_execute_actions_email(
-        &realm_display,
-        user.username.as_ref(),
-        &link,
-        lifespan / 60,
-    );
+    // With a bundle resolver wired (the composition root hands over the
+    // server's per-recipient locale bundle) the copy is localized; without
+    // one the renderer falls back to the built-in English text.
+    let rendered = match state.email_bundle.as_ref() {
+        Some(resolve) => crate::email::render_execute_actions_email_localized(
+            &realm_display,
+            user.username.as_ref(),
+            &link,
+            lifespan / 60,
+            &resolve(&realm, &user),
+        ),
+        None => crate::email::render_execute_actions_email(
+            &realm_display,
+            user.username.as_ref(),
+            &link,
+            lifespan / 60,
+        ),
+    };
     state
         .email_sender
         .send(&realm, &email, &rendered.subject, &rendered.text, Some(rendered.html))
@@ -463,6 +475,11 @@ mod tests {
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
             base_url: "http://localhost:8080".to_string(),
+            email_bundle: None,
+            available_locales: issuerd_core::i18n::SHIPPED_LOCALES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -723,6 +740,11 @@ mod tests {
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
             base_url: "http://localhost:8080".to_string(),
+            email_bundle: None,
+            available_locales: issuerd_core::i18n::SHIPPED_LOCALES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         });
         let app = action_routes(state.clone());
         let (realm, user_id) = realm_and_user(&state, Some("alice@example.com")).await;
@@ -777,6 +799,11 @@ mod tests {
             token_issuer: issuer.clone(),
             signing_key_reload: Arc::new(|| {}),
             base_url: "http://localhost:8080".to_string(),
+            email_bundle: None,
+            available_locales: issuerd_core::i18n::SHIPPED_LOCALES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         });
         (state, issuer)
     }

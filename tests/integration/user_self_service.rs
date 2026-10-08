@@ -695,8 +695,13 @@ async fn registration_password_policy_violation_rerenders_form() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
-    assert!(body.contains("require_digits"), "body: {body}");
-    assert!(body.contains("require_upper"), "body: {body}");
+    // Policy violations render through the i18n message bundle (English
+    // defaults here — the realm has internationalization disabled).
+    assert!(body.contains("password must contain at least one digit"), "body: {body}");
+    assert!(
+        body.contains("password must contain at least one uppercase letter"),
+        "body: {body}"
+    );
     // The form is re-rendered with the non-secret values prefilled.
     assert!(body.contains("value=\"pavel\""), "body: {body}");
     assert!(body.contains("value=\"pavel@example.com\""), "body: {body}");

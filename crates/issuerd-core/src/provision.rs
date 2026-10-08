@@ -78,6 +78,9 @@ impl ProvisionConfig {
                 login_theme: None,
                 email_theme: None,
                 admin_theme: None,
+                internationalization_enabled: None,
+                supported_locales: None,
+                default_locale: None,
                 default_role: Some("user".to_string()),
                 access_token_lifespan: Some(300),
                 refresh_token_lifespan: Some(1800),
@@ -227,6 +230,16 @@ pub struct ProvisionRealm {
     pub email_theme: Option<String>,
     #[serde(default)]
     pub admin_theme: Option<String>,
+    /// Enable login/email localization (default: realm default `false`).
+    #[serde(default)]
+    pub internationalization_enabled: Option<bool>,
+    /// BCP 47 locale tags the realm can render (default: realm default `[]`).
+    #[serde(default)]
+    pub supported_locales: Option<Vec<String>>,
+    /// Fallback locale when the client does not negotiate one (default: realm
+    /// default `None`).
+    #[serde(default)]
+    pub default_locale: Option<String>,
     #[serde(default)]
     pub default_role: Option<String>,
     #[serde(default)]
@@ -511,6 +524,28 @@ registration_flow: custom-registration
     }
 
     #[test]
+    fn realm_i18n_fields_parse() {
+        let yaml = r#"
+name: localized
+internationalization_enabled: true
+supported_locales: [en, de]
+default_locale: en
+"#;
+        let realm: ProvisionRealm = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(realm.internationalization_enabled, Some(true));
+        assert_eq!(realm.supported_locales, Some(vec!["en".to_string(), "de".to_string()]));
+        assert_eq!(realm.default_locale.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn realm_i18n_fields_default_to_none() {
+        let realm: ProvisionRealm = serde_yaml::from_str("name: minimal").unwrap();
+        assert!(realm.internationalization_enabled.is_none());
+        assert!(realm.supported_locales.is_none());
+        assert!(realm.default_locale.is_none());
+    }
+
+    #[test]
     fn user_and_flow_boolean_defaults() {
         let user: ProvisionUser = serde_yaml::from_str("realm: r1\nusername: u1").unwrap();
         assert!(!user.email_verified);
@@ -524,6 +559,9 @@ registration_flow: custom-registration
     /// Verify the committed `examples/provision.example.yaml` is valid and matches the
     /// generated example struct. If this fails, regenerate with:
     ///   cargo run --bin issuerd -- example provision-config -o examples/provision.example.yaml
+    /// The committed file also carries a hand-maintained commented-out i18n
+    /// example block in the realm section — regeneration drops comments, so
+    /// restore that block after regenerating.
     #[test]
     fn committed_example_file_is_valid() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
