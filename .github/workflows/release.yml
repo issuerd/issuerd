@@ -606,6 +606,12 @@ jobs:
       # Pin the deployment target instead of letting the host SDK raise the
       # floor to the runner's macOS (11.0 covers both arm64 and x86_64 std).
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Override the Windows-only Strawberry Perl path from .cargo/config.toml:
+      # the x86_64 half of this job builds openssl vendored, and openssl-src
+      # would otherwise invoke a Windows perl.exe. Inert for the arm64 build
+      # (vendored openssl never compiles there). Job-level so the build and
+      # test steps agree (openssl-src tracks the var via rerun-if-env-changed).
+      OPENSSL_SRC_PERL: /usr/bin/perl
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

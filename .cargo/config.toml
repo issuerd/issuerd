@@ -1,7 +1,9 @@
 # Windows: point the vendored OpenSSL build (webauthn-rs-core -> openssl-src)
 # at the portable Strawberry Perl in tools/, so plain `cargo build/test` works
-# in a Visual Studio Developer Prompt without editing PATH. Harmless elsewhere:
-# openssl-src only compiles in the Windows-targeted vendored build, and a
-# pre-existing OPENSSL_SRC_PERL in the environment takes precedence.
+# in a Visual Studio Developer Prompt without editing PATH. A pre-existing
+# OPENSSL_SRC_PERL in the environment takes precedence. Note openssl-src also
+# compiles for the vendored x86_64-apple-darwin target (cross-built from arm64
+# runners): the CI macOS jobs override this to /usr/bin/perl, and a local
+# Intel-Mac build must do the same (or unset the var).
 [env]
 OPENSSL_SRC_PERL = { value = "tools/strawberry-perl/perl/bin/perl.exe", relative = true }
