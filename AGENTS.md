@@ -864,7 +864,7 @@ Dry-run fully rehearses every crate whose `issuerd-*` deps are already live on c
 
 `.github/workflows/release.yml` runs on every pushed `v*` tag:
 
-1. **validate** — the tag (`v0.1.2`) must equal `[workspace.package] version` (`0.1.2`) and CHANGELOG.md must have a dated `## [0.1.2] - …` section; release notes are extracted from that section.
+1. **validate** — the tag (`v0.1.2`) must equal `[workspace.package] version` (`0.1.2`) and CHANGELOG.md must have a dated `## [0.1.2] - …` section; release notes are extracted from that section plus a hardcoded footer composed here (Archives list naming all six platform archives + the evidence bundle, Docker pull lines, crates.io line — keep it in sync when platforms change).
 2. **heavy** — calls `heavy.yml` as a reusable workflow (`workflow_call`): the full heavy suites (federation, cluster E2E, Keycloak parity, OIDF conformance) run inside the release run against the exact tagged commit. The GitHub Release job waits for it; every publish job (crates.io, Docker Hub) waits for it transitively via the release job's gate.
 3. **docker** (linux/amd64) — builds the canonical root Dockerfile and pushes `issuerd/issuerd:X.Y.Z-amd64` to Docker Hub. Needs repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`. FINAL stage: runs side by side with the crates-io publish, only after the heavy suites, every platform build/test job, and the GitHub Release have all succeeded — a broken tag never publishes images.
 4. **linux-binary** (amd64) — builds the same Dockerfile and extracts `/usr/local/bin/issuerd`, so the archive ships the exact binary the amd64 image ships. Runtime deps (documented in the release notes): glibc ≥ 2.35, OpenSSL 3, `libgssapi-krb5-2`.
