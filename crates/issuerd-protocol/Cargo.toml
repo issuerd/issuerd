@@ -8,7 +8,7 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Pure OIDC/OAuth2 protocol parsing and validation for the Issuerd IAM server"
-keywords = ["oidc", "oauth2", "iam"]
+keywords = ["oidc", "oauth2", "iam", "ciba"]
 categories = ["authentication", "parsing"]
 
 [dependencies]

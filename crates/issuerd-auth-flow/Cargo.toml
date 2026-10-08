@@ -40,3 +40,9 @@ base64 = { workspace = true }
 # (e.g. Strawberry Perl) and MSVC build tools on PATH.
 [target.'cfg(windows)'.dependencies]
 openssl = { workspace = true, features = ["vendored"] }
+
+# macOS x86_64 builds are cross-compiled from arm64 runners, where Homebrew's
+# openssl@3 is arm64-only — build vendored from source for this target too
+# (system perl + Xcode clang suffice).
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+openssl = { workspace = true, features = ["vendored"] }

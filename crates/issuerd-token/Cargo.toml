@@ -8,7 +8,7 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "JWT/JWS/JWK creation, signing and validation for the Issuerd IAM server"
-keywords = ["oidc", "oauth2", "jwt", "jwk"]
+keywords = ["oidc", "oauth2", "jwt", "jwk", "dpop"]
 categories = ["authentication", "cryptography"]
 
 [dependencies]

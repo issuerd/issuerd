@@ -451,6 +451,10 @@ jobs:
     # this host (no Windows containers), so the same steps are rehearsed
     # natively instead (see .act/run-release.sh).
     runs-on: windows-latest
+    # The vendored OpenSSL objects ship no PDB, so every MSVC link prints a
+    # wall of LNK4099 warnings (harmless: strip = true ships no debug info).
+    env:
+      RUSTFLAGS: "-C link-args=/ignore:4099"
     defaults:
       run:
         shell: bash
@@ -507,21 +511,107 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  macos-binary:
-    name: macOS arm64 binary (build + test + package)
+  windows-arm64-binary:
+    name: windows arm64 binary
     needs: validate
-    # Native build + full workspace tests on an Apple Silicon runner (macos-13
-    # is Intel — avoid), then packages the shipped macOS arm64 archive like the
-    # other platform jobs. Not part of per-commit CI. Skipped under act like
+    # Native build on the ARM64 Windows runner (free for public repos) — same
+    # native-build philosophy as linux-arm64 (ubuntu-22.04-arm) and macos
+    # (macos-15). Kerberos stays cfg(unix)-gated off on Windows; the vendored
+    # openssl (WebAuthn) builds via Strawberry Perl under x64 emulation + the
+    # ARM64 MSVC toolchain from the runner image. Same act treatment as
+    # windows-binary: no Windows containers under act, so every step is gated
+    # on env.ACT != 'true'.
+    runs-on: windows-11-arm
+    # Same LNK4099 silencing as windows-binary (vendored OpenSSL ships no PDB).
+    env:
+      RUSTFLAGS: "-C link-args=/ignore:4099"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/checkout@v7
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webclientsrc/package-lock.json
+      # The release build embeds the SPA (crates/issuerd-server/build.rs).
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the web client
+        working-directory: webclientsrc
+        run: npm ci && npm run generate-api && npm run build
+      # Vendored openssl (WebAuthn) needs a native perl on PATH; the committed
+      # .cargo/config.toml points at a dev-host path, so override via env.
+      - if: ${{ env.ACT != 'true' }}
+        name: Strawberry Perl (vendored openssl build)
+        run: choco install strawberryperl --no-progress -y
+      - if: ${{ env.ACT != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+      - if: ${{ env.ACT != 'true' }}
+        uses: Swatinem/rust-cache@v2
+      # cargo-auditable embeds the dependency tree in the binary (same as the
+      # Dockerfile) so the SBOM scan sees every crate.
+      - if: ${{ env.ACT != 'true' }}
+        uses: taiki-e/install-action@cargo-auditable
+      - if: ${{ env.ACT != 'true' }}
+        name: Build the release binary
+        env:
+          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+        run: cargo auditable build --locked --release --bin issuerd
+      - if: ${{ env.ACT != 'true' }}
+        name: Smoke-run the binary
+        run: ./target/release/issuerd.exe --version
+      # Native unit suite on the ARM64 runner, release profile so the deps
+      # compiled for the binary are reused (dev profile would rebuild the
+      # whole tree). --lib excludes the Docker-backed integration suites —
+      # same philosophy as the linux-arm64 unit run; crypto paths (aws-lc-rs,
+      # ring) get real ARM64 coverage here.
+      - if: ${{ env.ACT != 'true' }}
+        name: Unit tests (native)
+        run: cargo test --locked --release --workspace --lib
+      - if: ${{ env.ACT != 'true' }}
+        name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o syft.zip https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_windows_amd64.zip
+          powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w syft.zip)' -DestinationPath '$(cygpath -w "$HOME/bin")'"
+          rm syft.zip
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - if: ${{ env.ACT != 'true' }}
+        name: Package the archive
+        run: bash scripts/package-release.sh windows-arm64 "${{ needs.validate.outputs.version }}" target/release/issuerd.exe ./dist
+      - if: ${{ env.ACT != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-dist
+          path: dist/
+          if-no-files-found: error
+
+  macos-binary:
+    name: macOS binaries (arm64 + amd64 build + test + package)
+    needs: validate
+    # Native arm64 build + full workspace tests on an Apple Silicon runner
+    # (macos-13 is Intel — avoid), then packages the shipped macOS arm64
+    # archive like the other platform jobs. The x86_64 archive is
+    # cross-compiled on the same runner and smoke-tested + unit-tested under
+    # Rosetta 2. Not part of per-commit CI. Skipped under act like
     # the heavy call (no macOS runners there; vars.ACT because job-level `if`
-    # has no env context) — the release job tolerates the missing macos-dist
-    # artifact in rehearsal.
+    # has no env context) — the release job tolerates the missing macOS
+    # artifacts in rehearsal.
     if: ${{ vars.ACT != 'true' }}
     runs-on: macos-15
     env:
-      # Pin the deployment target to the aarch64-apple-darwin std minimum
-      # instead of letting the host SDK raise the floor to the runner's macOS.
+      # Pin the deployment target instead of letting the host SDK raise the
+      # floor to the runner's macOS (11.0 covers both arm64 and x86_64 std).
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Override the Windows-only Strawberry Perl path from .cargo/config.toml:
+      # the x86_64 half of this job builds openssl vendored, and openssl-src
+      # would otherwise invoke a Windows perl.exe. Inert for the arm64 build
+      # (vendored openssl never compiles there). Job-level so the build and
+      # test steps agree (openssl-src tracks the var via rerun-if-env-changed).
+      OPENSSL_SRC_PERL: /usr/bin/perl
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -535,6 +625,8 @@ jobs:
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       # cargo-auditable embeds the dependency tree in the binary (same as the
       # Dockerfile) so the SBOM scan sees every crate.
@@ -568,10 +660,32 @@ jobs:
           name: macos-dist
           path: dist/
           if-no-files-found: error
+      # x86_64 (Intel) build: cross-compile from the arm64 host, then run the
+      # binary and the unit suite under Rosetta 2 (executing an x86_64 binary
+      # invokes it automatically). openssl is vendored for this target —
+      # Homebrew's openssl@3 on the runner is arm64-only (see the cfg block in
+      # crates/issuerd-auth-flow/Cargo.toml).
+      - name: Rosetta 2 (x86_64 run support)
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Build the x86_64 release binary
+        run: cargo auditable build --locked --release --bin issuerd --target x86_64-apple-darwin
+      - name: Smoke-run the x86_64 binary (Rosetta)
+        run: ./target/x86_64-apple-darwin/release/issuerd --version
+      # Release profile reuses the deps compiled for the binary; --lib excludes
+      # the Docker-backed suites (no Docker on macOS runners anyway).
+      - name: Unit tests (x86_64, Rosetta)
+        run: cargo test --locked --release --workspace --lib --target x86_64-apple-darwin
+      - name: Package the x86_64 archive
+        run: bash scripts/package-release.sh macos-amd64 "${{ needs.validate.outputs.version }}" target/x86_64-apple-darwin/release/issuerd ./dist-amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-amd64-dist
+          path: dist-amd64/
+          if-no-files-found: error
 
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, linux-arm64, windows-binary, macos-binary, heavy]
+    needs: [validate, linux-binary, linux-arm64, windows-binary, windows-arm64-binary, macos-binary, heavy]
     # Gate on every need, tolerating ONLY skips (act leaves out the heavy
     # call and the macos-binary job): a failed suite or packaging job means
     # no GitHub Release.
@@ -602,22 +716,25 @@ jobs:
         with:
           name: conformance-evidence
           path: conformance-evidence
-      # Real runs must ship all four platforms; rehearsal (act) has no macOS
-      # job, so macos-dist is only required by this check, never under act.
+      # Real runs must ship all six platforms; rehearsal (act) has no macOS
+      # job, so the macOS artifacts are only required by this check, never
+      # under act.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
              linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
+             windows-arm64-dist/*.zip windows-arm64-dist/*.sbom.cyclonedx.json \
              macos-dist/*.tar.gz macos-dist/*.sbom.cyclonedx.json \
+             macos-amd64-dist/*.tar.gz macos-amd64-dist/*.sbom.cyclonedx.json \
              conformance-evidence/conformance-evidence.tar.gz
       - name: SHA256SUMS.txt
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist linux-arm64-dist windows-dist macos-dist; do
+          for d in linux-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           # Standalone conformance evidence asset (absent under act).
@@ -635,7 +752,9 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            windows-arm64-dist/*
             macos-dist/*
+            macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
@@ -648,7 +767,9 @@ jobs:
             linux-dist/*
             linux-arm64-dist/*
             windows-dist/*
+            windows-arm64-dist/*
             macos-dist/*
+            macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
       - name: Release contents (always logged — this is what rehearsal inspects)
