@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-10-08
+
 ### Added
 
 - **New release platforms: Windows ARM64 and macOS x86_64 (Intel).** Every tag now ships six binary archives: `issuerd_X.Y.Z_windows_arm64.zip` (built natively on a `windows-11-arm` runner, smoke-run and unit-tested on real ARM64 hardware) and `issuerd_X.Y.Z_macos_amd64.tar.gz` (cross-compiled on the Apple Silicon runner, smoke-run and unit-tested under Rosetta 2) join the existing Linux amd64/arm64, Windows amd64 and macOS arm64 builds — each with its CycloneDX SBOM, a `SHA256SUMS.txt` entry and a build-provenance attestation like the other platforms.
