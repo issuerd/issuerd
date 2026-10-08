@@ -644,13 +644,26 @@ fn mapper_types() -> Vec<EnumValueRepresentation> {
         .collect()
 }
 
-fn locales() -> Vec<EnumValueRepresentation> {
-    issuerd_core::i18n::SHIPPED_LOCALES
-        .iter()
-        .map(|tag| EnumValueRepresentation {
-            id: (*tag).to_string(),
-            name: locale_label(tag).to_string(),
-            description: Some("Built-in message bundle".to_string()),
+/// Map locale tags to enum values. Shipped built-ins are labelled and
+/// described as such; theme-supplied tags (a `messages_<locale>.json` in a
+/// theme directory) fall back to the raw tag as the name with a generic
+/// description.
+fn locales(tags: &[String]) -> Vec<EnumValueRepresentation> {
+    tags.iter()
+        .map(|tag| {
+            let shipped = issuerd_core::i18n::SHIPPED_LOCALES.contains(&tag.as_str());
+            EnumValueRepresentation {
+                id: tag.clone(),
+                name: locale_label(tag).to_string(),
+                description: Some(
+                    if shipped {
+                        "Built-in message bundle"
+                    } else {
+                        "Message bundle supplied by a login theme"
+                    }
+                    .to_string(),
+                ),
+            }
         })
         .collect()
 }
@@ -732,7 +745,7 @@ async fn build_server_info(state: &AdminApiState) -> ServerInfoRepresentation {
         idp_mapper_types: idp_mapper_types(),
         mapper_types: mapper_types(),
         identity_provider_presets: issuerd_core::identity_provider_presets(),
-        locales: locales(),
+        locales: locales(&state.available_locales),
         themes: themes(&state.available_themes),
         subject_types: subject_types(),
         client_installations: crate::client_installation::providers(),
@@ -857,8 +870,30 @@ enum_endpoint!(
     "Enums"
 );
 enum_endpoint!(list_mapper_types, "/admin/enums/mapper-types", mapper_types, "Enums");
-enum_endpoint!(list_locales, "/admin/enums/locales", locales, "Enums");
 enum_endpoint!(list_subject_types, "/admin/enums/subject-types", subject_types, "Enums");
+
+// Locales are state-backed (the boot-time themes-directory scan can contribute
+// theme-supplied locales), so the handler is written out like `list_themes`
+// instead of using `enum_endpoint!`. NOTE: no doc comment here on purpose —
+// utoipa lifts `///` lines into the spec's `summary`, and the committed
+// OpenAPI spec documents this endpoint without one.
+#[utoipa::path(
+    get,
+    path = "/admin/enums/locales",
+    responses(
+        (status = 200, description = "List of enum values", body = Vec<EnumValueRepresentation>),
+        (status = 401, description = "Unauthorized", body = crate::error::AdminApiErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::AdminApiErrorResponse),
+    ),
+    tag = "Enums"
+)]
+pub async fn list_locales(
+    State(state): State<Arc<AdminApiState>>,
+    Extension(auth): Extension<AdminAuth>,
+) -> Result<Json<Vec<EnumValueRepresentation>>, AdminApiError> {
+    require_roles(&auth, &["view-realm", "manage-realm"])?;
+    Ok(Json(locales(&state.available_locales)))
+}
 
 /// List registered authenticator providers (flow execution provider ids).
 #[utoipa::path(
@@ -1001,7 +1036,9 @@ mod tests {
 
     #[test]
     fn locales_match_shipped_bundles_with_labels() {
-        let list = locales();
+        let tags: Vec<String> =
+            issuerd_core::i18n::SHIPPED_LOCALES.iter().map(|s| s.to_string()).collect();
+        let list = locales(&tags);
         let ids: Vec<&str> = list.iter().map(|v| v.id.as_str()).collect();
         assert_eq!(ids, issuerd_core::i18n::SHIPPED_LOCALES);
         let en = list.iter().find(|v| v.id == "en").unwrap();
@@ -1011,6 +1048,22 @@ mod tests {
         for item in &list {
             assert!(item.description.as_ref().is_some_and(|d| !d.is_empty()));
         }
+    }
+
+    #[test]
+    fn locales_fall_back_to_raw_tag_for_theme_supplied_locales() {
+        let tags = vec!["en".to_string(), "ru".to_string()];
+        let list = locales(&tags);
+        assert_eq!(list.len(), 2);
+        let ru = list.iter().find(|v| v.id == "ru").unwrap();
+        // Unknown tag: the raw tag is the name, with a generic description
+        // (the description is part of the API contract and must not be None).
+        assert_eq!(ru.name, "ru");
+        assert!(ru.description.as_ref().is_some_and(|d| !d.is_empty()));
+        assert_ne!(
+            ru.description, list[0].description,
+            "theme-supplied locales are described differently from built-ins"
+        );
     }
 
     #[test]
@@ -1426,7 +1479,6 @@ mod tests {
                     "oidc-allowed-origins-mapper",
                 ],
             ),
-            ("/admin/enums/locales", |a| Box::pin(list_locales(a)), &["en", "de"]),
             (
                 "/admin/enums/subject-types",
                 |a| Box::pin(list_subject_types(a)),
@@ -1453,6 +1505,10 @@ mod tests {
         // test_state exposes the built-in `issuerd` theme.
         assert_enum_list("/admin/enums/themes", &list, &["issuerd"]);
 
+        let Json(list) = list_locales(State(state.clone()), Extension(auth.clone())).await.unwrap();
+        // Default test state exposes exactly the shipped built-in locales.
+        assert_enum_list("/admin/enums/locales", &list, &["en", "de"]);
+
         let Json(list) = list_authenticators(State(state), Extension(auth)).await.unwrap();
         // Ids come from the state's plugin registry; the stub mirrors the
         // issuerd-auth-flow built-ins.
@@ -1467,6 +1523,29 @@ mod tests {
                 "auth-registration",
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn theme_supplied_locales_appear_in_serverinfo_and_enum_endpoint() {
+        // A state whose boot-time theme scan found a `messages_fr.json`
+        // bundle: both surfaces must expose the extra locale.
+        let state = crate::test_utils::tests::test_state_with_locales(
+            vec![issuerd_core::RoleName::new("view-realm").unwrap()],
+            vec!["en".to_string(), "de".to_string(), "fr".to_string()],
+        );
+        let auth = auth_with_role("view-realm");
+
+        let Json(info) =
+            get_serverinfo(State(state.clone()), Extension(auth.clone())).await.unwrap();
+        let ids: Vec<&str> = info.locales.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["en", "de", "fr"]);
+        let fr = info.locales.iter().find(|v| v.id == "fr").unwrap();
+        assert_eq!(fr.name, "fr", "unknown tags fall back to the raw tag as name");
+        assert!(fr.description.as_ref().is_some_and(|d| !d.is_empty()));
+
+        let Json(list) = list_locales(State(state), Extension(auth)).await.unwrap();
+        let ids: Vec<&str> = list.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["en", "de", "fr"]);
     }
 
     #[tokio::test]

@@ -39,7 +39,10 @@ use issuerd_core::{EventType, Realm, RealmId, UserId, ACTION_TOKEN_PURPOSE_RESET
 use issuerd_token::action_tokens::{action_token_claims, issue_action_token, verify_action_token};
 
 use super::oidc::emit_oidc_event;
-use super::required_actions::{error_banner, error_response, page, url_path_segment};
+use super::required_actions::{
+    accept_language, error_banner, error_response, js_string_literal, page, url_path_segment,
+    PageCopy,
+};
 
 /// Cache key for a pending (not yet consumed) reset-credentials token id.
 fn reset_credentials_cache_key(realm_id: &RealmId, jti: &str) -> String {
@@ -66,7 +69,9 @@ const USED_LINK: &str = "This password reset link has already been used.";
 /// to the neutral confirmation — the POST answers 204 with no body, so a
 /// native submit would land the browser on a blank page. Without JavaScript
 /// the form still posts (blank 204 page; acceptable). Assembled from
-/// `RESET_FORM_SCRIPT_PRE` + [`CONFIRMATION`] + `RESET_FORM_SCRIPT_POST`.
+/// `RESET_FORM_SCRIPT_PRE` + the localized confirmation heading/body (as
+/// JS string literals via [`js_string_literal`]) + `RESET_FORM_SCRIPT_MID` +
+/// `RESET_FORM_SCRIPT_POST`.
 const RESET_FORM_SCRIPT_PRE: &str = "\
 <script>\
 (function(){\
@@ -77,84 +82,111 @@ var data=new URLSearchParams(new FormData(form));\
 fetch(form.action,{method:\"POST\",\
 headers:{\"Content-Type\":\"application/x-www-form-urlencoded\"},body:data})\
 .then(function(){\
-document.querySelector(\"main.card\").innerHTML=\"<h1>Check your email</h1><p>";
+document.querySelector(\"main.card\").innerHTML=\"<h1>\"+";
 
-const RESET_FORM_SCRIPT_POST: &str = "</p>\";});});})();</script>";
+const RESET_FORM_SCRIPT_MID: &str = "+\"</h1><p>\"+";
+
+const RESET_FORM_SCRIPT_POST: &str = "+\"</p>\";});});})();</script>";
 
 /// Render the "request a reset link" form (single `username` field).
-fn render_reset_request_page(realm_name: &str) -> Response {
+fn render_reset_request_page(copy: &PageCopy, realm_name: &str) -> Response {
     let url = format!("/realms/{}/login/reset-credentials", url_path_segment(realm_name));
+    let heading = copy.msg("reset.requestHeading", "Forgot your password?");
+    let lead = copy.msg(
+        "reset.requestLead",
+        "Enter your username or email address and we will send you a link to reset \
+         your password.",
+    );
+    let username_label = copy.msg("reset.usernameLabel", "Username or email");
+    let submit = copy.msg("reset.requestSubmit", "Send reset email");
     let mut body = format!(
-        "<h1>Forgot your password?</h1>\
-         <p>Enter your username or email address and we will send you a link to reset \
-         your password.</p>\
+        "<h1>{heading}</h1>\
+         <p>{lead}</p>\
          <form method=\"post\" action=\"{url}\" id=\"issuerd-reset-form\">\
-         <label for=\"username\">Username or email</label>\
+         <label for=\"username\">{username_label}</label>\
          <input type=\"text\" id=\"username\" name=\"username\" \
          autocomplete=\"username\" required>\
-         <button type=\"submit\">Send reset email</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>"
     );
     body.push_str(RESET_FORM_SCRIPT_PRE);
-    body.push_str(CONFIRMATION);
+    body.push_str(&js_string_literal(&copy.msg("reset.confirmationHeading", "Check your email")));
+    body.push_str(RESET_FORM_SCRIPT_MID);
+    body.push_str(&js_string_literal(&copy.msg("reset.confirmation", CONFIRMATION)));
     body.push_str(RESET_FORM_SCRIPT_POST);
-    page("Reset password", &body).into_response()
+    page(&copy.msg("reset.requestTitle", "Reset password"), &body, &copy.lang).into_response()
 }
 
 /// Render the new-password form the emailed link opens. `token` is round-
 /// tripped through a hidden field so the POST can re-verify it.
-fn render_update_credentials_page(realm_name: &str, token: &str, error: Option<&str>) -> Response {
+fn render_update_credentials_page(
+    copy: &PageCopy,
+    realm_name: &str,
+    token: &str,
+    error: Option<&str>,
+) -> Response {
     let url = format!("/realms/{}/login/update-credentials", url_path_segment(realm_name));
     let banner = error_banner(error);
+    let heading = copy.msg("reset.updateHeading", "Choose a new password");
+    let new_label = copy.msg("reset.newPasswordLabel", "New password");
+    let confirm_label = copy.msg("reset.confirmPasswordLabel", "Confirm password");
+    let submit = copy.msg("reset.updateSubmit", "Update password");
     let body = format!(
-        "<h1>Choose a new password</h1>\
+        "<h1>{heading}</h1>\
          {banner}\
          <form method=\"post\" action=\"{url}\">\
          <input type=\"hidden\" name=\"token\" value=\"{}\">\
-         <label for=\"new_password\">New password</label>\
+         <label for=\"new_password\">{new_label}</label>\
          <input type=\"password\" id=\"new_password\" name=\"new_password\" \
          autocomplete=\"new-password\" required>\
-         <label for=\"confirm_password\">Confirm password</label>\
+         <label for=\"confirm_password\">{confirm_label}</label>\
          <input type=\"password\" id=\"confirm_password\" name=\"confirm_password\" \
          autocomplete=\"new-password\" required>\
-         <button type=\"submit\">Update password</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>",
         html_escape(token),
     );
-    page("Update password", &body).into_response()
+    page(&copy.msg("reset.updateTitle", "Update password"), &body, &copy.lang).into_response()
 }
 
 /// Error page for dead links (invalid/expired/already used), with a way back
 /// to the request form.
-fn link_error_page(realm_name: &str, msg: &str) -> Response {
+fn link_error_page(copy: &PageCopy, realm_name: &str, msg: &str) -> Response {
     let url = format!("/realms/{}/login/reset-credentials", url_path_segment(realm_name));
+    let title = copy.msg("reset.requestTitle", "Reset password");
     (
         StatusCode::BAD_REQUEST,
         page(
-            "Reset password",
+            &title,
             &format!(
-                "<h1>Reset password</h1>\
+                "<h1>{title}</h1>\
                  <p class=\"error\">{}</p>\
-                 <p><a href=\"{url}\">Request a new reset link</a></p>",
-                html_escape(msg)
+                 <p><a href=\"{url}\">{}</a></p>",
+                html_escape(msg),
+                copy.msg("reset.requestNewLink", "Request a new reset link"),
             ),
+            &copy.lang,
         ),
     )
         .into_response()
 }
 
 /// Success page after the password was changed.
-fn update_success_page(realm_name: &str) -> Response {
+fn update_success_page(copy: &PageCopy, realm_name: &str) -> Response {
     let mut login = url::form_urlencoded::Serializer::new(String::new());
     login.append_pair("realm", realm_name);
     let login_url = format!("/login.html?{}", login.finish());
+    let title = copy.msg("reset.successTitle", "Password updated");
     page(
-        "Password updated",
+        &title,
         &format!(
-            "<h1>Password updated</h1>\
-             <p>Your password has been changed.</p>\
-             <p><a href=\"{login_url}\">Continue to sign in</a></p>"
+            "<h1>{title}</h1>\
+             <p>{}</p>\
+             <p><a href=\"{login_url}\">{}</a></p>",
+            copy.msg("reset.successLead", "Your password has been changed."),
+            copy.msg("reset.successContinue", "Continue to sign in"),
         ),
+        &copy.lang,
     )
     .into_response()
 }
@@ -256,18 +288,28 @@ async fn send_reset_email(
 pub async fn reset_credentials_page(
     State(state): State<Arc<ServerState>>,
     Path(realm_name): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
     if !realm.reset_password_allowed {
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Password reset is not enabled for this realm.",
+            &copy.msg("reset.notEnabled", "Password reset is not enabled for this realm."),
         );
     }
-    render_reset_request_page(&realm_name)
+    render_reset_request_page(&copy, &realm_name)
 }
 
 /// POST `/realms/{realm}/login/reset-credentials` — accept the request and,
@@ -282,12 +324,21 @@ pub async fn reset_credentials_submit(
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     if !realm.reset_password_allowed {
+        let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Password reset is not enabled for this realm.",
+            &copy.msg("reset.notEnabled", "Password reset is not enabled for this realm."),
         );
     }
 
@@ -307,21 +358,31 @@ pub async fn update_credentials_page(
     State(state): State<Arc<ServerState>>,
     Path(realm_name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
     if !realm.reset_password_allowed {
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Password reset is not enabled for this realm.",
+            &copy.msg("reset.notEnabled", "Password reset is not enabled for this realm."),
         );
     }
     let realm_id = realm.id.clone();
 
     let Some(token) = query.get("token") else {
-        return link_error_page(&realm_name, INVALID_LINK);
+        return link_error_page(&copy, &realm_name, &copy.msg("reset.invalidLink", INVALID_LINK));
     };
     let claims = match verify_action_token(
         state.crypto.as_ref(),
@@ -334,35 +395,49 @@ pub async fn update_credentials_page(
         Ok(c) => c,
         Err(e) => {
             debug!(realm = %realm_id, error = %e, "reset-credentials link rejected: invalid or expired token");
-            return link_error_page(&realm_name, INVALID_LINK);
+            return link_error_page(
+                &copy,
+                &realm_name,
+                &copy.msg("reset.invalidLink", INVALID_LINK),
+            );
         }
     };
     // Single-use: the jti must still be pending in the cache.
     match state.cache.get(&reset_credentials_cache_key(&realm_id, &claims.jti)).await {
-        Ok(Some(_)) => render_update_credentials_page(&realm_name, token, None),
-        _ => link_error_page(&realm_name, USED_LINK),
+        Ok(Some(_)) => render_update_credentials_page(&copy, &realm_name, token, None),
+        _ => link_error_page(&copy, &realm_name, &copy.msg("reset.usedLink", USED_LINK)),
     }
 }
 
 /// POST `/realms/{realm}/login/update-credentials` — validate the form,
 /// consume the token atomically, and set the new password through the
 /// canonical policy/history-enforcing writer.
-#[instrument(skip(state, ip, body), fields(realm = %realm_name))]
+#[instrument(skip(state, ip, headers, body), fields(realm = %realm_name))]
 pub async fn update_credentials_submit(
     State(state): State<Arc<ServerState>>,
     Path(realm_name): Path<String>,
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap_or_default();
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
     if !realm.reset_password_allowed {
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Password reset is not enabled for this realm.",
+            &copy.msg("reset.notEnabled", "Password reset is not enabled for this realm."),
         );
     }
     let realm_id = realm.id.clone();
@@ -379,7 +454,11 @@ pub async fn update_credentials_submit(
         Ok(c) => c,
         Err(e) => {
             debug!(realm = %realm_id, error = %e, "reset-credentials link rejected: invalid or expired token");
-            return link_error_page(&realm_name, INVALID_LINK);
+            return link_error_page(
+                &copy,
+                &realm_name,
+                &copy.msg("reset.invalidLink", INVALID_LINK),
+            );
         }
     };
     let key = reset_credentials_cache_key(&realm_id, &claims.jti);
@@ -387,41 +466,60 @@ pub async fn update_credentials_submit(
     // actual consumption below is the atomic point of no return.
     match state.cache.get(&key).await {
         Ok(Some(_)) => {}
-        _ => return link_error_page(&realm_name, USED_LINK),
+        _ => return link_error_page(&copy, &realm_name, &copy.msg("reset.usedLink", USED_LINK)),
     }
 
     let new_password = form.get("new_password").cloned().unwrap_or_default();
     let confirm_password = form.get("confirm_password").cloned().unwrap_or_default();
     if new_password != confirm_password {
         return render_update_credentials_page(
+            &copy,
             &realm_name,
             &token,
-            Some("The passwords do not match."),
+            Some(&copy.msg("reset.passwordsDoNotMatch", "The passwords do not match.")),
         );
     }
 
     let user_id = match UserId::new(claims.sub.clone()) {
         Ok(id) => id,
-        Err(_) => return link_error_page(&realm_name, INVALID_LINK),
+        Err(_) => {
+            return link_error_page(
+                &copy,
+                &realm_name,
+                &copy.msg("reset.invalidLink", INVALID_LINK),
+            )
+        }
     };
     let mut user = match state.storage.get_user(&realm_id, &user_id).await {
         Ok(Some(u)) if u.enabled => u,
-        _ => return link_error_page(&realm_name, "This account is no longer available."),
+        _ => {
+            return link_error_page(
+                &copy,
+                &realm_name,
+                &copy.msg("error.accountUnavailable", "This account is no longer available."),
+            )
+        }
     };
 
     if let Err(err) = realm.password_policy.validate(&new_password, &user) {
-        let message =
-            err.violations.iter().map(|v| v.message.as_str()).collect::<Vec<_>>().join(" ");
+        // Best-effort localization of the known policy messages; unknown
+        // texts pass through unchanged.
+        let message = err
+            .violations
+            .iter()
+            .map(|v| crate::i18n::localize_error(&copy.bundle, &v.message))
+            .collect::<Vec<_>>()
+            .join(" ");
         // The token is deliberately NOT consumed: the user may correct the
         // password and resubmit with the same link.
-        return render_update_credentials_page(&realm_name, &token, Some(&message));
+        return render_update_credentials_page(&copy, &realm_name, &token, Some(&message));
     }
 
     // All checks passed — consume the jti atomically. A concurrent replay of
     // the same link loses the race here.
     match state.cache.get_and_delete(&key).await {
         Ok(Some(_)) => {}
-        _ => return link_error_page(&realm_name, USED_LINK),
+        _ => return link_error_page(&copy, &realm_name, &copy.msg("reset.usedLink", USED_LINK)),
     }
 
     // Federated user: write the new password through to the external
@@ -441,8 +539,12 @@ pub async fn update_credentials_submit(
         Err(e) => {
             error!(realm = %realm_id, user_id = %user_id, error = %e, "password reset failed");
             return link_error_page(
+                &copy,
                 &realm_name,
-                "Could not update the password. Please request a new reset link.",
+                &copy.msg(
+                    "reset.updateFailed",
+                    "Could not update the password. Please request a new reset link.",
+                ),
             );
         }
     };
@@ -460,8 +562,12 @@ pub async fn update_credentials_submit(
         {
             error!(realm = %realm_id, user_id = %user_id, error = %e, "password reset failed");
             return link_error_page(
+                &copy,
                 &realm_name,
-                "Could not update the password. Please request a new reset link.",
+                &copy.msg(
+                    "reset.updateFailed",
+                    "Could not update the password. Please request a new reset link.",
+                ),
             );
         }
     }
@@ -494,7 +600,7 @@ pub async fn update_credentials_submit(
     )
     .await;
 
-    update_success_page(&realm_name)
+    update_success_page(&copy, &realm_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +745,7 @@ mod tests {
             State(state.clone()),
             Path("master".to_string()),
             client_ip(),
+            HeaderMap::new(),
             Bytes::from(body),
         )
         .await
@@ -657,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_page_renders_form_and_js_confirmation() {
-        let resp = render_reset_request_page("my realm");
+        let resp = render_reset_request_page(&PageCopy::builtin("en"), "my realm");
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("action=\"/realms/my+realm/login/reset-credentials\""));
@@ -669,8 +776,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_page_localizes_copy_and_js_confirmation() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("reset.requestHeading".to_string(), "Passwort vergessen?".to_string());
+        bundle.insert("reset.confirmation".to_string(), "E-Mail unterwegs.".to_string());
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let resp = render_reset_request_page(&copy, "master");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Passwort vergessen?</h1>"), "body: {body}");
+        // The JS swap text lands as a quoted, escaped string literal.
+        assert!(body.contains("+\"E-Mail unterwegs.\"+"), "body: {body}");
+        assert!(!body.contains(CONFIRMATION), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn update_page_escapes_token_and_shows_error() {
         let resp = render_update_credentials_page(
+            &PageCopy::builtin("en"),
             "master",
             "tok-\"<script>",
             Some("passwords do not match & more"),
@@ -687,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_error_page_points_back_to_request_form() {
-        let resp = link_error_page("master", USED_LINK);
+        let resp = link_error_page(&PageCopy::builtin("en"), "master", USED_LINK);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -697,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_page_links_to_login() {
-        let resp = update_success_page("my realm");
+        let resp = update_success_page(&PageCopy::builtin("en"), "my realm");
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("Password updated"));
@@ -732,12 +859,19 @@ mod tests {
         let (state, _storage, _cache) = test_state().await;
 
         // Disabled by default: a 404 page, not the form.
-        let resp = reset_credentials_page(State(state.clone()), Path("master".to_string())).await;
+        let resp = reset_credentials_page(
+            State(state.clone()),
+            Path("master".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(body_string(resp).await.contains("not enabled"));
 
         enable_reset_password(&state).await;
-        let resp = reset_credentials_page(State(state), Path("master".to_string())).await;
+        let resp =
+            reset_credentials_page(State(state), Path("master".to_string()), HeaderMap::new())
+                .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         assert!(body.contains("Forgot your password?"));
@@ -891,6 +1025,7 @@ mod tests {
             State(state),
             Path("master".to_string()),
             Query(HashMap::from([("token".to_string(), token.clone())])),
+            HeaderMap::new(),
         )
         .await;
 
@@ -915,6 +1050,7 @@ mod tests {
             State(state.clone()),
             Path("master".to_string()),
             Query(HashMap::from([("token".to_string(), "garbage".to_string())])),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -926,6 +1062,7 @@ mod tests {
             State(state),
             Path("master".to_string()),
             Query(HashMap::from([("token".to_string(), token)])),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

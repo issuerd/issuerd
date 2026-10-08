@@ -51,7 +51,8 @@ use crate::state::{default_browser_flow, registration_flow, ServerState};
 
 use super::oidc::{emit_oidc_event, flow_cookie_header, has_flow_cookie};
 use super::required_actions::{
-    error_banner, error_response, page, send_verification_email, url_path_segment,
+    accept_language, error_banner, error_response, page, send_verification_email, url_path_segment,
+    PageCopy,
 };
 
 /// Cache TTL for an in-flight registration flow (matches the pending auth TTL).
@@ -74,6 +75,10 @@ pub struct PendingRegistration {
     /// it so the user lands on the originating app, not the account console.
     #[serde(default)]
     pub login_execution_id: Option<String>,
+    /// UI locale pinned by the GET (Accept-Language + realm default); the POST
+    /// re-renders reuse it so the flow does not change language mid-way.
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 /// Form fields forwarded to the authenticator as flow parameters.
@@ -97,6 +102,7 @@ const FORM_FIELDS: [&str; 6] = [
 /// (with a visible `*` marker in the label); `passwordless` omits the
 /// password/confirm inputs entirely.
 fn render_register_page(
+    copy: &PageCopy,
     realm_name: &str,
     flow_id: &str,
     error: Option<&str>,
@@ -112,33 +118,42 @@ fn render_register_page(
     let password_fields = if passwordless {
         String::new()
     } else {
-        "<label for=\"password\">Password</label>\
-         <input type=\"password\" id=\"password\" name=\"password\" \
-         autocomplete=\"new-password\" required>\
-         <label for=\"confirm_password\">Confirm password</label>\
-         <input type=\"password\" id=\"confirm_password\" name=\"confirm_password\" \
-         autocomplete=\"new-password\" required>"
-            .to_string()
+        format!(
+            "<label for=\"password\">{}</label>\
+             <input type=\"password\" id=\"password\" name=\"password\" \
+             autocomplete=\"new-password\" required>\
+             <label for=\"confirm_password\">{}</label>\
+             <input type=\"password\" id=\"confirm_password\" name=\"confirm_password\" \
+             autocomplete=\"new-password\" required>",
+            copy.msg("register.passwordLabel", "Password"),
+            copy.msg("register.confirmPasswordLabel", "Confirm password"),
+        )
     };
+    let heading = copy.msg("register.heading", "Create your account");
+    let username_label = copy.msg("register.usernameLabel", "Username");
+    let email_label = copy.msg("register.emailLabel", "Email");
+    let first_label = copy.msg("register.firstNameLabel", "First name");
+    let last_label = copy.msg("register.lastNameLabel", "Last name");
+    let submit = copy.msg("register.submit", "Register");
     let body = format!(
-        "<h1>Create your account</h1>\
+        "<h1>{heading}</h1>\
          {banner}\
          <form method=\"post\" action=\"{url}\">\
          <input type=\"hidden\" name=\"flow\" value=\"{}\">\
-         <label for=\"username\">Username</label>\
+         <label for=\"username\">{username_label}</label>\
          <input type=\"text\" id=\"username\" name=\"username\" value=\"{}\" \
          autocomplete=\"username\" required>\
-         <label for=\"email\">Email</label>\
+         <label for=\"email\">{email_label}</label>\
          <input type=\"email\" id=\"email\" name=\"email\" value=\"{}\" \
          autocomplete=\"email\" required>\
-         <label for=\"first_name\">First name{name_marker}</label>\
+         <label for=\"first_name\">{first_label}{name_marker}</label>\
          <input type=\"text\" id=\"first_name\" name=\"first_name\" value=\"{}\" \
          autocomplete=\"given-name\"{name_required}>\
-         <label for=\"last_name\">Last name{name_marker}</label>\
+         <label for=\"last_name\">{last_label}{name_marker}</label>\
          <input type=\"text\" id=\"last_name\" name=\"last_name\" value=\"{}\" \
          autocomplete=\"family-name\"{name_required}>\
          {password_fields}\
-         <button type=\"submit\">Register</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>",
         html_escape(flow_id),
         field("username"),
@@ -146,7 +161,7 @@ fn render_register_page(
         field("first_name"),
         field("last_name"),
     );
-    page("Register", &body).into_response()
+    page(&copy.msg("register.title", "Register"), &body, &copy.lang).into_response()
 }
 
 /// Absolute-path link to the login page for the realm. `execution_id` points
@@ -163,24 +178,32 @@ fn login_page_url(realm_name: &str, execution_id: Option<&str>) -> String {
 
 /// Confirmation page after a successful registration.
 fn registration_success_page(
+    copy: &PageCopy,
     realm_name: &str,
     verify_email: bool,
     execution_id: Option<&str>,
 ) -> Response {
     let login_url = login_page_url(realm_name, execution_id);
     let hint = if verify_email {
-        "We sent you an email with a verification link &mdash; open it to \
-         verify your address, then sign in."
+        copy.msg(
+            "register.successHintVerify",
+            "We sent you an email with a verification link &mdash; open it to \
+             verify your address, then sign in.",
+        )
     } else {
-        "You can now sign in."
+        copy.msg("register.successHint", "You can now sign in.")
     };
+    let title = copy.msg("register.successTitle", "Registration successful");
     page(
-        "Registration successful",
+        &title,
         &format!(
-            "<h1>Registration successful</h1>\
-             <p>Your account has been created. {hint}</p>\
-             <p><a href=\"{login_url}\">Continue to sign-in</a></p>"
+            "<h1>{title}</h1>\
+             <p>{} {hint}</p>\
+             <p><a href=\"{login_url}\">{}</a></p>",
+            copy.msg("register.successLead", "Your account has been created."),
+            copy.msg("register.continueToLogin", "Continue to sign-in"),
         ),
+        &copy.lang,
     )
     .into_response()
 }
@@ -192,6 +215,7 @@ async fn restore_and_render(
     realm_id: &RealmId,
     flow_id: &str,
     pending: &PendingRegistration,
+    copy: &PageCopy,
     realm_name: &str,
     error: Option<&str>,
     form: &HashMap<String, String>,
@@ -208,7 +232,7 @@ async fn restore_and_render(
             Some(Duration::from_secs(PENDING_REGISTRATION_TTL_SECS)),
         )
         .await;
-    render_register_page(realm_name, flow_id, error, form, require_names, passwordless)
+    render_register_page(copy, realm_name, flow_id, error, form, require_names, passwordless)
 }
 
 // ---------------------------------------------------------------------------
@@ -229,15 +253,25 @@ pub async fn register_page(
     Path(realm_name): Path<String>,
     axum::extract::Query(query): axum::extract::Query<RegisterPageQuery>,
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    headers: HeaderMap,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
     if !realm.registration_enabled {
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Registration is not enabled for this realm.",
+            &copy.msg("register.notEnabled", "Registration is not enabled for this realm."),
         );
     }
     let realm_id = realm.id.clone();
@@ -275,15 +309,20 @@ pub async fn register_page(
         Err(e) => {
             error!(realm = %realm_id, error = %e, "registration flow execution failed");
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Registration failed due to an internal error. Please try again later.",
+                &copy.msg(
+                    "register.internalError",
+                    "Registration failed due to an internal error. Please try again later.",
+                ),
             );
         }
     };
     let FlowOutput::Challenge { paused } = outcome else {
         return error_response(
+            &copy,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Registration flow is misconfigured.",
+            &copy.msg("register.misconfigured", "Registration flow is misconfigured."),
         );
     };
 
@@ -293,6 +332,7 @@ pub async fn register_page(
         execution_id: paused.execution_id().clone(),
         ip_address: Some(ip),
         login_execution_id,
+        locale: Some(copy.lang.clone()),
     };
     // Serialization cannot fail: every field is a plain String/Option.
     let bytes = serde_json::to_vec(&entry).unwrap();
@@ -306,6 +346,7 @@ pub async fn register_page(
         .await;
 
     let mut resp = render_register_page(
+        &copy,
         &realm_name,
         &flow_id,
         None,
@@ -334,12 +375,21 @@ pub async fn register_submit(
     let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap_or_default();
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     if !realm.registration_enabled {
+        let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
         return error_response(
+            &copy,
             StatusCode::NOT_FOUND,
-            "Registration is not enabled for this realm.",
+            &copy.msg("register.notEnabled", "Registration is not enabled for this realm."),
         );
     }
     let realm_id = realm.id.clone();
@@ -349,7 +399,12 @@ pub async fn register_submit(
     // The POST must carry the correlation cookie minted by the GET (CSRF).
     let flow_id = form.get("flow").cloned().unwrap_or_default();
     if flow_id.is_empty() || !has_flow_cookie(&headers, &flow_id) {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid or expired registration flow.");
+        let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("register.flowInvalid", "Invalid or expired registration flow."),
+        );
     }
 
     // Consume the entry atomically; failure paths below re-store it so the
@@ -363,12 +418,20 @@ pub async fn register_submit(
     let pending = match pending {
         Some(p) if p.realm_id == realm_id.0 => p,
         _ => {
+            let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "Your registration session has expired. Please start again.",
+                &copy.msg(
+                    "register.sessionExpired",
+                    "Your registration session has expired. Please start again.",
+                ),
             );
         }
     };
+    // The GET pinned the locale; the POST re-renders in the same language.
+    let copy =
+        PageCopy::for_realm(&state, &realm, pending.locale.as_deref(), accept_language(&headers));
 
     let mut ctx = TypedAuthContext::new_anonymous(realm_id.clone());
     ctx.ip_address = pending.ip_address.or(Some(ip));
@@ -391,8 +454,12 @@ pub async fn register_submit(
         Err(e) => {
             error!(realm = %realm_id, error = %e, "registration flow execution failed");
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Registration failed due to an internal error. Please try again later.",
+                &copy.msg(
+                    "register.internalError",
+                    "Registration failed due to an internal error. Please try again later.",
+                ),
             );
         }
     };
@@ -424,8 +491,12 @@ pub async fn register_submit(
                 Ok(Some(u)) => u,
                 _ => {
                     return error_response(
+                        &copy,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "Your account was created but could not be loaded.",
+                        &copy.msg(
+                            "register.accountNotLoaded",
+                            "Your account was created but could not be loaded.",
+                        ),
                     );
                 }
             };
@@ -476,6 +547,7 @@ pub async fn register_submit(
                 }
             }
             registration_success_page(
+                &copy,
                 &realm_name,
                 realm.verify_email_enabled,
                 pending.login_execution_id.as_deref(),
@@ -489,12 +561,14 @@ pub async fn register_submit(
             let form_error = match &e {
                 IssuerdError::InvalidRequest(msg) => {
                     warn!(realm = %realm_id, error = %e, "registration failed");
-                    msg.clone()
+                    crate::i18n::localize_error(&copy.bundle, msg)
                 }
                 _ => {
                     error!(realm = %realm_id, error = %e, "registration failed with internal error");
-                    "Registration failed due to an internal error. Please try again later."
-                        .to_string()
+                    copy.msg(
+                        "register.internalError",
+                        "Registration failed due to an internal error. Please try again later.",
+                    )
                 }
             };
             let mut details = HashMap::new();
@@ -518,6 +592,7 @@ pub async fn register_submit(
                 &realm_id,
                 &flow_id,
                 &pending,
+                &copy,
                 &realm_name,
                 Some(&form_error),
                 &form,
@@ -534,6 +609,7 @@ pub async fn register_submit(
                 &realm_id,
                 &flow_id,
                 &pending,
+                &copy,
                 &realm_name,
                 None,
                 &form,
@@ -776,6 +852,7 @@ mod tests {
                 execution_id: login_execution_id.map(str::to_string),
             }),
             client_ip(),
+            HeaderMap::new(),
         )
         .await;
         let set_cookie = resp
@@ -864,6 +941,7 @@ mod tests {
         prefill.insert("username".to_string(), "<script>alert(1)</script>".to_string());
         prefill.insert("email".to_string(), "a@b.example".to_string());
         let resp = render_register_page(
+            &PageCopy::builtin("en"),
             "master",
             "flow-\"x\"",
             Some("bad & worse"),
@@ -881,8 +959,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn form_localizes_labels_and_lang() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("register.heading".to_string(), "Konto erstellen".to_string());
+        bundle.insert("register.usernameLabel".to_string(), "Benutzername".to_string());
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let resp =
+            render_register_page(&copy, "master", "flow-1", None, &HashMap::new(), false, false);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Konto erstellen</h1>"), "body: {body}");
+        assert!(body.contains("<label for=\"username\">Benutzername</label>"), "body: {body}");
+        // Untouched keys keep the English default.
+        assert!(body.contains("<label for=\"email\">Email</label>"), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn form_marks_names_required_when_realm_requires_them() {
-        let resp = render_register_page("master", "flow-1", None, &HashMap::new(), true, false);
+        let resp = render_register_page(
+            &PageCopy::builtin("en"),
+            "master",
+            "flow-1",
+            None,
+            &HashMap::new(),
+            true,
+            false,
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         // Visible marker plus the HTML required attribute on both name inputs.
@@ -901,7 +1007,15 @@ mod tests {
 
     #[tokio::test]
     async fn form_omits_password_fields_when_passwordless() {
-        let resp = render_register_page("master", "flow-1", None, &HashMap::new(), false, true);
+        let resp = render_register_page(
+            &PageCopy::builtin("en"),
+            "master",
+            "flow-1",
+            None,
+            &HashMap::new(),
+            false,
+            true,
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!body.contains("name=\"password\""));
@@ -913,13 +1027,13 @@ mod tests {
 
     #[tokio::test]
     async fn success_pages_link_to_login() {
-        let resp = registration_success_page("my realm", true, None);
+        let resp = registration_success_page(&PageCopy::builtin("en"), "my realm", true, None);
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("verification link"));
         assert!(body.contains("/login.html?realm=my+realm"));
 
-        let resp = registration_success_page("my realm", false, None);
+        let resp = registration_success_page(&PageCopy::builtin("en"), "my realm", false, None);
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!body.contains("verification link"));
@@ -928,7 +1042,8 @@ mod tests {
 
     #[tokio::test]
     async fn success_page_threads_login_execution_into_link() {
-        let resp = registration_success_page("my realm", false, Some("exec 1"));
+        let resp =
+            registration_success_page(&PageCopy::builtin("en"), "my realm", false, Some("exec 1"));
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("/login.html?realm=my+realm&execution_id=exec+1"));
@@ -958,6 +1073,7 @@ mod tests {
             Path("master".to_string()),
             axum::extract::Query(RegisterPageQuery { execution_id: None }),
             client_ip(),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1072,6 +1188,7 @@ mod tests {
             execution_id: FlowStageId::new("registration").unwrap(),
             ip_address: None,
             login_execution_id: None,
+            locale: None,
         };
         cache
             .set(

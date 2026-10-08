@@ -128,6 +128,13 @@ impl Provisioner {
                     .admin_theme
                     .as_ref()
                     .and_then(|t| issuerd_core::ThemeName::new(t).ok()),
+                // Optional i18n settings fall back to the `Realm` defaults when
+                // the provision file omits them (empty locales / no default).
+                internationalization_enabled: p
+                    .internationalization_enabled
+                    .unwrap_or(defaults.internationalization_enabled),
+                supported_locales: p.supported_locales.clone().unwrap_or_default(),
+                default_locale: p.default_locale.clone(),
                 default_role: p.default_role.clone(),
                 access_token_lifespan: nonzero_lifespan(
                     p.access_token_lifespan,
@@ -606,6 +613,13 @@ impl Provisioner {
             realm.login_theme = realm.login_theme.as_ref().map(|s| substitute(s, &mut errors));
             realm.email_theme = realm.email_theme.as_ref().map(|s| substitute(s, &mut errors));
             realm.admin_theme = realm.admin_theme.as_ref().map(|s| substitute(s, &mut errors));
+            if let Some(locales) = realm.supported_locales.as_mut() {
+                for locale in locales {
+                    *locale = substitute(locale, &mut errors);
+                }
+            }
+            realm.default_locale =
+                realm.default_locale.as_ref().map(|s| substitute(s, &mut errors));
             realm.default_role = realm.default_role.as_ref().map(|s| substitute(s, &mut errors));
             realm.browser_flow = realm.browser_flow.as_ref().map(|s| substitute(s, &mut errors));
             realm.registration_flow =
@@ -800,6 +814,9 @@ mod tests {
                 login_theme: None,
                 email_theme: None,
                 admin_theme: None,
+                internationalization_enabled: None,
+                supported_locales: None,
+                default_locale: None,
                 default_role: None,
                 access_token_lifespan: None,
                 refresh_token_lifespan: None,
@@ -1009,6 +1026,40 @@ mod tests {
         assert_eq!(realm.login_theme.as_ref().map(|t| t.as_str()), Some("acme-login"));
         assert_eq!(realm.email_theme.as_ref().map(|t| t.as_str()), Some("acme-email"));
         assert_eq!(realm.admin_theme.as_ref().map(|t| t.as_str()), Some("acme-admin"));
+    }
+
+    #[tokio::test]
+    async fn realm_i18n_settings_are_applied() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        {
+            let realm = &mut config.realms[0];
+            realm.internationalization_enabled = Some(true);
+            realm.supported_locales = Some(vec!["en".to_string(), "de".to_string()]);
+            realm.default_locale = Some("en".to_string());
+        }
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().expect("realm missing");
+        assert!(realm.internationalization_enabled);
+        assert_eq!(realm.supported_locales, vec!["en".to_string(), "de".to_string()]);
+        assert_eq!(realm.default_locale.as_deref(), Some("en"));
+    }
+
+    #[tokio::test]
+    async fn realm_i18n_settings_default_when_unset() {
+        let storage = InMemoryStorage::new();
+        let provisioner = Provisioner {
+            config: sample_config(),
+        };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().expect("realm missing");
+        let defaults = Realm::default();
+        assert_eq!(realm.internationalization_enabled, defaults.internationalization_enabled);
+        assert_eq!(realm.supported_locales, defaults.supported_locales);
+        assert_eq!(realm.default_locale, defaults.default_locale);
     }
 
     #[tokio::test]
@@ -1249,6 +1300,9 @@ mod tests {
                 login_theme: None,
                 email_theme: None,
                 admin_theme: None,
+                internationalization_enabled: None,
+                supported_locales: None,
+                default_locale: None,
                 default_role: None,
                 access_token_lifespan: None,
                 refresh_token_lifespan: None,

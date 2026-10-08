@@ -36,6 +36,7 @@ use issuerd_core::{
 };
 
 use crate::email::{html_escape, render_verify_email_localized, VERIFY_EMAIL_LINK_TTL_SECS};
+use crate::i18n::MessageBundle;
 use crate::middleware::proxy_ip::ClientIp;
 use crate::state::ServerState;
 
@@ -100,7 +101,13 @@ pub(crate) fn url_path_segment(segment: &str) -> String {
 }
 
 fn continuation_url(realm_name: &str, execution: &str) -> String {
-    format!("/realms/{}/login/required-action/{execution}", url_path_segment(realm_name))
+    // Both segments are percent-encoded: `execution` arrives from the URL and
+    // is embedded unquoted into HTML form actions by the page renderers.
+    format!(
+        "/realms/{}/login/required-action/{}",
+        url_path_segment(realm_name),
+        url_path_segment(execution)
+    )
 }
 
 /// Start the required-action continuation: store the paused state and
@@ -241,9 +248,11 @@ font-size:22px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;outlin
 .otp-row .otp-digit:focus{border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.25);}\
 ";
 
-pub(crate) fn page(title: &str, body: &str) -> Html<String> {
+pub(crate) fn page(title: &str, body: &str, lang: &str) -> Html<String> {
     let mut html = String::with_capacity(PAGE_CSS.len() + title.len() + body.len() + 256);
-    html.push_str("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    html.push_str("<!DOCTYPE html><html lang=\"");
+    html.push_str(&html_escape(lang));
+    html.push_str("\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     html.push_str("<title>");
     html.push_str(&html_escape(title));
@@ -262,39 +271,146 @@ pub(crate) fn error_banner(error: Option<&str>) -> String {
     }
 }
 
-pub(crate) fn error_response(status: StatusCode, msg: &str) -> Response {
+/// Locale-resolved copy context for the server-rendered login pages: the
+/// `<html lang>` tag plus the layered message bundle every user-facing string
+/// is pulled from (bundle values are trusted operator content and are inserted
+/// into the HTML verbatim; dynamic values stay escaped at the call sites).
+pub(crate) struct PageCopy {
+    /// BCP-47 tag resolved for this request.
+    pub lang: String,
+    /// Layered message bundle for `lang` (per-key English fallback).
+    pub bundle: MessageBundle,
+}
+
+impl PageCopy {
+    /// Resolve the page copy for `realm`: the locale pinned at the authorize
+    /// endpoint wins, then the `Accept-Language` header, then the realm
+    /// default (via [`crate::i18n::resolve_locale`]); strings come from the
+    /// realm's login theme bundle.
+    pub(crate) fn for_realm(
+        state: &ServerState,
+        realm: &Realm,
+        pinned_locale: Option<&str>,
+        accept_language: Option<&str>,
+    ) -> Self {
+        let lang = match pinned_locale {
+            Some(locale) => locale.to_string(),
+            None => crate::i18n::resolve_locale(realm, &[], accept_language),
+        };
+        let bundle = crate::i18n::message_bundle(
+            Some(state.config.themes.dir.as_path()),
+            realm.login_theme.as_ref().map(|t| t.as_str()),
+            &lang,
+        );
+        Self { lang, bundle }
+    }
+
+    /// Copy for error pages rendered before any realm is known (missing or
+    /// unknown realm): the default locale, with the default theme's overrides
+    /// still applied.
+    pub(crate) fn fallback(state: &ServerState) -> Self {
+        let lang = crate::i18n::DEFAULT_LOCALE.to_string();
+        let bundle =
+            crate::i18n::message_bundle(Some(state.config.themes.dir.as_path()), None, &lang);
+        Self { lang, bundle }
+    }
+
+    /// Built-in bundles only — page-render unit tests run without a state.
+    #[cfg(test)]
+    pub(crate) fn builtin(locale: &str) -> Self {
+        Self {
+            lang: locale.to_string(),
+            bundle: crate::i18n::message_bundle(None, None, locale),
+        }
+    }
+
+    /// Look up `key` in the bundle, falling back to `default` when absent.
+    pub(crate) fn msg(&self, key: &str, default: &str) -> String {
+        crate::i18n::msg(&self.bundle, key, default)
+    }
+}
+
+/// The request's `Accept-Language` header value, when present and well-formed.
+pub(crate) fn accept_language(headers: &HeaderMap) -> Option<&str> {
+    headers.get(axum::http::header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok())
+}
+
+/// Render a bare error page. `msg` arrives already localized (callers pull it
+/// from the bundle); the page chrome (title, `<html lang>`) comes from `copy`.
+pub(crate) fn error_response(copy: &PageCopy, status: StatusCode, msg: &str) -> Response {
+    let title = copy.msg("page.error.title", "Sign-in error");
     (
         status,
         page(
-            "Sign-in error",
-            &format!("<h1>Sign-in error</h1><p class=\"error\">{}</p>", html_escape(msg)),
+            &title,
+            &format!("<h1>{title}</h1><p class=\"error\">{}</p>", html_escape(msg)),
+            &copy.lang,
         ),
     )
         .into_response()
 }
 
+/// Encode `value` as a JavaScript string literal (including the surrounding
+/// quotes) safe for embedding in an inline `<script>`: `"` and `\` are
+/// escaped, `<`/`>` become unicode escapes so the payload can never close the
+/// script element early, and non-ASCII rides along as `\uXXXX` UTF-16 units.
+pub(crate) fn js_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c if (c as u32) < 0x80 => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Render the OTP second-factor challenge page. The form re-POSTs
 /// to the login endpoint with the hidden browser flow id and the one-time
 /// code; a wrong code re-renders this page with the error banner.
-pub(crate) fn otp_challenge_page(realm_name: &str, flow_id: &str, error: Option<&str>) -> Response {
+pub(crate) fn otp_challenge_page(
+    copy: &PageCopy,
+    realm_name: &str,
+    flow_id: &str,
+    error: Option<&str>,
+) -> Response {
     let mut action = url::form_urlencoded::Serializer::new(String::new());
     action.append_pair("realm", realm_name);
     let action = format!("/api/v1/auth/login?{}", action.finish());
     let banner = error_banner(error);
     let flow_id = html_escape(flow_id);
+    let title = copy.msg("otp.title", "Two-factor authentication");
+    let lead =
+        copy.msg("otp.lead", "Enter the one-time code from your authenticator app to continue.");
+    let code_label = copy.msg("otp.codeLabel", "One-time code");
+    let submit = copy.msg("otp.submit", "Sign in");
     let body = format!(
-        "<h1>Two-factor authentication</h1>\
-         <p>Enter the one-time code from your authenticator app to continue.</p>\
+        "<h1>{title}</h1>\
+         <p>{lead}</p>\
          {banner}\
          <form method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"execution_id\" value=\"{flow_id}\">\
-         <label for=\"otp\">One-time code</label>\
+         <label for=\"otp\">{code_label}</label>\
          <input type=\"text\" id=\"otp\" name=\"otp\" inputmode=\"numeric\" pattern=\"[0-9]*\" \
          autocomplete=\"one-time-code\" autofocus required>\
-         <button type=\"submit\">Sign in</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>"
     );
-    page("Two-factor authentication", &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 /// Inline script for the email-code challenge page. Keeps the digit boxes in
@@ -348,6 +464,7 @@ box.addEventListener("focus",function(){box.select();});
 /// the partially hidden destination address; `None` when the entered address
 /// resolved to no account (the page then stays deliberately vague).
 pub(crate) fn email_code_challenge_page(
+    copy: &PageCopy,
     realm_name: &str,
     flow_id: &str,
     masked_email: Option<&str>,
@@ -359,15 +476,23 @@ pub(crate) fn email_code_challenge_page(
     let action = format!("/api/v1/auth/login?{}", action.finish());
     let banner = error_banner(error);
     let flow_id = html_escape(flow_id);
+    let title = copy.msg("emailCode.title", "Check your email");
     let lead = match masked_email {
-        Some(masked) => {
-            format!(
-                "We sent a {code_length}-digit code to <strong>{}</strong>.",
-                html_escape(masked)
+        Some(masked) => copy
+            .msg(
+                "emailCode.leadMasked",
+                "We sent a {length}-digit code to <strong>{email}</strong>.",
             )
-        }
-        None => format!("Enter the {code_length}-digit code we sent to your email address."),
+            .replace("{length}", &code_length.to_string())
+            .replace("{email}", &html_escape(masked)),
+        None => copy
+            .msg("emailCode.lead", "Enter the {length}-digit code we sent to your email address.")
+            .replace("{length}", &code_length.to_string()),
     };
+    let code_label = copy.msg("emailCode.codeLabel", "One-time code");
+    let submit = copy.msg("emailCode.submit", "Sign in");
+    let resend = copy.msg("emailCode.resend", "Resend code");
+    let digit_label = copy.msg("emailCode.digitAriaLabel", "Code digit {index}");
     let mut boxes = String::with_capacity(code_length * 160);
     for i in 1..=code_length {
         let first = if i == 1 {
@@ -377,31 +502,32 @@ pub(crate) fn email_code_challenge_page(
         };
         boxes.push_str(&format!(
             "<input type=\"text\" class=\"otp-digit\"{first} inputmode=\"numeric\" \
-             pattern=\"[0-9]*\" aria-label=\"Code digit {i}\">"
+             pattern=\"[0-9]*\" aria-label=\"{}\">",
+            digit_label.replace("{index}", &i.to_string())
         ));
     }
     let body = format!(
-        "<h1>Check your email</h1>\
+        "<h1>{title}</h1>\
          <p>{lead}</p>\
          {banner}\
          <form method=\"post\" action=\"{action}\" id=\"code-form\">\
          <input type=\"hidden\" name=\"execution_id\" value=\"{flow_id}\">\
          <input type=\"hidden\" name=\"otp\" id=\"otp-value\" disabled>\
-         <label for=\"otp\">One-time code</label>\
+         <label for=\"otp\">{code_label}</label>\
          <div class=\"otp-row\">{boxes}</div>\
          <noscript><style>.otp-row{{display:none}}</style>\
          <input type=\"text\" name=\"otp\" inputmode=\"numeric\" pattern=\"[0-9]*\" \
          autocomplete=\"one-time-code\" required></noscript>\
-         <button type=\"submit\">Sign in</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>\
          <form method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"execution_id\" value=\"{flow_id}\">\
          <input type=\"hidden\" name=\"resend\" value=\"1\">\
-         <button type=\"submit\" class=\"secondary\">Resend code</button>\
+         <button type=\"submit\" class=\"secondary\">{resend}</button>\
          </form>\
          <script>{EMAIL_CODE_CHALLENGE_SCRIPT}</script>"
     );
-    page("Check your email", &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 /// Inline script for the WebAuthn challenge page. Drives
@@ -409,7 +535,9 @@ pub(crate) fn email_code_challenge_page(
 /// auto-submits the assertion as a hidden form field back to the login
 /// endpoint. `__OPTIONS__` is replaced with the options JSON (every `<`
 /// escaped as a JSON unicode escape so the payload can never break out of
-/// the script element). Self-contained: no external resources.
+/// the script element); `__WAITING__` / `__FAILED_PREFIX__` are replaced with
+/// the localized status strings as JSON string literals (same escaping, via
+/// [`js_string_literal`]). Self-contained: no external resources.
 const WEBAUTHN_CHALLENGE_SCRIPT: &str = r#"const options=__OPTIONS__;
 function b64d(s){const b=atob(s.replace(/-/g,"+").replace(/_/g,"/"));
 const a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;}
@@ -418,7 +546,7 @@ for(let i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);
 return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");}
 async function run(){
 const st=document.getElementById("status");
-st.textContent="Waiting for your passkey\u2026";
+st.textContent=__WAITING__;
 document.getElementById("retry").style.display="none";
 try{
 const pk=options;
@@ -433,7 +561,7 @@ userHandle:cred.response.userHandle?b64e(cred.response.userHandle):null}};
 document.getElementById("webauthn_assertion").value=JSON.stringify(assertion);
 document.getElementById("waform").submit();
 }catch(e){
-st.textContent="Passkey authentication failed: "+(e&&e.message?e.message:e);
+st.textContent=__FAILED_PREFIX__+(e&&e.message?e.message:e);
 document.getElementById("retry").style.display="block";
 }}
 run();
@@ -444,6 +572,7 @@ run();
 /// this page with fresh options and the error banner, and client-side
 /// failures surface a "Try again" button that re-runs the ceremony.
 pub(crate) fn webauthn_challenge_page(
+    copy: &PageCopy,
     realm_name: &str,
     flow_id: &str,
     options_json: &str,
@@ -457,26 +586,39 @@ pub(crate) fn webauthn_challenge_page(
     // Escape `<` inside the embedded JSON so a crafted value can never close
     // the script element (a JSON unicode escape remains valid JSON).
     let options = options_json.replace('<', "\\u003c");
-    let script = WEBAUTHN_CHALLENGE_SCRIPT.replace("__OPTIONS__", &options);
+    let waiting =
+        js_string_literal(&copy.msg("webauthn.scriptWaiting", "Waiting for your passkey\u{2026}"));
+    let failed_prefix = js_string_literal(
+        &copy.msg("webauthn.scriptFailedPrefix", "Passkey authentication failed: "),
+    );
+    let script = WEBAUTHN_CHALLENGE_SCRIPT
+        .replace("__OPTIONS__", &options)
+        .replace("__WAITING__", &waiting)
+        .replace("__FAILED_PREFIX__", &failed_prefix);
+    let title = copy.msg("webauthn.title", "Sign in with your passkey");
+    let lead = copy.msg("webauthn.lead", "Use your passkey to continue.");
+    let retry = copy.msg("webauthn.retry", "Try again");
     let body = format!(
-        "<h1>Sign in with your passkey</h1>\
-         <p id=\"status\">Use your passkey to continue.</p>\
+        "<h1>{title}</h1>\
+         <p id=\"status\">{lead}</p>\
          {banner}\
          <form id=\"waform\" method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"execution_id\" value=\"{flow_id}\">\
          <input type=\"hidden\" id=\"webauthn_assertion\" name=\"webauthn_assertion\" value=\"\">\
          </form>\
          <button id=\"retry\" class=\"secondary\" style=\"display:none\" \
-         onclick=\"run();return false;\">Try again</button>\
+         onclick=\"run();return false;\">{retry}</button>\
          <script>{script}</script>"
     );
-    page("Sign in with your passkey", &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 /// Render the CONFIGURE_TOTP enrollment page: QR code + manual setup key +
 /// verification form. `secret_b32` is the pending enrollment secret carried
 /// in the continuation entry (never persisted until a code verifies).
+#[allow(clippy::too_many_arguments)]
 fn render_configure_totp_page(
+    copy: &PageCopy,
     realm_name: &str,
     execution: &str,
     realm: &Realm,
@@ -504,27 +646,36 @@ fn render_configure_totp_page(
         .join(" ");
     let secret = html_escape(&grouped);
     let otpauth_link = html_escape(&otpauth);
+    let title = copy.msg("totp.title", "Configure authenticator app");
+    let lead = copy.msg(
+        "totp.lead",
+        "Scan the QR code with your authenticator app (or enter the setup key \
+         manually), then enter the one-time code it shows to finish setup.",
+    );
+    let open_in_app = copy.msg("totp.openInApp", "Open in authenticator app");
+    let code_label = copy.msg("totp.codeLabel", "One-time code");
+    let submit = copy.msg("totp.submit", "Finish setup");
     let body = format!(
-        "<h1>Configure authenticator app</h1>\
-         <p>Scan the QR code with your authenticator app (or enter the setup key \
-         manually), then enter the one-time code it shows to finish setup.</p>\
+        "<h1>{title}</h1>\
+         <p>{lead}</p>\
          {banner}\
          <div style=\"text-align:center;margin:12px 0;\">{qr}</div>\
          <p style=\"text-align:center;\"><code style=\"font-size:16px;\
          letter-spacing:1px;\">{secret}</code></p>\
          <p style=\"word-break:break-all;\"><a href=\"{otpauth_link}\">\
-         Open in authenticator app</a></p>\
+         {open_in_app}</a></p>\
          <form method=\"post\" action=\"{url}\">\
-         <label for=\"totp_code\">One-time code</label>\
+         <label for=\"totp_code\">{code_label}</label>\
          <input type=\"text\" id=\"totp_code\" name=\"totp_code\" inputmode=\"numeric\" \
          autocomplete=\"one-time-code\" required>\
-         <button type=\"submit\">Finish setup</button>\
+         <button type=\"submit\">{submit}</button>\
          </form>"
     );
-    page("Configure authenticator app", &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 fn render_action_page(
+    copy: &PageCopy,
     realm_name: &str,
     execution: &str,
     action: &str,
@@ -534,20 +685,31 @@ fn render_action_page(
     let url = continuation_url(realm_name, execution);
     let banner = error_banner(error);
     let body = match action {
-        "UPDATE_PASSWORD" => format!(
-            "<h1>Update your password</h1>\
-             <p>You must set a new password before you can continue.</p>\
-             {banner}\
-             <form method=\"post\" action=\"{url}\">\
-             <label for=\"new_password\">New password</label>\
-             <input type=\"password\" id=\"new_password\" name=\"new_password\" \
-             autocomplete=\"new-password\" required>\
-             <label for=\"confirm_password\">Confirm password</label>\
-             <input type=\"password\" id=\"confirm_password\" name=\"confirm_password\" \
-             autocomplete=\"new-password\" required>\
-             <button type=\"submit\">Update password</button>\
-             </form>"
-        ),
+        "UPDATE_PASSWORD" => {
+            let heading = copy.msg("action.updatePassword.heading", "Update your password");
+            let lead = copy.msg(
+                "action.updatePassword.lead",
+                "You must set a new password before you can continue.",
+            );
+            let new_label = copy.msg("action.updatePassword.newPasswordLabel", "New password");
+            let confirm_label =
+                copy.msg("action.updatePassword.confirmPasswordLabel", "Confirm password");
+            let submit = copy.msg("action.updatePassword.submit", "Update password");
+            format!(
+                "<h1>{heading}</h1>\
+                 <p>{lead}</p>\
+                 {banner}\
+                 <form method=\"post\" action=\"{url}\">\
+                 <label for=\"new_password\">{new_label}</label>\
+                 <input type=\"password\" id=\"new_password\" name=\"new_password\" \
+                 autocomplete=\"new-password\" required>\
+                 <label for=\"confirm_password\">{confirm_label}</label>\
+                 <input type=\"password\" id=\"confirm_password\" name=\"confirm_password\" \
+                 autocomplete=\"new-password\" required>\
+                 <button type=\"submit\">{submit}</button>\
+                 </form>"
+            )
+        }
         "UPDATE_PROFILE" => {
             let (email, first, last) = match prefill {
                 Some(u) => (
@@ -557,59 +719,92 @@ fn render_action_page(
                 ),
                 None => ("", "", ""),
             };
+            let heading = copy.msg("action.updateProfile.heading", "Update your profile");
+            let lead = copy.msg(
+                "action.updateProfile.lead",
+                "Please review your account details before you continue.",
+            );
+            let email_label = copy.msg("action.updateProfile.emailLabel", "Email");
+            let first_label = copy.msg("action.updateProfile.firstNameLabel", "First name");
+            let last_label = copy.msg("action.updateProfile.lastNameLabel", "Last name");
+            let submit = copy.msg("action.updateProfile.submit", "Save");
             format!(
-                "<h1>Update your profile</h1>\
-                 <p>Please review your account details before you continue.</p>\
+                "<h1>{heading}</h1>\
+                 <p>{lead}</p>\
                  {banner}\
                  <form method=\"post\" action=\"{url}\">\
-                 <label for=\"email\">Email</label>\
+                 <label for=\"email\">{email_label}</label>\
                  <input type=\"email\" id=\"email\" name=\"email\" value=\"{}\">\
-                 <label for=\"first_name\">First name</label>\
+                 <label for=\"first_name\">{first_label}</label>\
                  <input type=\"text\" id=\"first_name\" name=\"first_name\" value=\"{}\">\
-                 <label for=\"last_name\">Last name</label>\
+                 <label for=\"last_name\">{last_label}</label>\
                  <input type=\"text\" id=\"last_name\" name=\"last_name\" value=\"{}\">\
-                 <button type=\"submit\">Save</button>\
+                 <button type=\"submit\">{submit}</button>\
                  </form>",
                 html_escape(email),
                 html_escape(first),
                 html_escape(last)
             )
         }
-        "TERMS_AND_CONDITIONS" => format!(
-            "<h1>Terms and conditions</h1>\
-             <p>You must accept the terms and conditions to continue.</p>\
-             {banner}\
-             <form method=\"post\" action=\"{url}\">\
-             <label class=\"checkbox\" for=\"terms_accepted\">\
-             <input type=\"checkbox\" id=\"terms_accepted\" name=\"terms_accepted\" value=\"true\">\
-             <span>I accept the terms and conditions of this service.</span></label>\
-             <button type=\"submit\">Continue</button>\
-             </form>"
-        ),
-        "VERIFY_EMAIL" => format!(
-            "<h1>Verify your email address</h1>\
-             <p>We sent you an email with a verification link. Open the link to \
-             verify your address, then continue here.</p>\
-             {banner}\
-             <form method=\"post\" action=\"{url}\">\
-             <button type=\"submit\">I have verified &mdash; continue</button>\
-             </form>\
-             <form method=\"post\" action=\"{url}\">\
-             <input type=\"hidden\" name=\"resend\" value=\"true\">\
-             <button type=\"submit\" class=\"secondary\">Resend email</button>\
-             </form>"
-        ),
+        "TERMS_AND_CONDITIONS" => {
+            let heading = copy.msg("action.terms.heading", "Terms and conditions");
+            let lead = copy
+                .msg("action.terms.lead", "You must accept the terms and conditions to continue.");
+            let accept = copy.msg(
+                "action.terms.acceptLabel",
+                "I accept the terms and conditions of this service.",
+            );
+            let submit = copy.msg("action.terms.submit", "Continue");
+            format!(
+                "<h1>{heading}</h1>\
+                 <p>{lead}</p>\
+                 {banner}\
+                 <form method=\"post\" action=\"{url}\">\
+                 <label class=\"checkbox\" for=\"terms_accepted\">\
+                 <input type=\"checkbox\" id=\"terms_accepted\" name=\"terms_accepted\" value=\"true\">\
+                 <span>{accept}</span></label>\
+                 <button type=\"submit\">{submit}</button>\
+                 </form>"
+            )
+        }
+        "VERIFY_EMAIL" => {
+            let heading = copy.msg("action.verifyEmail.heading", "Verify your email address");
+            let lead = copy.msg(
+                "action.verifyEmail.lead",
+                "We sent you an email with a verification link. Open the link to \
+                 verify your address, then continue here.",
+            );
+            let continue_label =
+                copy.msg("action.verifyEmail.continue", "I have verified &mdash; continue");
+            let resend = copy.msg("action.verifyEmail.resend", "Resend email");
+            format!(
+                "<h1>{heading}</h1>\
+                 <p>{lead}</p>\
+                 {banner}\
+                 <form method=\"post\" action=\"{url}\">\
+                 <button type=\"submit\">{continue_label}</button>\
+                 </form>\
+                 <form method=\"post\" action=\"{url}\">\
+                 <input type=\"hidden\" name=\"resend\" value=\"true\">\
+                 <button type=\"submit\" class=\"secondary\">{resend}</button>\
+                 </form>"
+            )
+        }
         // Unknown actions are skipped before rendering; this is unreachable.
-        other => format!("<h1>Unsupported action</h1><p>{}</p>", html_escape(other)),
+        other => format!(
+            "<h1>{}</h1><p>{}</p>",
+            copy.msg("action.unsupported.heading", "Unsupported action"),
+            html_escape(other)
+        ),
     };
     let title = match action {
-        "UPDATE_PASSWORD" => "Update password",
-        "UPDATE_PROFILE" => "Update profile",
-        "TERMS_AND_CONDITIONS" => "Terms and conditions",
-        "VERIFY_EMAIL" => "Verify email",
-        _ => "Action required",
+        "UPDATE_PASSWORD" => copy.msg("action.updatePassword.title", "Update password"),
+        "UPDATE_PROFILE" => copy.msg("action.updateProfile.title", "Update profile"),
+        "TERMS_AND_CONDITIONS" => copy.msg("action.terms.title", "Terms and conditions"),
+        "VERIFY_EMAIL" => copy.msg("action.verifyEmail.title", "Verify email"),
+        _ => copy.msg("action.unsupported.title", "Action required"),
     };
-    page(title, &body).into_response()
+    page(&title, &body, &copy.lang).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +970,9 @@ pub async fn required_action_page(
     let mint_cookie = !has_flow_cookie(&headers, &execution);
     // Resolved before `state` moves into the page renderer.
     let secure_cookies = state.config.secure_cookies();
-    let mut resp = required_action_page_inner(state, realm_name, execution.clone()).await;
+    let mut resp =
+        required_action_page_inner(state, realm_name, execution.clone(), accept_language(&headers))
+            .await;
     if mint_cookie {
         if let Ok(v) = HeaderValue::from_str(&flow_cookie_header(&execution, secure_cookies)) {
             resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
@@ -788,10 +985,18 @@ async fn required_action_page_inner(
     state: Arc<ServerState>,
     realm_name: String,
     execution: String,
+    accept_language: Option<&str>,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     let realm_id = realm.id.clone();
     let key = pending_actions_cache_key(&realm_id, &execution);
@@ -802,28 +1007,49 @@ async fn required_action_page_inner(
     let mut entry = match entry {
         Some(e) if e.pending.realm_id == realm_id.0 => e,
         _ => {
+            let copy = PageCopy::for_realm(&state, &realm, None, accept_language);
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "Your sign-in session has expired. Please go back and sign in again.",
+                &copy.msg(
+                    "error.sessionExpired",
+                    "Your sign-in session has expired. Please go back and sign in again.",
+                ),
             );
         }
     };
+    // Page copy follows the locale pinned at the authorize endpoint, then the
+    // request's Accept-Language header.
+    let copy =
+        PageCopy::for_realm(&state, &realm, entry.pending.locale.as_deref(), accept_language);
 
     // Work through the remaining list: completed/unknown actions are dropped
     // until a renderable action is found or the login can finish.
     loop {
         let Some(action) = entry.remaining_actions.first().cloned() else {
-            return finish_continuation(&state, &realm_id, &entry).await;
+            return finish_continuation(&state, &realm_id, &entry, &copy).await;
         };
         match action.as_str() {
             "VERIFY_EMAIL" => {
                 let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
                     Ok(id) => id,
-                    Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid session."),
+                    Err(_) => {
+                        return error_response(
+                            &copy,
+                            StatusCode::BAD_REQUEST,
+                            &copy.msg("error.invalidSession", "Invalid session."),
+                        )
+                    }
                 };
                 let user = match state.storage.get_user(&realm_id, &user_id).await {
                     Ok(Some(u)) => u,
-                    _ => return error_response(StatusCode::BAD_REQUEST, "Account not found."),
+                    _ => {
+                        return error_response(
+                            &copy,
+                            StatusCode::BAD_REQUEST,
+                            &copy.msg("error.accountNotFound", "Account not found."),
+                        )
+                    }
                 };
                 if user.email_verified {
                     // Verified via the email link (possibly in another tab).
@@ -848,15 +1074,20 @@ async fn required_action_page_inner(
                         }
                         Err(e) => {
                             error!(realm = %realm_id, error = %e, "failed to send verification email");
-                            entry.error = Some(format!(
-                                "Could not send the verification email: {e}. \
-                                 Try resending, or contact your administrator."
-                            ));
+                            entry.error = Some(
+                                copy.msg(
+                                    "verifyEmail.sendFailed",
+                                    "Could not send the verification email: {error}. \
+                                     Try resending, or contact your administrator.",
+                                )
+                                .replace("{error}", &e.to_string()),
+                            );
                         }
                     }
                     store_entry(&state, &realm_id, &execution, &entry).await;
                 }
                 return render_action_page(
+                    &copy,
                     &realm_name,
                     &execution,
                     "VERIFY_EMAIL",
@@ -868,6 +1099,7 @@ async fn required_action_page_inner(
                 let error = entry.error.take();
                 store_entry(&state, &realm_id, &execution, &entry).await;
                 return render_action_page(
+                    &copy,
                     &realm_name,
                     &execution,
                     &action,
@@ -878,12 +1110,19 @@ async fn required_action_page_inner(
             "UPDATE_PROFILE" => {
                 let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
                     Ok(id) => id,
-                    Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid session."),
+                    Err(_) => {
+                        return error_response(
+                            &copy,
+                            StatusCode::BAD_REQUEST,
+                            &copy.msg("error.invalidSession", "Invalid session."),
+                        )
+                    }
                 };
                 let user = state.storage.get_user(&realm_id, &user_id).await.ok().flatten();
                 let error = entry.error.take();
                 store_entry(&state, &realm_id, &execution, &entry).await;
                 return render_action_page(
+                    &copy,
                     &realm_name,
                     &execution,
                     &action,
@@ -894,11 +1133,23 @@ async fn required_action_page_inner(
             "CONFIGURE_TOTP" => {
                 let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
                     Ok(id) => id,
-                    Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid session."),
+                    Err(_) => {
+                        return error_response(
+                            &copy,
+                            StatusCode::BAD_REQUEST,
+                            &copy.msg("error.invalidSession", "Invalid session."),
+                        )
+                    }
                 };
                 let user = match state.storage.get_user(&realm_id, &user_id).await {
                     Ok(Some(u)) => u,
-                    _ => return error_response(StatusCode::BAD_REQUEST, "Account not found."),
+                    _ => {
+                        return error_response(
+                            &copy,
+                            StatusCode::BAD_REQUEST,
+                            &copy.msg("error.accountNotFound", "Account not found."),
+                        )
+                    }
                 };
                 // First render of the enrollment page mints the pending
                 // secret; re-renders (and failed codes) reuse it.
@@ -909,6 +1160,7 @@ async fn required_action_page_inner(
                 let error = entry.error.take();
                 store_entry(&state, &realm_id, &execution, &entry).await;
                 return render_configure_totp_page(
+                    &copy,
                     &realm_name,
                     &execution,
                     &realm,
@@ -939,11 +1191,23 @@ pub async fn required_action_submit(
     // The continuation POST must carry the correlation cookie minted when the
     // continuation started (login-CSRF protection).
     if !has_flow_cookie(&headers, &execution) {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid or expired sign-in flow.");
+        let copy = PageCopy::fallback(&state);
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("error.invalidFlow", "Invalid or expired sign-in flow."),
+        );
     }
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     let realm_id = realm.id.clone();
 
@@ -957,16 +1221,27 @@ pub async fn required_action_submit(
     let mut entry = match entry {
         Some(e) if e.pending.realm_id == realm_id.0 => e,
         _ => {
+            let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "Your sign-in session has expired. Please go back and sign in again.",
+                &copy.msg(
+                    "error.sessionExpired",
+                    "Your sign-in session has expired. Please go back and sign in again.",
+                ),
             );
         }
     };
+    let copy = PageCopy::for_realm(
+        &state,
+        &realm,
+        entry.pending.locale.as_deref(),
+        accept_language(&headers),
+    );
     let redirect_back = || Redirect::to(&continuation_url(&realm_name, &execution)).into_response();
 
     let Some(action) = entry.remaining_actions.first().cloned() else {
-        return finish_continuation(&state, &realm_id, &entry).await;
+        return finish_continuation(&state, &realm_id, &entry, &copy).await;
     };
 
     let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap_or_default();
@@ -995,10 +1270,16 @@ pub async fn required_action_submit(
                         entry.email_sent = true;
                         None
                     }
-                    Err(e) => Some(format!("Could not resend the verification email: {e}")),
+                    Err(e) => Some(
+                        copy.msg(
+                            "verifyEmail.resendFailed",
+                            "Could not resend the verification email: {error}",
+                        )
+                        .replace("{error}", &e.to_string()),
+                    ),
                 }
             }
-            None => Some("Account not found.".to_string()),
+            None => Some(copy.msg("error.accountNotFound", "Account not found.")),
         };
         store_entry(&state, &realm_id, &execution, &entry).await;
         return redirect_back();
@@ -1006,7 +1287,13 @@ pub async fn required_action_submit(
 
     let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
         Ok(id) => id,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid session."),
+        Err(_) => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("error.invalidSession", "Invalid session."),
+            )
+        }
     };
     let action_impl = match state.plugin_registry.get_required_action(&action).await {
         Ok(Some(a)) => a,
@@ -1049,17 +1336,32 @@ pub async fn required_action_submit(
         RequiredActionResult::Challenge(_) => {
             // Missing/invalid form input (or email not yet verified).
             if action == "TERMS_AND_CONDITIONS" {
-                entry.error =
-                    Some("You must accept the terms and conditions to continue.".to_string());
+                entry.error = Some(copy.msg(
+                    "action.terms.lead",
+                    "You must accept the terms and conditions to continue.",
+                ));
             }
         }
         RequiredActionResult::Failure(e) => {
-            entry.error = Some(e.to_string());
+            entry.error = Some(match &e {
+                // Validation failures carry a stable, user-facing message —
+                // localize it. (`e.to_string()` would add the "invalid
+                // request: " Display prefix and defeat the mapping.)
+                issuerd_core::IssuerdError::InvalidRequest(msg) => {
+                    crate::i18n::localize_error(&copy.bundle, msg)
+                }
+                // Internal variants (storage, crypto, …) carry server detail
+                // that must not reach the page: show a generic message.
+                _ => copy.msg(
+                    "error.actionFailed",
+                    "The action could not be completed. Please try again.",
+                ),
+            });
         }
     }
 
     if entry.remaining_actions.is_empty() {
-        return finish_continuation(&state, &realm_id, &entry).await;
+        return finish_continuation(&state, &realm_id, &entry, &copy).await;
     }
     store_entry(&state, &realm_id, &execution, &entry).await;
     redirect_back()
@@ -1076,25 +1378,43 @@ pub async fn verify_email_handler(
     State(state): State<Arc<ServerState>>,
     Path(realm_name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
-    let Some(token) = query.get("token") else {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid verification link.");
-    };
-    let execution = query.get("execution");
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     let realm_id = realm.id.clone();
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
+
+    let Some(token) = query.get("token") else {
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("verifyEmail.invalidLink", "Invalid verification link."),
+        );
+    };
+    let execution = query.get("execution");
 
     let token_key = verify_email_cache_key(&realm_id, token);
     let user_id_bytes = match state.cache.get_and_delete(&token_key).await {
         Ok(Some(b)) => b,
         _ => {
             return error_response(
+                &copy,
                 StatusCode::BAD_REQUEST,
-                "This verification link is invalid or has expired. \
-                 Sign in again to request a new one.",
+                &copy.msg(
+                    "verifyEmail.linkExpired",
+                    "This verification link is invalid or has expired. \
+                     Sign in again to request a new one.",
+                ),
             );
         }
     };
@@ -1103,7 +1423,13 @@ pub async fn verify_email_handler(
         .and_then(|s| issuerd_core::UserId::new(s).ok())
     {
         Some(id) => id,
-        None => return error_response(StatusCode::BAD_REQUEST, "Invalid verification token."),
+        None => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("verifyEmail.invalidToken", "Invalid verification token."),
+            )
+        }
     };
 
     let user = match state.storage.get_user(&realm_id, &user_id).await {
@@ -1124,8 +1450,12 @@ pub async fn verify_email_handler(
                     error!(realm = %realm_id, user_id = %user_id, error = %e,
                         "verify-email: failed to persist verified flag");
                     return error_response(
+                        &copy,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "Could not verify the email address. Please try again.",
+                        &copy.msg(
+                            "verifyEmail.verifyFailed",
+                            "Could not verify the email address. Please try again.",
+                        ),
                     );
                 }
             }
@@ -1133,7 +1463,11 @@ pub async fn verify_email_handler(
         _ => None,
     };
     if user.is_none() {
-        return error_response(StatusCode::BAD_REQUEST, "Account not found.");
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("error.accountNotFound", "Account not found."),
+        );
     }
 
     // No required-action continuation in flight (self-registration): render
@@ -1149,14 +1483,22 @@ pub async fn verify_email_handler(
             login_url.append_pair("execution_id", login_execution);
         }
         let login_url = login_url.finish();
+        let title = copy.msg("verifyEmail.pageTitle", "Email verified");
         return page(
-            "Email verified",
+            &title,
             &format!(
-                "<h1>Email address verified</h1>\
-                 <p>Your email address has been verified successfully. \
-                 You can now sign in to your account.</p>\
-                 <p><a href=\"/login.html?{login_url}\">Continue to sign-in</a></p>"
+                "<h1>{}</h1>\
+                 <p>{}</p>\
+                 <p><a href=\"/login.html?{login_url}\">{}</a></p>",
+                copy.msg("verifyEmail.heading", "Email address verified"),
+                copy.msg(
+                    "verifyEmail.successLogin",
+                    "Your email address has been verified successfully. \
+                     You can now sign in to your account.",
+                ),
+                copy.msg("verifyEmail.continueToLogin", "Continue to sign-in"),
             ),
+            &copy.lang,
         )
         .into_response();
     };
@@ -1193,15 +1535,20 @@ pub async fn verify_email_handler(
     // be opened on a different device than the login, and auto-completing
     // would issue tokens on the wrong browser. The user clicks through.
     let continue_url = continuation_url(&realm_name, execution);
+    let title = copy.msg("verifyEmail.pageTitle", "Email verified");
     page(
-        "Email verified",
+        &title,
         &format!(
-            "<h1>Email address verified</h1>\
-             <p>Your email address has been verified successfully.</p>\
+            "<h1>{}</h1>\
+             <p>{}</p>\
              <form method=\"get\" action=\"{continue_url}\">\
-             <button type=\"submit\">Continue sign-in</button>\
-             </form>"
+             <button type=\"submit\">{}</button>\
+             </form>",
+            copy.msg("verifyEmail.heading", "Email address verified"),
+            copy.msg("verifyEmail.success", "Your email address has been verified successfully.",),
+            copy.msg("verifyEmail.continueSignIn", "Continue sign-in"),
         ),
+        &copy.lang,
     )
     .into_response()
 }
@@ -1242,16 +1589,29 @@ pub async fn execute_actions_handler(
     State(state): State<Arc<ServerState>>,
     Path(realm_name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
-        _ => return error_response(StatusCode::NOT_FOUND, "Realm not found."),
+        _ => {
+            let copy = PageCopy::fallback(&state);
+            return error_response(
+                &copy,
+                StatusCode::NOT_FOUND,
+                &copy.msg("error.realmNotFound", "Realm not found."),
+            );
+        }
     };
     let realm_id = realm.id.clone();
+    let copy = PageCopy::for_realm(&state, &realm, None, accept_language(&headers));
 
     let Some(token) = query.get("token") else {
-        return error_response(StatusCode::BAD_REQUEST, INVALID_ACTIONS_LINK);
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("action.execute.invalidLink", INVALID_ACTIONS_LINK),
+        );
     };
     let claims = match issuerd_token::action_tokens::verify_action_token(
         state.crypto.as_ref(),
@@ -1262,7 +1622,13 @@ pub async fn execute_actions_handler(
     .await
     {
         Ok(c) => c,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_ACTIONS_LINK),
+        Err(_) => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("action.execute.invalidLink", INVALID_ACTIONS_LINK),
+            )
+        }
     };
 
     // Single-use: the continuation entry must still be pending in the cache.
@@ -1274,17 +1640,31 @@ pub async fn execute_actions_handler(
             _ => None,
         };
     let Some(continuation) = continuation else {
-        return error_response(StatusCode::BAD_REQUEST, USED_ACTIONS_LINK);
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("action.execute.usedLink", USED_ACTIONS_LINK),
+        );
     };
 
     let user_id = match issuerd_core::UserId::new(claims.sub.clone()) {
         Ok(id) => id,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_ACTIONS_LINK),
+        Err(_) => {
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("action.execute.invalidLink", INVALID_ACTIONS_LINK),
+            )
+        }
     };
     let mut user = match state.storage.get_user(&realm_id, &user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => {
-            return error_response(StatusCode::BAD_REQUEST, "This account is no longer available.")
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("error.accountUnavailable", "This account is no longer available."),
+            )
         }
     };
 
@@ -1301,8 +1681,12 @@ pub async fn execute_actions_handler(
         if let Err(e) = state.storage.update_user(&realm_id, &user).await {
             error!(realm = %realm_id, user_id = %user_id, error = %e, "execute-actions: user update failed");
             return error_response(
+                &copy,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not start the account setup. Please contact your administrator.",
+                &copy.msg(
+                    "action.execute.startFailed",
+                    "Could not start the account setup. Please contact your administrator.",
+                ),
             );
         }
     }
@@ -1365,7 +1749,11 @@ pub async fn execute_actions_handler(
         Ok(Some(_)) => {}
         _ => {
             let _ = state.cache.delete(&pending_actions_cache_key(&realm_id, &flow_id)).await;
-            return error_response(StatusCode::BAD_REQUEST, USED_ACTIONS_LINK);
+            return error_response(
+                &copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("action.execute.usedLink", USED_ACTIONS_LINK),
+            );
         }
     }
 
@@ -1382,6 +1770,7 @@ async fn finish_continuation(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     entry: &PendingActionsData,
+    copy: &PageCopy,
 ) -> Response {
     if let Some(ref redirect_uri) = entry.redirect_uri {
         return Redirect::to(redirect_uri).into_response();
@@ -1391,7 +1780,13 @@ async fn finish_continuation(
         issuerd_core::SessionId::new(entry.session_id.clone()),
     ) {
         (Ok(u), Ok(s)) => (u, s),
-        _ => return error_response(StatusCode::BAD_REQUEST, "Invalid session."),
+        _ => {
+            return error_response(
+                copy,
+                StatusCode::BAD_REQUEST,
+                &copy.msg("error.invalidSession", "Invalid session."),
+            )
+        }
     };
     // Typestate proof: the actions list is empty here, so the result can be
     // cleared while preserving the original authentication time.
@@ -1577,7 +1972,8 @@ mod tests {
     async fn webauthn_challenge_page_escapes_script_breakout() {
         let options =
             r#"{"challenge":"Y2Fi","rpId":"localhost","x":"</script><script>alert(1)</script>"}"#;
-        let response = webauthn_challenge_page("master", "flow-123", options, None);
+        let response =
+            webauthn_challenge_page(&PageCopy::builtin("en"), "master", "flow-123", options, None);
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_string(response).await;
         assert!(
@@ -1590,8 +1986,13 @@ mod tests {
     #[tokio::test]
     async fn webauthn_challenge_page_embeds_flow_id_and_error() {
         let options = r#"{"challenge":"Y2Fi","rpId":"localhost"}"#;
-        let response =
-            webauthn_challenge_page("master", "flow-456", options, Some("Passkey failed."));
+        let response = webauthn_challenge_page(
+            &PageCopy::builtin("en"),
+            "master",
+            "flow-456",
+            options,
+            Some("Passkey failed."),
+        );
         let body = body_string(response).await;
         assert!(body.contains("value=\"flow-456\""));
         assert!(body.contains("name=\"webauthn_assertion\""));
@@ -1599,8 +2000,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webauthn_challenge_page_localizes_copy_and_script_strings() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("webauthn.title".to_string(), "Mit Passkey anmelden".to_string());
+        bundle.insert("webauthn.scriptWaiting".to_string(), "Warte auf Passkey…".to_string());
+        bundle.insert(
+            "webauthn.scriptFailedPrefix".to_string(),
+            "Passkey fehlgeschlagen: ".to_string(),
+        );
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let response =
+            webauthn_challenge_page(&copy, "master", "flow-9", r#"{"challenge":"Y2Fi"}"#, None);
+        let body = body_string(response).await;
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Mit Passkey anmelden</h1>"), "body: {body}");
+        // The script strings land as JSON string literals (non-ASCII escaped).
+        assert!(body.contains("st.textContent=\"Warte auf Passkey\\u2026\";"), "body: {body}");
+        assert!(
+            body.contains("st.textContent=\"Passkey fehlgeschlagen: \"+(e&&e.message"),
+            "body: {body}"
+        );
+        assert!(!body.contains("Waiting for your passkey"), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn email_code_challenge_page_renders_one_box_per_digit() {
-        let response = email_code_challenge_page("master", "flow-789", Some("a***@b.c"), None, 6);
+        let response = email_code_challenge_page(
+            &PageCopy::builtin("en"),
+            "master",
+            "flow-789",
+            Some("a***@b.c"),
+            None,
+            6,
+        );
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_string(response).await;
         assert_eq!(body.matches("class=\"otp-digit\"").count(), 6);
@@ -1614,7 +2049,8 @@ mod tests {
 
     #[tokio::test]
     async fn email_code_challenge_page_honors_realm_code_length() {
-        let response = email_code_challenge_page("master", "flow-1", None, None, 8);
+        let response =
+            email_code_challenge_page(&PageCopy::builtin("en"), "master", "flow-1", None, None, 8);
         let body = body_string(response).await;
         assert_eq!(body.matches("class=\"otp-digit\"").count(), 8);
         assert!(body.contains("Enter the 8-digit code we sent"));
@@ -1623,6 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn email_code_challenge_page_keeps_noscript_single_input() {
         let response = email_code_challenge_page(
+            &PageCopy::builtin("en"),
             "master",
             "flow-2",
             None,
@@ -1636,6 +2073,66 @@ mod tests {
         assert!(body.contains("Invalid or expired code."));
         let noscript = body.split("<noscript>").nth(1).unwrap();
         assert!(noscript.contains("name=\"otp\""));
+    }
+
+    #[tokio::test]
+    async fn email_code_challenge_page_localizes_copy() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("emailCode.title".to_string(), "Posteingang prüfen".to_string());
+        bundle.insert(
+            "emailCode.lead".to_string(),
+            "Geben Sie den {length}-stelligen Code ein.".to_string(),
+        );
+        bundle.insert("emailCode.digitAriaLabel".to_string(), "Ziffer {index}".to_string());
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let response = email_code_challenge_page(&copy, "master", "flow-1", None, None, 4);
+        let body = body_string(response).await;
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Posteingang prüfen</h1>"), "body: {body}");
+        assert!(body.contains("Geben Sie den 4-stelligen Code ein."), "body: {body}");
+        assert!(body.contains("aria-label=\"Ziffer 3\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn otp_challenge_page_localizes_copy() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("otp.title".to_string(), "Zwei-Faktor-Anmeldung".to_string());
+        bundle.insert("otp.codeLabel".to_string(), "Einmalcode".to_string());
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let response = otp_challenge_page(&copy, "master", "flow-7", None);
+        let body = body_string(response).await;
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Zwei-Faktor-Anmeldung</h1>"), "body: {body}");
+        assert!(body.contains("<label for=\"otp\">Einmalcode</label>"), "body: {body}");
+        // Untouched keys keep the English default.
+        assert!(body.contains("<button type=\"submit\">Sign in</button>"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn error_page_localizes_title_and_message() {
+        let mut bundle = crate::i18n::message_bundle(None, None, "en");
+        bundle.insert("page.error.title".to_string(), "Anmeldefehler".to_string());
+        bundle.insert("error.realmNotFound".to_string(), "Realm nicht gefunden.".to_string());
+        let copy = PageCopy {
+            lang: "de".to_string(),
+            bundle,
+        };
+        let resp = error_response(
+            &copy,
+            StatusCode::NOT_FOUND,
+            &copy.msg("error.realmNotFound", "Realm not found."),
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+        assert!(body.contains("<h1>Anmeldefehler</h1>"), "body: {body}");
+        assert!(body.contains("Realm nicht gefunden."), "body: {body}");
     }
 
     #[test]
@@ -1841,6 +2338,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_password_failure_localizes_via_pinned_locale() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        // German-enabled realm; the flow pins `de` (as the authorize endpoint
+        // would for a German browser).
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.internationalization_enabled = true;
+        realm.supported_locales = vec!["en".to_string(), "de".to_string()];
+        realm.default_locale = Some("en".to_string());
+        state.storage.update_realm(&realm).await.unwrap();
+        let _ = state.cache.delete(&issuerd_cluster::cache_keys::realm_by_name("master")).await;
+
+        let user = test_user(&realm_id, "heinz", &["UPDATE_PASSWORD"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        state
+            .storage
+            .create_credential(&realm_id, &user.id, &temp_password_cred())
+            .await
+            .unwrap();
+
+        let mut pending = test_pending(&realm_id);
+        pending.locale = Some("de".to_string());
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            pending,
+            pending_result(&user, &["UPDATE_PASSWORD"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+        let cookie_name = flow_cookie_name_of(&resp);
+
+        // Mismatched passwords: the engine's `InvalidRequest("passwords do not
+        // match")` must surface localized — not raw, and never with the
+        // "invalid request: " Display prefix.
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, format!("{cookie_name}=1").parse().unwrap());
+        let resp = required_action_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            headers,
+            Bytes::from("new_password=N0wPassword!&confirm_password=different"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution)),
+            HeaderMap::new(),
+        )
+        .await;
+        let body = body_string(resp).await;
+        assert!(body.contains("Passwörter stimmen nicht überein"), "body: {body}");
+        assert!(!body.contains("invalid request"), "body: {body}");
+        assert!(body.contains("<html lang=\"de\">"), "body: {body}");
+    }
+
+    #[test]
+    fn js_string_literal_escapes_quotes_markup_controls_and_unicode() {
+        assert_eq!(js_string_literal("plain"), "\"plain\"");
+        assert_eq!(js_string_literal("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        // `<`/`>` can never close the inline script element early.
+        assert_eq!(js_string_literal("</script>"), "\"\\u003c/script\\u003e\"");
+        // C0 controls, non-ASCII, and the JS line terminators ride as escapes;
+        // astral characters encode as UTF-16 surrogate pairs.
+        assert_eq!(js_string_literal("a\nb"), "\"a\\u000ab\"");
+        assert_eq!(js_string_literal("Warten\u{2026}"), "\"Warten\\u2026\"");
+        assert_eq!(js_string_literal("\u{2028}"), "\"\\u2028\"");
+        assert_eq!(js_string_literal("\u{1F600}"), "\"\\ud83d\\ude00\"");
+    }
+
+    #[tokio::test]
+    async fn email_code_challenge_page_escapes_masked_email_inside_bundle_text() {
+        // The bundle text is trusted (its <strong> markup survives), but the
+        // substituted dynamic value must stay escaped.
+        let copy = PageCopy::builtin("en");
+        let response =
+            email_code_challenge_page(&copy, "master", "flow-1", Some("a<b>@x.yz"), None, 6);
+        let body = body_string(response).await;
+        assert!(body.contains("<strong>a&lt;b&gt;@x.yz</strong>"), "body: {body}");
+        assert!(!body.contains("a<b>@x.yz"), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn verify_email_roundtrip_sends_mail_and_completes() {
         let mut state =
             ServerState::from_config(&crate::config::ServerConfig::default()).await.unwrap();
@@ -1899,9 +2481,13 @@ mod tests {
         let mut query = HashMap::new();
         query.insert("token".to_string(), token.clone());
         query.insert("execution".to_string(), execution.clone());
-        let resp =
-            verify_email_handler(State(state.clone()), Path("master".to_string()), Query(query))
-                .await;
+        let resp = verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains("Email address verified"));
 
@@ -1913,9 +2499,13 @@ mod tests {
         let mut query = HashMap::new();
         query.insert("token".to_string(), token);
         query.insert("execution".to_string(), execution.clone());
-        let resp =
-            verify_email_handler(State(state.clone()), Path("master".to_string()), Query(query))
-                .await;
+        let resp = verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // The continuation now advances straight into login completion.
@@ -2074,6 +2664,7 @@ mod tests {
             State(state.clone()),
             Path("master".to_string()),
             Query(query),
+            HeaderMap::new(),
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
         )
         .await
@@ -2269,7 +2860,7 @@ mod tests {
             redirect_uri: Some("https://app.example.com/after".to_string()),
             _typestate_tag: action_required_tag(),
         };
-        let resp = finish_continuation(&state, &realm_id, &entry).await;
+        let resp = finish_continuation(&state, &realm_id, &entry, &PageCopy::builtin("en")).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();

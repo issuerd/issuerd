@@ -1421,6 +1421,11 @@ mod tests {
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
             base_url: "http://localhost:8080".to_string(),
+            email_bundle: None,
+            available_locales: issuerd_core::i18n::SHIPPED_LOCALES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -2673,6 +2678,8 @@ mod tests {
             token_issuer: base.token_issuer.clone(),
             signing_key_reload: base.signing_key_reload.clone(),
             base_url: base.base_url.clone(),
+            email_bundle: base.email_bundle.clone(),
+            available_locales: base.available_locales.clone(),
         })
     }
 

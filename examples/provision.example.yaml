@@ -7,6 +7,15 @@ realms:
   login_theme: null
   email_theme: null
   admin_theme: null
+  internationalization_enabled: null
+  supported_locales: null
+  default_locale: null
+  # Internationalization (optional): enable localized login and email pages.
+  # This file is generated (issuerd example provision-config) — the block
+  # below is hand-maintained; uncomment and adapt to enable it.
+  # internationalization_enabled: true
+  # supported_locales: [en, de]
+  # default_locale: en
   default_role: user
   access_token_lifespan: 300
   refresh_token_lifespan: 1800
@@ -34,10 +43,14 @@ groups:
   name: developers
   path: /developers
   attributes: {}
+  realm_roles: []
+  client_roles: {}
 - realm: myrealm
   name: ops
   path: null
   attributes: {}
+  realm_roles: []
+  client_roles: {}
 clients:
 - realm: myrealm
   client_id: my-app
@@ -99,9 +112,10 @@ identity_providers:
   provider_id: ldap
   enabled: true
   config:
-    url: ldap://localhost:389
     bind_dn: cn=admin,dc=example,dc=com
+    url: ldap://localhost:389
     users_dn: ou=users,dc=example,dc=com
+  mappers: []
 flow_configs:
 - realm: myrealm
   alias: browser

@@ -9,7 +9,10 @@
 //! `Accept-Language`, realm default) and ships the matching message bundle;
 //! the theme endpoint serves per-realm login theme assets with fallback to
 //! the built-in `issuerd` theme; outbound mail follows the user's `locale`
-//! attribute.
+//! attribute. Theme-supplied locales (a `messages_<locale>.json` dropped into
+//! a theme directory, for a locale that is NOT compiled in) localize the
+//! server-rendered pages and emails without any code change — the tests below
+//! prove it with a scratch French bundle in a temporary themes dir.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -45,6 +48,78 @@ async fn get_with_language(
 async fn json_body(resp: Response) -> serde_json::Value {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+/// HTML body of a server-rendered page response.
+async fn html_body(resp: Response) -> String {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+/// Records every mail it is asked to send as `(to, subject)`.
+#[derive(Default)]
+struct RecordingSender {
+    sent: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl issuerd_core::EmailSender for RecordingSender {
+    async fn send(
+        &self,
+        _realm: &issuerd_core::Realm,
+        to: &str,
+        subject: &str,
+        _text_body: &str,
+        _html_body: Option<String>,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        self.sent.lock().unwrap().push((to.to_string(), subject.to_string()));
+        Ok(())
+    }
+}
+
+/// Write a scratch themes dir whose default `issuerd` theme carries a minimal
+/// French bundle. `fr` is NOT one of the compiled-in locales
+/// (`SHIPPED_LOCALES` is en + de), so every French string in these tests must
+/// come from this theme file. Returns the temp dir (caller cleans up).
+fn write_fr_theme() -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("issuerd-i18n-fr-{}", issuerd_core::utils::generate_id()));
+    std::fs::create_dir_all(dir.join("issuerd")).unwrap();
+    std::fs::write(
+        dir.join("issuerd").join("messages_fr.json"),
+        r#"{
+  "login.title": "Connexion",
+  "otp.title": "Authentification à deux facteurs",
+  "reset.requestHeading": "Mot de passe oublié ?",
+  "register.heading": "Créez votre compte",
+  "email.reset.subject": "Réinitialisez votre mot de passe"
+}"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// A harness whose `[themes] dir` is the scratch French-bundle dir.
+async fn fr_theme_harness() -> (TestHarness, std::path::PathBuf) {
+    use issuerd_server::{config::ServerConfig, state::ServerState};
+
+    let dir = write_fr_theme();
+    let mut config = ServerConfig::default();
+    config.themes.dir = dir.clone();
+    let state = std::sync::Arc::new(ServerState::from_config(&config).await.unwrap());
+    (TestHarness::with_state(state), dir)
+}
+
+/// Create a realm with internationalization enabled for the theme-supplied
+/// French bundle: `en` (built-in) + `fr` (theme file only — not compiled in).
+/// No `login_theme` is set: the default-theme fallback must pick the bundle up.
+async fn create_fr_i18n_realm(harness: &TestHarness, name: &str) -> issuerd_core::Realm {
+    let mut realm = harness.create_realm(name).await;
+    realm.internationalization_enabled = true;
+    realm.supported_locales = vec!["en".to_string(), "fr".to_string()];
+    realm.default_locale = Some("en".to_string());
+    harness.storage.update_realm(&realm).await.unwrap();
+    realm
 }
 
 #[tokio::test]
@@ -191,26 +266,6 @@ async fn custom_theme_overrides_default_and_falls_back() {
 async fn reset_password_email_uses_user_locale() {
     use issuerd_server::{config::ServerConfig, state::ServerState};
 
-    #[derive(Default)]
-    struct RecordingSender {
-        sent: std::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl issuerd_core::EmailSender for RecordingSender {
-        async fn send(
-            &self,
-            _realm: &issuerd_core::Realm,
-            to: &str,
-            subject: &str,
-            _text_body: &str,
-            _html_body: Option<String>,
-        ) -> Result<(), issuerd_core::IssuerdError> {
-            self.sent.lock().unwrap().push((to.to_string(), subject.to_string()));
-            Ok(())
-        }
-    }
-
     let config = ServerConfig::default();
     let mut state = ServerState::from_config(&config).await.unwrap();
     let recorder = std::sync::Arc::new(RecordingSender::default());
@@ -242,4 +297,153 @@ async fn reset_password_email_uses_user_locale() {
     assert_eq!(german.1, "Setzen Sie Ihr Passwort zurück");
     let english = sent.iter().find(|(to, _)| to == "olga@example.com").expect("olga mail");
     assert_eq!(english.1, "Reset your password");
+}
+
+#[tokio::test]
+async fn login_context_supports_theme_supplied_locale() {
+    let (harness, dir) = fr_theme_harness().await;
+    create_fr_i18n_realm(&harness, "i18n-fr-ctx").await;
+
+    // `fr` is not compiled in (SHIPPED_LOCALES is en + de): the bundle must
+    // come from the theme's messages_fr.json via the default-theme fallback —
+    // the realm has no login_theme set.
+    let resp = get_with_language(&harness, "/realms/i18n-fr-ctx/login/context", Some("fr")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["locale"], "fr");
+    assert_eq!(body["supported_locales"], serde_json::json!(["en", "fr"]));
+    assert!(body["login_theme"].is_null(), "no login_theme set: {body}");
+    assert_eq!(body["messages"]["login.title"], "Connexion");
+    // A server-page key (not used by the SPA login page itself) localizes too.
+    assert_eq!(body["messages"]["otp.title"], "Authentification à deux facteurs");
+    // Keys missing from the partial theme bundle keep the English text.
+    assert_eq!(body["messages"]["login.submit"], "Sign In");
+
+    // Unsupported/unknown locales fall through to the realm default (en).
+    for tag in ["de", "zz"] {
+        let resp =
+            get_with_language(&harness, "/realms/i18n-fr-ctx/login/context", Some(tag)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["locale"], "en", "Accept-Language: {tag}");
+        assert_eq!(body["messages"]["login.title"], "Sign In");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn reset_credentials_page_renders_in_theme_supplied_locale() {
+    let (harness, dir) = fr_theme_harness().await;
+    let mut realm = create_fr_i18n_realm(&harness, "i18n-fr-reset").await;
+    realm.reset_password_allowed = true;
+    harness.storage.update_realm(&realm).await.unwrap();
+
+    let resp =
+        get_with_language(&harness, "/realms/i18n-fr-reset/login/reset-credentials", Some("fr"))
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("<html lang=\"fr\">"), "body: {body}");
+    assert!(body.contains("Mot de passe oublié ?"), "body: {body}");
+
+    // No preference: the realm default (en) renders.
+    let resp =
+        get_with_language(&harness, "/realms/i18n-fr-reset/login/reset-credentials", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("<html lang=\"en\">"), "body: {body}");
+    assert!(body.contains("Forgot your password?"), "body: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn registration_page_renders_in_theme_supplied_locale() {
+    let (harness, dir) = fr_theme_harness().await;
+    let mut realm = create_fr_i18n_realm(&harness, "i18n-fr-reg").await;
+    realm.registration_enabled = true;
+    harness.storage.update_realm(&realm).await.unwrap();
+
+    let resp = get_with_language(&harness, "/realms/i18n-fr-reg/login/register", Some("fr")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("<html lang=\"fr\">"), "body: {body}");
+    assert!(body.contains("Créez votre compte"), "body: {body}");
+
+    // No preference: the realm default (en) renders.
+    let resp = get_with_language(&harness, "/realms/i18n-fr-reg/login/register", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("Create your account"), "body: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn reset_password_email_uses_theme_supplied_locale() {
+    use issuerd_server::{config::ServerConfig, state::ServerState};
+
+    let dir = write_fr_theme();
+    let mut config = ServerConfig::default();
+    config.themes.dir = dir.clone();
+    let mut state = ServerState::from_config(&config).await.unwrap();
+    let recorder = std::sync::Arc::new(RecordingSender::default());
+    state.email_sender = recorder.clone();
+    let harness = TestHarness::with_state(std::sync::Arc::new(state));
+
+    let mut realm = create_fr_i18n_realm(&harness, "i18n-fr-mail").await;
+    realm.reset_password_allowed = true;
+    harness.storage.update_realm(&realm).await.unwrap();
+
+    // The user's `locale` attribute selects the theme-supplied bundle (the
+    // realm has no email_theme set — the default theme is read).
+    let mut user = harness.create_user("i18n-fr-mail", "pierre", "Password123!").await;
+    user.attributes.insert("locale".to_string(), vec!["fr".to_string()]);
+    harness.storage.update_user(&realm.id.clone(), &user).await.unwrap();
+
+    let resp = harness
+        .post_form("/realms/i18n-fr-mail/login/reset-credentials", &[("username", "pierre")])
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let sent = recorder.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "one reset email sent: {sent:?}");
+    assert_eq!(sent[0].0, "pierre@example.com");
+    assert_eq!(sent[0].1, "Réinitialisez votre mot de passe");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn theme_supplied_locale_ignored_when_i18n_disabled() {
+    let (harness, dir) = fr_theme_harness().await;
+    let mut realm = harness.create_realm("i18n-fr-off").await;
+    realm.reset_password_allowed = true;
+    realm.registration_enabled = true;
+    harness.storage.update_realm(&realm).await.unwrap();
+
+    // Login context: the fr preference is ignored entirely.
+    let resp = get_with_language(&harness, "/realms/i18n-fr-off/login/context", Some("fr")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["locale"], "en");
+    assert_eq!(body["messages"]["login.title"], "Sign In");
+
+    // Server-rendered pages stay English too.
+    let resp =
+        get_with_language(&harness, "/realms/i18n-fr-off/login/reset-credentials", Some("fr"))
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("<html lang=\"en\">"), "body: {body}");
+    assert!(body.contains("Forgot your password?"), "body: {body}");
+
+    let resp = get_with_language(&harness, "/realms/i18n-fr-off/login/register", Some("fr")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = html_body(resp).await;
+    assert!(body.contains("<html lang=\"en\">"), "body: {body}");
+    assert!(body.contains("Create your account"), "body: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

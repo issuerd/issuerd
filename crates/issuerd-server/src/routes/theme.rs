@@ -82,6 +82,38 @@ pub fn available_themes(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// Discover available UI locales: the shipped built-ins plus every
+/// `messages_<locale>.json` file found in any theme directory.
+pub fn available_locales(dir: &std::path::Path) -> Vec<String> {
+    let mut tags: Vec<String> =
+        issuerd_core::i18n::SHIPPED_LOCALES.iter().map(|s| s.to_string()).collect();
+    if let Ok(themes) = std::fs::read_dir(dir) {
+        for theme in themes.filter_map(|e| e.ok()) {
+            if !theme.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(theme.path()) {
+                for file in files.filter_map(|f| f.ok()) {
+                    let name = file.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    if let Some(tag) =
+                        name.strip_prefix("messages_").and_then(|n| n.strip_suffix(".json"))
+                    {
+                        if !tag.is_empty() {
+                            tags.push(tag.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +162,31 @@ mod tests {
 
         // A missing directory still yields the built-in default.
         assert_eq!(available_themes(&base), vec![DEFAULT_THEME]);
+    }
+
+    #[test]
+    fn available_locales_discovers_theme_message_bundles() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-locales-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("acme")).unwrap();
+        std::fs::create_dir_all(base.join("empty-theme")).unwrap();
+        std::fs::write(base.join("acme").join("messages_fr.json"), b"{}").unwrap();
+        // A bundle for a shipped locale changes nothing (deduped).
+        std::fs::write(base.join("acme").join("messages_en.json"), b"{}").unwrap();
+        // Files outside the `messages_<locale>.json` shape are ignored.
+        std::fs::write(base.join("acme").join("login.css"), b"x").unwrap();
+        std::fs::write(base.join("acme").join("messages_.json"), b"{}").unwrap();
+        // Bundles directly under the themes root belong to no theme.
+        std::fs::write(base.join("messages_fr.json"), b"{}").unwrap();
+
+        let locales = available_locales(&base);
+        assert_eq!(locales, vec!["de", "en", "fr"]);
+
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // A missing directory still yields the shipped built-ins.
+        assert_eq!(available_locales(&base), vec!["de", "en"]);
     }
 
     #[tokio::test]

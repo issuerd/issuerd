@@ -37,7 +37,8 @@ mod registration;
 mod required_actions;
 mod reset_credentials;
 mod system;
-mod theme;
+// `pub(crate)`: `i18n` reaches `theme::DEFAULT_THEME` / `theme::available_locales`.
+pub(crate) mod theme;
 mod token_exchange;
 mod web_ui;
 
@@ -137,9 +138,24 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         broker_client: state.broker_client.clone(),
         logout_notifier: state.logout_notifier.clone(),
         available_themes: theme::available_themes(&state.config.themes.dir),
+        available_locales: theme::available_locales(&state.config.themes.dir),
         token_issuer: state.token_manager.clone(),
         signing_key_reload: state.signing_key_reload.clone(),
         base_url: state.config.issuer_url.trim_end_matches('/').to_string(),
+        // Per-recipient locale bundle for outbound admin email copy: the
+        // recipient's `locale` attribute (then the realm default) selects the
+        // language, the realm's email theme supplies the override layer.
+        email_bundle: {
+            let themes_dir = state.config.themes.dir.clone();
+            let resolver = move |realm: &issuerd_core::Realm, user: &issuerd_core::User| {
+                crate::i18n::message_bundle(
+                    Some(themes_dir.as_path()),
+                    realm.email_theme.as_ref().map(|t| t.as_str()),
+                    &crate::i18n::user_locale(realm, user),
+                )
+            };
+            Some(Arc::new(resolver) as issuerd_admin_api::state::EmailBundleResolver)
+        },
     });
     let admin_routes = issuerd_admin_api::routes::admin_routes(admin_state)
         .fallback(web_ui::admin_console_handler);
