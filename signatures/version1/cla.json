@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "neonZen",
+      "id": 64816187,
+      "comment_id": 6085394117,
+      "created_at": "2026-10-09T16:55:33Z",
+      "repoId": 1383380853,
+      "pullRequestNo": 11
+    }
+  ]
 }
