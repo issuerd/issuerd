@@ -120,7 +120,6 @@ export default function LdapConfigForm({ value, onChange, className, section = '
       }
     }
     if (changed) onChange(next)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendor])
 
   const showConnection = section === 'all' || section === 'connection'

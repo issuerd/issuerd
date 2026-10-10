@@ -23,6 +23,7 @@ import { AccountApiError, unwrap } from '../api/errors'
 import { getAccountRealm } from '../../config'
 import type { WebAuthnCreationOptionsJSON } from '../webauthn'
 import { attestationToJSON, creationOptionsFromJSON } from '../webauthn'
+import { errorMessage } from '../../lib/utils'
 import Spinner from '../../components/ui/Spinner'
 import Input from '../../components/ui/Input'
 import Button from '../../components/ui/Button'
@@ -82,7 +83,7 @@ export default function PasswordPage() {
     return accountWebauthnListCredentials({ path: { realm: getAccountRealm() } })
       .then(unwrap)
       .then((data) => setPasskeys(data))
-      .catch((err) => setPasskeysError(err.message))
+      .catch((err) => setPasskeysError(errorMessage(err)))
   }
 
   useEffect(() => {
@@ -93,7 +94,7 @@ export default function PasswordPage() {
         setLoading(false)
       })
       .catch((err) => {
-        setLoadError(err.message)
+        setLoadError(errorMessage(err))
         setLoading(false)
       })
     loadPasskeys()
@@ -106,8 +107,8 @@ export default function PasswordPage() {
       const data = await accountTotpStart({ path: { realm: getAccountRealm() } }).then(unwrap)
       setTotpEnrollment(data)
       setTotpCode('')
-    } catch (err: any) {
-      setTotpError(err.message || 'Failed to start authenticator setup')
+    } catch (err) {
+      setTotpError(errorMessage(err) || 'Failed to start authenticator setup')
     } finally {
       setTotpBusy(false)
     }
@@ -125,8 +126,8 @@ export default function PasswordPage() {
       setTotpEnrollment(null)
       setTotpCode('')
       await refreshCredentials()
-    } catch (err: any) {
-      setTotpError(err.message || 'Failed to verify the code')
+    } catch (err) {
+      setTotpError(errorMessage(err) || 'Failed to verify the code')
     } finally {
       setTotpBusy(false)
     }
@@ -139,8 +140,8 @@ export default function PasswordPage() {
       await accountTotpDelete({ path: { realm: getAccountRealm() } }).then(unwrap)
       setTotpConfirmingRemove(false)
       await refreshCredentials()
-    } catch (err: any) {
-      setTotpError(err.message || 'Failed to remove the authenticator')
+    } catch (err) {
+      setTotpError(errorMessage(err) || 'Failed to remove the authenticator')
     } finally {
       setTotpBusy(false)
     }
@@ -165,8 +166,8 @@ export default function PasswordPage() {
       }).then(unwrap)
       setPasskeyLabel('')
       await loadPasskeys()
-    } catch (err: any) {
-      setPasskeysError(err.message || 'Failed to register the passkey')
+    } catch (err) {
+      setPasskeysError(errorMessage(err) || 'Failed to register the passkey')
     } finally {
       setRegistering(false)
     }
@@ -178,8 +179,8 @@ export default function PasswordPage() {
     try {
       await accountWebauthnDeleteCredential({ path: { realm: getAccountRealm(), id } }).then(unwrap)
       await loadPasskeys()
-    } catch (err: any) {
-      setPasskeysError(err.message || 'Failed to delete the passkey')
+    } catch (err) {
+      setPasskeysError(errorMessage(err) || 'Failed to delete the passkey')
     } finally {
       setDeletingPasskey(null)
     }
@@ -212,12 +213,12 @@ export default function PasswordPage() {
       setConfirmPassword('')
       // A password now exists even if it was not enrolled before.
       setCredentials((prev) => (prev ? { ...prev, password: true } : prev))
-    } catch (err: any) {
+    } catch (err) {
       const violations = (err as AccountApiError).policyViolations
       if (violations && violations.length > 0) {
         setPolicyViolations(violations.map((v) => v.message))
       } else {
-        setSaveError(err.message || 'Failed to change password')
+        setSaveError(errorMessage(err) || 'Failed to change password')
       }
     } finally {
       setSaving(false)

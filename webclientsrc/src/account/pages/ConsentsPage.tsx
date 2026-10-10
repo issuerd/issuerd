@@ -6,6 +6,7 @@ import { Link2 } from 'lucide-react'
 import { accountDeleteConsent, accountListConsents } from '@generated'
 import type { AccountConsentResponse } from '@generated'
 import { unwrap } from '../api/errors'
+import { errorMessage } from '../../lib/utils'
 import { getAccountRealm } from '../../config'
 import Spinner from '../../components/ui/Spinner'
 import { Table, Thead, Tbody, Tr, Th, Td } from '../../components/ui/Table'
@@ -25,7 +26,7 @@ export default function ConsentsPage() {
         setLoading(false)
       })
       .catch((err) => {
-        setError(err.message)
+        setError(errorMessage(err))
         setLoading(false)
       })
   }
@@ -42,8 +43,8 @@ export default function ConsentsPage() {
         path: { realm: getAccountRealm(), client_id: clientId },
       }).then(unwrap)
       loadConsents()
-    } catch (err: any) {
-      setError(err.message)
+    } catch (err) {
+      setError(errorMessage(err))
     } finally {
       setRevoking(null)
     }

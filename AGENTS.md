@@ -176,8 +176,8 @@ Actions layout:
   `cargo fmt --all -- --check`, `check --locked --all-targets --all-features`,
   `clippy --locked --all-targets --all-features -- -D warnings`,
   `doc --locked --workspace --no-deps`, `audit`,
-  `deny check`, the web client (`npm ci` → `generate-api` → `npm run test` →
-  `npm run build`), a `coverage` job (this IS the CI test run — there is no
+  `deny check`, the web client (`npm ci` → `generate-api` → `npm run lint` →
+  `npm run test` → `npm run build`), a `coverage` job (this IS the CI test run — there is no
   separate `cargo test` job: cargo-llvm-cov `--locked --workspace` runs the
   full unit + root integration suite instrumented, then
   `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
