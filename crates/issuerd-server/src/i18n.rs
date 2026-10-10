@@ -19,6 +19,10 @@
 //! 3. theme `en` override (`{themes_dir}/{theme}/messages_en.json`)
 //! 4. theme `{locale}` override (`{themes_dir}/{theme}/messages_{locale}.json`)
 //!
+//! Locale strings are request-controlled (`ui_locales`, `Accept-Language`,
+//! the user `locale` attribute); only strict ASCII-alphanumeric language
+//! subtags may become filesystem path components (see [`safe_layer_name`]).
+//!
 //! A `None` theme falls back to the default theme
 //! ([`crate::routes::theme::DEFAULT_THEME`]), matching the theme asset
 //! handler: operators can drop `messages_<locale>.json` into the default
@@ -66,6 +70,20 @@ fn builtin_bundle(locale: &str) -> Option<MessageBundle> {
 /// Primary language subtag of a BCP-47 tag (`de-DE` → `de`).
 fn language_subtag(tag: &str) -> &str {
     tag.split(['-', '_']).next().unwrap_or(tag)
+}
+
+/// A language tag that is safe to use as a filesystem path component:
+/// non-empty and strictly ASCII alphanumeric (what a BCP-47 primary subtag
+/// looks like once split on `-`/`_`). Locale strings are request-controlled
+/// (`ui_locales`, `Accept-Language`, the user `locale` attribute), so
+/// anything containing separators, dots, or other bytes must never reach the
+/// filesystem — it is rejected here, at the sink.
+fn safe_layer_name(tag: &str) -> Option<&str> {
+    if !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Some(tag)
+    } else {
+        None
+    }
 }
 
 /// Parse an `Accept-Language` header value into quality-ordered tags.
@@ -196,6 +214,13 @@ pub fn message_bundle(
             None => crate::routes::theme::DEFAULT_THEME,
         };
         for layer in [DEFAULT_LOCALE, lang] {
+            // The locale string is request-controlled; only a strict
+            // alphanumeric subtag may become a path component. An unsafe
+            // layer is skipped — the built-in English layer is already
+            // loaded, so the bundle simply stays at the fallback.
+            let Some(layer) = safe_layer_name(layer) else {
+                continue;
+            };
             let path = dir.join(theme_name).join(format!("messages_{layer}.json"));
             // A missing override file for a layer is normal; malformed JSON is not.
             if let Ok(content) = std::fs::read_to_string(&path) {
@@ -465,6 +490,39 @@ mod tests {
         assert_eq!(bundle.get("login.title").map(String::as_str), Some("Custom"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn message_bundle_rejects_request_controlled_path_traversal() {
+        // A crafted locale with separators must never become a path
+        // component. The `messages_x` directory is created on purpose: the OS
+        // resolves path components sequentially, so `../` traversal only
+        // resolves when the prefix directory exists — with it present, the
+        // naive join `messages_x/../../evil.json` would read
+        // `{themes_dir}/evil.json`, one level above the theme directory.
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd-i18n-test-{}", issuerd_core::utils::generate_id()));
+        let theme_dir = dir.join(crate::routes::theme::DEFAULT_THEME);
+        std::fs::create_dir_all(theme_dir.join("messages_x")).unwrap();
+        std::fs::write(dir.join("evil.json"), r#"{"login.title":"PWNED"}"#).unwrap();
+
+        let bundle = message_bundle(Some(&dir), None, "x/../../evil");
+        // The unsafe layer is skipped; only the built-in English text remains.
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Sign In"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_layer_name_accepts_only_strict_subtags() {
+        assert_eq!(safe_layer_name("de"), Some("de"));
+        assert_eq!(safe_layer_name("zh419"), Some("zh419"));
+        assert_eq!(safe_layer_name(""), None);
+        assert_eq!(safe_layer_name("../evil"), None);
+        assert_eq!(safe_layer_name("x/../../evil"), None);
+        // Already subtag-split by `language_subtag`; a raw tag must not pass.
+        assert_eq!(safe_layer_name("de-DE"), None);
+        assert_eq!(safe_layer_name("evil.json"), None);
     }
 
     #[test]
