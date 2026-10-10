@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-10-10
+
 ### Added
 
 - **Property-based (proptest) suites for the `issuerd-protocol` parsers.** The PKCE verifier/challenge handling (`pkce.rs`) and both request parsers (`authorization.rs`, `token.rs`) now carry proptest suites that assert both directions where meaningful: adversarial generators produce empty, over-long, non-ASCII and control-character inputs plus near-boundary lengths (43/128 for the RFC 7636 verifier window), and the tests pin that well-formed input is accepted and roundtrips while malformed input is rejected with the exact `IssuerdError` / OAuth2 error code (`invalid_request` with the documented message, `invalid_authorization_details`, `request_not_supported`, `invalid_grant`) — never panicking on arbitrary input. The generators are explicitly size-capped so the harnesses stay deterministic. No new workspace dependencies: `proptest` was already a dev-dependency of the crate.
