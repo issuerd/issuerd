@@ -47,7 +47,16 @@ export default function DownloadClientConfigDialog({
     error,
   } = useClientInstallation(realm, clientId, selectedProvider?.id ?? '', open && !!selectedProvider)
 
-  const snippet = config ? JSON.stringify(config, null, 2) : ''
+  function serializeConfig(config: any): string {
+    if (selectedProvider.media_type === "text/plain") {
+      return Object.entries(config)
+        .map(([key, value]) => `${key}=${value}`)
+        .join('\n')
+    }
+
+    return JSON.stringify(config, null, 2)
+  }
+  const snippet = config ? serializeConfig(config) : ''
 
   function handleDownload() {
     if (!snippet || !selectedProvider) return

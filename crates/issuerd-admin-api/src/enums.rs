@@ -1021,7 +1021,14 @@ mod tests {
             assert!(!provider.display_type.is_empty());
             assert!(!provider.help_text.is_empty());
             assert!(!provider.filename.is_empty());
-            assert_eq!(provider.media_type, "application/json");
+
+            // Check media type based on provider type
+            let expected_media_type = if provider.filename == ".env" {
+                "text/plain"
+            } else {
+                "application/json"
+            };
+            assert_eq!(provider.media_type, expected_media_type);
             assert!(!provider.download_only);
         }
     }
