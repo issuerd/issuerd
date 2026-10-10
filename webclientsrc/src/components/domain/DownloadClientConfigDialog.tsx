@@ -24,24 +24,15 @@ interface DownloadClientConfigDialogProps {
 
 /**
  * Render a client configuration for preview/download: JSON providers as
- * pretty-printed JSON, `text/plain` providers (dotenv) as KEY=VALUE lines.
+ * pretty-printed JSON; `text/plain` providers (dotenv) arrive from the server
+ * as an already-rendered string and pass through verbatim.
  */
-export function serializeClientConfig(
-  cfg: ClientInstallationRepresentation,
-  mediaType: string,
-): string {
-  if (mediaType === 'text/plain') {
-    return Object.entries(cfg)
-      .map(([key, value]) => `${key}=${dotenvQuote(value)}`)
-      .join('\n')
+export function serializeClientConfig(cfg: ClientInstallationRepresentation | string): string {
+  if (typeof cfg === 'string') {
+    return cfg
   }
 
   return JSON.stringify(cfg, null, 2)
-}
-
-/** dotenv values are double-quoted so `#`, `&`, `=`, and spaces survive parsers. */
-function dotenvQuote(value: unknown): string {
-  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 }
 
 /**
@@ -70,7 +61,7 @@ export default function DownloadClientConfigDialog({
     error,
   } = useClientInstallation(realm, clientId, selectedProvider?.id ?? '', open && !!selectedProvider)
 
-  const snippet = config ? serializeClientConfig(config, selectedProvider?.media_type ?? '') : ''
+  const snippet = config ? serializeClientConfig(config) : ''
 
   function handleDownload() {
     if (!snippet || !selectedProvider) return
