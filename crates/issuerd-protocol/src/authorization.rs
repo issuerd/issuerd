@@ -1480,10 +1480,249 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// The wire spellings the parser accepts for `response_type`
+    /// (OIDC Core §3.1.2.1).
+    const RESPONSE_TYPE_WIRE_VALUES: [&str; 7] = [
+        "code",
+        "id_token",
+        "token",
+        "code id_token",
+        "code token",
+        "id_token token",
+        "code id_token token",
+    ];
+
+    /// The wire spellings accepted for `response_mode` (OIDC Core §3.1.2.1
+    /// + OIDC Session Management / JARM, FAPI 2.0).
+    const RESPONSE_MODE_WIRE_VALUES: [&str; 7] = [
+        "query",
+        "fragment",
+        "form_post",
+        "jwt",
+        "query.jwt",
+        "fragment.jwt",
+        "form_post.jwt",
+    ];
+
+    /// The `prompt` values accepted per OIDC Core §3.1.2.1.
+    const PROMPT_VALUES: [&str; 4] = ["none", "login", "consent", "select_account"];
+
+    /// An arbitrary parameter value: adversarial — empty, over-long,
+    /// non-ASCII, control characters, near-boundary lengths.
+    fn arbitrary_value() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..=64usize)
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+    }
+
+    /// A parameter map over the recognized authorization-request keys with
+    /// adversarial values, plus arbitrary unknown keys.
+    fn arbitrary_params() -> impl Strategy<Value = std::collections::HashMap<String, String>> {
+        prop::collection::btree_map(
+            prop::collection::vec(any::<char>(), 0..=20usize)
+                .prop_filter("non-empty key", |k| !k.is_empty())
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            arbitrary_value(),
+            0..=12usize,
+        )
+        .prop_map(|map| map.into_iter().collect())
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `parse` never panics on arbitrary parameter maps (the existing
+        /// `parse_does_not_panic` covers the empty map; this one concentrates
+        /// on adversarial *values*).
         #[test]
-        fn parse_does_not_panic(params: std::collections::HashMap<String, String>) {
+        fn parse_never_panics_on_adversarial_values(params in arbitrary_params()) {
             let _ = AuthorizationRequest::parse(&params);
+        }
+
+        /// A `response_type` is accepted only when it is one of the seven
+        /// OIDC spellings (space-separated combination of `code`/`token`/
+        /// `id_token`); everything else is rejected with `invalid_request`.
+        #[test]
+        fn response_type_parsing_is_exhaustive(
+            raw in prop::collection::vec(any::<char>(), 0..=40usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            match raw.parse::<ResponseType>() {
+                Ok(rt) => {
+                    prop_assert!(RESPONSE_TYPE_WIRE_VALUES.contains(&rt.as_str()));
+                    prop_assert_eq!(rt.as_str(), raw);
+                }
+                Err(err) => {
+                    prop_assert!(matches!(err, IssuerdError::InvalidRequest(ref m)
+                        if m.contains("unsupported response_type")));
+                    prop_assert!(!RESPONSE_TYPE_WIRE_VALUES.contains(&raw.as_str()));
+                }
+            }
+        }
+
+        /// A `response_mode` is accepted only for the seven known wire
+        /// spellings (query/fragment/form_post plus the four JARM forms).
+        #[test]
+        fn response_mode_parsing_is_exhaustive(
+            raw in prop::collection::vec(any::<char>(), 0..=40usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            match raw.parse::<ResponseMode>() {
+                Ok(mode) => {
+                    prop_assert!(RESPONSE_MODE_WIRE_VALUES.contains(&mode.as_str()));
+                    prop_assert_eq!(mode.as_str(), &raw);
+                    // JARM-wrapped modes are exactly `jwt` and the dotted forms.
+                    prop_assert_eq!(mode.is_jwt_secured(), raw == "jwt" || raw.ends_with(".jwt"));
+                }
+                Err(()) => {
+                    prop_assert!(!RESPONSE_MODE_WIRE_VALUES.contains(&raw.as_str()));
+                }
+            }
+        }
+
+        /// `prompt` values are accepted only from the known set; `none`
+        /// combined with anything else is rejected with `invalid_request`
+        /// naming the exclusivity rule — and a bogus value is rejected with
+        /// a message naming it. Never panics.
+        #[test]
+        fn prompt_parsing_rejects_unknown_and_mixed_none(
+            raw in prop::collection::vec(any::<char>(), 0..=60usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let tokens: Vec<&str> = raw.split_whitespace().collect();
+            match parse_prompt(Some(&raw)) {
+                Ok(prompts) => {
+                    // Accepted ⇒ every token is a known value and `none`
+                    // (if present) is alone.
+                    prop_assert!(tokens.iter().all(|t| PROMPT_VALUES.contains(t)));
+                    prop_assert!(!(prompts.contains(&Prompt::None) && prompts.len() > 1));
+                }
+                Err(err) => {
+                    prop_assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+                    let has_none = tokens.contains(&"none");
+                    let all_known = tokens.iter().all(|t| PROMPT_VALUES.contains(t));
+                    // Rejection reason is exactly one of the two rules.
+                    prop_assert!(
+                        (has_none && tokens.len() > 1 && all_known) || !all_known,
+                        "unexpected rejection for {raw:?}"
+                    );
+                }
+            }
+        }
+
+        /// `claims` must be valid JSON when present; arbitrary input is
+        /// rejected with `invalid_request` naming `claims` — never panics.
+        #[test]
+        fn claims_must_be_valid_json(raw in arbitrary_value()) {
+            let base = [
+                ("response_type", "code".to_string()),
+                ("client_id", "client1".to_string()),
+                ("redirect_uri", "https://example.com/cb".to_string()),
+            ];
+            let mut params: std::collections::HashMap<String, String> = base
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            params.insert("claims".to_string(), raw.clone());
+            match AuthorizationRequest::parse(&params) {
+                Ok(req) => {
+                    prop_assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+                    prop_assert_eq!(req.claims, serde_json::from_str(&raw).ok());
+                }
+                Err(err) => {
+                    prop_assert!(matches!(err, IssuerdError::InvalidRequest(ref m)
+                        if m.contains("claims")));
+                }
+            }
+        }
+
+        /// JAR (RFC 9101): any presence of `request`/`request_uri` in the
+        /// parameter map is rejected with `request_not_supported`, whatever
+        /// the value — the extraction layer must have consumed them first.
+        #[test]
+        fn request_params_are_always_rejected(
+            jar_param in prop::sample::select(vec!["request", "request_uri"]),
+            value in arbitrary_value(),
+        ) {
+            let mut params: std::collections::HashMap<String, String> = [
+                ("response_type".to_string(), "code".to_string()),
+                ("client_id".to_string(), "client1".to_string()),
+                ("redirect_uri".to_string(), "https://example.com/cb".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            params.insert(jar_param.to_string(), value);
+            let err = AuthorizationRequest::parse(&params).unwrap_err();
+            prop_assert_eq!(err, IssuerdError::RequestNotSupported);
+        }
+
+        /// `authorization_details` (RFC 9396 §2) accepts only a JSON array
+        /// of objects with a non-empty string `type`; anything else is
+        /// rejected with the `invalid_authorization_details` error code.
+        #[test]
+        fn authorization_details_structural_validation(raw in arbitrary_value()) {
+            let mut params: std::collections::HashMap<String, String> = [
+                ("response_type".to_string(), "code".to_string()),
+                ("client_id".to_string(), "client1".to_string()),
+                ("redirect_uri".to_string(), "https://example.com/cb".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            params.insert("authorization_details".to_string(), raw.clone());
+            let outcome = AuthorizationRequest::parse(&params);
+            let valid = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .map(|v| match v {
+                    serde_json::Value::Array(elements) => elements.iter().all(|e| {
+                        e.get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| !t.is_empty())
+                    }),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            match outcome {
+                Ok(req) => {
+                    prop_assert!(valid, "accepted invalid authorization_details: {raw}");
+                    let details = req.authorization_details.expect("parsed details");
+                    let expected: Vec<serde_json::Value> =
+                        serde_json::from_str(&raw).expect("already parsed above");
+                    prop_assert_eq!(details, expected);
+                }
+                Err(err) => {
+                    prop_assert!(!valid);
+                    prop_assert!(matches!(err, IssuerdError::InvalidAuthorizationDetails(_)));
+                    let code = err.oauth_error_code();
+                    prop_assert_eq!(code.as_ref(), "invalid_authorization_details");
+                }
+            }
+        }
+
+        /// Request-object claim conversion (RFC 9101 §4): JWT envelope
+        /// claims (`iss`/`aud`/`exp`/`nbf`/`iat`/`jti`) and null values are
+        /// always dropped; everything else is stringified verbatim.
+        #[test]
+        fn request_object_claims_conversion_drops_envelope(
+            key in prop::sample::select(vec![
+                "iss", "aud", "exp", "nbf", "iat", "jti", "response_type", "scope", "state",
+                "max_age", "custom", "x",
+            ]),
+            value in prop::collection::vec(any::<char>(), 0..=20usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            is_null in any::<bool>(),
+        ) {
+            let mut claims = serde_json::Map::new();
+            if is_null {
+                claims.insert(key.to_string(), serde_json::Value::Null);
+            } else {
+                claims.insert(key.to_string(), serde_json::Value::String(value.clone()));
+            }
+            let params = request_object_claims_to_params(&claims);
+            let envelope = matches!(key, "iss" | "aud" | "exp" | "nbf" | "iat" | "jti");
+            if envelope || is_null {
+                prop_assert!(!params.contains_key(key));
+            } else {
+                prop_assert_eq!(params.get(key), Some(&value));
+            }
         }
     }
 }

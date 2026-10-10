@@ -273,6 +273,7 @@ impl std::str::FromStr for GrantType {
 mod tests {
     use super::*;
     use issuerd_core::{ClientAuthenticatorType, ClientProtocol};
+    use proptest::prelude::*;
     use rstest::rstest;
     use std::str::FromStr;
 
@@ -780,5 +781,384 @@ mod tests {
         // No explicit scope: the availability check does not apply.
         req.scope = Scope::empty();
         assert!(req.validate(&Realm::default(), &client).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Property-based tests (RFC 6749 §4.5 / RFC 9396 §6 / RFC 8693)
+    // ------------------------------------------------------------------
+
+    /// Every supported grant-type wire spelling, as the token endpoint sees it.
+    const GRANT_TYPE_WIRE_VALUES: [&str; 8] = [
+        "authorization_code",
+        "refresh_token",
+        "password",
+        "client_credentials",
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "urn:openid:params:grant-type:ciba",
+        "urn:ietf:params:oauth:grant-type:token-exchange",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    ];
+
+    /// Parameters that must never survive parsing as `Some` when empty
+    /// (RFC 6749: an omitted parameter and an empty one behave alike for
+    /// these fields, so an empty value is dropped rather than validated).
+    const DROP_IF_EMPTY: [&str; 9] = [
+        "code",
+        "client_secret",
+        "refresh_token",
+        "password",
+        "assertion",
+        "subject_token",
+        "audience",
+        "requested_subject",
+        "actor_token",
+    ];
+
+    fn body_with(entries: &[(&str, String)]) -> HashMap<String, String> {
+        let mut body = HashMap::new();
+        for (k, v) in entries {
+            body.insert((*k).to_string(), v.clone());
+        }
+        body
+    }
+
+    fn param_presence(req: &TokenRequest, param: &str) -> bool {
+        match param {
+            "code" => req.code.is_some(),
+            "client_secret" => req.client_secret.is_some(),
+            "refresh_token" => req.refresh_token.is_some(),
+            "password" => req.password.is_some(),
+            "assertion" => req.assertion.is_some(),
+            "subject_token" => req.subject_token.is_some(),
+            "audience" => req.audience.is_some(),
+            "requested_subject" => req.requested_subject.is_some(),
+            "actor_token" => req.actor_token.is_some(),
+            "totp" => req.totp.is_some(),
+            "username" => req.username.is_some(),
+            "assertion_type" => req.assertion_type.is_some(),
+            "device_code" => req.device_code.is_some(),
+            "auth_req_id" => req.auth_req_id.is_some(),
+            "subject_token_type" => req.subject_token_type.is_some(),
+            "requested_token_type" => req.requested_token_type.is_some(),
+            "authorization_details" => req.authorization_details.is_some(),
+            _ => unreachable!("unknown parameter {param}"),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// A `grant_type` never panics parsing, and every supported wire
+        /// value roundtrips to its `GrantType` variant; anything else is
+        /// rejected with `invalid_request` (`unsupported grant_type`).
+        #[test]
+        fn grant_type_parsing_roundtrip(
+            raw in prop::collection::vec(any::<char>(), 0..=120usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            match raw.parse::<GrantType>() {
+                Ok(gt) => {
+                    // Accepted inputs are exactly the known spellings.
+                    prop_assert!(GRANT_TYPE_WIRE_VALUES.contains(&gt.as_str()));
+                    prop_assert_eq!(gt.as_str(), raw);
+                }
+                Err(err) => {
+                    prop_assert!(matches!(err, IssuerdError::InvalidRequest(ref m)
+                        if m.contains("unsupported grant_type")));
+                    prop_assert!(!GRANT_TYPE_WIRE_VALUES.contains(&raw.as_str()));
+                }
+            }
+        }
+
+        /// `TokenRequest::parse` never panics on an arbitrary form body and
+        /// rejects a missing/unsupported `grant_type` with `invalid_request`.
+        #[test]
+        fn parse_rejects_missing_or_unsupported_grant_type(
+            entries in prop::collection::btree_map(
+                prop::collection::vec(any::<char>(), 0..=20usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+                prop::collection::vec(any::<char>(), 0..=40usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+                0..=8usize,
+            ),
+        ) {
+            let body: HashMap<String, String> = entries.into_iter().collect();
+            match TokenRequest::parse(&body) {
+                Ok(req) => {
+                    // Parsed successfully ⇒ the body carried a known spelling.
+                    let known = body
+                        .get("grant_type")
+                        .map(|g| GRANT_TYPE_WIRE_VALUES.contains(&g.as_str()))
+                        .unwrap_or(false);
+                    prop_assert!(known);
+                    prop_assert!(GRANT_TYPE_WIRE_VALUES.contains(&req.grant_type.as_str()));
+                }
+                Err(err) => {
+                    prop_assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+                }
+            }
+        }
+
+        /// A malformed `redirect_uri` is rejected with `invalid_request`
+        /// naming the parameter, for every arbitrary value.
+        #[test]
+        fn malformed_redirect_uri_rejected(
+            grant_type in prop::sample::select(GRANT_TYPE_WIRE_VALUES.to_vec()),
+            raw in prop::collection::vec(any::<char>(), 0..=60usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            prop_assume!(raw.parse::<url::Url>().is_err());
+            let body =
+                body_with(&[("grant_type", grant_type.to_string()), ("redirect_uri", raw)]);
+            let err = TokenRequest::parse(&body).expect_err("invalid redirect_uri");
+            prop_assert!(matches!(err, IssuerdError::InvalidRequest(ref m)
+                if m.contains("redirect_uri")));
+        }
+
+        /// A well-formed URL is accepted verbatim (roundtrip through
+        /// `url::Url`). The generator assembles `https://host[:port]/path[?query]`
+        /// from arbitrary-but-safe components — no `Arbitrary` impl exists
+        /// for `url::Url` in the dependency set, and no new workspace
+        /// dependency may be added.
+        #[test]
+        fn valid_redirect_uri_roundtrips(
+            grant_type in prop::sample::select(GRANT_TYPE_WIRE_VALUES.to_vec()),
+            host in "[a-z]{1,20}",
+            port in 1u16..=65535,
+            path in prop::collection::vec("[a-z]{0,8}", 0..=3usize),
+        ) {
+            let path = path.join("/");
+            let raw = format!("https://{host}:{port}/{path}");
+            let url: url::Url = raw.parse().expect("assembled from safe components");
+            let body = body_with(&[
+                ("grant_type", grant_type.to_string()),
+                ("redirect_uri", url.to_string()),
+            ]);
+            let req = TokenRequest::parse(&body).expect("a parseable URL is accepted");
+            prop_assert_eq!(req.redirect_uri, Some(url));
+        }
+
+        /// Empty form values are treated as absent for every field the
+        /// parser documents that way; non-empty values are kept (or rejected
+        /// by the newtype's own validator — never a panic).
+        #[test]
+        fn empty_params_are_dropped(
+            param in prop::sample::select(DROP_IF_EMPTY.to_vec()),
+            value in prop::collection::vec(any::<char>(), 1..=30usize)
+                .prop_filter("non-empty string", |s| !s.is_empty())
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let grant_type = "authorization_code".to_string();
+            let present = TokenRequest::parse(&body_with(&[
+                ("grant_type", grant_type.clone()),
+                (param, value),
+            ]));
+            match present {
+                Ok(req) => {
+                    prop_assert!(param_presence(&req, param), "non-empty {param} must be kept");
+                }
+                Err(_) => {
+                    // Newtype validation rejected the value — fine, as long
+                    // as the empty case below is still accepted.
+                }
+            }
+            let absent = TokenRequest::parse(&body_with(&[
+                ("grant_type", grant_type),
+                (param, String::new()),
+            ]));
+            prop_assert!(absent.is_ok(), "empty {param} must parse: {:?}", absent.err());
+            let req = absent.unwrap();
+            prop_assert!(!param_presence(&req, param), "empty {param} must be absent");
+        }
+
+        /// Arbitrary `authorization_details` JSON is rejected with the
+        /// RFC 9396 `invalid_authorization_details` code unless it is an
+        /// array of objects with a non-empty string `type` — and never
+        /// panics.
+        #[test]
+        fn authorization_details_structural_validation(
+            grant_type in prop::sample::select(GRANT_TYPE_WIRE_VALUES.to_vec()),
+            raw in prop::collection::vec(any::<char>(), 0..=80usize)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let body = body_with(&[
+                ("grant_type", grant_type.to_string()),
+                ("authorization_details", raw.clone()),
+            ]);
+            let outcome = TokenRequest::parse(&body);
+            let valid = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .map(|v| match v {
+                    serde_json::Value::Array(elements) => elements.iter().all(|e| {
+                        e.get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| !t.is_empty())
+                    }),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            match outcome {
+                Ok(req) => {
+                    prop_assert!(valid, "accepted invalid authorization_details: {raw}");
+                    let details = req.authorization_details.expect("parsed details");
+                    let expected: Vec<serde_json::Value> =
+                        serde_json::from_str(&raw).expect("already parsed above");
+                    prop_assert_eq!(details, expected);
+                }
+                Err(err) => {
+                    prop_assert!(!valid);
+                    prop_assert!(matches!(err, IssuerdError::InvalidAuthorizationDetails(_)));
+                    let code = err.oauth_error_code();
+                    prop_assert_eq!(code.as_ref(), "invalid_authorization_details");
+                }
+            }
+        }
+
+        /// Token exchange (RFC 8693): the subject token/type pair is
+        /// REQUIRED, the subject type must be the access-token URN, the
+        /// requested type (if any) too, and delegation via `actor_token` is
+        /// rejected outright. Arbitrary values never panic.
+        #[test]
+        fn token_exchange_validation(
+            subject_token in prop::option::of(
+                prop::collection::vec(any::<char>(), 0..=20usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ),
+            subject_token_type in prop::option::of(
+                prop::collection::vec(any::<char>(), 0..=60usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ),
+            requested_token_type in prop::option::of(
+                prop::collection::vec(any::<char>(), 0..=60usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ),
+            actor_token in prop::option::of(
+                prop::collection::vec(any::<char>(), 0..=20usize)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ),
+        ) {
+            let grant = "urn:ietf:params:oauth:grant-type:token-exchange".to_string();
+            let mut entries: Vec<(&str, String)> = vec![("grant_type", grant)];
+            if let Some(v) = &subject_token {
+                entries.push(("subject_token", v.clone()));
+            }
+            if let Some(v) = &subject_token_type {
+                entries.push(("subject_token_type", v.clone()));
+            }
+            if let Some(v) = &requested_token_type {
+                entries.push(("requested_token_type", v.clone()));
+            }
+            if let Some(v) = &actor_token {
+                entries.push(("actor_token", v.clone()));
+            }
+            let body = body_with(&entries);
+            let parsed = TokenRequest::parse(&body);
+            prop_assert!(parsed.is_ok(), "parse must succeed: {:?}", parsed.err());
+            let req = parsed.unwrap();
+            let client = make_test_client(false);
+            let outcome = req.validate(&Realm::default(), &client);
+
+            let has_subject = subject_token.is_some() && subject_token_type.is_some();
+            let subject_type_ok = subject_token_type.as_deref() == Some(TOKEN_TYPE_ACCESS_TOKEN);
+            let requested_ok = requested_token_type
+                .as_deref()
+                .map(|r| r == TOKEN_TYPE_ACCESS_TOKEN)
+                .unwrap_or(true);
+            let no_actor = actor_token.is_none();
+            let expected_ok = has_subject && subject_type_ok && requested_ok && no_actor;
+            prop_assert_eq!(outcome.is_ok(), expected_ok, "req: {:?}", req);
+            if !outcome.is_ok() {
+                let err = outcome.unwrap_err();
+                if !no_actor && has_subject && subject_type_ok && requested_ok {
+                    prop_assert!(
+                        matches!(err, IssuerdError::InvalidRequest(ref m)
+                            if m.contains("actor_token")),
+                        "expected the delegation rejection, got {err:?}"
+                    );
+                }
+            }
+        }
+
+        /// Grant-specific required fields (RFC 6749 §4): every grant that
+        /// demands a field must reject a request without it with
+        /// `invalid_grant`, and accept one carrying every field it needs.
+        #[test]
+        fn grant_required_fields_enforced(
+            grant_type in prop::sample::select(GRANT_TYPE_WIRE_VALUES.to_vec()),
+            omit in any::<bool>(),
+        ) {
+            let fill = |k: &str, v: &str| (k.to_string(), v.to_string());
+            let full: Vec<(String, String)> = match grant_type {
+                "authorization_code" => vec![
+                    fill("grant_type", "authorization_code"),
+                    fill("code", "code-123"),
+                    fill("redirect_uri", "https://example.com/cb"),
+                ],
+                "refresh_token" => vec![
+                    fill("grant_type", "refresh_token"),
+                    fill("refresh_token", "refresh-123"),
+                ],
+                "password" => vec![
+                    fill("grant_type", "password"),
+                    fill("username", "alice"),
+                    fill("password", "s3cret"),
+                ],
+                "client_credentials" => vec![fill("grant_type", "client_credentials")],
+                "urn:ietf:params:oauth:grant-type:device_code" => vec![
+                    fill("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    fill("device_code", "device-123"),
+                ],
+                "urn:openid:params:grant-type:ciba" => vec![
+                    fill("grant_type", "urn:openid:params:grant-type:ciba"),
+                    fill("auth_req_id", "authreq-123"),
+                ],
+                "urn:ietf:params:oauth:grant-type:token-exchange" => vec![
+                    fill("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+                    fill("subject_token", "token-123"),
+                    fill("subject_token_type", TOKEN_TYPE_ACCESS_TOKEN),
+                ],
+                "urn:ietf:params:oauth:grant-type:jwt-bearer" => vec![
+                    fill("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                    fill("assertion", "jwt-123"),
+                    fill("assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER),
+                ],
+                _ => unreachable!(),
+            };
+            // The key each grant requires, if any.
+            let required = match grant_type {
+                "authorization_code" => Some("code"),
+                "refresh_token" => Some("refresh_token"),
+                "password" => Some("password"),
+                "client_credentials" => None,
+                "urn:ietf:params:oauth:grant-type:device_code" => Some("device_code"),
+                "urn:openid:params:grant-type:ciba" => Some("auth_req_id"),
+                "urn:ietf:params:oauth:grant-type:token-exchange" => Some("subject_token"),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some("assertion"),
+                _ => unreachable!(),
+            };
+
+            let mut entries = full.clone();
+            if omit {
+                if let Some(key) = required {
+                    entries.retain(|(k, _)| k != key);
+                }
+            }
+            let body: HashMap<String, String> = entries.into_iter().collect();
+            let req = TokenRequest::parse(&body).expect("a well-formed body parses");
+            let client = make_test_client(false);
+            let outcome = req.validate(&Realm::default(), &client);
+            let expected_ok = !omit || required.is_none();
+            prop_assert_eq!(
+                outcome.is_ok(),
+                expected_ok,
+                "grant={} omit={}: {:?}",
+                grant_type,
+                omit,
+                outcome
+            );
+            if !expected_ok {
+                prop_assert!(matches!(outcome.unwrap_err(), IssuerdError::InvalidGrant));
+            }
+        }
     }
 }
