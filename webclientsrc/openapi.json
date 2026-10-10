@@ -5938,7 +5938,7 @@
           "Clients"
         ],
         "summary": "Download client adapter configuration",
-        "description": "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config, dotenv for dotenv-style client configuration). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
+        "description": "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config, `dotenv` for a dotenv-style .env file rendered as `text/plain`). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
         "operationId": "get_installation_provider",
         "parameters": [
           {
@@ -5976,6 +5976,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ClientInstallationRepresentation"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -18729,13 +18734,9 @@
           {
             "$ref": "#/components/schemas/GenericOidcClientConfigRepresentation",
             "description": "`generic-oidc-json` — generic OIDC client config."
-          },
-          {
-            "$ref": "#/components/schemas/DotenvClientConfigRepresentation",
-            "description": "`dotenv` — dotenv-style client configuration (.env file)."
           }
         ],
-        "description": "Response of the client installation endpoint; the concrete shape depends on\nthe requested provider id."
+        "description": "Response of the client installation endpoint for the JSON providers; the\nconcrete shape depends on the requested provider id. (The `dotenv` provider\nis rendered as a `text/plain` .env body and has no JSON representation.)"
       },
       "ClientMappingsRepresentation": {
         "type": "object",
@@ -19168,29 +19169,6 @@
             }
           }
         ]
-      },
-      "DotenvClientConfigRepresentation": {
-        "type": "object",
-        "description": "dotenv-style client configuration (.env file) as key-value pairs.",
-        "required": [
-          "ISSUERD_CLIENT_ID",
-          "ISSUERD_ISSUER",
-          "ISSUERD_REDIRECT_URI"
-        ],
-        "properties": {
-          "ISSUERD_CLIENT_ID": {
-            "type": "string",
-            "description": "The client identifier."
-          },
-          "ISSUERD_ISSUER": {
-            "type": "string",
-            "description": "The issuer URL."
-          },
-          "ISSUERD_REDIRECT_URI": {
-            "type": "string",
-            "description": "The redirect URI (first redirect URI if multiple are configured)."
-          }
-        }
       },
       "EnumValueRepresentation": {
         "type": "object",

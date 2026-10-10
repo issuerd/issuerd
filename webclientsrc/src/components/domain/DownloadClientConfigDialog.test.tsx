@@ -3,45 +3,34 @@
 
 import { describe, it, expect } from 'vitest'
 import { serializeClientConfig } from './DownloadClientConfigDialog'
-import type { DotenvClientConfigRepresentation } from '@generated'
+import type { GenericOidcClientConfigRepresentation } from '@generated'
 
-const dotenvConfig: DotenvClientConfigRepresentation = {
-  ISSUERD_CLIENT_ID: 'my-app',
-  ISSUERD_ISSUER: 'https://idp.example.com/realms/test',
-  ISSUERD_REDIRECT_URI: 'https://app.example.com/cb',
+const oidcConfig: GenericOidcClientConfigRepresentation = {
+  issuer: 'https://idp.example.com/realms/test',
+  authorization_endpoint: 'https://idp.example.com/realms/test/protocol/openid-connect/auth',
+  token_endpoint: 'https://idp.example.com/realms/test/protocol/openid-connect/token',
+  userinfo_endpoint: 'https://idp.example.com/realms/test/protocol/openid-connect/userinfo',
+  jwks_uri: 'https://idp.example.com/realms/test/protocol/openid-connect/certs',
+  end_session_endpoint: 'https://idp.example.com/realms/test/protocol/openid-connect/logout',
+  introspection_endpoint:
+    'https://idp.example.com/realms/test/protocol/openid-connect/token/introspect',
+  client_id: 'my-app',
+  client_secret: 'old-secret',
+  redirect_uris: ['https://app.example.com/cb'],
 }
 
 describe('serializeClientConfig', () => {
   it('renders JSON providers as pretty-printed JSON', () => {
-    expect(serializeClientConfig(dotenvConfig, 'application/json')).toBe(
-      JSON.stringify(dotenvConfig, null, 2),
-    )
+    expect(serializeClientConfig(oidcConfig)).toBe(JSON.stringify(oidcConfig, null, 2))
   })
 
-  it('renders text/plain providers as quoted KEY=VALUE lines', () => {
-    expect(serializeClientConfig(dotenvConfig, 'text/plain')).toBe(
-      [
-        'ISSUERD_CLIENT_ID="my-app"',
-        'ISSUERD_ISSUER="https://idp.example.com/realms/test"',
-        'ISSUERD_REDIRECT_URI="https://app.example.com/cb"',
-      ].join('\n'),
-    )
-  })
-
-  it('keeps URL special characters intact inside quotes', () => {
-    const cfg = {
-      ...dotenvConfig,
-      ISSUERD_REDIRECT_URI: 'https://app.example.com/cb?param=value&other=123#section',
-    }
-    expect(serializeClientConfig(cfg, 'text/plain')).toContain(
+  it('passes the server-rendered dotenv body through verbatim', () => {
+    const dotenv = [
+      'ISSUERD_CLIENT_ID="my-app"',
+      'ISSUERD_ISSUER="https://idp.example.com/realms/test"',
       'ISSUERD_REDIRECT_URI="https://app.example.com/cb?param=value&other=123#section"',
-    )
-  })
-
-  it('escapes backslashes and double quotes in dotenv values', () => {
-    const cfg = { ...dotenvConfig, ISSUERD_REDIRECT_URI: 'C:\\apps\\"my app"\\cb' }
-    expect(serializeClientConfig(cfg, 'text/plain')).toContain(
-      'ISSUERD_REDIRECT_URI="C:\\\\apps\\\\\\"my app\\"\\\\cb"',
-    )
+      '',
+    ].join('\n')
+    expect(serializeClientConfig(dotenv)).toBe(dotenv)
   })
 })

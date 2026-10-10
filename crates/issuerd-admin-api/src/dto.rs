@@ -549,22 +549,9 @@ pub struct GenericOidcClientConfigRepresentation {
     pub redirect_uris: Vec<String>,
 }
 
-/// dotenv-style client configuration (.env file) as key-value pairs.
-#[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
-pub struct DotenvClientConfigRepresentation {
-    /// The client identifier.
-    #[serde(rename = "ISSUERD_CLIENT_ID")]
-    pub client_id: String,
-    /// The issuer URL.
-    #[serde(rename = "ISSUERD_ISSUER")]
-    pub issuer: String,
-    /// The redirect URI (first redirect URI if multiple are configured).
-    #[serde(rename = "ISSUERD_REDIRECT_URI")]
-    pub redirect_uri: String,
-}
-
-/// Response of the client installation endpoint; the concrete shape depends on
-/// the requested provider id.
+/// Response of the client installation endpoint for the JSON providers; the
+/// concrete shape depends on the requested provider id. (The `dotenv` provider
+/// is rendered as a `text/plain` .env body and has no JSON representation.)
 #[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum ClientInstallationRepresentation {
@@ -572,8 +559,6 @@ pub enum ClientInstallationRepresentation {
     Keycloak(KeycloakAdapterConfigRepresentation),
     /// `generic-oidc-json` — generic OIDC client config.
     GenericOidc(GenericOidcClientConfigRepresentation),
-    /// `dotenv` — dotenv-style client configuration (.env file).
-    Dotenv(DotenvClientConfigRepresentation),
 }
 
 /// Request body for minting an initial access token (Keycloak's

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 //
-// Client adapter-config download endpoints (keycloak.json, generic OIDC).
+// Client adapter-config download endpoints (keycloak.json, generic OIDC, dotenv).
 
 //! Client installation endpoints — Keycloak's "Download adapter config"
 //! (`ClientResource.getInstallationProvider`).
@@ -12,12 +12,15 @@
 //!
 //! - `keycloak-oidc-keycloak-json` — the Keycloak OIDC adapter `keycloak.json`
 //! - `generic-oidc-json` — product-neutral OIDC client configuration
-//! - `dotenv` — dotenv-style client configuration (.env file)
+//! - `dotenv` — dotenv-style client configuration (.env file), rendered
+//!   server-side as a `text/plain` body (the JSON providers return JSON)
 //!
 //! Unknown provider ids return 404, matching Keycloak's `NotFoundException`.
 
 use axum::{
     extract::{Extension, State},
+    http::header,
+    response::{IntoResponse, Response},
     Json,
 };
 use issuerd_core::{ClientId, Pagination};
@@ -27,8 +30,8 @@ use crate::{
     auth::{require_roles, AdminAuth},
     dto::{
         AdapterCredentials, ClientInstallationProviderRepresentation,
-        ClientInstallationRepresentation, DotenvClientConfigRepresentation,
-        GenericOidcClientConfigRepresentation, KeycloakAdapterConfigRepresentation,
+        ClientInstallationRepresentation, GenericOidcClientConfigRepresentation,
+        KeycloakAdapterConfigRepresentation,
     },
     error::AdminApiError,
     state::AdminApiState,
@@ -148,27 +151,37 @@ fn generic_oidc_config(
     }
 }
 
-/// Build the dotenv-style client configuration (.env file) for a client.
+/// Render the dotenv-style client configuration (.env file body) for a client.
 ///
-/// Returns a configuration suitable for saving as a .env file with the format:
-/// ISSUERD_CLIENT_ID=<client-id>
-/// ISSUERD_ISSUER=<issuer-url>
-/// ISSUERD_REDIRECT_URI=<first-redirect-uri-or-empty-string>
-fn dotenv_config(
-    client: &issuerd_core::Client,
-    base_url: &str,
-    realm_name: &str,
-) -> DotenvClientConfigRepresentation {
+/// Returns the .env file verbatim:
+/// ISSUERD_CLIENT_ID="<client-id>"
+/// ISSUERD_ISSUER="<issuer-url>"
+/// ISSUERD_REDIRECT_URI="<first-redirect-uri-or-empty-string>"
+///
+/// Values are double-quoted (see [`dotenv_quote`]) so `#`, `&`, `=`, and
+/// spaces survive dotenv parsers.
+fn dotenv_config(client: &issuerd_core::Client, base_url: &str, realm_name: &str) -> String {
     let issuer = format!("{base_url}/realms/{realm_name}");
 
-    let redirect_uri =
-        client.redirect_uris.first().map(|uri| uri.as_str()).unwrap_or("").to_string();
+    let redirect_uri = client.redirect_uris.first().map(|uri| uri.as_str()).unwrap_or("");
 
-    DotenvClientConfigRepresentation {
-        client_id: client.client_id.to_string(),
-        issuer,
-        redirect_uri,
-    }
+    format!(
+        "ISSUERD_CLIENT_ID={}\nISSUERD_ISSUER={}\nISSUERD_REDIRECT_URI={}\n",
+        dotenv_quote(client.client_id.as_str()),
+        dotenv_quote(&issuer),
+        dotenv_quote(redirect_uri),
+    )
+}
+
+/// Quote a value for a .env file: wrap it in double quotes and escape `\`,
+/// `"`, and the line breaks that would otherwise corrupt the file.
+fn dotenv_quote(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("\"{escaped}\"")
 }
 
 #[utoipa::path(
@@ -176,14 +189,17 @@ fn dotenv_config(
     path = "/admin/realms/{realm}/clients/{id}/installation/providers/{provider_id}",
     tag = "Clients",
     summary = "Download client adapter configuration",
-    description = "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config, dotenv for dotenv-style client configuration). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
+    description = "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config, `dotenv` for a dotenv-style .env file rendered as `text/plain`). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("id" = String, Path, description = "Client ID (internal UUID)"),
         ("provider_id" = String, Path, description = "Installation provider id (see serverinfo `client_installations`)")
     ),
     responses(
-        (status = 200, description = "Client configuration in the requested format", body = ClientInstallationRepresentation),
+        (status = 200, description = "Client configuration in the requested format", content(
+            (ClientInstallationRepresentation = "application/json"),
+            (String = "text/plain")
+        )),
         (status = 401, description = "Unauthorized", body = crate::error::AdminApiErrorResponse),
         (status = 403, description = "Forbidden", body = crate::error::AdminApiErrorResponse),
         (status = 404, description = "Realm, client, or provider not found", body = crate::error::AdminApiErrorResponse),
@@ -194,7 +210,7 @@ pub async fn get_installation_provider(
     State(state): State<Arc<AdminApiState>>,
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path((realm, id, provider_id)): axum::extract::Path<(String, String, String)>,
-) -> Result<Json<ClientInstallationRepresentation>, AdminApiError> {
+) -> Result<Response, AdminApiError> {
     require_roles(&auth, &["view-clients", "manage-clients"])?;
     let realm_model =
         state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
@@ -219,16 +235,18 @@ pub async fn get_installation_provider(
                 &client,
                 &state.base_url,
                 has_client_roles,
-            ))))
+            )))
+            .into_response())
         }
         GENERIC_OIDC_JSON_PROVIDER_ID => Ok(Json(ClientInstallationRepresentation::GenericOidc(
             generic_oidc_config(&client, &state.base_url, &realm),
-        ))),
-        DOTENV_PROVIDER_ID => Ok(Json(ClientInstallationRepresentation::Dotenv(dotenv_config(
-            &client,
-            &state.base_url,
-            &realm,
-        )))),
+        ))
+        .into_response()),
+        DOTENV_PROVIDER_ID => Ok((
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            dotenv_config(&client, &state.base_url, &realm),
+        )
+            .into_response()),
         _ => Err(AdminApiError::NotFound),
     }
 }
@@ -319,6 +337,33 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    async fn get_text(
+        app: Router,
+        realm: &str,
+        client_id: &str,
+        provider_id: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/realms/{realm}/clients/{client_id}/installation/providers/{provider_id}"
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, content_type, String::from_utf8(body.to_vec()).unwrap())
     }
 
     #[tokio::test]
@@ -569,16 +614,16 @@ mod tests {
         setup(&state, test_client(&issuerd_core::RealmId::new("realm-1").unwrap())).await;
         let app = installation_routes(state);
 
-        let (status, json) = get_json(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
+        let (status, content_type, body) =
+            get_text(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
 
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
         assert_eq!(
-            json,
-            serde_json::json!({
-                "ISSUERD_CLIENT_ID": "my-app",
-                "ISSUERD_ISSUER": "http://localhost:8080/realms/test",
-                "ISSUERD_REDIRECT_URI": "https://app.example.com/cb"
-            })
+            body,
+            "ISSUERD_CLIENT_ID=\"my-app\"\n\
+             ISSUERD_ISSUER=\"http://localhost:8080/realms/test\"\n\
+             ISSUERD_REDIRECT_URI=\"https://app.example.com/cb\"\n"
         );
     }
 
@@ -599,18 +644,30 @@ mod tests {
         setup(&state, client).await;
         let app = installation_routes(state);
 
-        let (status, json) = get_json(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
+        let (status, content_type, body) =
+            get_text(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
 
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        // URL special characters pass through verbatim inside the quotes.
         assert_eq!(
-            json,
-            serde_json::json!({
-                "ISSUERD_CLIENT_ID": "my-app",
-                "ISSUERD_ISSUER": "http://localhost:8080/realms/test",
-                "ISSUERD_REDIRECT_URI": "https://app.example.com/cb?param=value&other=123#section"
-            })
+            body,
+            "ISSUERD_CLIENT_ID=\"my-app\"\n\
+             ISSUERD_ISSUER=\"http://localhost:8080/realms/test\"\n\
+             ISSUERD_REDIRECT_URI=\"https://app.example.com/cb?param=value&other=123#section\"\n"
         );
     }
+
+    #[test]
+    fn dotenv_quote_escapes_quotes_backslashes_and_line_breaks() {
+        assert_eq!(dotenv_quote("plain"), "\"plain\"");
+        assert_eq!(
+            dotenv_quote("C:\\apps\\\"my app\"\\cb"),
+            "\"C:\\\\apps\\\\\\\"my app\\\"\\\\cb\""
+        );
+        assert_eq!(dotenv_quote("a\nb\rc"), "\"a\\nb\\rc\"");
+    }
+
     #[test]
     fn provider_ids_match_between_metadata_and_dispatch() {
         let ids: Vec<String> = providers().into_iter().map(|p| p.id).collect();
