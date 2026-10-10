@@ -38,7 +38,8 @@ pub async fn admin_auth_middleware(
         warn!(error = %e, "admin API authentication failed");
         AdminApiError::Unauthorized
     })?;
-    enforce_realm_binding(&state, &validated.claims, request.uri().path()).await?;
+    enforce_realm_binding(&state, &validated.claims, request.method(), request.uri().path())
+        .await?;
     request.extensions_mut().insert(AdminAuth {
         claims: validated.claims,
     });
@@ -51,10 +52,12 @@ pub async fn admin_auth_middleware(
 /// Keycloak model: a token issued by the `master` realm administers every
 /// realm; any other token administers only the realm that issued it. Paths
 /// without a `{realm}` segment (realm creation/listing) are master-only, with
-/// one exception: `GET /admin/serverinfo` serves server-global capability
-/// metadata (enum lists, provider ids, version — no realm-scoped data) and is
+/// one exception family: `GET /admin/serverinfo` and the read-only
+/// `GET /admin/enums/*` listings serve server-global capability metadata
+/// (enum lists, provider ids, version — no realm-scoped data) and are
 /// readable by any authenticated admin token, because every realm's admin
-/// console loads it (Keycloak console parity). The handler still requires
+/// console loads them (Keycloak console parity). The exemption is enforced
+/// for GET requests only; the handlers still require
 /// `view-realm`/`manage-realm`.
 ///
 /// When a realm's `not_before` is set (non-zero), tokens with `iat` before
@@ -69,6 +72,7 @@ pub async fn admin_auth_middleware(
 async fn enforce_realm_binding(
     state: &AdminApiState,
     claims: &issuerd_core::AccessTokenClaims,
+    method: &axum::http::Method,
     path: &str,
 ) -> Result<(), AdminApiError> {
     // The token's home realm name is the trailing segment of the issuer URL
@@ -109,10 +113,15 @@ async fn enforce_realm_binding(
         return Ok(());
     }
     let Some(path_realm) = path_realm_segment(path) else {
-        // Server metadata is server-global and realm-agnostic; every realm's
-        // admin console reads it, so it is exempt from the master-only rule
-        // (the handler enforces view-realm/manage-realm on top).
-        if path == "/admin/serverinfo" {
+        // Server metadata and the enum listings are server-global and
+        // realm-agnostic; every realm's admin console reads them, so they are
+        // exempt from the master-only rule (the handlers enforce
+        // view-realm/manage-realm on top). The exemption is method-scoped to
+        // GET: a future non-GET route under these prefixes must not silently
+        // inherit it.
+        if *method == axum::http::Method::GET
+            && (path == "/admin/serverinfo" || path.starts_with("/admin/enums/"))
+        {
             return Ok(());
         }
         warn!("admin API authorization denied: realm-less path requires a master realm token");
@@ -451,6 +460,7 @@ mod tests {
             .route("/admin/realms", get(|| async { StatusCode::OK }))
             .route("/admin/realms/{realm}/users", get(|| async { StatusCode::OK }))
             .route("/admin/serverinfo", get(|| async { StatusCode::OK }))
+            .route("/admin/enums/protocols", get(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn_with_state(state.clone(), admin_auth_middleware))
             .with_state(state)
     }
@@ -475,6 +485,7 @@ mod tests {
         assert_eq!(path_realm_segment("/admin/realms"), None);
         assert_eq!(path_realm_segment("/admin/realms/count"), None);
         assert_eq!(path_realm_segment("/admin/serverinfo"), None);
+        assert_eq!(path_realm_segment("/admin/enums/protocols"), None);
     }
 
     #[tokio::test]
@@ -544,6 +555,68 @@ mod tests {
         set_not_before(&state, "tenant", 1000).await;
         let app = binding_app(state);
         assert_eq!(call(app, "/admin/serverinfo").await, StatusCode::UNAUTHORIZED);
+    }
+
+    // -- Enum listings: realm-less but readable by any admin token ------------
+
+    #[tokio::test]
+    async fn realm_token_reads_enums() {
+        // The `/admin/enums/*` listings carry the same server-global metadata
+        // serverinfo aggregates, so a realm-bound admin token may read them.
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/enums/protocols").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn master_token_reads_enums() {
+        let state = state_with_tenant("http://localhost:8080/realms/master").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/enums/protocols").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn anonymous_enums_read_is_unauthorized() {
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        let status = app
+            .oneshot(Request::builder().uri("/admin/enums/protocols").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn not_before_still_applies_to_enums_reads() {
+        // Same as serverinfo: the relaxation does not bypass realm revocation.
+        let state = state_with_tenant_and_iat("http://localhost:8080/realms/tenant", 500).await;
+        set_not_before(&state, "tenant", 1000).await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/enums/protocols").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metadata_exemption_is_get_only() {
+        // A non-GET request under an exempt prefix still requires a master
+        // token: the middleware rejects it before the router would answer 405.
+        for uri in ["/admin/serverinfo", "/admin/enums/protocols"] {
+            let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+            let app = binding_app(state);
+            let status = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(axum::http::header::AUTHORIZATION, "Bearer token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
     }
 
     #[tokio::test]
