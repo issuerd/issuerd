@@ -1,8 +1,11 @@
 name: "issuerd CodeQL config"
 
-# Merged into the code scanning DEFAULT setup via the repository property
-# `github-codeql-config-file` (no workflow file needed — see
-# https://github.blog/changelog/2026-08-04-customize-code-scanning-default-setup-at-scale/).
+# Referenced from the ADVANCED setup workflow `.github/workflows/codeql.yml`
+# via `config-file`. (Previously merged into the default setup via the
+# org-level repository property `github-codeql-config-file`; the default setup
+# was retired on 2026-10-10 because its runs were never created for
+# approval-gated fork PRs, while the `main` ruleset requires CodeQL results
+# at merge.)
 #
 # Test code is full of intentional fixture secrets (Password123!, TOTP seeds,
 # mock keys, loopback harness traffic) that flooded the queue with ~520
