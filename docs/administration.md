@@ -242,7 +242,7 @@ The `{realm}` path segment is always the realm **name**, never the UUID. The `{i
 
 ### Authentication and authorization
 
-`Authorization: Bearer <access_token>` on every call. Missing/invalid token → `401`; token bound to another realm, realm-less path without a master token, or missing required role → `403`. Role requirements by area (reads accept view- or manage-; writes require manage-):
+`Authorization: Bearer <access_token>` on every call. Missing/invalid token → `401`; token bound to another realm, realm-less path without a master token (except the server-global metadata reads `GET /admin/serverinfo` and `GET /admin/enums/*`, which any authenticated admin token may use), or missing required role → `403`. Role requirements by area (reads accept view- or manage-; writes require manage-):
 
 | Area | Read roles | Write roles |
 |---|---|---|
