@@ -159,8 +159,7 @@ fn dotenv_config(
     base_url: &str,
     realm_name: &str,
 ) -> DotenvClientConfigRepresentation {
-    let realm_base = format!("{base_url}/realms/{realm_name}");
-    let issuer = realm_base;
+    let issuer = format!("{base_url}/realms/{realm_name}");
 
     let redirect_uri =
         client.redirect_uris.first().map(|uri| uri.as_str()).unwrap_or("").to_string();

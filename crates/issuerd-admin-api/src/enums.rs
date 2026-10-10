@@ -1022,12 +1022,12 @@ mod tests {
             assert!(!provider.help_text.is_empty());
             assert!(!provider.filename.is_empty());
 
-            // Check media type based on provider type
-            let expected_media_type = if provider.filename == ".env" {
-                "text/plain"
-            } else {
-                "application/json"
-            };
+            let expected_media_type =
+                if provider.id == crate::client_installation::DOTENV_PROVIDER_ID {
+                    "text/plain"
+                } else {
+                    "application/json"
+                };
             assert_eq!(provider.media_type, expected_media_type);
             assert!(!provider.download_only);
         }
