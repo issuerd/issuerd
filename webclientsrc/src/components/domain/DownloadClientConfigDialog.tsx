@@ -10,6 +10,7 @@ import Spinner from '../ui/Spinner'
 import ErrorMessage from '../ui/ErrorMessage'
 import { useServerInfo } from '../../api/hooks/useServerInfo'
 import { useClientInstallation } from '../../api/hooks/useClients'
+import type { ClientInstallationRepresentation } from '@generated'
 
 interface DownloadClientConfigDialogProps {
   open: boolean
@@ -19,6 +20,28 @@ interface DownloadClientConfigDialogProps {
   clientId: string
   /** Client protocol; available formats are filtered by it. */
   protocol?: string
+}
+
+/**
+ * Render a client configuration for preview/download: JSON providers as
+ * pretty-printed JSON, `text/plain` providers (dotenv) as KEY=VALUE lines.
+ */
+export function serializeClientConfig(
+  cfg: ClientInstallationRepresentation,
+  mediaType: string,
+): string {
+  if (mediaType === 'text/plain') {
+    return Object.entries(cfg)
+      .map(([key, value]) => `${key}=${dotenvQuote(value)}`)
+      .join('\n')
+  }
+
+  return JSON.stringify(cfg, null, 2)
+}
+
+/** dotenv values are double-quoted so `#`, `&`, `=`, and spaces survive parsers. */
+function dotenvQuote(value: unknown): string {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 }
 
 /**
@@ -47,16 +70,7 @@ export default function DownloadClientConfigDialog({
     error,
   } = useClientInstallation(realm, clientId, selectedProvider?.id ?? '', open && !!selectedProvider)
 
-  function serializeConfig(config: any): string {
-    if (selectedProvider.media_type === "text/plain") {
-      return Object.entries(config)
-        .map(([key, value]) => `${key}=${value}`)
-        .join('\n')
-    }
-
-    return JSON.stringify(config, null, 2)
-  }
-  const snippet = config ? serializeConfig(config) : ''
+  const snippet = config ? serializeClientConfig(config, selectedProvider?.media_type ?? '') : ''
 
   function handleDownload() {
     if (!snippet || !selectedProvider) return
