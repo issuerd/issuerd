@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added dotenv-style (.env) client installation provider for clients to download configuration in .env format.
+
 - **Full bundle-driven localization of every login-flow page and all outbound email.** The OTP, email-code and WebAuthn challenge pages, the CONFIGURE_TOTP enrollment, the required-action pages (UPDATE_PASSWORD, UPDATE_PROFILE, TERMS_AND_CONDITIONS, VERIFY_EMAIL), the registration and reset-credentials pages, the broker first-login pages and the error pages now render from the same layered message bundles as the consent page (`crates/issuerd-server/i18n/messages_{en,de}.json` compiled in, plus theme overrides at `{themes.dir}/{theme}/messages_{locale}.json` with per-key English fallback); the admin execute-actions email is localizable through the same mechanism. Locale resolution keeps the Keycloak precedence (flow-pinned `ui_locales` → `Accept-Language` → realm default → `en`, gated on the realm's internationalization toggle and restricted by its supported locales), and a realm without `login_theme`/`email_theme` reads the default theme's bundles. Locales are not limited to the compiled-in set: at boot the server scans `[themes] dir` for `messages_*.json` files and exposes the union via `GET /admin/enums/locales` and `GET /admin/serverinfo`, so theme-supplied locales appear in the admin console's realm i18n checkboxes. Provision YAML realms accept `internationalization_enabled`, `supported_locales` and `default_locale` (all optional; omitted keys keep the realm defaults). Theme message bundles are deployment-local content (`themes/*/messages_*.json` is gitignored). The admin and account consoles remain English-only.
 
 ## [0.1.13] - 2026-10-08

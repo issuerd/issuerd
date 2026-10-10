@@ -12,6 +12,7 @@
 //!
 //! - `keycloak-oidc-keycloak-json` — the Keycloak OIDC adapter `keycloak.json`
 //! - `generic-oidc-json` — product-neutral OIDC client configuration
+//! - `dotenv` — dotenv-style client configuration (.env file)
 //!
 //! Unknown provider ids return 404, matching Keycloak's `NotFoundException`.
 
@@ -26,8 +27,8 @@ use crate::{
     auth::{require_roles, AdminAuth},
     dto::{
         AdapterCredentials, ClientInstallationProviderRepresentation,
-        ClientInstallationRepresentation, GenericOidcClientConfigRepresentation,
-        KeycloakAdapterConfigRepresentation,
+        ClientInstallationRepresentation, DotenvClientConfigRepresentation,
+        GenericOidcClientConfigRepresentation, KeycloakAdapterConfigRepresentation,
     },
     error::AdminApiError,
     state::AdminApiState,
@@ -37,6 +38,9 @@ use crate::{
 pub const KEYCLOAK_OIDC_JSON_PROVIDER_ID: &str = "keycloak-oidc-keycloak-json";
 /// Provider id of the generic OIDC client configuration JSON format.
 pub const GENERIC_OIDC_JSON_PROVIDER_ID: &str = "generic-oidc-json";
+
+/// Provider id of the dotenv-style client configuration (.env file).
+pub const DOTENV_PROVIDER_ID: &str = "dotenv";
 
 /// Metadata of all available installation providers.
 ///
@@ -65,6 +69,19 @@ pub fn providers() -> Vec<ClientInstallationProviderRepresentation> {
                 .to_string(),
             filename: "oidc-client-config.json".to_string(),
             media_type: "application/json".to_string(),
+            download_only: false,
+        },
+        ClientInstallationProviderRepresentation {
+            id: DOTENV_PROVIDER_ID.to_string(),
+            protocol: "openid-connect".to_string(),
+            display_type: "Dotenv".to_string(),
+            help_text:
+                "dotenv-style client configuration (.env file) containing the client identifier, \
+                issuer URL, and redirect URI (first redirect URI if multiple are configured). \
+                Save it as .env in your application."
+                    .to_string(),
+            filename: ".env".to_string(),
+            media_type: "text/plain".to_string(),
             download_only: false,
         },
     ]
@@ -131,12 +148,35 @@ fn generic_oidc_config(
     }
 }
 
+/// Build the dotenv-style client configuration (.env file) for a client.
+///
+/// Returns a configuration suitable for saving as a .env file with the format:
+/// ISSUERD_CLIENT_ID=<client-id>
+/// ISSUERD_ISSUER=<issuer-url>
+/// ISSUERD_REDIRECT_URI=<first-redirect-uri-or-empty-string>
+fn dotenv_config(
+    client: &issuerd_core::Client,
+    base_url: &str,
+    realm_name: &str,
+) -> DotenvClientConfigRepresentation {
+    let issuer = format!("{base_url}/realms/{realm_name}");
+
+    let redirect_uri =
+        client.redirect_uris.first().map(|uri| uri.as_str()).unwrap_or("").to_string();
+
+    DotenvClientConfigRepresentation {
+        client_id: client.client_id.to_string(),
+        issuer,
+        redirect_uri,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/admin/realms/{realm}/clients/{id}/installation/providers/{provider_id}",
     tag = "Clients",
     summary = "Download client adapter configuration",
-    description = "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
+    description = "Renders the client configuration in a provider-specific downloadable format (`keycloak-oidc-keycloak-json` for the Keycloak adapter `keycloak.json`, `generic-oidc-json` for a product-neutral OIDC config, dotenv for dotenv-style client configuration). Unknown provider ids return 404. Requires `view-clients` or `manage-clients` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("id" = String, Path, description = "Client ID (internal UUID)"),
@@ -184,6 +224,11 @@ pub async fn get_installation_provider(
         GENERIC_OIDC_JSON_PROVIDER_ID => Ok(Json(ClientInstallationRepresentation::GenericOidc(
             generic_oidc_config(&client, &state.base_url, &realm),
         ))),
+        DOTENV_PROVIDER_ID => Ok(Json(ClientInstallationRepresentation::Dotenv(dotenv_config(
+            &client,
+            &state.base_url,
+            &realm,
+        )))),
         _ => Err(AdminApiError::NotFound),
     }
 }
@@ -515,6 +560,57 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn dotenv_client() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-clients").unwrap()
+            ]);
+        setup(&state, test_client(&issuerd_core::RealmId::new("realm-1").unwrap())).await;
+        let app = installation_routes(state);
+
+        let (status, json) = get_json(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ISSUERD_CLIENT_ID": "my-app",
+                "ISSUERD_ISSUER": "http://localhost:8080/realms/test",
+                "ISSUERD_REDIRECT_URI": "https://app.example.com/cb"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn dotenv_client_special_characters_in_redirect_uri() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-clients").unwrap()
+            ]);
+
+        // Create a client with special characters in redirect URI
+        let mut client = test_client(&issuerd_core::RealmId::new("realm-1").unwrap());
+        client.redirect_uris = vec![issuerd_core::RedirectUri::new(
+            "https://app.example.com/cb?param=value&other=123#section",
+        )
+        .unwrap()];
+
+        setup(&state, client).await;
+        let app = installation_routes(state);
+
+        let (status, json) = get_json(app, "test", "client-1", DOTENV_PROVIDER_ID).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ISSUERD_CLIENT_ID": "my-app",
+                "ISSUERD_ISSUER": "http://localhost:8080/realms/test",
+                "ISSUERD_REDIRECT_URI": "https://app.example.com/cb?param=value&other=123#section"
+            })
+        );
+    }
     #[test]
     fn provider_ids_match_between_metadata_and_dispatch() {
         let ids: Vec<String> = providers().into_iter().map(|p| p.id).collect();
@@ -522,7 +618,8 @@ mod tests {
             ids,
             [
                 KEYCLOAK_OIDC_JSON_PROVIDER_ID.to_string(),
-                GENERIC_OIDC_JSON_PROVIDER_ID.to_string()
+                GENERIC_OIDC_JSON_PROVIDER_ID.to_string(),
+                DOTENV_PROVIDER_ID.to_string(),
             ]
         );
     }
