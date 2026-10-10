@@ -11,6 +11,7 @@ import {
   useDeleteIdpMapper,
 } from '../../api/hooks/useIdentityProviders'
 import { useServerInfo } from '../../api/hooks/useServerInfo'
+import { errorMessage } from '../../lib/utils'
 import Input from '../ui/Input'
 import FormSelect from '../ui/FormSelect'
 import FormContextLine from '../ui/FormContextLine'
@@ -108,8 +109,8 @@ export default function IdpMappersSection({ realm, alias }: IdpMappersSectionPro
         await create.mutateAsync({ realm, alias, body })
       }
       setDialogOpen(false)
-    } catch (err: any) {
-      setFormError(err.message)
+    } catch (err) {
+      setFormError(errorMessage(err))
     }
   }
 

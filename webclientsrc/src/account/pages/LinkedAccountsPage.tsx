@@ -11,6 +11,7 @@ import {
 } from '@generated'
 import type { LinkedAccountResponse, LoginContextIdp } from '@generated'
 import { unwrap } from '../api/errors'
+import { errorMessage } from '../../lib/utils'
 import { getAccountRealm } from '../../config'
 import Spinner from '../../components/ui/Spinner'
 import { Table, Thead, Tbody, Tr, Th, Td } from '../../components/ui/Table'
@@ -39,7 +40,7 @@ export default function LinkedAccountsPage() {
         setLoading(false)
       })
       .catch((err) => {
-        setError(err.message)
+        setError(errorMessage(err))
         setLoading(false)
       })
   }
@@ -79,8 +80,8 @@ export default function LinkedAccountsPage() {
     try {
       const res = await accountLinkIdentity({ path: { realm: getAccountRealm(), alias } }).then(unwrap)
       window.location.href = res.redirect_url
-    } catch (err: any) {
-      setError(err.message)
+    } catch (err) {
+      setError(errorMessage(err))
       setLinking(null)
     }
   }
@@ -94,8 +95,8 @@ export default function LinkedAccountsPage() {
         path: { realm: getAccountRealm(), alias: account.alias },
       }).then(unwrap)
       loadLinked()
-    } catch (err: any) {
-      setError(err.message)
+    } catch (err) {
+      setError(errorMessage(err))
     } finally {
       setUnlinking(null)
     }

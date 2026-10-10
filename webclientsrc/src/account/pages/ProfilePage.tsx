@@ -10,6 +10,7 @@ import {
 import type { AccountMeResponse, LoginContextResponse, UpdateMeRequest } from '@generated'
 import { unwrap } from '../api/errors'
 import { getAccountRealm } from '../../config'
+import { errorMessage } from '../../lib/utils'
 import Spinner from '../../components/ui/Spinner'
 import Input from '../../components/ui/Input'
 import Button from '../../components/ui/Button'
@@ -49,7 +50,7 @@ export default function ProfilePage() {
         setLoading(false)
       })
       .catch((err) => {
-        setLoadError(err.message)
+        setLoadError(errorMessage(err))
         setLoading(false)
       })
   }, [])
@@ -87,8 +88,8 @@ export default function ProfilePage() {
       setVerificationSent(
         emailChanged && !updated.email_verified && (loginCtx?.verify_email_enabled ?? false)
       )
-    } catch (err: any) {
-      setSaveError(err.message || 'Failed to update profile')
+    } catch (err) {
+      setSaveError(errorMessage(err) || 'Failed to update profile')
     } finally {
       setSaving(false)
     }

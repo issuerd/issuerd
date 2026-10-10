@@ -121,6 +121,9 @@ npm run build
 # Run tests (Vitest)
 npm run test
 
+# Lint (ESLint — bans explicit `any` in production TypeScript; runs in CI)
+npm run lint
+
 # Run tests in watch mode
 npx vitest
 
@@ -450,3 +453,4 @@ In development, `npm run dev` proxies `/admin`, `/realms`, `/api`, and `/login.h
 7. **Dropping `description` from enum values** — `EnumValueRepresentation` includes `description` for a reason. It explains the value to the admin user. Never map only `id` + `name`; always thread `description` into the UI via tooltips, subtitles, or `title` attributes.
 8. **Calling an endpoint that is not in `openapi.json`, or bypassing the generated SDK** — every request must use a generated SDK function (see the Generated-SDK rule above). The account console and admin SPA share the same SDK singleton, configured once in `src/config.ts` (auth resolver covers both token stores).
 9. **Linking the Google Fonts CDN** — all HTML entry points (`index.html`, `account.html`, `public/login.html`) must load fonts only from the same-origin vendored `/fonts/fonts.css` (populated by `node scripts/fetch-fonts.mjs`). Runtime requests to `fonts.googleapis.com`/`fonts.gstatic.com` fail in hermetic networks (the OIDC conformance stack is `internal: true`) and flood the suite's browser logs with exceptions.
+10. **Reaching for `any`** — explicit `any` in production TypeScript fails `npm run lint` (`@typescript-eslint/no-explicit-any` in `eslint.config.js`, enforced in the CI webclient job; test files are exempt — mock fixtures may loosen types). For catch clauses use `catch (err)` and render via the `errorMessage(err)` helper from `src/lib/utils.ts`; API payloads already carry generated types — use them.

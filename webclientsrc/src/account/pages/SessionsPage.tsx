@@ -6,6 +6,7 @@ import { Monitor, LogOut, Clock, Globe } from 'lucide-react'
 import { accountListSessions, accountLogoutSession } from '@generated'
 import type { AccountSession } from '@generated'
 import { unwrap } from '../api/errors'
+import { errorMessage } from '../../lib/utils'
 import { getAccountRealm } from '../../config'
 import Spinner from '../../components/ui/Spinner'
 
@@ -23,7 +24,7 @@ export default function SessionsPage() {
         setLoading(false)
       })
       .catch((err) => {
-        setError(err.message)
+        setError(errorMessage(err))
         setLoading(false)
       })
   }
@@ -36,8 +37,8 @@ export default function SessionsPage() {
     try {
       await accountLogoutSession({ path: { realm: getAccountRealm(), id: sessionId } }).then(unwrap)
       loadSessions()
-    } catch (err: any) {
-      setError(err.message)
+    } catch (err) {
+      setError(errorMessage(err))
     }
   }
 

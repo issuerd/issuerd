@@ -99,6 +99,7 @@ jobs:
       # openapi.json before type-checking/building (mirrors the Dockerfile).
       - run: npm ci
       - run: npm run generate-api
+      - run: npm run lint
       - run: npm run test
       - run: npm run build
 

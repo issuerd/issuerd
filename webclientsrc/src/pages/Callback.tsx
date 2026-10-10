@@ -7,9 +7,14 @@ import { tokenEndpoint } from '@generated'
 import { CONFIG, CONSOLE_BASENAME } from '../config'
 import { useAuthStore } from '../state/authStore'
 import { startSessionRefresh } from '../api/tokenRefresh'
+import { errorMessage } from '../lib/utils'
 import Spinner from '../components/ui/Spinner'
 
-function parseJwtPayload(token: string): Record<string, any> {
+interface JwtPayload {
+  realm_access?: { roles?: string[] }
+}
+
+function parseJwtPayload(token: string): JwtPayload {
   try {
     const base64Url = token.split('.')[1]
     const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
@@ -175,8 +180,8 @@ export default function Callback() {
         } else {
           window.location.href = `/realms/${realm}/account`
         }
-      } catch (err: any) {
-        setError(err.message || 'Authentication failed')
+      } catch (err) {
+        setError(errorMessage(err) || 'Authentication failed')
       }
     }
 

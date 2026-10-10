@@ -18,6 +18,7 @@ import IdPForm from '../../components/domain/IdPForm'
 import IdpMappersSection from '../../components/domain/IdpMappersSection'
 import DeleteConfirmModal from '../../components/domain/DeleteConfirmModal'
 import PageHeader from '@/components/layout/PageHeader'
+import { errorMessage } from '@/lib/utils'
 import type { IdentityProviderRepresentation, IdpTestConnectionResponse } from '@generated'
 
 export default function IdPEditPage() {
@@ -51,8 +52,8 @@ export default function IdPEditPage() {
     try {
       const result = await testConnection.mutateAsync({ realm, alias: decodeURIComponent(alias!) })
       setTestResult(result)
-    } catch (e: any) {
-      setTestError(e.message || 'Connection test failed')
+    } catch (e) {
+      setTestError(errorMessage(e) || 'Connection test failed')
     }
   }
 
@@ -84,8 +85,8 @@ export default function IdPEditPage() {
                 try {
                   const result = await sync.mutateAsync({ realm, alias: decodeURIComponent(alias!) })
                   alert(`Sync complete: ${result.added} added, ${result.updated} updated, ${result.removed} removed, ${result.failed} failed`)
-                } catch (e: any) {
-                  alert('Sync failed: ' + (e.message || 'Unknown error'))
+                } catch (e) {
+                  alert('Sync failed: ' + (errorMessage(e) || 'Unknown error'))
                 }
               }}
               disabled={sync.isPending}
