@@ -249,5 +249,56 @@ cargo test --workspace --lib
   suite-API-driven rotation evidence (create module → CONFIGURED → admin
   key rotation → start → require PASSED). NOT yet executed against the live
   stack — validate after gate v5.
-- **Next:** evaluate gate v5 (full matrix incl. session ×6 + dynamic ×6);
-  run the rotation sidecar; then M6 closeout (COVERAGE/README/journal).
+- **Next:** evaluate gate v5; close out M2 (journal + COVERAGE) when green.
+
+### 2026-10-11 (late) — M2/M3/M4 nearly green; dynamic-plan debugging campaign
+
+Gate iterations 2–5 + live debug against a long-running stack:
+
+- **Session OP root cause + fix:** the suite drives the browser DIRECTLY to
+  its own session_verify pages; `BrowserControl.goToUrl` only automates URLs
+  matching a top-level `browser[].match` — the OP-side entry never covered
+  them, so the dance page never loaded. The session config gained a
+  suite-side browser entry that waits for the dance's `*session_result`
+  navigation (the WebRunner closes its driver — and its pending JS timers —
+  when the task list completes). Result: session plan PASSED (code), 1.4s.
+- **Dynamic OP debug chain** (each layer found by reading suite module logs
+  via the suite's `/api/log/{id}` from the test-runner container):
+  1. `invalid_scope` on auth requests — DCR clients seeded from realm
+     defaults lack `openid`; fixed by exempting the `openid` protocol marker
+     in the authorization scope check (`60f3953`, authorization.rs).
+  2. `invalid_client` 400 at the token endpoint — the suite sends
+     private_key_jwt WITHOUT a `client_id` form field; RFC 7523 allows
+     identification from the assertion. `e294dd1` adds
+     `resolve_form_client_id` (iss/sub, iss≠sub rejected).
+  3. `invalid_scope` on refresh — same openid exemption needed in
+     `TokenRequest::validate` (token.rs), `5c0ecdd`.
+  4. `CheckTokenEndpointCacheHeaders` — token-endpoint ERROR responses lacked
+     no-store/no-cache; `token_handler` now decorates (same commit).
+  5. `oidcc-redirect-uri-regfrag` — DCR now rejects fragment-bearing
+     redirect_uris with 400 invalid_redirect_uri (`355011e`).
+  6. SSRF-guarded fetches (client jwks_uri / sector docs / request_uri
+     objects) refused the all-private conformance network — new
+     `[outbound_http] allow_private_addresses` knob (`86602f6`, default off,
+     enabled in the rig).
+  7. `oidcc-refresh-token`'s SECOND registration needs
+     `client2.initial_access_token` — added to the dynamic config.
+  8. Login-page client branding (`fab3fc2`): login-context exposes
+     client_logo/policy/tos URIs (M1 attributes); the static login page
+     renders them (http(s) only). The logo/policy/tos modules fill their
+     screenshot placeholders via the login task's
+     update-image-placeholder-optional wait (dynamic config only).
+  9. Skips bookkeeping: `issuerd-expected-skips-dynamic.json` (the dynamic
+     plan's self-skipper is `oidcc-request-uri-unsigned`, a different name
+     than the basic plans') + `oidcc-idtoken-unsigned`; rotate-keys is an
+     expected FAILURE in-plan (`issuerd-expected-failures-dynamic.json`,
+     glob-matched config filename) with real evidence from the sidecar.
+- **Rotation sidecar validated live** (`run-rotation-check.sh`): the module
+  finishes PASSED with a real admin-API rotation. Detail: rotate with
+  `{"algorithm":"RS256"}` — the suite's verify condition can't parse Ed25519
+  (OKP) keys, and per-alg rotation keeps the EdDSA default active.
+- Dynamic plan (code) after the campaign: all modules green/REVIEW except
+  the expected rotate-keys failure; refresh-token 162 conditions green.
+- **Next:** gate v6 (full 41-invocation matrix, fresh stack); then M6
+  closeout docs (COVERAGE/README/AGENTS) and updating
+  `certification/execution-matrix.md` statuses.
