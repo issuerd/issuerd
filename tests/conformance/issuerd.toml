@@ -17,3 +17,8 @@ enabled = true
 trusted_proxies = []
 trust_x_forwarded_for = true
 trust_x_real_ip = true
+
+# The hermetic stack's TLS is a local root CA; the OP's outbound HTTPS calls
+# (back-channel logout delivery to the suite) must trust it.
+[outbound_http]
+extra_ca_bundle = "/pki/ca.crt"

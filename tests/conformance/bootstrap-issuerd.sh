@@ -123,7 +123,7 @@ echo "=== Creating logout-profile clients ==="
         "enabled": true,
         "protocol": "openid-connect",
         "public_client": false,
-        "secret": "conformance-secret-rpi",
+        "secret": "conformance-secret-rpi-0123456789abcdef",
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
@@ -143,7 +143,7 @@ echo "=== Creating logout-profile clients ==="
         "enabled": true,
         "protocol": "openid-connect",
         "public_client": false,
-        "secret": "conformance-secret-fc",
+        "secret": "conformance-secret-fc-0123456789abcdef",
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
@@ -165,7 +165,7 @@ echo "=== Creating logout-profile clients ==="
         "enabled": true,
         "protocol": "openid-connect",
         "public_client": false,
-        "secret": "conformance-secret-bc",
+        "secret": "conformance-secret-bc-0123456789abcdef",
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
