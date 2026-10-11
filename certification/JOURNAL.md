@@ -208,3 +208,46 @@ cargo test --workspace --lib
   cleaned, front-channel config clicks the interstitial's Continue link.
 - Gate run 2 in progress at commit `944bbf1`+`579c4bf`.
 - **Next:** evaluate gate 2; close out M2 (journal + COVERAGE) when green.
+
+### 2026-10-11 (evening) — M2/M3/M4 landed; gate v5 (full matrix) in flight
+
+- Gate runs 2–4 iterated on the logout/session plans. Fixes that landed:
+  - `579c4bf` — pure-implicit id_token overlays union IdToken+UserInfo
+    mapper targets; logout without a redirect target renders a 200
+    confirmation page (was bare 204 — the suite's screenshot-placeholder
+    modules need a rendered page).
+  - `944bbf1` — dedicated per-plan logout clients (rpi/fc/bc): the
+    RP-initiated plan FAILs on front-channel iframe calls to unserved paths,
+    so each logout profile gets its own static client. Front-channel config
+    clicks the interstitial's Continue link (see WebRunner note below).
+  - `432fbe3` — `claims.userinfo` entries ride the pure-implicit id_token.
+  - `ba7a95c` — `claims.id_token` section evaluated on all
+    authorization-endpoint id_tokens + token-endpoint code grant (the
+    claims-essential module sends the id_token section for implicit/hybrid).
+  - `78ba43b` + `1c832cf` — `[outbound_http] extra_ca_bundle` config knob
+    (all outbound HTTPS: back-channel dispatch, broker, jwks.url, sector
+    fetch); the conformance OP mounts the stack CA. Without it the
+    back-channel logout POST failed TLS verification and the module hung.
+  - `9e6c7d8` — dynamic-plan harness (config + expected-failures for
+    rotate-keys), session-config wait task, expected-warnings glob fix
+    (`configuration-filename` matches the full passed path).
+- **WebRunner mechanics (important for any future browser-page work):** the
+  suite's Selenium driver CLOSES when the matched task list completes —
+  pending JS timers die with it. Any OP/suite page that continues via
+  `setTimeout` needs either a click task or a `["wait","contains",…]` task
+  keeping the page open (session verify pages, our logout interstitial).
+- **Session plan root cause chain:** session_state in the authorization
+  response worked on first try; the stall was purely the WebRunner/timer
+  interaction above.
+- M4 server-side (`c9c6fd5`): per-client `id_token_signed_response_alg`
+  (strict — no fallback), signed userinfo (`application/jwt`), JAR-by-
+  reference (`request_uri`: pre-registered exact-match list, SSRF-guarded
+  fetch, 64 KiB cap, extra-CA trust), dual `token id_token`/`id_token token`
+  discovery spelling, sector + jwks-rotation confirmations. 411 integration
+  tests green.
+- M5.1: `run-rotation-check.sh` + `scripts/rotate-check.py` — standalone
+  suite-API-driven rotation evidence (create module → CONFIGURED → admin
+  key rotation → start → require PASSED). NOT yet executed against the live
+  stack — validate after gate v5.
+- **Next:** evaluate gate v5 (full matrix incl. session ×6 + dynamic ×6);
+  run the rotation sidecar; then M6 closeout (COVERAGE/README/journal).
