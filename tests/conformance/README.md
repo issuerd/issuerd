@@ -24,11 +24,11 @@ Actions runner is 1001); on failure it dumps the stack logs before teardown.
 `docker compose up` builds missing images on first run (the suite JAR is
 built in-docker from `conformance-suite/` — maven downloads are cached
 between builds; the OP image builds the full Issuerd release binary),
-generates the local PKI, bootstraps the realm, runs all three test plans
+generates the local PKI, bootstraps the realm, runs all test plans (Config, Basic, Form Post, and the 3rd-Party-Init plan once per response type)
 and exports the reports. Watch for `Conformance test run complete: all
 plans OK` in the log, then Ctrl+C (or `docker compose down --volumes` from
 another shell). Subsequent runs reuse the build cache: a full warm `run.sh`
-(build + PKI + bootstrap + all three plans + report export) measured ~6 min
+(build + PKI + bootstrap + all plans + report export) measured ~7 min
 wall-clock (2026-10-03; the three plans themselves total ~3.5 min of suite
 time).
 
@@ -84,8 +84,9 @@ downloads). The test environment itself never touches the internet —
 | `oidcc-config-certification-test-plan` | `configs/issuerd-config-op.json` | Discovery metadata & JWKS — **PASSED** |
 | `oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-basic-op.json` | Authorization code flow — **PASSED** |
 | `oidcc-formpost-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-formpost-op.json` | Code flow via `response_mode=form_post` — **PASSED** |
+| `oidcc-3rdparty-init-login-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-3rdparty-init-op.json` (rendered with the bootstrap-minted initial access token) | DCR handling of `initiate_login_uri` — **PASSED** for all six response types |
 
-Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all three plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 
@@ -105,7 +106,7 @@ tests/conformance/
 ├── configs/                   # test plan configs + expected skips/failures
 ├── conformance-suite/         # pristine upstream suite clone (gitignored; you create this)
 ├── scripts/
-│   ├── run-conformance.sh     # the one-shot run: checks, bootstrap, 3 plans, reports
+│   ├── run-conformance.sh     # the one-shot run: checks, bootstrap, all plans, reports
 │   ├── suite-entrypoint.sh    # suite container entrypoint: root CA -> JVM cacerts, native HTTPS
 │   └── export-html.py         # HTML report export/extraction (public suite API only)
 └── results/                   # test output (gitignored)

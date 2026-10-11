@@ -24,26 +24,21 @@
 ## Where we are (read this first)
 
 - **Branch:** `feat/oidc-certification-expansion` (from `main` @ plan baseline).
-- **Suite tag:** `release-v5.3.2` checked out at
-  `tests/conformance/conformance-suite/` (moved up from `release-v5.2.4`;
-  all references — `tests/conformance/README.md`, `run.sh`, `COVERAGE.md`,
-  `.github/workflows/heavy.yml`, `AGENTS.md` — updated in the same pass).
-- **Conformance run vs v5.3.2: ALL GREEN** (2026-10-11, `run.sh`, exit 0) —
-  Config OP 39 conditions; Basic OP 36 modules / 1858 conditions; Form Post
-  OP 36 modules / 2010 conditions; **0 failures, 0 warnings**. Identical
-  numbers to the v5.2.4 baseline. Evidence: `tests/conformance/results/`
-  (html-reports-20261011-075455, export-json zips).
-- **Module-count re-verification at v5.3.2: unchanged** — all 13 plan classes
-  byte-identical to v5.2.4 except a semantics-preserving discovery-check
-  refactor; counts in `execution-matrix.md` stand. One OP-facing behavioral
-  change to remember: an id_token carrying a nonce when none was requested is
-  now a FAILURE (`ValidateIdTokenNonce`, issue-2027 fix) — issuerd only
-  echoes requested nonces, confirmed by the green v5.3.2 run.
-- **Code changes:** none yet — repository code is untouched; only
-  `certification/` docs + suite-tag reference bumps exist so far.
-- **Next action:** start Milestone M1 (`certification/README.md` §5) —
-  client metadata & registration foundation, task C1 (RFC 7591 metadata
-  acceptance in `crates/issuerd-server/src/routes/client_registration.rs`).
+- **Suite tag:** `release-v5.3.2` (all references updated; re-run green).
+- **M1 — DONE (exit gate green 2026-10-11):** RFC 7591/7592 DCR + logout
+  client fields landed (commit `4410659`); harness + 3rd-party ×6 runner loop
+  landed (`593379a`, `281f93b`). Full `run.sh` green: Config/Basic/FormPost
+  unchanged (0 failures/0 warnings) + **3rd-Party-Init OP 6/6 runs PASSED
+  (12/12 module executions)** — evidence
+  `tests/conformance/results/html-reports-20261011-092241`.
+- **Cumulative: 85/634 green** (Config 1 + Basic 36 + FormPost-basic 36 +
+  3rd-Party-Init 12).
+- **Next action:** Milestone M2 — authorization response types & nonce
+  (README §4 WS-A, §5 M2): accept `id_token token` / `code token` /
+  `code id_token token` at the authorization endpoint
+  (`crates/issuerd-server/src/routes/oidc.rs:889-921`), mint access tokens in
+  `finish_sso_login`, enforce nonce for id_token-bearing response types
+  (realm-attribute escape hatch per README §8), discovery update.
 
 ## Status by milestone
 
@@ -52,29 +47,29 @@ Legend: ⬜ not started · 🔶 in progress · ✅ done.
 
 | Milestone | Scope | Status | Evidence |
 |---|---|---|---|
-| M1 | Client metadata & registration foundation (DCR RFC 7591/7592 plumbing, logout URIs, `initiate_login_uri`) | ⬜ | |
+| M1 | Client metadata & registration foundation (DCR RFC 7591/7592 plumbing, logout URIs, `initiate_login_uri`) | ✅ | `4410659` + gate 2026-10-11 (3rd-party 12/12) |
 | M2 | Authorization response types + nonce rules (`id_token token`, `code token`, `code id_token token`) | ⬜ | |
 | M3 | Session management (`session_state`, `check_session_iframe`) | ⬜ | |
-| M4 | Registration-backed deep features (sector fetch, signed userinfo, `jwks_uri` verification) | ⬜ | |
-| M5 | Harness & rotation automation (configs, bootstrap, runner matrix, focus generalization, rotate-keys sidecar) | ⬜ | |
+| M4 | Registration-backed deep features (sector fetch, signed userinfo, `jwks_uri` verification) | ⬜ | sector fetch/validate already existed (`issuerd_core::pairwise`) — M4 shrinks accordingly |
+| M5 | Harness & rotation automation (configs, bootstrap, runner matrix, focus generalization, rotate-keys sidecar) | 🔶 | 3rd-party config + bootstrap + runner loop landed in M1; rest pending |
 | M6 | Full-matrix gate + submission prep | ⬜ | |
 
 ## Status by profile (634 module executions total)
 
 | Profile | Tests | Suite green? | Notes |
 |---|---|---|---|
-| Config OP | 1 | ✅ (since 2026-09-13, v5.2.4) | re-validating vs v5.3.2 |
-| Basic OP | 36 | ✅ (since 2026-09-13, v5.2.4) | re-validating vs v5.3.2 |
-| Form Post OP (basic leg) | 36 | ✅ (since 2026-09-13, v5.2.4) | re-validating vs v5.3.2 |
+| Config OP | 1 | ✅ (v5.3.2, 2026-10-11) | |
+| Basic OP | 36 | ✅ (v5.3.2, 2026-10-11) | |
+| Form Post OP (basic leg) | 36 | ✅ (v5.3.2, 2026-10-11) | |
 | Implicit OP | 58 | ⬜ | needs M2 |
 | Hybrid OP | 102 | ⬜ | needs M2 |
 | Form Post OP (implicit+hybrid legs) | 160 | ⬜ | needs M2 |
-| Dynamic OP | 127 | ⬜ | needs M1+M4+M5 |
-| 3rd Party-Init OP | 12 | ⬜ | needs M1 |
-| RP-Initiated OP | 66 | ⬜ | needs M2 (+M1) |
+| Dynamic OP | 127 | ⬜ | needs M4+M5.1 (DCR plumbing landed in M1) |
+| 3rd Party-Init OP | 12 | ✅ (v5.3.2, 2026-10-11) | M1 exit gate |
+| RP-Initiated OP | 66 | ⬜ | needs M2 (logout client fields landed in M1) |
 | Session OP | 12 | ⬜ | needs M3 (+M2) |
-| Front-Channel OP | 12 | ⬜ | needs M2 (+M1) |
-| Back-Channel OP | 12 | ⬜ | needs M2 (+M1) |
+| Front-Channel OP | 12 | ⬜ | needs M2 (+M1 done) |
+| Back-Channel OP | 12 | ⬜ | needs M2 (+M1 done) |
 
 ## How to resume (verbatim commands)
 
@@ -129,3 +124,48 @@ cargo test --workspace --lib
   evidence comes from a standalone suite-API-driven run.
 - **Next:** begin M1 — C1 (RFC 7591 metadata acceptance in
   `crates/issuerd-server/src/routes/client_registration.rs`).
+
+### 2026-10-11 — M1 complete: 3rd-Party-Init OP green (85/634)
+
+- Commit `4410659` — M1 server-side (delegated to a coder subagent, all repo
+  gates green): new `crates/issuerd-server/src/client_metadata.rs`
+  (constants + typed accessors); RFC 7591 request translation in
+  `client_registration.rs` (client_name/grant_types/response_types/
+  token_endpoint_auth_method/scope/jwks/jwks_uri/subject_type/
+  sector_identifier_uri/initiate_login_uri/post_logout_redirect_uris/
+  front+backchannel fields/logo/policy/tos/signed-alg fields; https and
+  allowlist validation with 400 `invalid_client_metadata`); additive RFC
+  response fields (`registration_access_token`, `registration_client_uri`,
+  `client_id_issued_at`, `client_secret_expires_at`, `client_secret`) + full
+  metadata echo on create/read/update; `post_logout_redirect_uris` allowlist
+  preferred over `redirect_uris` in logout validation; `sid` omitted from
+  logout tokens / `iss`+`sid` from front-channel URLs when the per-client
+  `*_session_required` attribute is `false`. 23 new unit tests; integration:
+  `dynamic_client_registration.rs` +3, `logout_channels.rs` +3; full
+  integration suite 375/375.
+  Notable sub-decisions by the implementer (recorded in the commit report):
+  `response_types` attribute stores a JSON array (space-joining is lossy for
+  multi-token types); `client_id_issued_at` stamped on every DCR create;
+  Keycloak spelling wins when both spellings of a field arrive.
+- Commit `593379a` — harness: bootstrap enables
+  `dynamic_client_registration_enabled` on the conformance realm, pre-
+  registers logout URIs on both static clients, mints an unlimited
+  initial-access token into `/results/initial-access-token.txt`; config
+  template `configs/issuerd-3rdparty-init-op.json`; run-conformance runs the
+  3rd-party plan once per response type.
+- Commit `281f93b` — fix: the 3rd-party/dynamic/logout plans PIN
+  server_metadata/client_auth/response_mode; only `response_type` (and
+  `client_registration` on logout plans) may be passed. First gate attempt
+  failed plan creation on exactly this; matrix + runner corrected.
+- **Gate result:** `run.sh` exit 0 — existing 3 plans unchanged-green, plus
+  6/6 3rd-party runs PASSED (2 modules each; evidence
+  `tests/conformance/results/html-reports-20261011-092241`).
+- **Decision (supersedes README WS-C C4):** no open-registration changes —
+  the suite's `client.initial_access_token` + issuerd's unlimited initial
+  access tokens cover dynamic registration; the open endpoint and its rate
+  limit are untouched. README updated.
+- Sector `sector_identifier_uri` fetch+validation turned out to already exist
+  (`issuerd_core::pairwise::validate_pairwise_subject_config`, wired into
+  registration) — M4 scope shrinks to sector *confirmation tests* + signed
+  userinfo + `jwks_uri` verification.
+- **Next:** M2 — response types & nonce (see "Where we are").

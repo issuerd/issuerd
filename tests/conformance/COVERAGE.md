@@ -1,6 +1,6 @@
 # Issuerd OIDC Conformance Test Coverage
 
-> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — Config OP 39 conditions, Basic OP 36 modules / 1858 conditions, Form Post OP 36 modules / 2010 conditions; **0 failures and 0 warnings** across all three plans. Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
+> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — Config OP 39 conditions, Basic OP 36 modules / 1858 conditions, Form Post OP 36 modules / 2010 conditions, 3rd-Party-Init OP 6 response-type runs × 2 modules; **0 failures and 0 warnings** across all plans. Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
 > Conformance Suite version: release-v5.3.2
 
 ## Test Environment
@@ -122,6 +122,26 @@ Runs the same module set as Basic OP with `response_mode=form_post` — the auth
 | `oidcc-ensure-request-object-with-redirect-uri` | **SKIPPED** | 16 SUCCESS, 0 FAILURE — expected skip (see Basic OP) |
 | `oidcc-refresh-token` | **PASSED** | 145 SUCCESS, 0 FAILURE |
 | `oidcc-ensure-request-with-valid-pkce-succeeds` | **PASSED** | 51 SUCCESS, 0 FAILURE |
+
+### 4. 3rd Party-Init OP (`oidcc-3rdparty-init-login-certification-test-plan`)
+
+Validates RFC 7591/7592 dynamic registration handling of `initiate_login_uri`:
+the client registers an https initiate-login URI (echoed on the RFC 7592 read)
+and a non-https URI must be rejected with HTTP 400 `invalid_client_metadata`.
+The plan pins `client_registration=dynamic_client` and runs once per response
+type (menu-selected, never exercised by the modules); registrations use the
+bootstrap-minted initial access token.
+
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 response-type runs
+(`code`, `code id_token`, `code id_token token`, `code token`, `id_token`,
+`id_token token`) × 2 test modules, 0 failures, 0 warnings (≤0.1s per run)
+
+| Module | Result | Notes |
+|--------|--------|-------|
+| `oidcc-3rd_party-init-login` | **PASSED** ×6 | 30 SUCCESS, 0 FAILURE per run — `initiate_login_uri` accepted, stored, and echoed in the 201 response and the RFC 7592 management read |
+| `oidcc-3rd_party-init-login-nohttps` | **PASSED** ×6 | 20 SUCCESS, 0 FAILURE per run — non-https `initiate_login_uri` rejected with 400 `invalid_client_metadata` |
+
+**Summary**: **PASSED** — 12/12 module executions green.
 
 ## Known Gaps vs. Conformance Suite Requirements
 

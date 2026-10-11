@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full conformance run, executed INSIDE the isolated network by the
 # one-shot `conformance-run` compose service:
-#   TLS/CA checks -> isolation check -> bootstrap -> three test plans via
+#   TLS/CA checks -> isolation check -> bootstrap -> all test plans via
 #   the pristine upstream run-test-plan.py -> JSON + HTML reports.
 # Exit code 0 only when every plan finished without unexpected failures.
 set -uo pipefail

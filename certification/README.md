@@ -249,12 +249,13 @@ initial-access-token-gated advertised endpoint, RFC metadata silently dropped
   `initiate_login_uri` (`ValidateInitiateLoginUriInConfigurationResponse`).
   PUT/DELETE exist (`client_registration.rs:649/:669/:833`); verify DELETE is
   warning-free.
-- **C4. Advertised open registration.** Discovery currently advertises the
-  initial-access-token-gated path only (`oidc.rs:130-138`). The suite has no
-  token → certification needs the **open** (unauthenticated, per-IP
-  rate-limited — `client_registration.rs:556`) path advertised for the
-  conformance realm. Per-realm attribute (`open` | `token-gated`), default
-  unchanged (token-gated).
+- **C4. ~~Advertised open registration~~ — RESOLVED BY DECISION (2026-10-11,
+  see JOURNAL.md):** no open-registration changes. The suite's dynamic_client
+  variant supports `client.initial_access_token`, and issuerd's initial access
+  tokens are cache-backed with unlimited-count/no-expiry options — so the
+  conformance bootstrap mints one and the token-gated endpoint (already the
+  advertised `registration_endpoint`) serves all dynamic registrations. The
+  open endpoint and its 50/h rate limit stay exactly as they are.
 - **C5. `sector_identifier_uri` fetch + validation.** Pairwise is advertised,
   so `OIDCCRegistrationSectorUri` / `OIDCCRegistrationSectorBad` run: fetch
   the sector document (reuse the SSRF-guarded outbound fetch from the
@@ -325,7 +326,8 @@ separate times.
 
 ### M1 — Client metadata & registration foundation
 
-**Pulls in:** C1, C2, C3, C4, D1, D2, WS-E.
+**Pulls in:** C1, C2, C3, D1, D2, WS-E (C4 dropped — initial-access-token
+decision, see WS-C note).
 
 One pass over the whole client-metadata surface: `Client` model attributes →
 admin DTO (`crates/issuerd-admin-api/src/dto.rs`) → DCR accept/validate/echo →
@@ -508,10 +510,11 @@ land.
 - **Nonce tightening (A4)** changes existing hybrid behavior. Mitigation:
   realm-attribute escape hatch + CHANGELOG breaking-change note with
   migration path (per the backward-compat policy).
-- **Open registration endpoint (C4)** is a deliberate security-posture
-  change: unauthenticated client creation, even rate-limited, must stay
-  opt-in per realm (default: today's token-gated behavior). Document in
-  `docs/`.
+- **Open registration endpoint — REMOVED FROM SCOPE (decision 2026-10-11).**
+  The original plan considered advertising the unauthenticated registration
+  path per realm; the suite's `client.initial_access_token` support plus
+  issuerd's unlimited initial access tokens make that unnecessary, so no
+  security-posture change happens at all. (Kept in this list for the record.)
 - **`session_state` = session id (B1)** mirrors Keycloak but bakes the
   session id into another RP-visible value. Acceptable (already exposed as
   `sid`); revisit if we ever randomize `sid` per token.
