@@ -375,6 +375,29 @@ fn validate_post_logout_redirect_uri(uri: &str) -> Result<(), Response> {
     }
 }
 
+/// Registration redirect_uris must be syntactically valid URLs
+/// (`RedirectUri::new`) and — per RFC 6749 §3.1.2 / OIDC Core §3.1.2 — must
+/// NOT carry a fragment component (the redirection endpoint's response must
+/// never inherit one). Rejected with `invalid_redirect_uri`.
+#[allow(clippy::result_large_err)]
+fn validate_registration_redirect_uri(uri: &str) -> Result<(), Response> {
+    let parsed = issuerd_core::RedirectUri::new(uri).map_err(|e| {
+        registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            &format!("invalid redirect_uri: {e}"),
+        )
+    })?;
+    if url::Url::parse(parsed.as_str()).is_ok_and(|u| u.fragment().is_some()) {
+        return Err(registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            "redirect_uri must not contain a fragment component",
+        ));
+    }
+    Ok(())
+}
+
 /// `id_token_signed_response_alg` / `userinfo_signed_response_alg` must name
 /// an asymmetric JWS algorithm Issuerd signs tokens with; `none` and the
 /// symmetric HS* family are rejected outright.
@@ -960,12 +983,8 @@ async fn register_client(
     // `invalid_client_metadata`.
     if let Some(uris) = &rep.redirect_uris {
         for uri in uris {
-            if let Err(e) = issuerd_core::RedirectUri::new(uri) {
-                return registration_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_redirect_uri",
-                    &format!("invalid redirect_uri: {e}"),
-                );
+            if let Err(resp) = validate_registration_redirect_uri(uri) {
+                return resp;
             }
         }
     }
@@ -1414,12 +1433,8 @@ pub async fn update_registered_client_handler(
     }
     if let Some(uris) = &rep.redirect_uris {
         for uri in uris {
-            if let Err(e) = issuerd_core::RedirectUri::new(uri) {
-                return registration_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_redirect_uri",
-                    &format!("invalid redirect_uri: {e}"),
-                );
+            if let Err(resp) = validate_registration_redirect_uri(uri) {
+                return resp;
             }
         }
     }
@@ -2065,6 +2080,30 @@ mod tests {
         let client_id = issuerd_core::ClientIdentifier::new("dcr-js-uri").unwrap();
         let stored = state.storage.get_client_by_client_id(&realm.id, &client_id).await.unwrap();
         assert!(stored.is_none(), "no partial registration on policy rejection");
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_fragment_in_redirect_uri() {
+        let (state, realm) = registration_state().await;
+        // RFC 6749 §3.1.2 / OIDC Core §3.1.2: no fragment component, on both
+        // the open and the token-gated paths (the conformance suite's
+        // oidcc-redirect-uri-regfrag module drives the trusted path).
+        for policy in [RegistrationPolicy::Open, RegistrationPolicy::Trusted] {
+            let resp = register_client(
+                &state,
+                &realm,
+                serde_json::json!({
+                    "client_id": format!("dcr-frag-{policy:?}"),
+                    "redirect_uris": ["https://app.example.com/cb#frag"],
+                }),
+                policy,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"], "invalid_redirect_uri");
+        }
     }
 
     #[tokio::test]
