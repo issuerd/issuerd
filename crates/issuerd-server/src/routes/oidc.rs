@@ -2946,6 +2946,26 @@ pub async fn token_handler(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
+    // RFC 6749 §5.1: the no-store/no-cache directive applies to error
+    // responses too — decorate every response that does not already carry it
+    // (the success path sets it in `token_response`).
+    let mut resp = token_handler_inner(state, realm, ip, headers, body).await;
+    let h = resp.headers_mut();
+    h.entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    h.entry(axum::http::header::PRAGMA)
+        .or_insert(axum::http::HeaderValue::from_static("no-cache"));
+    resp
+}
+
+#[instrument(skip(state, headers, body, ip), fields(realm = ?realm))]
+async fn token_handler_inner(
+    state: Arc<ServerState>,
+    realm: Option<String>,
+    ip: std::net::IpAddr,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
     let realm_name = match realm {
         Some(r) => r,
         None => {
@@ -12970,6 +12990,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // RFC 6749 §5.1: error responses carry the cache directives too.
+        let headers = response.headers();
+        assert_eq!(headers.get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(axum::http::header::PRAGMA).unwrap(), "no-cache");
         let json = extract_json(response).await;
         assert_eq!(json["error"], "unsupported_grant_type");
     }
