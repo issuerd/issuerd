@@ -6,12 +6,13 @@ Suite pinned at `release-v5.3.2`; counts verified against the plan classes in
 
 > **Status 2026-10-11: the full matrix below is GREEN** — `run.sh` exit 0
 > (gate v10, evidence `tests/conformance/results/html-reports-20261011-193753`):
-> 0 failures / 0 unexpected warnings across all 43 invocations; the only
-> in-plan failure is the expected `oidcc-server-rotate-keys` (real evidence via
-> `run-rotation-check.sh`: PASSED). Implicit/Hybrid/FormPost run static_client
-> here (56/99/36 legs); the published counts (58/102/196) assume the
-> dynamic_client variant — the certification-grade dynamic reruns are the M6
-> submission-prep item.
+> 0 failures / 0 unexpected warnings across all 43 invocations — **612 executed
+> test modules green**; the only in-plan failure is the expected
+> `oidcc-server-rotate-keys` (real evidence via `run-rotation-check.sh`:
+> PASSED). The published 634 counts the suite's reporting convention (the
+> runner prints listing+1 per plan) plus the dynamic_client-only modules
+> (`oidcc-id-token-signature`, `oidcc-idtoken-unsigned`) that static runs mark
+> N/A — the M6 certification-grade dynamic reruns cover them.
 
 Variant-string syntax is the one already in use
 (`plan[server_metadata=discovery][client_registration=static_client]`).
@@ -45,7 +46,7 @@ Config `issuerd-config-op.json` · 1 module · skips `issuerd-expected-skips-con
 oidcc-implicit-certification-test-plan[server_metadata=discovery][client_registration=static_client]
 ```
 
-Config `issuerd-implicit-op.json` · 56 modules *(static)* / 58 *(dyn, published count)*.
+Config `issuerd-implicit-op.json` · 54 modules *(static, listed)* / 58 *(dyn, published count)*.
 One run covers both `id_token` (27 modules) and `id_token token` (27 + 4
 userinfo/response-type-missing modules). Certification-grade submission run:
 same plan with `[client_registration=dynamic_client]` (post-WS-C).
@@ -56,7 +57,7 @@ same plan with `[client_registration=dynamic_client]` (post-WS-C).
 oidcc-hybrid-certification-test-plan[server_metadata=discovery][client_registration=static_client]
 ```
 
-Config `issuerd-hybrid-op.json` · 99 *(static)* / 102 *(dyn, published count)*.
+Config `issuerd-hybrid-op.json` · 96 *(static, listed)* / 102 *(dyn, published count)*.
 One run covers `code id_token` (36), `code token` (33), `code id_token token`
 (33). Certification-grade run: dynamic_client (post-WS-C).
 
@@ -64,8 +65,8 @@ One run covers `code id_token` (36), `code token` (33), `code id_token token`
 
 ```
 oidcc-formpost-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]     # ✅ 36
-oidcc-formpost-implicit-certification-test-plan[server_metadata=discovery][client_registration=static_client]  # 🆕 56/58
-oidcc-formpost-hybrid-certification-test-plan[server_metadata=discovery][client_registration=static_client]    # 🆕 99/102
+oidcc-formpost-implicit-certification-test-plan[server_metadata=discovery][client_registration=static_client]  # 🆕 54/58
+oidcc-formpost-hybrid-certification-test-plan[server_metadata=discovery][client_registration=static_client]    # 🆕 96/102
 ```
 
 Configs `issuerd-formpost-op.json` (exists), `issuerd-formpost-implicit-op.json`,
@@ -87,13 +88,14 @@ oidcc-dynamic-certification-test-plan[response_type=id_token]
 oidcc-dynamic-certification-test-plan[response_type=id_token token]
 ```
 
-Config `issuerd-dynamic-op.json` (same file for all six) · per-run modules:
-`code` 23 · `code id_token` 22 · `code id_token token` 22 · `code token` 22 ·
-`id_token` 19 · `id_token token` 19 → **127** total.
+Config `issuerd-dynamic-op.json` (same file for all six) · per-run modules
+(exact `[1:N]` listings, verified against the gate-v10 logs):
+`code` 23 · `code id_token` 22 · `code id_token token` 22 · `code token` 23 ·
+`id_token` 18 · `id_token token` 19 → **127** total (the published count).
 Skips `issuerd-expected-skips-dynamic.json`; failures
 `issuerd-expected-failures-dynamic.json` lists only
 `oidcc-server-rotate-keys` (manual-step module — see README §5.3; evidence via
-`scripts/run-rotation-check.sh` standalone run).
+`run-rotation-check.sh` standalone run).
 URL-encoded response-type values (`%20` for spaces) if the runner requires it —
 mirror however the suite CLI accepts multi-word variant values; verify on first
 run.

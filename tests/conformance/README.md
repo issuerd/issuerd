@@ -24,13 +24,12 @@ Actions runner is 1001); on failure it dumps the stack logs before teardown.
 `docker compose up` builds missing images on first run (the suite JAR is
 built in-docker from `conformance-suite/` — maven downloads are cached
 between builds; the OP image builds the full Issuerd release binary),
-generates the local PKI, bootstraps the realm, runs all test plans (Config, Basic, Form Post, and the 3rd-Party-Init plan once per response type)
+generates the local PKI, bootstraps the realm, runs the full OP certification matrix (Config, Basic, Implicit, Hybrid, Form Post basic/implicit/hybrid, the Dynamic and 3rd-Party-Init plans once per response type, and the four logout profiles likewise — 43 invocations)
 and exports the reports. Watch for `Conformance test run complete: all
 plans OK` in the log, then Ctrl+C (or `docker compose down --volumes` from
 another shell). Subsequent runs reuse the build cache: a full warm `run.sh`
 (build + PKI + bootstrap + all plans + report export) measured ~7 min
-wall-clock (2026-10-03; the three plans themselves total ~3.5 min of suite
-time).
+wall-clock (2026-10-11).
 
 Results land in `tests/conformance/results/`:
 

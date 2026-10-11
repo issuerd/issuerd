@@ -33,8 +33,11 @@
   certification-grade dynamic_client re-runs of Implicit/Hybrid/FormPost
   (published counts 58/102/196 assume that variant) and the OIDF submissions
   themselves.
-- **Cumulative internal gate: 634/634 profile module executions green**
-  (see the published-vs-static count note in `execution-matrix.md`).
+- **Cumulative internal gate: 612/612 executed profile module executions
+  green** (43 invocations, exit 0). The published 634 counts the suite's
+  listing+1 reporting convention plus the dynamic_client-only modules
+  (`oidcc-id-token-signature`, `oidcc-idtoken-unsigned`) that static runs mark
+  N/A — the M6 certification-grade dynamic re-runs cover them.
 
 ## Status by milestone
 
@@ -316,3 +319,56 @@ Gate iterations 2–5 + live debug against a long-running stack:
 - **M6 remaining:** dynamic_client certification-grade re-runs of
   Implicit/Hybrid/FormPost (published counts assume that variant; the static
   runs cover 55/97/36+97 legs) and the OIDF submissions per README §9.
+
+### 2026-10-12 — branch review + fixes (pre-merge)
+
+- Five parallel read-only review tracks (plan: `certification/REVIEW.md`)
+  over `git diff main..HEAD`: protocol correctness, security, backward
+  compatibility, evidence integrity, tests/docs. **No blockers.** 7 major +
+  ~25 minor/nit findings.
+- **Majors, all fixed:**
+  - RFC 7592 PUT re-applies the open-registration policy for open-created
+    clients (`dcr.policy=open` marker; logout-URI scheme validation on the
+    open path) — `fdabf80`.
+  - Module-count bookkeeping corrected everywhere: counts are the exact
+    `[1:N]` listings (the runner prints listing+1; published OIDF counts mix
+    conventions). Dynamic = 23/22/22/23/18/19 = 127 (= published).
+    Implicit/Hybrid static = 54/96 listed; published 58/102 assume
+    dynamic_client (static N/A: id-token-signature ×2/×3 + idtoken-unsigned
+    ×2/×3). Basic/FormPost-basic: 35 listed.
+  - Journal headline now reads **612/612 executed green** (22 published-count
+    modules are deferred to the M6 dynamic re-runs).
+  - run.sh always starts from a clean slate (`down -v` first): a reused
+    stack's suite DB silently mixed stale plans into the exported evidence.
+  - Rotation evidence now runs inside every standard `run.sh` (tee'd into
+    results/) — CI produces and archives it via heavy.yml for free.
+  - `run-focus.sh` generalized (any plan[variants]:module + config; dynamic
+    configs auto-render the token) — the previously dropped M5.3.
+  - `docs/client-integration.md` response-types bullet rewritten (was
+    contradicting the headline feature).
+- **Minors fixed in the same pass:** `token id_token` accepted/normalized in
+  DCR + bare `token` rejected (`3ac5c00`); shared fragment-default rule for
+  pre-parse errors (`8c9b333`); login-API mint failure returns a generic
+  `server_error` body (`c8193f5`); debug `eprintln!` removed (`18934c8`);
+  RFC 7592 responses carry no-store/no-cache (`72ec83c`); companion-cookie
+  name falls back to the realm id for cookie-unsafe realm names (`742fbbc`);
+  account-console cookie-clear arms unit-tested (`6a8e146`); stale doc
+  comments (`06aaa42`); CHANGELOG: breaking marker on the nonce tightening,
+  openid-exemption + no-store entries, fragment-rejection explicitness,
+  merged duplicate Added sections, published-trait note; KEYCLOAK_DIFFS:
+  post_logout_redirect_uris + session_state notes; dead override blocks and
+  stale prose cleaned.
+- **Accepted with rationale (journaled, not fixed):**
+  - `check_session_iframe` answers postMessage from any origin (no
+    expected-origin allowlist, spec-MUST clause): Keycloak-parity; impact
+    negligible-by-design (122-bit UUID session ids; `changed` for absent and
+    mismatch alike). Disclosed in README §9 for the submission narrative.
+  - Out-of-band session teardowns flip the iframe verdict only at the next
+    browser-present event (cookie-only design; Keycloak parity; suite only
+    exercises browser-present logout). README B5 updated to as-built.
+  - Alg-pinning TOCTOU (keyset reload mid-issuance could sign with a
+    fallback alg): one-request wide, reloads are atomic swaps; accepted.
+  - Logout confirmation page renders in the default locale (the interstitial
+    pattern; `login.signedOut` bundles exist) — i18n when the page is next
+    touched.
+- Final gate rerun follows (code moved after gate v10).

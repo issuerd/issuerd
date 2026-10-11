@@ -1,6 +1,6 @@
 # OIDC Certification Surface Expansion — Master Plan
 
-> Status: **in progress** — Milestone M0 (plan + suite bump) done, M1 next.
+> Status: **implementation complete; review fixes applied** — full matrix green (gate v10, 612 executed modules, exit 0). M6 (certification-grade dynamic re-runs + OIDF submissions) remains.
 > Branch: `feat/oidc-certification-expansion`. Suite pinned at `release-v5.3.2`.
 > Companion documents:
 > [`execution-matrix.md`](./execution-matrix.md) — exact plan/variant run matrix;
@@ -182,9 +182,11 @@ Currently nothing exists (`session_state` never computed;
   bound to the SSO `UserSession` so the iframe can compare later. Design
   choice (mirrors Keycloak): `session_state` carries the SSO session id in a
   JS-comparable form — the `sid` claim already exposes the same id to the RP,
-  so no new identifier leaks. Add `session_state` wiring to
-  `AccessTokenClaims` and an optional, serde-defaulted `session_state` field
-  to `IdTokenClaims` (additive for JSON snapshots per the compat policy).
+  so no new identifier leaks. Spec scope: `session_state` is an authorization-RESPONSE parameter
+  (OIDC Session Management §2/§3) — the as-built implementation carries it
+  there and in the SPA `LoginResponse`; it is deliberately NOT embedded in
+  access/id tokens (Keycloak includes it in both; one line in
+  tests/KEYCLOAK_DIFFS.md records the parity note).
 - **B2. Session-state cookie.** The SSO cookie is `HttpOnly`
   (`login_api.rs:982`) — iframe JS cannot read it. Set a companion,
   JS-readable, non-HttpOnly cookie (e.g. `issuerd_session_state`) carrying the
@@ -206,11 +208,14 @@ Currently nothing exists (`session_state` never computed;
   `frame-ancestors`. Carve out this one route (`frame-ancestors https:`
   posture), keep the rest of the surface locked. The page is stateless and
   performs no writes — framing it is safe.
-- **B5. Logout propagation.** Every session-destruction path must flip the
-  iframe verdict to `"changed"`: clear the companion cookie in logout
-  responses and, for back-channel-only teardowns (admin delete, idle
-  cleanup), resolve the cookie against live storage so the next poll reports
-  `"changed"`.
+- **B5. Logout propagation (as built).** Browser-present teardown paths
+  clear the companion cookie in the logout response (RP-initiated all exits,
+  SPA logout API, account-console self-delete), so the next poll answers
+  `"changed"`. Out-of-band teardowns (admin delete, SSO idle cleanup) cannot
+  clear a browser cookie; the iframe keeps answering `"unchanged"` until the
+  next browser-present login/logout — the same limitation Keycloak's
+  static-JS iframe has (the suite's Session plan only exercises
+  browser-present logout). Recorded as an accepted deviation.
 - **B6. Discovery.** Advertise `check_session_iframe` (`discovery.rs` —
   remove the deliberate-omission assertion at `:501`).
 - **B7. Tests.** Unit: session_state stability/change semantics, cookie
@@ -391,7 +396,7 @@ and bootstrap extensions **ride along with the milestone that unblocks each
 profile** (M1 ships the 3rd-party config, M2 ships implicit/hybrid/logout
 configs, …). What remains here:
 
-- **M5.1** `scripts/run-rotation-check.sh` (§7.3) — needed for M4 sign-off.
+- **M5.1** `tests/conformance/run-rotation-check.sh` (§7.3) — needed for M4 sign-off.
 - **M5.2** `run-conformance.sh` full matrix assembly (all invocations from
   `execution-matrix.md`).
 - **M5.3** `run-focus.sh` generalization (any `plan[variants]:module`).
@@ -486,7 +491,7 @@ runner starts the module without rotating. Approach:
 1. In the six Dynamic-plan runs, list `oidcc-server-rotate-keys` in
    `issuerd-expected-failures-dynamic.json` with a comment explaining why
    (manual-step module; covered separately).
-2. `scripts/run-rotation-check.sh` drives the module standalone through the
+2. `tests/conformance/run-rotation-check.sh` drives the module standalone through the
    suite's REST API (the same public API `export-html.py` already uses):
    create module → poll until `CONFIGURED` (original JWKS snapshotted) →
    call `POST /admin/realms/conformance/keys/rotate` on the OP → start the
@@ -540,9 +545,18 @@ land.
    artifact — the release pipeline already does this).
 2. REVIEW-flagged modules (logout error pages, `prompt=login`, `max-age=1`,
    unregistered-redirect) visually verified; screenshots retained.
-3. Profile submission on openid.net/certification: plan export + logs +
+3. Known-deviation disclosure for the submission narrative: the
+   `check_session_iframe` OP page answers postMessage from any origin without
+   an expected-origin allowlist (OIDC Session Management §3.2/§6 is
+   MUST-level) — matching Keycloak's reference behavior. Impact is
+   negligible-by-design (session ids are 122-bit UUIDs; absent-cookie and
+   mismatch both answer `changed`, so even login state is not
+   distinguishable); tightening it requires a per-client server round-trip
+   the static-page design avoids. (If a future suite version tests it, the
+   page gains a per-client origin check via a server lookup.)
+4. (renumbered) Profile submission on openid.net/certification: plan export + logs +
    deployment description; rotation evidence per §7.3 for Dynamic OP.
-4. Update public docs (`docs/`, README badge list) only after the OIDF lists
+5. (renumbered) Update public docs (`docs/`, README badge list) only after the OIDF lists
    the profile.
 
 ## 10. References

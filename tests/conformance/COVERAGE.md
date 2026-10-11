@@ -1,6 +1,6 @@
 # Issuerd OIDC Conformance Test Coverage
 
-> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — the full OP certification matrix: Config OP, Basic OP, Implicit OP, Hybrid OP, Form Post OP (basic/implicit/hybrid legs), Dynamic OP (6 response types), 3rd-Party-Init OP (×6), and the four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel — each ×6 response types); **0 failures and 0 unexpected warnings across all 43 plan invocations** (`run.sh` exit 0). Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
+> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — the full OP certification matrix: Config OP, Basic OP, Implicit OP, Hybrid OP, Form Post OP (basic/implicit/hybrid legs), Dynamic OP (6 response types), 3rd-Party-Init OP (×6), and the four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel — each ×6 response types); **0 failures and 0 unexpected warnings across all 43 plan invocations (612 executed test modules)** (`run.sh` exit 0). Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run. Counting convention: module counts are the exact `[1:N]` plan listings; the runner's "Overall totals: ran N" line counts one bookkeeping entry extra (N+1), which is also the OIDF published-count convention.
 > Conformance Suite version: release-v5.3.2
 
 ## Test Environment
@@ -148,7 +148,7 @@ bootstrap-minted initial access token.
 
 Validates the implicit flow (`response_type=id_token` and `id_token token` in one run — fragment responses, mandatory nonce, `at_hash`).
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 55 test modules, 2215 successes, 0 failures, 0 warnings (27.9s), static_client
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 54 test modules listed (`[1:54]`), 0 failures, 0 warnings (27.9s), static_client. The suite's "Overall totals" line prints 55 (one bookkeeping entry counts as a module); the published profile count 58 assumes the dynamic_client variant — the static run omits `oidcc-id-token-signature` ×2 and `oidcc-idtoken-unsigned` ×2 (both `@VariantNotApplicable(static_client)`); they are covered by the M6 certification-grade dynamic re-runs.
 
 | Module group | Result | Notes |
 |--------------|--------|-------|
@@ -162,19 +162,19 @@ Validates the implicit flow (`response_type=id_token` and `id_token token` in on
 
 All three hybrid types (`code id_token`, `code token`, `code id_token token`) in one run: `c_hash`/`at_hash`, per-type nonce rules, sub consistency between the authorization- and token-endpoint id_tokens.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 97 test modules, 6154 successes, 0 failures, 0 warnings (145s), static_client (published count 102 assumes dynamic_client)
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 96 test modules listed, 0 failures, 0 warnings (145s), static_client. Same bookkeeping note: the runner prints 97; published 102 = dynamic_client adds `oidcc-id-token-signature` ×3 and `oidcc-idtoken-unsigned` ×3.
 
 ### 7. Form Post OP — implicit + hybrid legs (`oidcc-formpost-implicit/hybrid-certification-test-plan`)
 
 The implicit/hybrid module sets with `response_mode=form_post` (auto-submitted POST callback, no credentials in the URL query).
 
-**Latest run**: 2026-10-11 — implicit leg: 55 modules, 2333 successes, 0 failures, 0 warnings (28.6s); hybrid leg: 97 modules, 6366 successes, 0 failures, 0 warnings (146.5s)
+**Latest run**: 2026-10-11 — implicit leg: 54 modules listed (runner prints 55), 0 failures, 0 warnings; hybrid leg: 96 listed (prints 97), 0 failures, 0 warnings. Static-vs-published deltas as in §5/§6.
 
 ### 8. Dynamic OP (`oidcc-dynamic-certification-test-plan`)
 
 Dynamic registration (RFC 7591/7592) + per-client signing algs + signed userinfo + JAR-by-reference — one run per response type, `client_registration=dynamic_client`, `client_auth_type=private_key_jwt`.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 runs (code 24 / code id_token 23 / code id_token token 23 / code token 24 / id_token 19 / id_token token 20 modules), 0 failures, 0 warnings beyond the expected set below
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 runs (code 23 / code id_token 22 / code id_token token 22 / code token 23 / id_token 18 / id_token token 19 modules = **127 executions**, the published profile total), 0 failures, 0 warnings beyond the expected set below. (The runner's "Overall totals: ran N" line counts one bookkeeping entry extra per run — the `[1:N]` module listings above are the exact counts.)
 
 | Module group | Result | Notes |
 |--------------|--------|-------|
