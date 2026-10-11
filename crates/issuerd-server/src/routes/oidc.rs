@@ -882,12 +882,17 @@ async fn handle_auth_request(
         .await;
     }
 
-    // Reject response types that parse but are not implemented (implicit/hybrid
-    // variants involving `token`) instead of silently falling through to the
-    // code flow. The redirect target is safe here: `validate` already verified
-    // the redirect_uri is registered on this client.
+    // Only bare `token` (OAuth2-only, never part of an OIDC flow) is rejected
+    // among the parseable response types; every implicit/hybrid combination
+    // is implemented. The redirect target is safe here: `validate` already
+    // verified the redirect_uri is registered on this client.
     match &auth_req.response_type {
-        ResponseType::Code | ResponseType::IdToken | ResponseType::CodeIdToken => {}
+        ResponseType::Code
+        | ResponseType::IdToken
+        | ResponseType::IdTokenToken
+        | ResponseType::CodeIdToken
+        | ResponseType::CodeToken
+        | ResponseType::CodeIdTokenToken => {}
         unsupported => {
             let e = IssuerdError::UnsupportedResponseType;
             warn!(realm = %realm_id, client_id = %auth_req.client_id, response_type = %unsupported.as_str(), "unsupported response_type requested");
@@ -918,6 +923,48 @@ async fn handle_auth_request(
             )
             .await;
         }
+    }
+
+    // OIDC Core §3.2.2.1/§3.3.2.1: response types that issue an ID token
+    // straight from the authorization endpoint (implicit + hybrid) REQUIRE a
+    // nonce — it is the replay binding the pure code flow gets from the
+    // back-channel code redemption. `code` and `code token` stay
+    // nonce-optional. The realm's `compat.nonceless_hybrid` attribute opts
+    // back into the pre-tightening behavior during the deprecation window.
+    if auth_req.response_type.has_id_token()
+        && auth_req.nonce.is_none()
+        && !realm.compat_nonceless_hybrid()
+    {
+        let e = IssuerdError::InvalidRequest(
+            "nonce is required for implicit and hybrid response types".into(),
+        );
+        warn!(realm = %realm_id, client_id = %auth_req.client_id, response_type = %auth_req.response_type.as_str(), "missing nonce for id_token-bearing response type");
+        let mut details = std::collections::HashMap::new();
+        details.insert("error".to_string(), e.to_string());
+        emit_oidc_event(
+            &state,
+            &realm_id,
+            EventType::LoginError,
+            &ip,
+            Some(client.id.clone()),
+            None,
+            None,
+            Some(e.to_string()),
+            details,
+        )
+        .await;
+        return crate::routes::auth_response::oauth_error_redirect(
+            &state,
+            auth_req.redirect_uri.as_ref(),
+            &e,
+            auth_req.state.as_deref(),
+            &crate::routes::auth_response::ResponsePackaging::from_request(
+                &realm,
+                client.client_id.as_str(),
+                &auth_req,
+            ),
+        )
+        .await;
     }
 
     // RFC 9126 §6: a client pinned to PAR may not start a plain authorization
@@ -1462,6 +1509,158 @@ async fn handle_auth_request(
     }
 }
 
+/// The artifacts minted for one authorization response, per the response
+/// type's legs: an authorization code (code-bearing types), an access token
+/// (`token`-bearing types), and an ID token (`id_token`-bearing types).
+pub(crate) struct AuthorizationArtifacts {
+    pub code: Option<String>,
+    pub id_token: Option<String>,
+    pub access_token: Option<String>,
+    /// Access-token validity in seconds (meaningful iff `access_token`).
+    pub expires_in: u64,
+}
+
+/// Minting failure with the stage attached, so callers keep their distinct
+/// error surfaces (a failed code persist is `temporarily_unavailable` via
+/// `auth_code_store_failure`; token-issuance failures are a plain 500).
+pub(crate) enum MintFailure {
+    CodeStore(IssuerdError),
+    Issuance(IssuerdError),
+}
+
+/// Mint the artifacts for the pending flow's response type. Shared by
+/// [`finish_sso_login`] (SSO-resume) and
+/// `login_api::complete_login_with_method` (fresh login) so every path
+/// assembles identical claims:
+///
+/// - the code leg persists a single-use authorization code;
+/// - the access-token leg uses the same claims assembly as the token
+///   endpoint (access-token mapper overlay + granted RAR authorization
+///   details); implicit/hybrid access tokens never come with a refresh
+///   token;
+/// - the ID-token leg gets the IdToken-target claims overlay only for the
+///   PURE implicit flow (OIDC Core §5.4: when a code or access token rides
+///   along, the userinfo endpoint serves the claims) and carries
+///   `at_hash`/`c_hash` whenever an access token / code is issued alongside
+///   (OIDC Core §3.3.2.11 — `issue_id_token` computes both from the minted
+///   artifacts).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mint_authorization_artifacts(
+    state: &Arc<ServerState>,
+    realm: &issuerd_core::Realm,
+    client: &issuerd_core::Client,
+    user: &issuerd_core::User,
+    pending: &PendingAuthData,
+    session_id: &issuerd_core::SessionId,
+    auth_time: chrono::DateTime<chrono::Utc>,
+) -> Result<AuthorizationArtifacts, MintFailure> {
+    // Gated at the authorization endpoint; anything reaching here parses.
+    let response_type = pending
+        .response_type
+        .parse::<ResponseType>()
+        .map_err(|_| MintFailure::Issuance(IssuerdError::UnsupportedResponseType))?;
+
+    // The code leg (code-bearing types): persist the authorization code.
+    let code = if response_type.has_code() {
+        let code = issuerd_core::utils::generate_id();
+        let code_data = AuthCodeData::from_pending(pending, &user.id, session_id, auth_time);
+        store_auth_code(&state.cache, &code, &code_data, state.config.oauth.auth_code_ttl(realm))
+            .await
+            .map_err(MintFailure::CodeStore)?;
+        Some(code)
+    } else {
+        None
+    };
+
+    // The access-token leg (`token`-bearing types): the same claims
+    // assembly as the token endpoint. Front-channel artifact only — no
+    // refresh token is ever minted here.
+    let access_token: Option<issuerd_token::AccessToken> = if response_type.has_token() {
+        let overlay = crate::claims::build_claims_overlay(
+            state,
+            &realm.id,
+            Some(client),
+            user,
+            &pending.scope,
+            issuerd_core::ClaimTarget::AccessToken,
+        )
+        .await
+        .unwrap_or_default();
+        // Attach the granted RAR authorization details, as at the token
+        // endpoint (RFC 9396 §6).
+        let overlay = crate::claims::bind_authorization_details_overlay(
+            Some(overlay),
+            pending.authorization_details.as_deref(),
+        );
+        let token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                user,
+                client,
+                realm,
+                &pending.scope,
+                session_id,
+                None,
+                pending.claims.clone(),
+                overlay,
+            )
+            .await
+            .map_err(MintFailure::Issuance)?;
+        Some(token)
+    } else {
+        None
+    };
+
+    // The ID-token leg.
+    let id_token = if response_type.has_id_token() {
+        // OIDC Core §5.4: the IdToken-target claims overlay rides only the
+        // PURE implicit flow (no code/access token alongside); the other
+        // flows serve userinfo claims from the userinfo endpoint.
+        let overlay = if response_type.has_code() || response_type.has_token() {
+            None
+        } else {
+            Some(
+                crate::claims::build_claims_overlay(
+                    state,
+                    &realm.id,
+                    Some(client),
+                    user,
+                    &pending.scope,
+                    issuerd_core::ClaimTarget::IdToken,
+                )
+                .await
+                .unwrap_or_default(),
+            )
+        };
+        let token = state
+            .token_manager
+            .issue_id_token(
+                user,
+                client,
+                realm,
+                pending.nonce.as_deref(),
+                auth_time,
+                session_id,
+                access_token.as_ref(),
+                code.as_deref(),
+                Some(&pending.acr_values),
+                overlay,
+            )
+            .await
+            .map_err(MintFailure::Issuance)?;
+        Some(token.token)
+    } else {
+        None
+    };
+
+    Ok(AuthorizationArtifacts {
+        code,
+        id_token,
+        access_token: access_token.map(|t| t.token),
+        expires_in: realm.access_token_lifespan.get(),
+    })
+}
+
 /// SSO/cookie-path login completion: merge the client session into the
 /// (possibly pre-existing) SSO session, persist it, emit the login event, and
 /// mint the response per the requested response type.
@@ -1577,149 +1776,52 @@ pub(crate) async fn finish_sso_login(
         .await;
     }
 
-    match pending.response_type.as_str() {
-        "id_token" => {
-            // Pure implicit flow: no access token is issued, so scope
-            // claims ride in the ID token (OIDC Core §5.4) via the
-            // protocol-mapper overlay.
-            let overlay = crate::claims::build_claims_overlay(
-                state,
-                &realm_id,
-                Some(client),
-                user,
-                pending.scope.as_slice(),
-                issuerd_core::ClaimTarget::IdToken,
+    let artifacts = match mint_authorization_artifacts(
+        state, realm, client, user, pending, session_id, auth_time,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(MintFailure::CodeStore(e)) => {
+            return auth_code_store_failure(
+                state, realm, client, &user_id, session_id, &ip, pending, &e,
             )
-            .await
-            .unwrap_or_default();
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    user,
-                    client,
-                    realm,
-                    pending.nonce.as_deref(),
-                    auth_time,
-                    session_id,
-                    None,
-                    None,
-                    Some(&pending.acr_values),
-                    Some(overlay),
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to issue ID token");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
-                        .into_response();
-                }
-            };
-
-            let mut redirect_params: Vec<(&str, &str)> = vec![("id_token", &id_token.token)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the
-            // fragment is the default for pure implicit).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
+            .await;
         }
-        "code id_token" => {
-            let code = issuerd_core::utils::generate_id();
-            let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(realm),
-            )
-            .await
-            {
-                return auth_code_store_failure(
-                    state, realm, client, &user_id, session_id, &ip, pending, &e,
-                )
-                .await;
-            }
-
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    user,
-                    client,
-                    realm,
-                    pending.nonce.as_deref(),
-                    auth_time,
-                    session_id,
-                    None,
-                    Some(&code),
-                    Some(&pending.acr_values),
-                    // Hybrid flow: userinfo claims are served by the
-                    // userinfo endpoint, not embedded in the ID token.
-                    None,
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to issue ID token");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
-                        .into_response();
-                }
-            };
-
-            let mut redirect_params: Vec<(&str, &str)> =
-                vec![("code", &code), ("id_token", &id_token.token)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the
-            // fragment is the default for hybrid with id_token).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
+        Err(MintFailure::Issuance(e)) => {
+            error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to mint the authorization response");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e))).into_response();
         }
-        _ => {
-            let code = issuerd_core::utils::generate_id();
-            let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(realm),
-            )
-            .await
-            {
-                return auth_code_store_failure(
-                    state, realm, client, &user_id, session_id, &ip, pending, &e,
-                )
-                .await;
-            }
+    };
 
-            let mut redirect_params: Vec<(&str, &str)> = vec![("code", &code)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the query
-            // is the default for the code flow).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
-        }
+    // Assemble the response parameter set for the minted legs; the packaging
+    // (query/fragment/form_post/JARM) honors the requested response_mode —
+    // the fragment is the default whenever an id_token or an access token
+    // rides along (see `ResponsePackaging::from_pending`).
+    let expires_in;
+    let mut redirect_params: Vec<(&str, &str)> = Vec::new();
+    if let Some(ref code) = artifacts.code {
+        redirect_params.push(("code", code));
     }
+    if let Some(ref id_token) = artifacts.id_token {
+        redirect_params.push(("id_token", id_token));
+    }
+    if let Some(ref access_token) = artifacts.access_token {
+        redirect_params.push(("access_token", access_token));
+        redirect_params.push(("token_type", "Bearer"));
+        expires_in = artifacts.expires_in.to_string();
+        redirect_params.push(("expires_in", &expires_in));
+    }
+    if let Some(ref s) = pending.state {
+        redirect_params.push(("state", s));
+    }
+    crate::routes::auth_response::authorization_response(
+        state,
+        &pending.redirect_uri,
+        &redirect_params,
+        &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -6819,8 +6921,11 @@ mod tests {
     #[tokio::test]
     async fn auth_unimplemented_response_type_redirects_unsupported_response_type() {
         // `token` parses and is allowed by the client's default response_types, but is
-        // not implemented; it must be rejected with unsupported_response_type instead
-        // of silently falling through to the code flow.
+        // not implemented (OAuth2-only — never part of an OIDC flow); it must be
+        // rejected with unsupported_response_type instead of silently falling through
+        // to the code flow. The error rides the fragment: `token` is a token-bearing
+        // response type, whose spec default delivery is the fragment (OAuth 2.0
+        // Multiple Response Types §3).
         let state = setup_state().await;
         let mut params = std::collections::HashMap::new();
         params.insert("response_type".to_string(), "token".to_string());
@@ -6844,7 +6949,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert!(
-            location.starts_with("http://localhost:8080/admin/console/callback?"),
+            location.starts_with("http://localhost:8080/admin/console/callback#"),
             "location: {}",
             location
         );

@@ -6,9 +6,9 @@
 //! OIDC/OAuth2 client-metadata fields that have no first-class column in the
 //! [`Client`] model ride in its `attributes` map under the RFC's snake_case
 //! names — the pre-existing convention of the `backchannel_logout_uri` /
-//! `frontchannel_logout_uri` keys ([`crate::routes::logout`]). They are
+//! `frontchannel_logout_uri` keys (`crate::routes::logout`). They are
 //! written by the dynamic-client-registration translation layer
-//! ([`crate::routes::client_registration`]), settable through the Admin
+//! (`crate::routes::client_registration`), settable through the Admin
 //! API's generic client-attributes channel, and read back for the RFC 7592
 //! registration responses and by the logout endpoints.
 //!

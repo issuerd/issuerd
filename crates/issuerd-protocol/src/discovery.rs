@@ -250,9 +250,14 @@ impl DiscoveryResponse {
                 issuerd_core::Scope::parse("acr"),
             ],
             response_types_supported: vec![
+                // Every OIDC response type the authorization endpoint accepts
+                // (bare `token` is OAuth2-only and deliberately excluded).
                 crate::authorization::ResponseType::Code,
-                crate::authorization::ResponseType::IdToken,
                 crate::authorization::ResponseType::CodeIdToken,
+                crate::authorization::ResponseType::CodeIdTokenToken,
+                crate::authorization::ResponseType::CodeToken,
+                crate::authorization::ResponseType::IdToken,
+                crate::authorization::ResponseType::IdTokenToken,
             ],
             response_modes_supported: vec![
                 crate::authorization::ResponseMode::Query,
@@ -266,6 +271,9 @@ impl DiscoveryResponse {
             ],
             grant_types_supported: vec![
                 crate::token::GrantType::AuthorizationCode,
+                // Implicit and hybrid flows are implemented (the
+                // authorization endpoint issues tokens directly).
+                crate::token::GrantType::Implicit,
                 crate::token::GrantType::RefreshToken,
                 crate::token::GrantType::ClientCredentials,
                 crate::token::GrantType::DeviceCode,
@@ -547,15 +555,26 @@ mod tests {
     #[test]
     fn discovery_response_types_and_modes_match_implementation() {
         let d = DiscoveryResponse::for_realm("https://auth.example.com", "test-realm");
-        // Only implemented response types are advertised.
+        // Every implemented response type is advertised: the code flow plus
+        // the implicit/hybrid combinations (bare `token` is OAuth2-only and
+        // stays unadvertised — the authorization endpoint rejects it).
         assert_eq!(
             d.response_types_supported,
             vec![
                 crate::authorization::ResponseType::Code,
-                crate::authorization::ResponseType::IdToken,
                 crate::authorization::ResponseType::CodeIdToken,
+                crate::authorization::ResponseType::CodeIdTokenToken,
+                crate::authorization::ResponseType::CodeToken,
+                crate::authorization::ResponseType::IdToken,
+                crate::authorization::ResponseType::IdTokenToken,
             ]
         );
+        // `implicit` is advertised as a grant (OIDCD-3).
+        assert!(d.grant_types_supported.contains(&crate::token::GrantType::Implicit));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"implicit\""));
+        assert!(json.contains("\"id_token token\""));
+        // The typed list above is authoritative: bare `token` is not in it.
         // form_post and the JARM family are implemented and
         // therefore advertised.
         assert_eq!(

@@ -160,6 +160,9 @@ pub(crate) async fn begin_consent(
                 redirect_uri: url,
                 code: None,
                 id_token: None,
+                access_token: None,
+                token_type: None,
+                expires_in: None,
                 state: entry.pending.state.clone(),
             }),
         )

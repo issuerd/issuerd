@@ -51,6 +51,8 @@ mod federation_samba;
 mod i18n;
 #[path = "integration/identity_brokering.rs"]
 mod identity_brokering;
+#[path = "integration/implicit_hybrid.rs"]
+mod implicit_hybrid;
 #[path = "integration/jar_jarm_form_post.rs"]
 mod jar_jarm_form_post;
 #[path = "integration/jwt_client_auth.rs"]

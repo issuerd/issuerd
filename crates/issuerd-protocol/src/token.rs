@@ -137,6 +137,11 @@ impl TokenRequest {
                     return Err(IssuerdError::InvalidGrant);
                 }
             }
+            // Unreachable: `implicit` is a discovery-only variant — the
+            // token-request parser never produces it.
+            GrantType::Implicit => {
+                return Err(IssuerdError::InvalidRequest("unsupported grant_type".into()));
+            }
             GrantType::RefreshToken => {
                 if self.refresh_token.is_none() {
                     return Err(IssuerdError::InvalidGrant);
@@ -220,6 +225,13 @@ impl TokenRequest {
 pub enum GrantType {
     #[serde(rename = "authorization_code")]
     AuthorizationCode,
+    /// The implicit "grant" (OIDC Core §3.2): exists for the typed discovery
+    /// document's `grant_types_supported` list. It is deliberately NOT parsed
+    /// from token requests — implicit flows have no token-endpoint leg, so a
+    /// `grant_type=implicit` token request fails at parse time with
+    /// `unsupported grant_type` like any unknown value.
+    #[serde(rename = "implicit")]
+    Implicit,
     #[serde(rename = "refresh_token")]
     RefreshToken,
     #[serde(rename = "password")]
@@ -240,6 +252,7 @@ impl GrantType {
     pub fn as_str(&self) -> &'static str {
         match self {
             GrantType::AuthorizationCode => "authorization_code",
+            GrantType::Implicit => "implicit",
             GrantType::RefreshToken => "refresh_token",
             GrantType::Password => "password",
             GrantType::ClientCredentials => "client_credentials",

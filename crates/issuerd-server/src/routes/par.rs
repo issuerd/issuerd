@@ -169,9 +169,15 @@ pub async fn par_handler(
         return par_endpoint_error(&e);
     }
     // Reject unimplemented response types at push time, mirroring the
-    // authorization endpoint.
+    // authorization endpoint (bare `token` is OAuth2-only; every
+    // implicit/hybrid combination is accepted).
     match &auth_req.response_type {
-        ResponseType::Code | ResponseType::IdToken | ResponseType::CodeIdToken => {}
+        ResponseType::Code
+        | ResponseType::IdToken
+        | ResponseType::IdTokenToken
+        | ResponseType::CodeIdToken
+        | ResponseType::CodeToken
+        | ResponseType::CodeIdTokenToken => {}
         _ => return par_endpoint_error(&IssuerdError::UnsupportedResponseType),
     }
 

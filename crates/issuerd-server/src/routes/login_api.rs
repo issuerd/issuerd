@@ -96,6 +96,14 @@ pub struct LoginResponse {
     pub redirect_uri: String,
     pub code: Option<String>,
     pub id_token: Option<String>,
+    /// Access token minted at the authorization endpoint (implicit/hybrid
+    /// `token`-bearing response types); `None` for the code flow and pure
+    /// `id_token` implicit.
+    pub access_token: Option<String>,
+    /// `"Bearer"` when `access_token` is present.
+    pub token_type: Option<String>,
+    /// Access-token validity in seconds, when an access token is present.
+    pub expires_in: Option<u64>,
     pub state: Option<String>,
 }
 
@@ -758,23 +766,29 @@ pub(crate) async fn complete_login(
 }
 
 /// Assemble the authorization-response parameter set for form-based browser
-/// submissions (state first, then code, then id_token — the pre-24.7 order).
+/// submissions (state first, then the minted legs — code, id_token,
+/// access_token + token_type/expires_in — the pre-24.7 order, extended).
 /// Delivery (query/fragment/form_post/JARM) is decided from the pending
 /// entry's response_mode at response time.
 fn response_params<'a>(
     pending: &'a super::oidc::PendingAuthData,
-    code: Option<&'a str>,
-    id_token: Option<&'a str>,
+    artifacts: &'a super::oidc::AuthorizationArtifacts,
+    expires_in: &'a str,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params: Vec<(&str, &str)> = Vec::new();
     if let Some(ref s) = pending.state {
         params.push(("state", s.as_str()));
     }
-    if let Some(c) = code {
+    if let Some(ref c) = artifacts.code {
         params.push(("code", c));
     }
-    if let Some(t) = id_token {
+    if let Some(ref t) = artifacts.id_token {
         params.push(("id_token", t));
+    }
+    if let Some(ref t) = artifacts.access_token {
+        params.push(("access_token", t));
+        params.push(("token_type", "Bearer"));
+        params.push(("expires_in", expires_in));
     }
     params
 }
@@ -1027,203 +1041,72 @@ pub(crate) async fn complete_login_with_method(
         resp
     };
 
-    let resp = match pending.response_type.as_str() {
-        "id_token" => {
-            // Implicit flow: issue id_token directly; scope claims embed via
-            // the mapper overlay (no access token is issued alongside).
-            let overlay = crate::claims::build_claims_overlay(
+    // Mint the authorization response's artifacts (code / id_token / access
+    // token per the response type) — the same assembly as the SSO-resume
+    // path (`oidc::finish_sso_login`): pure implicit embeds the IdToken
+    // overlay, flows with an accompanying code/access token serve userinfo
+    // claims from the userinfo endpoint, and `at_hash`/`c_hash` ride along
+    // whenever the corresponding artifact exists.
+    let artifacts = match super::oidc::mint_authorization_artifacts(
+        state,
+        &realm,
+        &client,
+        &user,
+        &pending,
+        &session_id,
+        result_auth_time,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(super::oidc::MintFailure::CodeStore(e)) => {
+            return auth_code_store_failure(
                 state,
-                &realm_id,
-                Some(&client),
-                &user,
-                &pending.scope,
-                issuerd_core::ClaimTarget::IdToken,
-            )
-            .await
-            .unwrap_or_default();
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    &user,
-                    &client,
-                    &realm,
-                    pending.nonce.as_deref(),
-                    result_auth_time,
-                    &session_id,
-                    None,
-                    None,
-                    Some(&pending.acr_values),
-                    Some(overlay),
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, error = %e, "failed to issue ID token");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, None, Some(&id_token.token)),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: None,
-                        id_token: Some(id_token.token),
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
-        }
-        "code id_token" => {
-            // Hybrid flow: issue both code and id_token
-            let code = issuerd_core::utils::generate_id();
-            let code_data = super::oidc::AuthCodeData::from_pending(
+                &realm,
                 &pending,
+                &client,
                 &user_id,
                 &session_id,
-                result_auth_time,
-            );
-            if let Err(e) = super::oidc::store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(&realm),
+                is_browser_form,
+                &cookie_value,
+                &e,
             )
-            .await
-            {
-                return auth_code_store_failure(
-                    state,
-                    &realm,
-                    &pending,
-                    &client,
-                    &user_id,
-                    &session_id,
-                    is_browser_form,
-                    &cookie_value,
-                    &e,
-                )
-                .await;
-            }
-
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    &user,
-                    &client,
-                    &realm,
-                    pending.nonce.as_deref(),
-                    result_auth_time,
-                    &session_id,
-                    None,
-                    Some(&code),
-                    Some(&pending.acr_values),
-                    // Hybrid flow: userinfo claims via the userinfo endpoint.
-                    None,
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, error = %e, "failed to issue ID token");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, Some(&code), Some(&id_token.token)),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: Some(code),
-                        id_token: Some(id_token.token),
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
+            .await;
         }
-        _ => {
-            // Authorization code flow
-            let code = issuerd_core::utils::generate_id();
-            let code_data = super::oidc::AuthCodeData::from_pending(
-                &pending,
-                &user_id,
-                &session_id,
-                result_auth_time,
-            );
-            if let Err(e) = super::oidc::store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(&realm),
+        Err(super::oidc::MintFailure::Issuance(e)) => {
+            error!(realm = %realm_id, error = %e, "failed to mint the authorization response");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
-            .await
-            {
-                return auth_code_store_failure(
-                    state,
-                    &realm,
-                    &pending,
-                    &client,
-                    &user_id,
-                    &session_id,
-                    is_browser_form,
-                    &cookie_value,
-                    &e,
-                )
-                .await;
-            }
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, Some(&code), None),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: Some(code),
-                        id_token: None,
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
+                .into_response();
         }
+    };
+
+    let resp = if is_browser_form {
+        let expires_in = artifacts.expires_in.to_string();
+        browser_auth_response(
+            state,
+            &realm,
+            &pending,
+            &response_params(&pending, &artifacts, &expires_in),
+            &cookie_value,
+        )
+        .await
+    } else {
+        (
+            cookie_header,
+            Json(LoginResponse {
+                redirect_uri: pending.redirect_uri,
+                code: artifacts.code,
+                id_token: artifacts.id_token,
+                token_type: artifacts.access_token.as_ref().map(|_| "Bearer".to_string()),
+                expires_in: artifacts.access_token.as_ref().map(|_| artifacts.expires_in),
+                access_token: artifacts.access_token,
+                state: pending.state,
+            }),
+        )
+            .into_response()
     };
     with_remember_cookie(resp)
 }

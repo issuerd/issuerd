@@ -2130,6 +2130,22 @@ impl Realm {
             .is_some_and(|v| v == "true")
     }
 
+    /// Realm attribute (`"true"`) restoring the pre-M2 lenient behavior of
+    /// accepting nonce-less implicit/hybrid authorization requests
+    /// (`id_token`, `id_token token`, `code id_token`, `code id_token token`).
+    /// Default off: OIDC Core §3.2.2.1/§3.3.2.1 REQUIRE a nonce whenever an
+    /// ID token is issued from the authorization endpoint. Deprecation-window
+    /// escape hatch for existing deployments.
+    pub const COMPAT_NONCELESS_HYBRID_ATTRIBUTE: &'static str = "compat.nonceless_hybrid";
+
+    /// Whether nonce-less implicit/hybrid authorization requests are accepted
+    /// in this realm (default `false` — the nonce is required).
+    pub fn compat_nonceless_hybrid(&self) -> bool {
+        self.attributes
+            .get(Self::COMPAT_NONCELESS_HYBRID_ATTRIBUTE)
+            .is_some_and(|v| v == "true")
+    }
+
     /// Realm attribute (`"true"`) making first and last name mandatory on
     /// the self-registration form. Default off — names stay optional.
     pub const REGISTRATION_REQUIRE_NAMES_ATTRIBUTE: &'static str = "registration_require_names";
@@ -3542,6 +3558,18 @@ mod tests {
         assert_eq!(r.wait_increment_secs, 60);
         assert_eq!(r.max_failure_wait_secs, 900);
         assert_eq!(r.lockout_duration_secs, 900);
+    }
+
+    #[test]
+    fn realm_compat_nonceless_hybrid_accessor() {
+        let mut r = Realm::default();
+        assert!(!r.compat_nonceless_hybrid(), "default off: the nonce is required");
+        r.attributes
+            .insert(Realm::COMPAT_NONCELESS_HYBRID_ATTRIBUTE.to_string(), "true".to_string());
+        assert!(r.compat_nonceless_hybrid());
+        r.attributes
+            .insert(Realm::COMPAT_NONCELESS_HYBRID_ATTRIBUTE.to_string(), "yes".to_string());
+        assert!(!r.compat_nonceless_hybrid(), "only the literal \"true\" opts in");
     }
 
     #[test]

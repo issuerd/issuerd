@@ -31,7 +31,9 @@ pub(crate) struct ResponsePackaging<'a> {
     /// The requested `response_mode`; `None` = the spec default applies.
     pub requested_mode: Option<ResponseMode>,
     /// Whether the response type's default mode is the fragment (the
-    /// response type carries an id_token).
+    /// response type carries an id_token and/or an access token — OAuth 2.0
+    /// Multiple Response Types §3: only the pure code flow defaults to
+    /// query).
     pub default_fragment: bool,
 }
 
@@ -47,7 +49,10 @@ impl<'a> ResponsePackaging<'a> {
             realm,
             client_id,
             requested_mode: auth_req.response_mode,
-            default_fragment: auth_req.response_type.has_id_token(),
+            default_fragment: {
+                let rt = &auth_req.response_type;
+                rt.has_id_token() || rt.has_token()
+            },
         }
     }
 
@@ -61,7 +66,7 @@ impl<'a> ResponsePackaging<'a> {
             default_fragment: pending
                 .response_type
                 .parse::<issuerd_protocol::authorization::ResponseType>()
-                .is_ok_and(|rt| rt.has_id_token()),
+                .is_ok_and(|rt| rt.has_id_token() || rt.has_token()),
         }
     }
 }
@@ -255,6 +260,45 @@ mod tests {
             resolve_effective_mode(Some(ResponseMode::Jwt), true),
             EffectiveMode::FragmentJwt
         );
+    }
+
+    /// The fragment is the default delivery for every token-bearing response
+    /// type (OAuth 2.0 Multiple Response Types §3) — including `code token`,
+    /// which carries no id_token.
+    #[test]
+    fn default_fragment_follows_all_token_bearing_response_types() {
+        use issuerd_protocol::authorization::{AuthorizationRequest, ResponseType};
+        fn packaging_for(rt: ResponseType) -> bool {
+            let req = AuthorizationRequest {
+                response_type: rt,
+                client_id: issuerd_core::ClientIdentifier::new("c").unwrap(),
+                redirect_uri: url::Url::parse("http://localhost/cb").unwrap(),
+                scope: issuerd_core::Scope::parse("openid"),
+                state: None,
+                nonce: None,
+                response_mode: None,
+                prompt: vec![],
+                max_age: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                login_hint: None,
+                id_token_hint: None,
+                acr_values: vec![],
+                ui_locales: vec![],
+                claims: None,
+                authorization_details: None,
+                registration: false,
+                request: None,
+                request_uri: None,
+            };
+            ResponsePackaging::from_request(&Realm::default(), "c", &req).default_fragment
+        }
+        assert!(!packaging_for(ResponseType::Code));
+        assert!(packaging_for(ResponseType::IdToken));
+        assert!(packaging_for(ResponseType::IdTokenToken));
+        assert!(packaging_for(ResponseType::CodeIdToken));
+        assert!(packaging_for(ResponseType::CodeToken));
+        assert!(packaging_for(ResponseType::CodeIdTokenToken));
     }
 
     #[tokio::test]
