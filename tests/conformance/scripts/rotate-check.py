@@ -68,7 +68,10 @@ def main():
     wait_status(module_id, "CONFIGURED")
     print("module CONFIGURED (original JWKS snapshot taken)")
 
-    # 3. Rotate the OP signing keys through the admin API.
+    # 3. Rotate the OP signing keys through the admin API. The new key is
+    # RS256: the suite's VerifyNewJwksHasNewSigningKey condition cannot parse
+    # Ed25519 (OKP) keys, and rotation keeps one active key per algorithm, so
+    # the realm's EdDSA default stays active alongside.
     _, token_resp = http(
         "POST",
         f"{OP}/api/v1/auth/admin-token",
@@ -78,7 +81,7 @@ def main():
     status, _ = http(
         "POST",
         f"{OP}/admin/realms/conformance/keys/rotate",
-        body={},
+        body={"algorithm": "RS256"},
         bearer=admin,
     )
     assert status in (200, 201, 204), f"rotate failed: {status}"
