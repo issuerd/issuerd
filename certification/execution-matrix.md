@@ -1,7 +1,7 @@
 # Certification Execution Matrix
 
 Exact suite invocations this plan adds to `tests/conformance/scripts/run-conformance.sh`.
-Suite pinned at `release-v5.2.4`; counts verified against the plan classes in
+Suite pinned at `release-v5.3.2`; counts verified against the plan classes in
 `conformance-suite/src/main/java/net/openid/conformance/openid/`.
 
 Variant-string syntax is the one already in use
