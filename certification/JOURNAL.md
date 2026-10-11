@@ -372,3 +372,12 @@ Gate iterations 2–5 + live debug against a long-running stack:
     pattern; `login.signedOut` bundles exist) — i18n when the page is next
     touched.
 - Final gate rerun follows (code moved after gate v10).
+
+### 2026-10-12 — gate v11: full matrix green WITH review fixes (exit 0)
+
+Final validation after the review batch: all 43 invocations pass, the
+rotation sidecar ran inside the standard run ("PASSED with a real key
+rotation", archived at `results/rotate-check-output.log`), the evidence
+tarball carries no credentials, and the stack started from a clean slate.
+Evidence: `tests/conformance/results/html-reports-20261011-221213`.
+Branch is merge-ready.
