@@ -179,7 +179,7 @@ for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "
     run_plan \
         "oidcc-dynamic-certification-test-plan[response_type=$rt]" \
         "$DYNAMIC_CONFIG" \
-        "issuerd-expected-skips-config.json" \
+        "issuerd-expected-skips.json" \
         "oidcc-dynamic-certification-test-plan-${rt// /-}-output.log" \
         "issuerd-expected-failures-dynamic.json"
 done

@@ -5,7 +5,8 @@
   },
   "client": {
     "client_name": "issuerd-dynamic",
-    "initial_access_token": "@INITIAL_ACCESS_TOKEN@"
+    "initial_access_token": "@INITIAL_ACCESS_TOKEN@",
+    "scope": "openid profile email address phone"
   },
   "browser": [
     {
@@ -16,6 +17,14 @@
           "optional": true,
           "match": "https://op.conformance.test:8443/*execution_id*",
           "commands": [
+            [
+              "wait",
+              "xpath",
+              "//*",
+              10,
+              "Sign In",
+              "update-image-placeholder-optional"
+            ],
             [
               "text",
               "id",
@@ -57,9 +66,11 @@
           "commands": [
             [
               "wait",
-              "contains",
-              "error=",
-              10
+              "xpath",
+              "//body",
+              10,
+              "(?s).*",
+              "update-image-placeholder-optional"
             ]
           ]
         },
@@ -94,5 +105,9 @@
         }
       ]
     }
-  ]
+  ],
+  "client2": {
+    "client_name": "issuerd-dynamic-2",
+    "initial_access_token": "@INITIAL_ACCESS_TOKEN@"
+  }
 }

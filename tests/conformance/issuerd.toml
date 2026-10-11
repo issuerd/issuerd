@@ -22,3 +22,7 @@ trust_x_real_ip = true
 # (back-channel logout delivery to the suite) must trust it.
 [outbound_http]
 extra_ca_bundle = "/pki/ca.crt"
+# The hermetic network is entirely private (172.31.0.0/16): SSRF-guarded
+# fetches (client jwks_uri, sector docs, request_uri objects) target the
+# suite inside it. Test-rig only.
+allow_private_addresses = true
