@@ -84,17 +84,19 @@ run_plan \
     "issuerd-expected-skips.json" \
     "oidcc-formpost-basic-certification-test-plan-output.log"
 
-# 3rd-Party-Init OP: the plan pins dynamic_client, so registrations flow
-# through the initial-access-token-gated endpoint; bootstrap minted an
-# unlimited, non-expiring token into /results. The plan runs once per
-# response type (the variant is menu-selected but never exercised) — six
-# runs × 2 modules = the published 12.
+# 3rd-Party-Init OP: the plan pins server_metadata=discovery,
+# client_registration=dynamic_client, client_auth_type=client_secret_basic and
+# response_mode=default itself (passing them on the command line is an
+# error) — only response_type is user-selected, and it is never exercised by
+# the two modules. Registrations flow through the initial-access-token-gated
+# endpoint; bootstrap minted an unlimited, non-expiring token into /results.
+# Six runs × 2 modules = the published 12.
 THIRDPARTY_CONFIG=/tmp/issuerd-3rdparty-init-op.json
 sed "s/@INITIAL_ACCESS_TOKEN@/$(cat /results/initial-access-token.txt)/" \
     "$CONFIGS/issuerd-3rdparty-init-op.json" > "$THIRDPARTY_CONFIG"
 for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
     run_plan \
-        "oidcc-3rdparty-init-login-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=$rt]" \
+        "oidcc-3rdparty-init-login-certification-test-plan[response_type=$rt]" \
         "$THIRDPARTY_CONFIG" \
         "issuerd-expected-skips-config.json" \
         "oidcc-3rdparty-init-login-certification-test-plan-${rt// /-}-output.log"

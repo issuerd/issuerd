@@ -70,12 +70,12 @@ Six invocations, one per response type (client auth pinned to
 `private_key_jwt` by the plan; `client_registration=dynamic_client` pinned):
 
 ```
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=code]
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=code id_token]
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=code id_token token]
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=code token]
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=id_token]
-oidcc-dynamic-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=id_token token]
+oidcc-dynamic-certification-test-plan[response_type=code]
+oidcc-dynamic-certification-test-plan[response_type=code id_token]
+oidcc-dynamic-certification-test-plan[response_type=code id_token token]
+oidcc-dynamic-certification-test-plan[response_type=code token]
+oidcc-dynamic-certification-test-plan[response_type=id_token]
+oidcc-dynamic-certification-test-plan[response_type=id_token token]
 ```
 
 Config `issuerd-dynamic-op.json` (same file for all six) · per-run modules:
@@ -95,7 +95,7 @@ Six invocations (response type is menu-selected but never exercised; run all
 six for the published total):
 
 ```
-oidcc-3rdparty-init-login-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=<each of the six>]
+oidcc-3rdparty-init-login-certification-test-plan[response_type=<each of the six>]
 ```
 
 Config `issuerd-3rdparty-init-op.json` · 2 modules per run
@@ -112,7 +112,7 @@ response type.
 ### RP-Initiated OP — 🆕 (WS-A + WS-D)
 
 ```
-oidcc-rp-initiated-logout-certification-test-plan[server_metadata=discovery][client_registration=static_client][response_type=<each of the six>]
+oidcc-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=<each of the six>]
 ```
 
 Config `issuerd-rpinitiated-logout-op.json` · 11 modules per run
@@ -123,7 +123,7 @@ same posture as today's `oidcc-ensure-registered-redirect-uri`.
 ### Session OP — 🆕 (WS-B)
 
 ```
-oidcc-session-management-certification-test-plan[server_metadata=discovery][client_registration=static_client][response_type=<each of the six>]
+oidcc-session-management-certification-test-plan[client_registration=static_client][response_type=<each of the six>]
 ```
 
 Config `issuerd-session-op.json` · 2 modules per run
@@ -133,7 +133,7 @@ Config `issuerd-session-op.json` · 2 modules per run
 ### Front-Channel OP — 🆕 (WS-A + WS-D)
 
 ```
-oidcc-frontchannel-rp-initiated-logout-certification-test-plan[server_metadata=discovery][client_registration=static_client][response_type=<each of the six>]
+oidcc-frontchannel-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=<each of the six>]
 ```
 
 Config `issuerd-frontchannel-logout-op.json` · 2 modules per run → **12** total.
@@ -141,7 +141,7 @@ Config `issuerd-frontchannel-logout-op.json` · 2 modules per run → **12** tot
 ### Back-Channel OP — 🆕 (WS-A + WS-D)
 
 ```
-oidcc-backchannel-rp-initiated-logout-certification-test-plan[server_metadata=discovery][client_registration=static_client][response_type=<each of the six>]
+oidcc-backchannel-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=<each of the six>]
 ```
 
 Config `issuerd-backchannel-logout-op.json` · 2 modules per run → **12** total.
