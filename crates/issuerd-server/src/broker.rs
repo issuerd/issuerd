@@ -272,8 +272,6 @@ impl BrokerClient for ReqwestBrokerClient {
 /// host/port oracle into the internal network.
 fn guarded_fetch_fail(why: &str) -> IssuerdError {
     warn!(why, "SSRF-guarded fetch rejected/failed");
-    #[cfg(test)]
-    eprintln!("guarded_fetch_fail: {why}");
     IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
 }
 
