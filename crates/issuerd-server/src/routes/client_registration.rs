@@ -282,17 +282,6 @@ const RFC7591_GRANT_TYPES: [&str; 8] = [
     "urn:openid:params:grant-type:ciba",
 ];
 
-/// The seven OIDC `response_types` combinations (OIDC Core §3).
-const RFC7591_RESPONSE_TYPES: [&str; 7] = [
-    "code",
-    "id_token",
-    "token",
-    "code id_token",
-    "code token",
-    "id_token token",
-    "code id_token token",
-];
-
 /// RFC 7591 `token_endpoint_auth_method` values Issuerd implements.
 const RFC7591_TOKEN_ENDPOINT_AUTH_METHODS: [&str; 5] = [
     "client_secret_basic",
@@ -479,17 +468,29 @@ fn translate_rfc7591_request(mut body: serde_json::Value) -> Result<serde_json::
                 "response_types must be an array of response-type strings".to_string(),
             ));
         };
-        let mut types = Vec::with_capacity(list.len());
+        let mut types: Vec<&'static str> = Vec::with_capacity(list.len());
         for entry in list {
             let Some(response_type) = entry.as_str() else {
                 return Err(invalid_metadata("response_types entries must be strings".to_string()));
             };
-            if !RFC7591_RESPONSE_TYPES.contains(&response_type) {
-                return Err(invalid_metadata(format!(
-                    "response_types value {response_type:?} is not a supported OIDC response type"
-                )));
+            // Both token/id_token orderings parse (normalized to the
+            // canonical `as_str` spelling — discovery advertises both). Bare
+            // `token` parses but is OAuth2-only: the authorization endpoint
+            // always rejects it, so it is not registrable metadata.
+            let parsed = response_type
+                .parse::<issuerd_protocol::authorization::ResponseType>()
+                .map_err(|_| {
+                    invalid_metadata(format!(
+                        "response_types value {response_type:?} is not a supported OIDC response type"
+                    ))
+                })?;
+            if parsed == issuerd_protocol::authorization::ResponseType::Token {
+                return Err(invalid_metadata(
+                    "response_types value \"token\" is OAuth2-only and never accepted by the authorization endpoint"
+                        .to_string(),
+                ));
             }
-            types.push(response_type);
+            types.push(parsed.as_str());
         }
         let encoded = serde_json::to_string(&types).expect("response type list serialization");
         insert_body_attribute(
@@ -2566,6 +2567,9 @@ mod tests {
         for body in [
             serde_json::json!({"grant_types": ["authorization_code", "made-up-grant"]}),
             serde_json::json!({"response_types": ["code", "token token"]}),
+            // Bare `token` parses but is OAuth2-only: never accepted by the
+            // authorization endpoint, so it is not registrable metadata.
+            serde_json::json!({"response_types": ["token"]}),
             serde_json::json!({"response_types": "code"}),
             serde_json::json!({"grant_types": {"authorization_code": true}}),
         ] {
@@ -2574,6 +2578,23 @@ mod tests {
             let json = response_json(resp).await;
             assert_eq!(json["error"], "invalid_client_metadata");
         }
+    }
+
+    /// The discovery-advertised `token id_token` spelling (OIDCD-3) registers
+    /// and normalizes to the canonical `id_token token`.
+    #[tokio::test]
+    async fn rfc7591_response_types_accept_and_normalize_token_id_token() {
+        let (state, realm) = registration_state().await;
+        let resp = register_client(
+            &state,
+            &realm,
+            serde_json::json!({"response_types": ["token id_token", "code"]}),
+            RegistrationPolicy::Trusted,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = response_json(resp).await;
+        assert_eq!(json["response_types"], serde_json::json!(["id_token token", "code"]));
     }
 
     #[tokio::test]
