@@ -236,6 +236,7 @@ pub async fn account_logout_session_handler(
     // The realm segment is resolved by middleware; only the session id is used.
     Path((realm_segment, session_id)): Path<(String, String)>,
 ) -> Response {
+    let _ = &realm_segment;
     let guard = match extract_auth(&state, &realm, &headers).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -289,15 +290,18 @@ pub async fn account_logout_session_handler(
             .into_response();
     }
     crate::session_cache::invalidate_session(&state, &guard.realm_id, &sid).await;
+    let realm = state.storage.get_realm(&guard.realm_id).await.ok().flatten();
     // Back-channel logout: notify clients with a `backchannel_logout_uri`
     // (fire-and-forget).
-    if let Ok(Some(realm)) = state.storage.get_realm(&guard.realm_id).await {
-        state.logout_notifier.notify_session_destroyed(&realm, &session).await;
+    if let Some(realm) = &realm {
+        state.logout_notifier.notify_session_destroyed(realm, &session).await;
     }
     // OIDC Session Management: when the deleted session IS the caller's
     // current one (the bearer token's sid), the browser's session-state
     // companion cookie must be cleared too; deleting a different session
-    // must not touch it.
+    // must not touch it. The clear needs the realm (the cookie name is
+    // name-scoped with an id fallback) — a transient realm-fetch failure
+    // skips it, matching the notifier's best-effort posture.
     let deleted_current = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -307,11 +311,12 @@ pub async fn account_logout_session_handler(
         .is_some_and(|current| current == sid);
     let mut resp = StatusCode::NO_CONTENT.into_response();
     if deleted_current {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&super::oidc::session_state_cookie_clear(
-            &realm_segment,
-            state.config.secure_cookies(),
-        )) {
-            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        if let Some(realm) = &realm {
+            if let Ok(v) = axum::http::HeaderValue::from_str(
+                &super::oidc::session_state_cookie_clear(realm, state.config.secure_cookies()),
+            ) {
+                resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+            }
         }
     }
     resp

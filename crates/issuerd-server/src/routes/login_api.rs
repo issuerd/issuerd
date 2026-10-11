@@ -1125,7 +1125,7 @@ pub(crate) async fn complete_login_with_method(
     // refreshes it.
     let mut resp = resp;
     if let Ok(v) = axum::http::HeaderValue::from_str(&super::oidc::session_state_cookie_header(
-        realm.name.as_str(),
+        &realm,
         session_id.as_ref(),
         state.config.secure_cookies(),
     )) {

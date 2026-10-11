@@ -258,12 +258,30 @@ pub(crate) fn remember_cookie_name(realm_id: &RealmId) -> String {
     format!("issuerd_remember_{realm_id}")
 }
 
+/// Whether `name` is a valid RFC 6265 cookie-name component: RFC 7230 token
+/// chars only. `RealmName` allows characters browsers reject in cookie names
+/// (`;`, `,`, `"`, whitespace, …) — a Set-Cookie with such a name is silently
+/// dropped, which would strand the session-state companion cookie.
+fn is_cookie_token_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(b,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'
+                | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+        })
+}
+
 /// Name of the per-realm session-state companion cookie (OIDC Session
-/// Management 1.0). Realm-NAME scoped: the `check_session_iframe` route
-/// resolves realms by name, and a valid [`RealmName`] is always a safe
-/// cookie-name component.
-pub(crate) fn session_state_cookie_name(realm_name: &str) -> String {
-    format!("issuerd_session_state_{realm_name}")
+/// Management 1.0). Realm-NAME scoped (the `check_session_iframe` route
+/// resolves realms by name) when the name is cookie-safe; otherwise falls
+/// back to the realm id (a UUID — always cookie-name safe).
+pub(crate) fn session_state_cookie_name(realm: &Realm) -> String {
+    let name = realm.name.as_str();
+    if is_cookie_token_safe(name) {
+        format!("issuerd_session_state_{name}")
+    } else {
+        format!("issuerd_session_state_{}", realm.id)
+    }
 }
 
 /// `Set-Cookie` value for the session-state companion cookie. NOT HttpOnly —
@@ -272,7 +290,7 @@ pub(crate) fn session_state_cookie_name(realm_name: &str) -> String {
 /// development rigs keep `SameSite=Lax` (browsers reject `SameSite=None`
 /// without `Secure`).
 pub(crate) fn session_state_cookie_header(
-    realm_name: &str,
+    realm: &Realm,
     session_state: &str,
     secure: bool,
 ) -> String {
@@ -281,18 +299,18 @@ pub(crate) fn session_state_cookie_header(
     } else {
         "SameSite=Lax"
     };
-    format!("{}={session_state}; Path=/; {same_site}", session_state_cookie_name(realm_name))
+    format!("{}={session_state}; Path=/; {same_site}", session_state_cookie_name(realm))
 }
 
 /// `Set-Cookie` clear for the companion cookie. The SameSite/Secure posture
 /// matches the write so the browser honors the clear in the same contexts.
-pub(crate) fn session_state_cookie_clear(realm_name: &str, secure: bool) -> String {
+pub(crate) fn session_state_cookie_clear(realm: &Realm, secure: bool) -> String {
     let same_site = if secure {
         "SameSite=None; Secure"
     } else {
         "SameSite=Lax"
     };
-    format!("{}=; Path=/; Max-Age=0; {same_site}", session_state_cookie_name(realm_name))
+    format!("{}=; Path=/; Max-Age=0; {same_site}", session_state_cookie_name(realm))
 }
 
 /// Append the session-state companion-cookie clear to a logout response
@@ -302,12 +320,10 @@ pub(crate) fn session_state_cookie_clear(realm_name: &str, secure: bool) -> Stri
 /// browser-present logout or login refreshes it.
 pub(crate) fn with_session_state_cleared(
     mut resp: Response,
-    realm_name: &str,
+    realm: &Realm,
     secure: bool,
 ) -> Response {
-    if let Ok(v) =
-        axum::http::HeaderValue::from_str(&session_state_cookie_clear(realm_name, secure))
-    {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&session_state_cookie_clear(realm, secure)) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     resp
@@ -6058,7 +6074,7 @@ async fn logout_inner(
                     })),
                 )
                     .into_response(),
-                realm.name.as_str(),
+                &realm,
                 state.config.secure_cookies(),
             );
         }
@@ -6072,13 +6088,13 @@ async fn logout_inner(
         if !frontchannel_urls.is_empty() {
             return with_session_state_cleared(
                 crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls),
-                realm.name.as_str(),
+                &realm,
                 state.config.secure_cookies(),
             );
         }
         return with_session_state_cleared(
             Redirect::to(&url).into_response(),
-            realm.name.as_str(),
+            &realm,
             state.config.secure_cookies(),
         );
     }
@@ -6086,7 +6102,7 @@ async fn logout_inner(
     if !frontchannel_urls.is_empty() {
         return with_session_state_cleared(
             crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
-            realm.name.as_str(),
+            &realm,
             state.config.secure_cookies(),
         );
     }
@@ -6098,7 +6114,7 @@ async fn logout_inner(
     // capture exactly this page). No links, no scripts, no further actions.
     with_session_state_cleared(
         crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
-        realm.name.as_str(),
+        &realm,
         state.config.secure_cookies(),
     )
 }
@@ -6109,11 +6125,11 @@ async fn logout_inner(
 
 /// The OP-iframe page: per-realm static content — only the companion cookie
 /// name varies. ES5-grade JS (the conformance suite's HtmlUnit executes it):
-/// no modules, no `fetch`, no WebCrypto. `realm_name` is validated
-/// (`RealmName`); it lands in the JS as a JSON-quoted string literal, so a
-/// `"` in a name cannot break out of the string.
-pub(crate) fn check_session_iframe_page(realm_name: &str) -> String {
-    let cookie_name = serde_json::to_string(&session_state_cookie_name(realm_name))
+/// no modules, no `fetch`, no WebCrypto. The realm lands in the JS as a
+/// JSON-quoted string literal, so a `"` in a name cannot break out of the
+/// string.
+pub(crate) fn check_session_iframe_page(realm: &Realm) -> String {
+    let cookie_name = serde_json::to_string(&session_state_cookie_name(realm))
         .unwrap_or_else(|_| "\"\"".to_string())
         .replace('<', "\\u003c");
     format!(
@@ -6178,15 +6194,15 @@ pub async fn check_session_iframe_handler(
             .into_response();
     };
     // Same 404 posture as the other protocol endpoints: unknown realm.
-    match state.resolve_realm(realm_name).await {
-        Ok(Some(_)) => {}
+    let realm = match state.resolve_realm(realm_name).await {
+        Ok(Some(r)) => r,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "realm not found"})))
                 .into_response();
         }
         Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
-    }
-    let mut resp = Html(check_session_iframe_page(realm_name)).into_response();
+    };
+    let mut resp = Html(check_session_iframe_page(&realm)).into_response();
     // Per-realm content; must never be cached cross-version.
     resp.headers_mut()
         .insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -7169,13 +7185,22 @@ mod tests {
         assert!(location.contains("state=xyz"), "location: {}", location);
     }
 
+    fn realm_named(name: &str) -> Realm {
+        issuerd_core::Realm {
+            id: RealmId::new("test-realm-id").unwrap(),
+            name: issuerd_core::RealmName::new(name).unwrap(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn session_state_cookie_shapes() {
-        assert_eq!(session_state_cookie_name("master"), "issuerd_session_state_master");
+        let realm = realm_named("master");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_master");
 
         // Plain HTTP: SameSite=Lax, no Secure, never HttpOnly (the OP
         // iframe's JS must read it).
-        let header = session_state_cookie_header("master", "sess-1", false);
+        let header = session_state_cookie_header(&realm, "sess-1", false);
         assert_eq!(
             header, "issuerd_session_state_master=sess-1; Path=/; SameSite=Lax",
             "got: {header}"
@@ -7183,7 +7208,7 @@ mod tests {
         assert!(!header.contains("HttpOnly"), "the iframe JS reads this cookie");
 
         // TLS: SameSite=None; Secure (cross-site RP iframe contexts).
-        let header = session_state_cookie_header("master", "sess-1", true);
+        let header = session_state_cookie_header(&realm, "sess-1", true);
         assert_eq!(
             header, "issuerd_session_state_master=sess-1; Path=/; SameSite=None; Secure",
             "got: {header}"
@@ -7191,18 +7216,32 @@ mod tests {
 
         // The clear matches the write's SameSite/Secure posture.
         assert_eq!(
-            session_state_cookie_clear("master", true),
+            session_state_cookie_clear(&realm, true),
             "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=None; Secure"
         );
         assert_eq!(
-            session_state_cookie_clear("master", false),
+            session_state_cookie_clear(&realm, false),
             "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=Lax"
         );
     }
 
     #[test]
+    fn session_state_cookie_name_falls_back_for_cookie_unsafe_realm_names() {
+        // `we"ird` is a valid RealmName but not an RFC 6265 cookie-name
+        // component — the name falls back to the (UUID-shaped) realm id.
+        let realm = realm_named("we\"ird");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_test-realm-id");
+        // `;` and `,` are likewise out (RFC 6265 separators).
+        let realm = realm_named("a;b");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_test-realm-id");
+        // Safe names keep the readable name-based cookie.
+        let realm = realm_named("my-realm_1.x");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_my-realm_1.x");
+    }
+
+    #[test]
     fn check_session_iframe_page_is_static_and_self_contained() {
-        let page = check_session_iframe_page("master");
+        let page = check_session_iframe_page(&realm_named("master"));
         // The postMessage protocol of OIDC Session Management 1.0 §4.2.
         assert!(page.contains("addEventListener"), "{page}");
         assert!(page.contains("\"message\""), "{page}");
@@ -7220,13 +7259,14 @@ mod tests {
     }
 
     #[test]
-    fn check_session_iframe_page_escapes_the_realm_name() {
+    fn check_session_iframe_page_uses_the_fallback_name_for_unsafe_realm_names() {
         // A realm name may contain a `"` (RealmName only forbids control
-        // chars, whitespace, and URL-reserved characters) — it must not
-        // break out of the JS string literal.
-        let page = check_session_iframe_page("we\"ird");
-        assert!(page.contains("issuerd_session_state_we\\\"ird"), "{page}");
-        assert!(!page.contains("\"issuerd_session_state_we\"ird\""), "{page}");
+        // chars, whitespace, and URL-reserved characters). Such a name is not
+        // cookie-safe, so the page embeds the id-based cookie name and the
+        // raw name never reaches the JS at all.
+        let page = check_session_iframe_page(&realm_named("we\"ird"));
+        assert!(page.contains("\"issuerd_session_state_test-realm-id\""), "{page}");
+        assert!(!page.contains("we\"ird"), "the raw name never reaches the JS: {page}");
     }
 
     #[tokio::test]
