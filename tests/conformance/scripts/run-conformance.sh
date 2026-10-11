@@ -47,6 +47,12 @@ ISSUERD_URL="$OP" ISSUERD_CACERT="$CACERT" bash /usr/local/bin/issuerd-bootstrap
 
 run_plan() {
     local plan="$1" config="$2" skips="$3" logname="$4"
+    # Absolute config paths (rendered configs under /tmp) pass through;
+    # relative ones resolve in the mounted configs directory.
+    local config_path="$config"
+    if [[ "$config" != /* ]]; then
+        config_path="$CONFIGS/$config"
+    fi
     echo ""
     echo "=========================================="
     echo "Running: $plan"
@@ -56,7 +62,7 @@ run_plan() {
         --expected-skips-file "$CONFIGS/$skips" \
         --export-dir /results/export-json \
         "$plan" \
-        "$CONFIGS/$config" \
+        "$config_path" \
         2>&1 | tee "/results/$logname" || OVERALL_RESULT=1
 }
 
@@ -77,6 +83,22 @@ run_plan \
     "issuerd-formpost-op.json" \
     "issuerd-expected-skips.json" \
     "oidcc-formpost-basic-certification-test-plan-output.log"
+
+# 3rd-Party-Init OP: the plan pins dynamic_client, so registrations flow
+# through the initial-access-token-gated endpoint; bootstrap minted an
+# unlimited, non-expiring token into /results. The plan runs once per
+# response type (the variant is menu-selected but never exercised) — six
+# runs × 2 modules = the published 12.
+THIRDPARTY_CONFIG=/tmp/issuerd-3rdparty-init-op.json
+sed "s/@INITIAL_ACCESS_TOKEN@/$(cat /results/initial-access-token.txt)/" \
+    "$CONFIGS/issuerd-3rdparty-init-op.json" > "$THIRDPARTY_CONFIG"
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-3rdparty-init-login-certification-test-plan[server_metadata=discovery][client_registration=dynamic_client][response_type=$rt]" \
+        "$THIRDPARTY_CONFIG" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-3rdparty-init-login-certification-test-plan-${rt// /-}-output.log"
+done
 
 echo ""
 echo "=== Exporting HTML reports ==="

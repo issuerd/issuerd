@@ -56,7 +56,10 @@ echo "=== Creating realm 'conformance' ==="
         "id": "conformance",
         "realm": "conformance",
         "enabled": true,
-        "displayName": "Conformance Test Realm"
+        "displayName": "Conformance Test Realm",
+        "attributes": {
+            "dynamic_client_registration_enabled": "true"
+        }
     }'
 
 echo "=== Creating client 'conformance-client' ==="
@@ -74,6 +77,13 @@ echo "=== Creating client 'conformance-client' ==="
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
+        "attributes": {
+            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
+            "frontchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/frontchannel_logout",
+            "frontchannel_logout_session_required": "true",
+            "backchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/backchannel_logout",
+            "backchannel_logout_session_required": "true"
+        },
         "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"],
         "optional_scopes": [],
         "standard_flow_enabled": true,
@@ -97,6 +107,13 @@ echo "=== Creating client 'conformance-client-2' ==="
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
+        "attributes": {
+            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
+            "frontchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/frontchannel_logout",
+            "frontchannel_logout_session_required": "true",
+            "backchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/backchannel_logout",
+            "backchannel_logout_session_required": "true"
+        },
         "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"],
         "optional_scopes": [],
         "standard_flow_enabled": true,
@@ -152,5 +169,23 @@ USER_ID=$("${CURL[@]}" "$BASE_URL/admin/realms/conformance/users?username=confor
         "value": "conformance-password",
         "temporary": false
     }' || { echo "Failed to set password, continuing..."; }
+
+echo "=== Minting initial access token for dynamic registration ==="
+# Unlimited-use, non-expiring token: the conformance suite's dynamic_client
+# plans register a fresh client per module (3rd-Party-Init OP, Dynamic OP).
+# The raw token is handed to the runner via the writable /results mount, which
+# run-conformance.sh renders into the generated plan configs.
+INITIAL_ACCESS_TOKEN=$("${CURL[@]}" "$BASE_URL/admin/realms/conformance/clients-initial-access" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{"expiration": 0, "count": 0}' | \
+    "$PYTHON" -c "import sys, json; print(json.load(sys.stdin)['token'])")
+if [[ -d /results ]] && [[ -w /results ]]; then
+    printf '%s' "$INITIAL_ACCESS_TOKEN" > /results/initial-access-token.txt
+    echo "Initial access token written to /results/initial-access-token.txt"
+else
+    echo "Initial access token: $INITIAL_ACCESS_TOKEN"
+fi
 
 echo "=== Bootstrap complete ==="
