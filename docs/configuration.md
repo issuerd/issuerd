@@ -24,6 +24,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[oauth]](#oauth)
 - [[dpop]](#dpop)
 - [[crypto.key_encryption]](#cryptokey_encryption)
+- [[outbound_http]](#outbound_http)
 - [[themes]](#themes)
 - [[smtp]](#smtp)
 - [Token signing algorithm](#token-signing-algorithm)
@@ -538,6 +539,26 @@ Environment equivalents: `ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_ID` and
   the internal copies `ring`/`jsonwebtoken` make per sign call — the guarantee
   is "no additional long-lived plaintext copies beyond the resident key".
 
+## [outbound_http]
+
+Trust roots for **outbound** HTTPS calls. Issuerd talks to other servers when
+it fetches identity-provider metadata and JWKS documents, client `jwks_url`
+documents and pairwise `sector_identifier_uri` documents, and when it delivers
+back-channel logout notifications. All of these ride reqwest/rustls with the
+public webpki root store; a deployment behind a private CA (corporate TLS
+inspection, an internal CA, a hermetic test rig) adds its roots here.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `extra_ca_bundle` | path | unset | PEM file with additional root CA certificates (the file may hold several). **Additive** to the public roots. A missing file, unparseable content, or a bundle with zero valid certificates aborts the boot — fail closed, so a typo never silently falls back to public roots only. |
+
+```toml
+[outbound_http]
+extra_ca_bundle = "/etc/issuerd/corp-root-ca.pem"
+```
+
+Environment equivalent: `ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE`.
+
 ## [themes]
 
 | Key | Type | Default |
@@ -800,6 +821,13 @@ lifetime_secs = 30              # single-use nonce TTL; 5-300
 # [[crypto.key_encryption.previous_keys]]   # retired KEKs, decrypt-only (rotation window)
 # key_id     = "kek-2025-01"
 # key_base64 = "..."
+
+# ---- Outbound HTTP ----------------------------------------------------------
+# Omitted = outbound HTTPS (IdP/JWKS/sector fetches, back-channel logout)
+# trusts the public webpki roots only. Add a bundle for private-CA endpoints;
+# a bad path/empty bundle aborts the boot.
+# [outbound_http]
+# extra_ca_bundle = "certs/corp-root-ca.pem"   # PEM file, may hold several roots
 
 # ---- Themes -----------------------------------------------------------------
 [themes]

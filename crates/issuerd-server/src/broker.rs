@@ -52,12 +52,14 @@ pub struct ReqwestBrokerClient {
 const MAX_UNTRUSTED_BODY_BYTES: usize = 64 * 1024;
 
 impl ReqwestBrokerClient {
-    pub fn new() -> Result<Self, IssuerdError> {
-        let client = reqwest::Client::builder()
+    /// Build the broker client. `extra_roots` are the additional root CAs from
+    /// `[outbound_http] extra_ca_bundle` (empty = public webpki roots only).
+    pub fn new(extra_roots: &[reqwest::Certificate]) -> Result<Self, IssuerdError> {
+        let client = crate::outbound_http::client_builder(extra_roots)
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
-        let untrusted_client = reqwest::Client::builder()
+        let untrusted_client = crate::outbound_http::client_builder(extra_roots)
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -565,12 +567,12 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_client_builds() {
-        assert!(ReqwestBrokerClient::new().is_ok());
+        assert!(ReqwestBrokerClient::new(&[]).is_ok());
     }
 
     #[tokio::test]
     async fn guarded_fetch_rejects_non_https_before_any_network_io() {
-        let client = ReqwestBrokerClient::new().unwrap();
+        let client = ReqwestBrokerClient::new(&[]).unwrap();
         let err = client.get_json_ssrf_guarded("http://app.example.com/jwks").await.unwrap_err();
         assert!(
             matches!(err, IssuerdError::InvalidRequest(_)),

@@ -52,5 +52,7 @@ lifetime_secs = 30
 
 [crypto]
 
+[outbound_http]
+
 [themes]
 dir = "themes"

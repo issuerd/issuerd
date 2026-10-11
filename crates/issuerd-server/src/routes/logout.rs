@@ -52,11 +52,14 @@ pub struct BackchannelLogoutDispatcher {
 }
 
 impl BackchannelLogoutDispatcher {
+    /// `extra_roots` are the additional root CAs from `[outbound_http]
+    /// extra_ca_bundle` (empty = public webpki roots only).
     pub fn new(
         storage: Arc<dyn Storage>,
         token_manager: Arc<dyn TokenIssuer>,
+        extra_roots: &[reqwest::Certificate],
     ) -> Result<Self, IssuerdError> {
-        let http = reqwest::Client::builder()
+        let http = crate::outbound_http::client_builder(extra_roots)
             .timeout(Duration::from_secs(BACKCHANNEL_TIMEOUT_SECS))
             .build()
             .map_err(|e| {
@@ -485,7 +488,7 @@ mod tests {
         };
 
         let dispatcher =
-            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(FailingTokenIssuer))
+            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(FailingTokenIssuer), &[])
                 .unwrap();
         dispatcher.dispatch(&realm, &session).await;
 
@@ -676,7 +679,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let dispatcher =
-            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(issuer)).unwrap();
+            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(issuer), &[]).unwrap();
         dispatcher.dispatch(&realm, &session).await;
 
         let recorded = calls.lock().unwrap().clone();

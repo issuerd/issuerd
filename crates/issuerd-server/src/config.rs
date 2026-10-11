@@ -41,6 +41,9 @@ pub struct ServerConfig {
     /// Crypto settings (`[crypto]` section).
     #[serde(default)]
     pub crypto: CryptoSettings,
+    /// Outbound HTTP settings (`[outbound_http]` section).
+    #[serde(default)]
+    pub outbound_http: OutboundHttpConfig,
     /// Login-theme asset directory (`[themes]` section).
     pub themes: ThemesConfig,
     /// Optional path to a provision config file (YAML/TOML/JSON).
@@ -67,6 +70,7 @@ impl Default for ServerConfig {
             oauth: OAuthConfig::default(),
             dpop: DpopConfig::default(),
             crypto: CryptoSettings::default(),
+            outbound_http: OutboundHttpConfig::default(),
             themes: ThemesConfig::default(),
             provision: None,
         }
@@ -164,6 +168,7 @@ impl ServerConfig {
             oauth: OAuthConfig::default(),
             dpop: DpopConfig::default(),
             crypto: CryptoSettings::default(),
+            outbound_http: OutboundHttpConfig::default(),
             provision: Some(PathBuf::from("provision.yaml")),
         }
     }
@@ -576,6 +581,52 @@ fn decode_kek(key_base64: &str) -> Result<[u8; 32], IssuerdError> {
     })
 }
 
+/// Outbound HTTP configuration (`[outbound_http]` section).
+///
+/// Every outbound HTTPS call the server makes — identity-broker and client
+/// JWKS fetches, pairwise `sector_identifier_uri` documents, back-channel
+/// logout POSTs — rides reqwest/rustls with the public webpki roots. A
+/// deployment behind a private CA (corporate proxy, hermetic test rig) adds
+/// its roots here; the extra bundle is ADDITIVE to the public roots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutboundHttpConfig {
+    /// Path to a PEM bundle of additional root CA certificates (the file may
+    /// hold several). A missing file, unparseable content, or a bundle with
+    /// zero valid certificates aborts the boot (fail closed — an operator
+    /// typo must not silently fall back to public roots only).
+    pub extra_ca_bundle: Option<PathBuf>,
+}
+
+impl OutboundHttpConfig {
+    /// Load the configured extra root certificates. `Ok([])` when the knob is
+    /// unset; a bad path, unparseable content, or an empty bundle is a
+    /// boot-fatal error.
+    pub fn load_extra_roots(&self) -> Result<Vec<reqwest::Certificate>, IssuerdError> {
+        let Some(path) = &self.extra_ca_bundle else {
+            return Ok(Vec::new());
+        };
+        let bytes = std::fs::read(path).map_err(|e| {
+            IssuerdError::ServerError(format!(
+                "outbound_http.extra_ca_bundle: cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|e| {
+            IssuerdError::ServerError(format!(
+                "outbound_http.extra_ca_bundle: {} is not a valid PEM certificate bundle: {e}",
+                path.display()
+            ))
+        })?;
+        if certs.is_empty() {
+            return Err(IssuerdError::ServerError(format!(
+                "outbound_http.extra_ca_bundle: {} contains no certificates",
+                path.display()
+            )));
+        }
+        Ok(certs)
+    }
+}
+
 /// Login-theme asset configuration (`[themes]` section).
 ///
 /// Themes are directories of static assets under `dir`: the realm's
@@ -661,6 +712,33 @@ impl SmtpConfig {
         }
     }
 }
+
+/// Two self-signed test root CAs (P-256, CN "Issuerd Test Root CA 1/2") in
+/// one PEM bundle. `pub(crate)`: the `outbound_http` module's builder test
+/// reuses it.
+#[cfg(test)]
+pub(crate) const TEST_CA_BUNDLE: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBlzCCAT2gAwIBAgIUcUefgec+cRxhBR1jLoWQIvQzDAMwCgYIKoZIzj0EAwIw\n\
+ITEfMB0GA1UEAwwWSXNzdWVyZCBUZXN0IFJvb3QgQ0EgMTAeFw0yNjEwMTExMjM2\n\
+NTZaFw0zNjEwMDgxMjM2NTZaMCExHzAdBgNVBAMMFklzc3VlcmQgVGVzdCBSb290\n\
+IENBIDEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQu0vi1aIYQyp8tVOWJEWQ8\n\
+S+kbGuFoqdUC9MoP8msh7f+J41XStvkBoNpHk+HmitWK2Qhy/87ApgY5yEO1T4Pr\n\
+o1MwUTAdBgNVHQ4EFgQUCW4VegNmq1RUny3Vd6Iyzy75k6kwHwYDVR0jBBgwFoAU\n\
+CW4VegNmq1RUny3Vd6Iyzy75k6kwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD\n\
+AgNIADBFAiA2OPBMyCmEUhrcjK1276F3V1yCoxFIxPkQvkIb2owsggIhAKbKyiIP\n\
+24PqbhXyX1NX2ua29G6a3iw0bE8cYyJMuED3\n\
+-----END CERTIFICATE-----\n\
+-----BEGIN CERTIFICATE-----\n\
+MIIBljCCAT2gAwIBAgIUC930DsPyCirPWa+66Fa5kPKlgaowCgYIKoZIzj0EAwIw\n\
+ITEfMB0GA1UEAwwWSXNzdWVyZCBUZXN0IFJvb3QgQ0EgMjAeFw0yNjEwMTExMjM2\n\
+NTZaFw0zNjEwMDgxMjM2NTZaMCExHzAdBgNVBAMMFklzc3VlcmQgVGVzdCBSb290\n\
+IENBIDIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS1jiXesqhcNE5llJg+M+uU\n\
+V5jHbmIeBZZEr8VX3SlDDrdTK4r3FIyl0ac3bkKmlbdjq9KqGsypVppIr41QUti/\n\
+o1MwUTAdBgNVHQ4EFgQUrfs5KKraDHH/LzD1gD5E4UNDpSwwHwYDVR0jBBgwFoAU\n\
+rfs5KKraDHH/LzD1gD5E4UNDpSwwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD\n\
+AgNHADBEAiA1ZQXpVoozsS20Oxe4VEtNMW879GrDGg5GcIgou+93WgIgFLkrIjV8\n\
+3O4kYIoY4KWau+mzQNF+FRhTLNW01/ArJF4=\n\
+-----END CERTIFICATE-----\n";
 
 #[cfg(test)]
 mod tests {
@@ -1010,6 +1088,96 @@ key_base64 = "{}"
             };
             assert!(settings.build_kek_provider().is_err(), "{label} must fail validation");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // [outbound_http]
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn outbound_http_absent_by_default() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.outbound_http.extra_ca_bundle.is_none());
+        assert!(cfg.outbound_http.load_extra_roots().unwrap().is_empty());
+        assert!(ServerConfig::generate_example().outbound_http.extra_ca_bundle.is_none());
+    }
+
+    #[test]
+    fn outbound_http_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("outbound_http_toml", "toml");
+        fs::write(&path, "[outbound_http]\nextra_ca_bundle = \"/etc/ssl/corp.pem\"\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert_eq!(
+            cfg.outbound_http.extra_ca_bundle.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/corp.pem"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbound_http_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE", "/tmp/roots.pem");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE");
+        assert_eq!(
+            cfg.outbound_http.extra_ca_bundle.as_deref(),
+            Some(std::path::Path::new("/tmp/roots.pem"))
+        );
+    }
+
+    #[test]
+    fn outbound_http_bundle_loading_failures_fail_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Missing file.
+        let cfg = OutboundHttpConfig {
+            extra_ca_bundle: Some(PathBuf::from("/nonexistent/roots.pem")),
+        };
+        let err = cfg.load_extra_roots().unwrap_err();
+        assert!(err.to_string().contains("extra_ca_bundle"), "{err}");
+        assert!(err.to_string().contains("cannot read"), "{err}");
+
+        let (path, dir) = temp_path("outbound_garbage", "pem");
+
+        // Malformed PEM block (bad base64 in a CERTIFICATE section).
+        fs::write(
+            &path,
+            "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let cfg = OutboundHttpConfig {
+            extra_ca_bundle: Some(path.clone()),
+        };
+        let err = cfg.load_extra_roots().unwrap_err();
+        assert!(err.to_string().contains("not a valid PEM"), "{err}");
+
+        // A readable file with zero certificates (plain text / empty file) —
+        // fail closed rather than silently trusting nothing extra.
+        for content in ["this is not a PEM bundle\n", ""] {
+            fs::write(&path, content).unwrap();
+            let cfg = OutboundHttpConfig {
+                extra_ca_bundle: Some(path.clone()),
+            };
+            let err = cfg.load_extra_roots().unwrap_err();
+            assert!(err.to_string().contains("no certificates"), "{err}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbound_http_valid_bundle_loads_all_certificates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("outbound_ok", "pem");
+        fs::write(&path, TEST_CA_BUNDLE).unwrap();
+        let cfg = OutboundHttpConfig {
+            extra_ca_bundle: Some(path.clone()),
+        };
+        let certs = cfg.load_extra_roots().unwrap();
+        assert_eq!(certs.len(), 2, "both bundle certificates load");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------------------------

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Extra CA bundle for outbound HTTP clients.** The new `[outbound_http] extra_ca_bundle` config key (env: `ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE`) points at a PEM file of additional root CA certificates trusted by every outbound HTTPS call the server makes — identity-broker metadata/JWKS fetches, client `jwks_url` documents, pairwise `sector_identifier_uri` documents, and back-channel logout POSTs. The bundle is additive to the public webpki roots; a missing file, unparseable content, or an empty bundle aborts the boot (fail closed). This is what real deployments behind corporate CAs (and hermetic test rigs with a private root CA) need.
+
 ### Fixed
 
 - **The `claims` request parameter's `userinfo` section is now honored in pure-implicit flows.** With `response_type=id_token` no access token is minted, so the userinfo endpoint cannot deliver userinfo-targeted requested claims (e.g. `claims={"userinfo":{"name":{"essential":true}}}`) — they now ride the ID token instead (OIDC Core §5.5, Keycloak parity; essential and voluntary entries alike; mapper-produced claims are never overwritten). Code, hybrid, and token-endpoint ID tokens are unchanged: userinfo serves those claims there. The `claims.id_token` section handling is untouched.

@@ -20,6 +20,7 @@ pub mod groups;
 pub mod i18n;
 pub mod middleware;
 pub mod openapi;
+pub mod outbound_http;
 pub mod provisioner;
 pub mod qr;
 pub mod routes;

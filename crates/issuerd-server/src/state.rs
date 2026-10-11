@@ -396,8 +396,15 @@ impl ServerState {
             Arc::new(issuerd_auth_flow::login_failures::LoginFailureTracker::new());
 
         // Brokered login talks to external IdPs over HTTP.
+        // Every server-built outbound HTTP client shares the configured extra
+        // root CAs (`[outbound_http] extra_ca_bundle`; fail closed on a bad
+        // bundle so a typo never silently falls back to public roots only).
+        let extra_roots = config.outbound_http.load_extra_roots()?;
+        if !extra_roots.is_empty() {
+            info!(count = extra_roots.len(), "outbound HTTP: additional root CAs configured");
+        }
         let broker_client: Arc<dyn issuerd_core::BrokerClient> =
-            Arc::new(crate::broker::ReqwestBrokerClient::new()?);
+            Arc::new(crate::broker::ReqwestBrokerClient::new(&extra_roots)?);
 
         let plugin_registry: Arc<dyn PluginRegistry> = {
             let mut reg = SimplePluginRegistry::new();
@@ -486,6 +493,7 @@ impl ServerState {
             Arc::new(crate::routes::logout::BackchannelLogoutDispatcher::new(
                 storage.clone(),
                 token_manager.clone(),
+                &extra_roots,
             )?);
 
         // Same-node signing-key reload hook: re-read the shared
@@ -891,6 +899,43 @@ mod tests {
                 "error must name the offending key: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_unreadable_extra_ca_bundle() {
+        // Fail closed: a configured-but-unreadable bundle must abort the boot
+        // instead of silently falling back to public roots only.
+        let cfg = ServerConfig {
+            outbound_http: crate::config::OutboundHttpConfig {
+                extra_ca_bundle: Some(std::path::PathBuf::from("/nonexistent/roots.pem")),
+            },
+            ..Default::default()
+        };
+        let err = match ServerState::from_config(&cfg).await {
+            Ok(_) => panic!("an unreadable extra_ca_bundle must abort boot"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("outbound_http.extra_ca_bundle"),
+            "error must name the offending key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_accepts_valid_extra_ca_bundle() {
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd_state_ca_test_{}", issuerd_core::utils::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("roots.pem");
+        std::fs::write(&bundle, crate::config::TEST_CA_BUNDLE).unwrap();
+        let cfg = ServerConfig {
+            outbound_http: crate::config::OutboundHttpConfig {
+                extra_ca_bundle: Some(bundle),
+            },
+            ..Default::default()
+        };
+        ServerState::from_config(&cfg).await.expect("a valid bundle boots");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
