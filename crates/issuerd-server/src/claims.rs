@@ -678,6 +678,39 @@ pub fn apply_requested_userinfo_claims(
     }
 }
 
+/// Evaluate the `claims` request parameter's `id_token` section into a
+/// claims overlay (OIDC Core §5.5). Identical resolution and precedence as
+/// the userinfo section ([`apply_requested_userinfo_claims`]): mapper-produced
+/// entries win, unresolvable entries are omitted (token overlays never carry
+/// null entries), essential/voluntary marks and `value`/`values` pins do not
+/// change the content.
+///
+/// Applies wherever an ID token is issued for a request that carried the
+/// `claims` parameter: the authorization endpoint (implicit and hybrid
+/// response types, via `PendingAuthData::claims`) and the token endpoint's
+/// authorization-code grant (via `AuthCodeData::claims`). The refresh,
+/// password, device and CIBA grants issue ID tokens without a `claims`
+/// context (the token request does not parse the parameter and the grant
+/// state does not retain it), so the section has no effect there.
+pub fn apply_requested_id_token_claims(
+    overlay: &mut Map<String, Value>,
+    user: &User,
+    claims: Option<&Value>,
+) {
+    let Some(claims) = claims else { return };
+    let Some(id_token_claims) = claims.get("id_token").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for claim_name in id_token_claims.keys() {
+        if overlay.contains_key(claim_name) {
+            continue;
+        }
+        if let Some(value) = requested_claim_value(user, claim_name) {
+            overlay.insert(claim_name.clone(), value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,5 +1235,47 @@ mod tests {
             ClaimTarget::UserInfo,
         );
         assert!(ui.contains_key("updated_at"));
+    }
+
+    #[test]
+    fn id_token_section_resolves_present_claims() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        let claims = serde_json::json!({
+            "id_token": {
+                "name": {"essential": true},
+                "email": null,
+                "unknown_custom_claim": null,
+                // Known but not set on the user: omitted, not null.
+                "birthdate": {"value": "1970-01-01"}
+            }
+        });
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert_eq!(overlay.get("name"), Some(&Value::String("Alice Smith".into())));
+        assert_eq!(overlay.get("email"), Some(&Value::String("alice@example.com".into())));
+        assert!(!overlay.contains_key("unknown_custom_claim"), "unknown names are ignored");
+        assert!(!overlay.contains_key("birthdate"), "unresolvable entries are omitted");
+    }
+
+    #[test]
+    fn id_token_section_never_overwrites_mapper_output() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        overlay.insert("name".to_string(), Value::String("From Mapper".into()));
+        let claims = serde_json::json!({"id_token": {"name": {"essential": true}}});
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert_eq!(overlay.get("name"), Some(&Value::String("From Mapper".into())));
+    }
+
+    #[test]
+    fn id_token_section_ignores_the_userinfo_section_and_absent_claims() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        // Only a userinfo section: the id_token evaluation is a no-op.
+        let claims = serde_json::json!({"userinfo": {"name": null}});
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert!(overlay.is_empty());
+        apply_requested_id_token_claims(&mut overlay, &user, None);
+        assert!(overlay.is_empty());
     }
 }

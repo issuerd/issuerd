@@ -1717,7 +1717,16 @@ pub(crate) async fn mint_authorization_artifacts(
         // `claims` request parameter's userinfo section (§5.5), which has no
         // other delivery channel in this flow.
         let overlay = if response_type.has_code() || response_type.has_token() {
-            None
+            // Code/hybrid legs: the scope claims are served by the userinfo
+            // endpoint (OIDC Core §5.4), but the request's `claims.id_token`
+            // section (§5.5) still applies to this ID token.
+            let mut overlay = serde_json::Map::new();
+            crate::claims::apply_requested_id_token_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            (!overlay.is_empty()).then_some(overlay)
         } else {
             let mut overlay = crate::claims::build_claims_overlay_for_targets(
                 state,
@@ -1733,6 +1742,11 @@ pub(crate) async fn mint_authorization_artifacts(
             .await
             .unwrap_or_default();
             crate::claims::apply_requested_userinfo_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            crate::claims::apply_requested_id_token_claims(
                 &mut overlay,
                 user,
                 pending.claims.as_ref(),
@@ -3423,6 +3437,16 @@ pub async fn token_handler(
             };
 
             let id_token = if scope.contains(&"openid".to_string()) {
+                // Code flow: userinfo claims via the userinfo endpoint (OIDC
+                // Core §5.4); the request's `claims.id_token` section (§5.5)
+                // applies here — it rode the authorization code along.
+                let mut id_overlay = serde_json::Map::new();
+                crate::claims::apply_requested_id_token_claims(
+                    &mut id_overlay,
+                    &user,
+                    code_data.claims.as_ref(),
+                );
+                let id_overlay = (!id_overlay.is_empty()).then_some(id_overlay);
                 match state
                     .token_manager
                     .issue_id_token(
@@ -3435,8 +3459,7 @@ pub async fn token_handler(
                         Some(&access_token),
                         Some(code),
                         Some(&code_data.acr_values),
-                        // Code flow: userinfo claims via the userinfo endpoint.
-                        None,
+                        id_overlay,
                     )
                     .await
                 {

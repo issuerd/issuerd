@@ -943,3 +943,127 @@ async fn claims_parameter_userinfo_entries_stay_out_of_code_flow_id_tokens() {
     );
     assert!(id_claims.get("nickname").is_none(), "{id_claims}");
 }
+
+// ---------------------------------------------------------------------------
+// The `claims` parameter's id_token section (OIDC Core §5.5)
+// ---------------------------------------------------------------------------
+
+/// Pure implicit with `claims={"id_token":{...}}`: the requested entries are
+/// evaluated into the authorization-endpoint ID token (the
+/// `oidcc-claims-essential` module's shape: `{"id_token":{"name":{"essential":true}}}`).
+#[tokio::test]
+async fn claims_parameter_id_token_entries_ride_the_pure_implicit_id_token() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    // scope=openid only: the mapper overlay contributes nothing profile-
+    // shaped, so every asserted claim comes from the §5.5 evaluation.
+    let claims = serde_json::json!({"id_token": {
+        "name": {"essential": true},
+        "nickname": null
+    }});
+    let query = encoded_query(&[
+        ("response_type", "id_token"),
+        ("client_id", client.client_id.as_ref()),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "s-1"),
+        ("nonce", "n-1"),
+        ("claims", &claims.to_string()),
+    ]);
+    let resp = run_flow(&harness, "test", &query, "alice").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let id_claims = jwt_payload(&params["id_token"]);
+    // The harness user is "Test User"; nickname rides from the attributes.
+    assert_eq!(id_claims["name"], "Test User", "{id_claims}");
+    assert_eq!(id_claims["nickname"], "ali", "{id_claims}");
+}
+
+/// Hybrid (`code id_token`): the `claims.id_token` section lands on the
+/// authorization-endpoint ID token, while the `claims.userinfo` section
+/// stays out of it (the userinfo endpoint serves those — §5.4).
+#[tokio::test]
+async fn claims_parameter_id_token_entries_ride_the_hybrid_id_token() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    let claims = serde_json::json!({
+        "id_token": {"name": {"essential": true}},
+        "userinfo": {"nickname": null}
+    });
+    let query = encoded_query(&[
+        ("response_type", "code id_token"),
+        ("client_id", client.client_id.as_ref()),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "s-1"),
+        ("nonce", "n-1"),
+        ("claims", &claims.to_string()),
+    ]);
+    let resp = run_flow(&harness, "test", &query, "alice").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let id_claims = jwt_payload(&params["id_token"]);
+    assert_eq!(id_claims["name"], "Test User", "{id_claims}");
+    assert!(
+        id_claims.get("nickname").is_none(),
+        "the userinfo section must not leak into the hybrid id_token: {id_claims}"
+    );
+}
+
+/// Code flow: the `claims` parameter rides the authorization code
+/// (`AuthCodeData::claims`), so the token-endpoint ID token gains the
+/// `claims.id_token` entries — while the `claims.userinfo` entries stay out
+/// (the userinfo endpoint serves them).
+#[tokio::test]
+async fn claims_parameter_id_token_entries_ride_the_code_flow_id_token() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    let claims = serde_json::json!({
+        "id_token": {"name": {"essential": true}},
+        "userinfo": {"nickname": null}
+    });
+    let query = encoded_query(&[
+        ("response_type", "code"),
+        ("client_id", client.client_id.as_ref()),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "s-1"),
+        ("claims", &claims.to_string()),
+    ]);
+    let resp = run_flow(&harness, "test", &query, "alice").await;
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let resp = harness
+        .post_form(
+            &token_path("test"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &params["code"]),
+                ("redirect_uri", REDIRECT_URI),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let id_claims = jwt_payload(json["id_token"].as_str().unwrap());
+    assert_eq!(id_claims["name"], "Test User", "{id_claims}");
+    assert!(
+        id_claims.get("nickname").is_none(),
+        "the userinfo section must not leak into the code-flow id_token: {id_claims}"
+    );
+
+    // And the userinfo endpoint serves the userinfo-section entry.
+    let resp = harness
+        .get_auth(&userinfo_path("test"), json["access_token"].as_str().unwrap())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = json_body(resp).await;
+    assert_eq!(info["nickname"], "ali", "{info}");
+}
