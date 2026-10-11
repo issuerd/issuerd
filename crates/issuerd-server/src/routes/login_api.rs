@@ -1086,10 +1086,9 @@ pub(crate) async fn complete_login_with_method(
         }
         Err(super::oidc::MintFailure::Issuance(e)) => {
             error!(realm = %realm_id, error = %e, "failed to mint the authorization response");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
+            // The body carries the OAuth error code only — the internal
+            // detail (e.g. which signing key is missing) stays in the log.
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(super::oidc::error_response(&e)))
                 .into_response();
         }
     };

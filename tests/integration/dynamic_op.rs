@@ -180,6 +180,12 @@ async fn per_client_id_token_alg_without_a_live_key_fails_loudly() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a pinned alg without a live key must fail loudly"
     );
+    // The body is the generic OAuth error — the internal detail (which
+    // algorithm has no key) stays in the server log.
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "server_error", "{json}");
+    assert!(!json.to_string().contains("ES256"), "no internals leak: {json}");
 }
 
 // ---------------------------------------------------------------------------
