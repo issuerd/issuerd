@@ -89,7 +89,9 @@ impl EffectiveMode {
 }
 
 /// Resolve the requested response mode against the spec default
-/// (`default_fragment` = the response type carries an id_token):
+/// (`default_fragment` = the response type carries an id_token and/or an
+/// access token — see
+/// [`issuerd_protocol::authorization::ResponseType::default_response_mode_is_fragment`]):
 /// - no explicit mode → query (code) or fragment (implicit/hybrid);
 /// - `jwt` → the default mode, JARM-wrapped;
 /// - explicit modes are honored as requested.
