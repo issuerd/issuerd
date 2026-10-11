@@ -1,6 +1,6 @@
 # Issuerd OIDC Conformance Test Coverage
 
-> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — Config OP 39 conditions, Basic OP 36 modules / 1858 conditions, Form Post OP 36 modules / 2010 conditions, 3rd-Party-Init OP 6 response-type runs × 2 modules; **0 failures and 0 warnings** across all plans. Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
+> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — the full OP certification matrix: Config OP, Basic OP, Implicit OP, Hybrid OP, Form Post OP (basic/implicit/hybrid legs), Dynamic OP (6 response types), 3rd-Party-Init OP (×6), and the four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel — each ×6 response types); **0 failures and 0 unexpected warnings across all 43 plan invocations** (`run.sh` exit 0). Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
 > Conformance Suite version: release-v5.3.2
 
 ## Test Environment
@@ -15,11 +15,12 @@
 
 ## Realm Configuration
 
-- Realm: `conformance`
+- Realm: `conformance` (with `dynamic_client_registration_enabled` — the Dynamic / 3rd-Party-Init plans register via DCR with a bootstrap-minted unlimited initial access token)
 - User: `conformance-user` / `conformance-password`
 - Client 1: `conformance-client` / `conformance-secret`
 - Client 2: `conformance-client-2` / `conformance-secret-2`
-- Redirect URIs: `https://suite.conformance.test:8443/test/a/issuerd/callback`
+- Logout-profile clients (per-plan isolation — the RP-Initiated plan fails on front-channel calls it doesn't expect): `conformance-client-rpi` (post_logout_redirect_uris only), `conformance-client-fc` (+ `frontchannel_logout_uri`, session-required), `conformance-client-bc` (+ `backchannel_logout_uri`, session-required)
+- Redirect URIs: `https://suite.conformance.test:8443/test/a/issuerd/callback`; post-logout: `…/post_logout_redirect`
 
 ## Test Plans
 
@@ -143,6 +144,65 @@ bootstrap-minted initial access token.
 
 **Summary**: **PASSED** — 12/12 module executions green.
 
+### 5. Implicit OP (`oidcc-implicit-certification-test-plan`)
+
+Validates the implicit flow (`response_type=id_token` and `id_token token` in one run — fragment responses, mandatory nonce, `at_hash`).
+
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 55 test modules, 2215 successes, 0 failures, 0 warnings (27.9s), static_client
+
+| Module group | Result | Notes |
+|--------------|--------|-------|
+| Happy flows, scope profiles (profile/email/address/phone/all) | **PASSED** | the pure-implicit id_token carries the full scope claim set (userinfo is unreachable without an access token) |
+| Nonce enforcement | **PASSED** | nonce-less implicit requests fail with an `invalid_request` fragment redirect |
+| display/prompt/max_age/locales/acr/claims-essential | **PASSED** (2 REVIEW) | `oidcc-prompt-login`, `oidcc-max-age-1` REVIEW-flagged as in Basic OP |
+| `oidcc-ensure-registered-redirect-uri` | **REVIEW** | error page, screenshot review (as Basic OP) |
+| `oidcc-id-token-signature` ×2 | N/A (static_client) | runs only under dynamic_client — the published count 58 assumes that variant |
+
+### 6. Hybrid OP (`oidcc-hybrid-certification-test-plan`)
+
+All three hybrid types (`code id_token`, `code token`, `code id_token token`) in one run: `c_hash`/`at_hash`, per-type nonce rules, sub consistency between the authorization- and token-endpoint id_tokens.
+
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 97 test modules, 6154 successes, 0 failures, 0 warnings (145s), static_client (published count 102 assumes dynamic_client)
+
+### 7. Form Post OP — implicit + hybrid legs (`oidcc-formpost-implicit/hybrid-certification-test-plan`)
+
+The implicit/hybrid module sets with `response_mode=form_post` (auto-submitted POST callback, no credentials in the URL query).
+
+**Latest run**: 2026-10-11 — implicit leg: 55 modules, 2333 successes, 0 failures, 0 warnings (28.6s); hybrid leg: 97 modules, 6366 successes, 0 failures, 0 warnings (146.5s)
+
+### 8. Dynamic OP (`oidcc-dynamic-certification-test-plan`)
+
+Dynamic registration (RFC 7591/7592) + per-client signing algs + signed userinfo + JAR-by-reference — one run per response type, `client_registration=dynamic_client`, `client_auth_type=private_key_jwt`.
+
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 runs (code 24 / code id_token 23 / code id_token token 23 / code token 24 / id_token 19 / id_token token 20 modules), 0 failures, 0 warnings beyond the expected set below
+
+| Module group | Result | Notes |
+|--------------|--------|-------|
+| DCR lifecycle (register → RFC 7592 read → update → delete) | **PASSED** | incl. `initiate_login_uri`, logo/policy/tos, `jwks`/`jwks_uri`, sector docs |
+| `oidcc-idtoken-rs256` / `oidcc-userinfo-rs256` | **PASSED** | per-client `id_token_signed_response_alg` / `userinfo_signed_response_alg` = RS256 (signed userinfo = `application/jwt`) |
+| `oidcc-request-uri-signed-rs256` | **PASSED** | JAR-by-reference: pre-registered `request_uris` exact-match, SSRF-guarded fetch |
+| `oidcc-refresh-token-rp-key-rotation` | **PASSED** | client JWKS rotation picked up via kid-miss refetch (61s module) |
+| `oidcc-registration-sector-uri` / `-sector-bad` | **PASSED** | sector document fetched/validated; bad sector → 400 `invalid_client_metadata` |
+| `oidcc-registration-logo/policy/tos-uri` | **REVIEW** | login page renders the client branding; screenshot review |
+| `oidcc-server-rotate-keys` | **expected failure in-plan** | manual-step module (upstream's own CI also can't rotate mid-run); real evidence: `run-rotation-check.sh` drives it standalone with a real admin-API rotation → **PASSED** |
+| `oidcc-request-uri-unsigned`, `oidcc-ensure-request-object-with-redirect-uri`, `oidcc-idtoken-unsigned` | **expected skips** | signed-only OP (`none` not advertised) |
+
+### 9. RP-Initiated Logout OP (`oidcc-rp-initiated-logout-certification-test-plan`)
+
+**Latest run**: 2026-10-11 — 6 response-type runs × (1 discovery + 10 logout modules), 0 failures, 0 warnings (≈10s per run). Negative variants (bad/modified/missing `id_token_hint`, unregistered `post_logout_redirect_uri`, missing params/state) land on rendered error/confirmation pages — REVIEW-flagged screenshot modules, as in Basic OP. `post_logout_redirect_uris` validated as the dedicated allowlist (redirect_uris fallback); the SSO session is genuinely destroyed (post-logout `prompt=none` fails).
+
+### 10. Session Management OP (`oidcc-session-management-certification-test-plan`)
+
+**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. `session_state` rides every authorization response; `check_session_iframe` serves the OP-iframe postMessage protocol (`unchanged`/`changed`/`error`); the JS-readable companion cookie is cleared on logout (second check flips to `changed`).
+
+### 11. Front-Channel Logout OP (`oidcc-frontchannel-rp-initiated-logout-certification-test-plan`)
+
+**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. The logout interstitial renders the client's `frontchannel_logout_uri` iframe with `iss`+`sid` (session-required semantics); the suite validates both against the id_token.
+
+### 12. Back-Channel Logout OP (`oidcc-backchannel-rp-initiated-logout-certification-test-plan`)
+
+**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, **2 expected warnings** per run: `EnsureIncomingTls13` / `EnsureIncomingTls12WithSecureCipherOrTls13` read the `x-ssl-protocol` request header, which the suite's own fronting nginx sets in its standard deployment — the hermetic stack serves the suite over direct HTTPS (no proxy), so the header cannot exist (`configs/issuerd-expected-warnings-backchannel.json`). The signed `logout_token` (events claim, `sub`/`sid` matching the id_token, no nonce) is delivered over TLS 1.3-capable rustls.
+
 ## Known Gaps vs. Conformance Suite Requirements
 
 | Feature | Status | Impact |
@@ -151,8 +211,8 @@ bootstrap-minted initial access token.
 
 ## Expected Failures
 
-None. `configs/issuerd-expected-failures.json` is an empty list.
+- `oidcc-server-rotate-keys` (Dynamic OP plan, in-plan): manual-step module — the pristine runner force-starts it without rotating (upstream's own CI lists it identically). Real rotation evidence comes from `run-rotation-check.sh` (standalone suite-API run with an admin-API rotation interposed, PASSED). Declared in `configs/issuerd-expected-failures-dynamic.json`.
 
 ## Expected Skips
 
-See `configs/issuerd-expected-skips.json`.
+See `configs/issuerd-expected-skips.json` (basic/formpost legs: unsigned-request-object modules) and `configs/issuerd-expected-skips-dynamic{,-other}.json` (dynamic runs, per-response-type split — a listed-but-absent skip fails a run).

@@ -83,8 +83,15 @@ downloads). The test environment itself never touches the internet —
 |------|--------|-------------|
 | `oidcc-config-certification-test-plan` | `configs/issuerd-config-op.json` | Discovery metadata & JWKS — **PASSED** |
 | `oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-basic-op.json` | Authorization code flow — **PASSED** |
-| `oidcc-formpost-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-formpost-op.json` | Code flow via `response_mode=form_post` — **PASSED** |
-| `oidcc-3rdparty-init-login-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-3rdparty-init-op.json` (rendered with the bootstrap-minted initial access token) | DCR handling of `initiate_login_uri` — **PASSED** for all six response types |
+| `oidcc-implicit-certification-test-plan[…static_client]` | `configs/issuerd-implicit-op.json` | Implicit flow (id_token, id_token token) — **PASSED** |
+| `oidcc-hybrid-certification-test-plan[…static_client]` | `configs/issuerd-hybrid-op.json` | All three hybrid types — **PASSED** |
+| `oidcc-formpost-{basic,implicit,hybrid}-certification-test-plan[…static_client]` | `configs/issuerd-formpost{-implicit,-hybrid}-op.json` | form_post variants — **PASSED** |
+| `oidcc-dynamic-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-dynamic-op.json` (+ initial-access token) | DCR (RFC 7591/7592), per-client algs, signed userinfo, JAR-by-reference — **PASSED** (`oidcc-server-rotate-keys` is the expected in-plan failure; real evidence via `run-rotation-check.sh`) |
+| `oidcc-3rdparty-init-login-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-3rdparty-init-op.json` (rendered) | `initiate_login_uri` DCR handling — **PASSED** |
+| `oidcc-rp-initiated-logout-certification-test-plan[…static_client][response_type=…]` ×6 | `configs/issuerd-rpinitiated-logout-op.json` | RP-initiated logout — **PASSED** |
+| `oidcc-session-management-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-session-op.json` | `session_state` + `check_session_iframe` — **PASSED** |
+| `oidcc-frontchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-frontchannel-logout-op.json` | front-channel iframes with iss+sid — **PASSED** |
+| `oidcc-backchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-backchannel-logout-op.json` | signed logout tokens — **PASSED** (2 expected TLS-header warnings per run — the suite's nginx-proxy header cannot exist in the proxy-less stack) |
 
 Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
@@ -97,6 +104,7 @@ tests/conformance/
 ├── docker-compose.yml         # the whole environment (see "How it works")
 ├── run.sh                     # one-command wrapper: compose up with exit-code propagation
 ├── run-focus.sh               # run a single Basic OP module against the stack
+├── run-rotation-check.sh      # standalone evidence for oidcc-server-rotate-keys (real admin-API key rotation between configure and start)
 ├── Dockerfile.suite           # pristine suite image (maven JAR build + temurin JRE)
 ├── Dockerfile.runner          # runner image (python + deps baked in, no runtime internet)
 ├── issuerd.toml             # OP config: port 8443, native TLS, issuer op.conformance.test

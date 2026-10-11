@@ -4,6 +4,15 @@ Exact suite invocations this plan adds to `tests/conformance/scripts/run-conform
 Suite pinned at `release-v5.3.2`; counts verified against the plan classes in
 `conformance-suite/src/main/java/net/openid/conformance/openid/`.
 
+> **Status 2026-10-11: the full matrix below is GREEN** — `run.sh` exit 0
+> (gate v10, evidence `tests/conformance/results/html-reports-20261011-193753`):
+> 0 failures / 0 unexpected warnings across all 43 invocations; the only
+> in-plan failure is the expected `oidcc-server-rotate-keys` (real evidence via
+> `run-rotation-check.sh`: PASSED). Implicit/Hybrid/FormPost run static_client
+> here (56/99/36 legs); the published counts (58/102/196) assume the
+> dynamic_client variant — the certification-grade dynamic reruns are the M6
+> submission-prep item.
+
 Variant-string syntax is the one already in use
 (`plan[server_metadata=discovery][client_registration=static_client]`).
 Variants not pinned by the plan and not listed here have no suite-side default

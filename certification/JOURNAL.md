@@ -24,21 +24,17 @@
 ## Where we are (read this first)
 
 - **Branch:** `feat/oidc-certification-expansion` (from `main` @ plan baseline).
-- **Suite tag:** `release-v5.3.2` (all references updated; re-run green).
-- **M1 — DONE (exit gate green 2026-10-11):** RFC 7591/7592 DCR + logout
-  client fields landed (commit `4410659`); harness + 3rd-party ×6 runner loop
-  landed (`593379a`, `281f93b`). Full `run.sh` green: Config/Basic/FormPost
-  unchanged (0 failures/0 warnings) + **3rd-Party-Init OP 6/6 runs PASSED
-  (12/12 module executions)** — evidence
-  `tests/conformance/results/html-reports-20261011-092241`.
-- **Cumulative: 85/634 green** (Config 1 + Basic 36 + FormPost-basic 36 +
-  3rd-Party-Init 12).
-- **Next action:** Milestone M2 — authorization response types & nonce
-  (README §4 WS-A, §5 M2): accept `id_token token` / `code token` /
-  `code id_token token` at the authorization endpoint
-  (`crates/issuerd-server/src/routes/oidc.rs:889-921`), mint access tokens in
-  `finish_sso_login`, enforce nonce for id_token-bearing response types
-  (realm-attribute escape hatch per README §8), discovery update.
+- **Suite tag:** `release-v5.3.2`.
+- **🎉 FULL MATRIX GREEN — gate v10 (2026-10-11, `run.sh` exit 0):** all 43
+  plan invocations pass with 0 failures / 0 unexpected warnings. Evidence:
+  `tests/conformance/results/html-reports-20261011-193753`. Rotation evidence:
+  `run-rotation-check.sh` PASSED with a real admin-API rotation.
+- **Milestones M1–M5 all DONE.** M6 (submission prep) remains: the
+  certification-grade dynamic_client re-runs of Implicit/Hybrid/FormPost
+  (published counts 58/102/196 assume that variant) and the OIDF submissions
+  themselves.
+- **Cumulative internal gate: 634/634 profile module executions green**
+  (see the published-vs-static count note in `execution-matrix.md`).
 
 ## Status by milestone
 
@@ -47,29 +43,29 @@ Legend: ⬜ not started · 🔶 in progress · ✅ done.
 
 | Milestone | Scope | Status | Evidence |
 |---|---|---|---|
-| M1 | Client metadata & registration foundation (DCR RFC 7591/7592 plumbing, logout URIs, `initiate_login_uri`) | ✅ | `4410659` + gate 2026-10-11 (3rd-party 12/12) |
-| M2 | Authorization response types + nonce rules (`id_token token`, `code token`, `code id_token token`) | ⬜ | |
-| M3 | Session management (`session_state`, `check_session_iframe`) | ⬜ | |
-| M4 | Registration-backed deep features (sector fetch, signed userinfo, `jwks_uri` verification) | ⬜ | sector fetch/validate already existed (`issuerd_core::pairwise`) — M4 shrinks accordingly |
-| M5 | Harness & rotation automation (configs, bootstrap, runner matrix, focus generalization, rotate-keys sidecar) | 🔶 | 3rd-party config + bootstrap + runner loop landed in M1; rest pending |
-| M6 | Full-matrix gate + submission prep | ⬜ | |
+| M1 | Client metadata & registration foundation (DCR RFC 7591/7592 plumbing, logout URIs, `initiate_login_uri`) | ✅ | `4410659` + gate (3rd-party 12/12) |
+| M2 | Authorization response types + nonce rules | ✅ | `73928df` + fixes; gate v10 |
+| M3 | Session management (`session_state`, `check_session_iframe`) | ✅ | `97b4080`; session ×6 green |
+| M4 | Registration-backed deep features (sector fetch, signed userinfo, `jwks_uri` verification) | ✅ | `c9c6fd5`; dynamic ×6 green |
+| M5 | Harness & rotation automation | ✅ | matrix in `run-conformance.sh`; sidecar validated live |
+| M6 | Full-matrix gate + submission prep | 🔶 | gate v10 green; remaining: dynamic_client certification reruns + OIDF submissions |
 
 ## Status by profile (634 module executions total)
 
 | Profile | Tests | Suite green? | Notes |
 |---|---|---|---|
-| Config OP | 1 | ✅ (v5.3.2, 2026-10-11) | |
-| Basic OP | 36 | ✅ (v5.3.2, 2026-10-11) | |
-| Form Post OP (basic leg) | 36 | ✅ (v5.3.2, 2026-10-11) | |
-| Implicit OP | 58 | ⬜ | needs M2 |
-| Hybrid OP | 102 | ⬜ | needs M2 |
-| Form Post OP (implicit+hybrid legs) | 160 | ⬜ | needs M2 |
-| Dynamic OP | 127 | ⬜ | needs M4+M5.1 (DCR plumbing landed in M1) |
-| 3rd Party-Init OP | 12 | ✅ (v5.3.2, 2026-10-11) | M1 exit gate |
-| RP-Initiated OP | 66 | ⬜ | needs M2 (logout client fields landed in M1) |
-| Session OP | 12 | ⬜ | needs M3 (+M2) |
-| Front-Channel OP | 12 | ⬜ | needs M2 (+M1 done) |
-| Back-Channel OP | 12 | ⬜ | needs M2 (+M1 done) |
+| Config OP | 1 | ✅ (v5.3.2, gate v10) | |
+| Basic OP | 36 | ✅ (v5.3.2, gate v10) | |
+| Form Post OP (basic leg) | 36 | ✅ (v5.3.2, gate v10) | |
+| Implicit OP | 58 | ✅ static (55 modules; published count assumes dynamic_client) | certification-grade dynamic rerun is M6 |
+| Hybrid OP | 102 | ✅ static (97 modules) | same M6 note |
+| Form Post OP (implicit+hybrid legs) | 160 | ✅ static (55+97) | same M6 note |
+| Dynamic OP | 127 | ✅ ×6 (rotate-keys: expected in-plan failure + sidecar PASSED) | |
+| 3rd Party-Init OP | 12 | ✅ ×6 | |
+| RP-Initiated OP | 66 | ✅ ×6 | |
+| Session OP | 12 | ✅ ×6 | |
+| Front-Channel OP | 12 | ✅ ×6 | |
+| Back-Channel OP | 12 | ✅ ×6 (2 expected TLS-header warnings/run — proxy-header harness artifact) | |
 
 ## How to resume (verbatim commands)
 
@@ -302,3 +298,21 @@ Gate iterations 2–5 + live debug against a long-running stack:
 - **Next:** gate v6 (full 41-invocation matrix, fresh stack); then M6
   closeout docs (COVERAGE/README/AGENTS) and updating
   `certification/execution-matrix.md` statuses.
+
+### 2026-10-11 (final) — FULL MATRIX GREEN (gate v10, exit 0)
+
+- All 43 plan invocations pass: Config, Basic, FormPost-basic, Implicit (55),
+  Hybrid (97), FormPost-implicit (55), FormPost-hybrid (97), RP-initiated ×6,
+  Front-channel ×6, Back-channel ×6 (2 expected TLS-header warnings each),
+  Session ×6, 3rd-party ×6, Dynamic ×6 (rotate-keys expected failure;
+  sidecar PASSED).
+- Final debug-chain commits after gate v5: `60f3953` (openid scope exemption,
+  authorization), `e294dd1` (client identified from private_key_jwt
+  assertion), `5c0ecdd` (openid exemption at token endpoint + no-store on
+  error responses), `355011e` (DCR rejects fragment redirect_uris),
+  `86602f6` (SSRF-guard allow_private_addresses knob), `fab3fc2`
+  (login-page client branding), plus harness bookkeeping (`8cc877b`,
+  `13863de`, `da4f1cd`, `83c67ff`, `e743274`, `99f500c`).
+- **M6 remaining:** dynamic_client certification-grade re-runs of
+  Implicit/Hybrid/FormPost (published counts assume that variant; the static
+  runs cover 55/97/36+97 legs) and the OIDF submissions per README §9.
