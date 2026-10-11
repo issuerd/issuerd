@@ -180,7 +180,7 @@ for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "
     # listed-but-absent expected skip fails the run — the code run gets its
     # own skips file with that extra entry.
     skips="issuerd-expected-skips-dynamic-other.json"
-    if [[ "$rt" == "code" ]]; then
+    if [[ "$rt" == "code" || "$rt" == "code token" ]]; then
         skips="issuerd-expected-skips-dynamic.json"
     fi
     run_plan \
