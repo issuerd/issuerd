@@ -43,6 +43,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Always start from a clean slate: a stack left running by an interactive
+# `docker compose up` would otherwise be reused — and its suite DB (mongo)
+# carries stale plans that the report export would silently mix into this
+# run's evidence.
+docker compose down --volumes >/dev/null 2>&1 || true
+
 docker compose up -d --wait --build
 
 # Stream the one-shot run's logs until it exits, then propagate its code.

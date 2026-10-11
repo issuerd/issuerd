@@ -132,7 +132,7 @@ jobs:
           git clone --depth 1 --branch release-v5.3.2
           https://gitlab.com/openid/conformance-suite.git
           tests/conformance/conformance-suite
-      # run.sh builds images, runs all three plans, exports reports into
+      # run.sh builds images, runs the full OP certification matrix (43 invocations), exports reports into
       # tests/conformance/results/, tears the stack down, and propagates the
       # conformance-run exit code. It exports DOCKER_HOST_UID/GID=$(id -u/g)
       # on Linux so the runner containers can write into the bind-mounted

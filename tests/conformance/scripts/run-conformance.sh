@@ -171,10 +171,13 @@ done
 # only response_type is user-selected. Each run registers its clients via DCR
 # with the bootstrap-minted initial access token. oidcc-server-rotate-keys is
 # an expected failure in-plan (operator-step module; real rotation evidence is
-# produced by scripts/run-rotation-check.sh).
+# produced by run-rotation-check.sh).
 DYNAMIC_CONFIG=/tmp/issuerd-dynamic-op.json
 sed "s/@INITIAL_ACCESS_TOKEN@/$(cat /results/initial-access-token.txt)/" \
     "$CONFIGS/issuerd-dynamic-op.json" > "$DYNAMIC_CONFIG"
+# The token was only needed to render the two configs above; never ship a
+# bearer credential in the evidence tarball.
+rm -f /results/initial-access-token.txt
 for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
     # oidcc-idtoken-unsigned exists (and self-skips) in the code and code
     # token runs only; a listed-but-absent expected skip fails a run, and a
@@ -191,6 +194,10 @@ for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "
         "oidcc-dynamic-certification-test-plan-${rt// /-}-output.log" \
         "issuerd-expected-failures-dynamic.json"
 done
+
+echo ""
+echo "=== Rotation evidence (oidcc-server-rotate-keys, standalone) ==="
+python3 /harness-scripts/rotate-check.py | tee /results/rotate-check-output.log || OVERALL_RESULT=1
 
 echo ""
 echo "=== Exporting HTML reports ==="
