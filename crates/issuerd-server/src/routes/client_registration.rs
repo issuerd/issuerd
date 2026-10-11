@@ -1214,7 +1214,7 @@ fn build_registration_response(
     );
     let attribute_bool = |key: &str| client.attributes.get(key).map(|v| v == "true");
     let attribute_str = |key: &str| client.attributes.get(key).filter(|v| !v.is_empty()).cloned();
-    (
+    let mut response = (
         status,
         Json(ClientRegistrationResponse {
             client: rep,
@@ -1260,7 +1260,14 @@ fn build_registration_response(
             request_uris: client_metadata::request_uris(&client),
         }),
     )
-        .into_response()
+        .into_response();
+    // The body echoes the client secret and the registration access token:
+    // never cacheable (RFC 6749 §5.1's token-response rule, applied to the
+    // management API).
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    headers.insert(axum::http::header::PRAGMA, "no-cache".parse().unwrap());
+    response
 }
 
 /// Authenticate a client-configuration request: resolve the client by its
@@ -2243,6 +2250,39 @@ mod tests {
             "the trusted path honors every field"
         );
         assert!(stored.service_accounts_enabled);
+    }
+
+    /// Create (201) and read (200) responses echo the client secret and the
+    /// registration access token: both carry no-store/no-cache.
+    #[tokio::test]
+    async fn registration_responses_carry_no_store_headers() {
+        let (state, realm) = registration_state().await;
+        let resp = register_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-cache-hdr",
+                "redirect_uris": ["http://localhost/cb"]
+            }),
+            RegistrationPolicy::Trusted,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.headers()[axum::http::header::PRAGMA], "no-cache");
+        let json = response_json(resp).await;
+        let token = json["registrationAccessToken"].as_str().unwrap().to_string();
+
+        let resp = read_registered_client_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            master_path("dcr-cache-hdr"),
+            bearer_headers(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.headers()[axum::http::header::PRAGMA], "no-cache");
     }
 
     #[test]
