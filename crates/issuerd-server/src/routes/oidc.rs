@@ -623,7 +623,7 @@ async fn try_auth_error_redirect(
     let default_fragment = params
         .get("response_type")
         .and_then(|s| s.parse::<ResponseType>().ok())
-        .is_some_and(|rt| rt.has_id_token());
+        .is_some_and(|rt| rt.default_response_mode_is_fragment());
     let packaging = crate::routes::auth_response::ResponsePackaging {
         realm: &realm,
         client_id: client.client_id.as_str(),

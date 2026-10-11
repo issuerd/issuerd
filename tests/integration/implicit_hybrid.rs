@@ -486,6 +486,40 @@ async fn nonce_is_echoed_into_the_id_token() {
     assert_eq!(jwt_payload(&params["id_token"])["nonce"], "echo-me");
 }
 
+/// Pre-parse errors (the request fails `AuthorizationRequest::parse`, but
+/// client + redirect_uri are still identifiable) ride the fragment for every
+/// token-bearing response type — `code token` included (OAuth 2.0 Multiple
+/// Response Types §3) — and the query for the pure code flow.
+#[tokio::test]
+async fn pre_parse_errors_follow_the_response_type_default_mode() {
+    // Malformed `claims` fails the parse.
+    let cases = [("code token", true), ("code", false), ("id_token", true)];
+    for (response_type, fragment) in cases {
+        let (harness, client) = fresh_fixture().await;
+        let resp = harness
+            .get(&format!(
+                "{}?{}",
+                auth_path("test"),
+                authz_query(&client, response_type, "&claims=not-json"),
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{response_type}");
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+        assert_eq!(
+            via_fragment(&location),
+            fragment,
+            "{response_type}: wrong error delivery mode: {location}"
+        );
+        let params = params_of(&location);
+        assert_eq!(
+            params.get("error").map(String::as_str),
+            Some("invalid_request"),
+            "{response_type}"
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("s-1"), "{response_type}");
+    }
+}
+
 /// Backward-compat escape hatch: the `compat.nonceless_hybrid` realm
 /// attribute restores the pre-tightening behavior for hybrid flows.
 #[tokio::test]

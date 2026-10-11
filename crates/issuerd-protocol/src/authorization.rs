@@ -512,6 +512,14 @@ impl ResponseType {
                 | ResponseType::CodeIdTokenToken
         )
     }
+
+    /// Whether the response type's default response mode is the fragment
+    /// (OAuth 2.0 Multiple Response Types §3: any token-bearing type — an
+    /// id_token and/or an access token; only the pure code flow defaults to
+    /// query).
+    pub fn default_response_mode_is_fragment(&self) -> bool {
+        self.has_id_token() || self.has_token()
+    }
 }
 
 impl std::str::FromStr for ResponseType {

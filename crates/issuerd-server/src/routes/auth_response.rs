@@ -49,10 +49,7 @@ impl<'a> ResponsePackaging<'a> {
             realm,
             client_id,
             requested_mode: auth_req.response_mode,
-            default_fragment: {
-                let rt = &auth_req.response_type;
-                rt.has_id_token() || rt.has_token()
-            },
+            default_fragment: auth_req.response_type.default_response_mode_is_fragment(),
         }
     }
 
@@ -66,7 +63,7 @@ impl<'a> ResponsePackaging<'a> {
             default_fragment: pending
                 .response_type
                 .parse::<issuerd_protocol::authorization::ResponseType>()
-                .is_ok_and(|rt| rt.has_id_token() || rt.has_token()),
+                .is_ok_and(|rt| rt.default_response_mode_is_fragment()),
         }
     }
 }
