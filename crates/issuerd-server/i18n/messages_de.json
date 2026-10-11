@@ -14,6 +14,8 @@
   "login.signedOut": "Sie wurden abgemeldet.",
   "login.redirecting": "Weiterleitung zur Anmeldung...",
   "login.continueWith": "Weiter mit {0}",
+  "login.policy": "Datenschutzerklärung",
+  "login.termsOfService": "Nutzungsbedingungen",
   "login.authFailed": "Anmeldung fehlgeschlagen. Bitte versuchen Sie es erneut.",
   "login.error.invalid_grant": "Ungültiger Benutzername oder ungültiges Passwort.",
   "login.error.access_denied": "Zugriff verweigert.",

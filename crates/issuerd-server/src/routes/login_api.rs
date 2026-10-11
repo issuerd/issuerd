@@ -1411,6 +1411,18 @@ pub struct LoginContextResponse {
     pub login_theme: Option<String>,
     /// Message bundle for `locale` (per-key English fallback applied).
     pub messages: std::collections::HashMap<String, String>,
+    /// Client branding (OIDC registration §2 metadata): present only when the
+    /// paused flow's client registered the corresponding URI. `client_name`
+    /// is the client's display name (or its client_id) — present whenever the
+    /// flow's client resolves, so the page can label the logo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_logo_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_policy_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_tos_uri: Option<String>,
 }
 
 /// Query parameters for [`login_context_handler`].
@@ -1472,16 +1484,35 @@ pub async fn login_context_handler(
                 .collect();
             // A paused flow pins its locale at the authorize
             // endpoint; reuse it when the login page passes its flow id.
-            let pending_locale = match &query.execution_id {
+            // The same lookup carries the flow's client for the branding
+            // fields below.
+            let pending = match &query.execution_id {
                 Some(execution) => {
                     let key = super::oidc::pending_auth_cache_key(&realm.id, execution);
                     match state.cache.get(&key).await {
-                        Ok(Some(bytes)) => serde_json::from_slice::<PendingAuthData>(&bytes)
-                            .ok()
-                            .and_then(|p| p.locale),
+                        Ok(Some(bytes)) => serde_json::from_slice::<PendingAuthData>(&bytes).ok(),
                         _ => None,
                     }
                 }
+                None => None,
+            };
+            let pending_locale = pending.as_ref().and_then(|p| p.locale.clone());
+            // Client branding (OIDC registration §2 `logo_uri`/`policy_uri`/
+            // `tos_uri`): resolved from the paused flow's client; UI-only
+            // hints, so a deleted/unresolvable client simply omits them.
+            let branding_client = match pending.as_ref() {
+                Some(p) => match ClientIdentifier::new(&p.client_id) {
+                    Ok(identifier) => {
+                        match state.storage.get_client_by_client_id(&realm.id, &identifier).await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                warn!(realm = %realm.id, error = %e, "login-context client lookup failed");
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                },
                 None => None,
             };
             let locale = pending_locale.unwrap_or_else(|| {
@@ -1514,6 +1545,21 @@ pub async fn login_context_handler(
                 supported_locales: realm.supported_locales.clone(),
                 login_theme: realm.login_theme.as_ref().map(|t| t.as_str().to_string()),
                 messages: bundle,
+                client_name: branding_client.as_ref().map(|c| {
+                    c.name
+                        .as_ref()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| c.client_id.to_string())
+                }),
+                client_logo_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::logo_uri(c).map(str::to_string)),
+                client_policy_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::policy_uri(c).map(str::to_string)),
+                client_tos_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::tos_uri(c).map(str::to_string)),
             })
             .into_response()
         }

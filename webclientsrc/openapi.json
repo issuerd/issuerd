@@ -20173,6 +20173,31 @@
           "messages"
         ],
         "properties": {
+          "client_logo_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client branding (OIDC registration §2 metadata): present only when the\npaused flow's client registered the corresponding URI. `client_name`\nis the client's display name (or its client_id) — present whenever the\nflow's client resolves, so the page can label the logo."
+          },
+          "client_policy_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_tos_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "duplicate_emails_allowed": {
             "type": "boolean"
           },

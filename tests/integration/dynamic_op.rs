@@ -373,3 +373,81 @@ async fn dcr_pairwise_sector_document_mismatch_rejected() {
     assert_eq!(json["error"], "invalid_client_metadata");
     assert_eq!(hits.load(Ordering::SeqCst), 1, "the sector document was fetched");
 }
+
+// ---------------------------------------------------------------------------
+// Client branding on the login page (OIDC registration §2 metadata)
+// ---------------------------------------------------------------------------
+
+/// The login-context endpoint exposes the paused flow client's registered
+/// `logo_uri`/`policy_uri`/`tos_uri` (the Dynamic OP registration modules
+/// `oidcc-registration-{logo,policy,tos}-uri` expect them on the login
+/// page); without a flow, or for a client without the attributes, the fields
+/// are omitted entirely.
+#[tokio::test]
+async fn login_context_exposes_client_branding() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("dyn-brand").await;
+    let mut client = harness.create_client("dyn-brand", false).await;
+    for (k, v) in [
+        ("logo_uri", "https://app.example.com/logo.png"),
+        ("policy_uri", "https://app.example.com/policy"),
+        ("tos_uri", "https://app.example.com/tos"),
+    ] {
+        client.attributes.insert(k.to_string(), v.to_string());
+    }
+    harness
+        .storage
+        .update_client(&issuerd_core::RealmId::new("dyn-brand").unwrap(), &client)
+        .await
+        .unwrap();
+
+    // Start a flow for that client: the login page passes its execution_id.
+    let resp = harness
+        .get(&format!(
+            "/realms/dyn-brand/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb&scope=openid&state=s-1",
+            client.client_id
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let execution_id =
+        TestHarness::extract_query_param(&location, "execution_id").expect("missing execution_id");
+
+    let resp = harness
+        .get(&format!("/realms/dyn-brand/login/context?execution_id={execution_id}"))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["client_logo_uri"], "https://app.example.com/logo.png");
+    assert_eq!(json["client_policy_uri"], "https://app.example.com/policy");
+    assert_eq!(json["client_tos_uri"], "https://app.example.com/tos");
+    // The client name rides along (the login page's logo alt text).
+    assert_eq!(json["client_name"], "Test Client");
+
+    // Without a flow there is no client context: no branding fields.
+    let resp = harness.get("/realms/dyn-brand/login/context").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    for field in ["client_logo_uri", "client_policy_uri", "client_tos_uri"] {
+        assert!(json.get(field).is_none(), "{field} must be omitted: {json}");
+    }
+
+    // A flow for a client without the attributes: same omission.
+    let plain = harness.create_client("dyn-brand", false).await;
+    let resp = harness
+        .get(&format!(
+            "/realms/dyn-brand/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb&scope=openid&state=s-1",
+            plain.client_id
+        ))
+        .await;
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let execution_id =
+        TestHarness::extract_query_param(&location, "execution_id").expect("missing execution_id");
+    let resp = harness
+        .get(&format!("/realms/dyn-brand/login/context?execution_id={execution_id}"))
+        .await;
+    let json = json_body(resp).await;
+    for field in ["client_logo_uri", "client_policy_uri", "client_tos_uri"] {
+        assert!(json.get(field).is_none(), "{field} must be omitted: {json}");
+    }
+}
