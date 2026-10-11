@@ -1618,25 +1618,31 @@ pub(crate) async fn mint_authorization_artifacts(
         // userinfo endpoint serves the claims (no overlay). Pure implicit
         // (`id_token` alone) mints NO access token, so userinfo is
         // unreachable and the ID token carries the FULL scope claim set:
-        // IdToken- AND UserInfo-targeted claims (Keycloak parity).
+        // IdToken- AND UserInfo-targeted claims (Keycloak parity) — plus the
+        // `claims` request parameter's userinfo section (§5.5), which has no
+        // other delivery channel in this flow.
         let overlay = if response_type.has_code() || response_type.has_token() {
             None
         } else {
-            Some(
-                crate::claims::build_claims_overlay_for_targets(
-                    state,
-                    &realm.id,
-                    Some(client),
-                    user,
-                    &pending.scope,
-                    &[
-                        issuerd_core::ClaimTarget::IdToken,
-                        issuerd_core::ClaimTarget::UserInfo,
-                    ],
-                )
-                .await
-                .unwrap_or_default(),
+            let mut overlay = crate::claims::build_claims_overlay_for_targets(
+                state,
+                &realm.id,
+                Some(client),
+                user,
+                &pending.scope,
+                &[
+                    issuerd_core::ClaimTarget::IdToken,
+                    issuerd_core::ClaimTarget::UserInfo,
+                ],
             )
+            .await
+            .unwrap_or_default();
+            crate::claims::apply_requested_userinfo_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            Some(overlay)
         };
         let token = state
             .token_manager
@@ -5498,165 +5504,23 @@ async fn userinfo_handler_inner(
                     resp.extend(overlay);
 
                     // Include claims requested via the `claims` parameter
+                    // (OIDC Core §5.5): presence-based; mapper-produced
+                    // claims win; known-but-missing entries keep their
+                    // null-entry shape; unknown claim names are ignored.
                     if let Some(ref claims_value) = claims.claims {
                         if let Some(userinfo_claims) =
                             claims_value.get("userinfo").and_then(|v| v.as_object())
                         {
-                            for (claim_name, _) in userinfo_claims {
+                            for claim_name in userinfo_claims.keys() {
                                 if resp.contains_key(claim_name) {
                                     continue;
                                 }
-                                match claim_name.as_str() {
-                                    "name" => {
-                                        let name = match (&user.first_name, &user.last_name) {
-                                            (Some(f), Some(l)) => format!("{f} {l}"),
-                                            (Some(f), None) => f.to_string(),
-                                            (None, Some(l)) => l.to_string(),
-                                            (None, None) => user.username.to_string(),
-                                        };
-                                        resp.insert(claim_name.clone(), serde_json::json!(name));
-                                    }
-                                    "given_name" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.first_name.as_deref()),
-                                        );
-                                    }
-                                    "family_name" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.last_name.as_deref()),
-                                        );
-                                    }
-                                    "middle_name" => {
-                                        let v = user
-                                            .attributes
-                                            .get("middle_name")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "nickname" => {
-                                        let v = user
-                                            .attributes
-                                            .get("nickname")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "preferred_username" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.username),
-                                        );
-                                    }
-                                    "profile" => {
-                                        let v = user
-                                            .attributes
-                                            .get("profile")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "picture" => {
-                                        let v = user
-                                            .attributes
-                                            .get("picture")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "website" => {
-                                        let v = user
-                                            .attributes
-                                            .get("website")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "gender" => {
-                                        let v = user
-                                            .attributes
-                                            .get("gender")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "birthdate" => {
-                                        let v = user
-                                            .attributes
-                                            .get("birthdate")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "zoneinfo" => {
-                                        let v = user
-                                            .attributes
-                                            .get("zoneinfo")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "locale" => {
-                                        let v = user
-                                            .attributes
-                                            .get("locale")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "updated_at" => {
-                                        // Truthful source: the User model now
-                                        // tracks modification time (P3-1).
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.updated_at.timestamp()),
-                                        );
-                                    }
-                                    "email" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.email.as_deref()),
-                                        );
-                                    }
-                                    "email_verified" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.email_verified),
-                                        );
-                                    }
-                                    "phone_number" => {
-                                        let v = user
-                                            .attributes
-                                            .get("phone_number")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "phone_number_verified" => {
-                                        let v = user
-                                            .attributes
-                                            .get("phone_number_verified")
-                                            .and_then(|vals| vals.first())
-                                            .map(|v| v.parse::<bool>().unwrap_or(false));
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "address" => {
-                                        let mut address = serde_json::Map::new();
-                                        for (field, attr_key) in [
-                                            ("formatted", "address_formatted"),
-                                            ("street_address", "address_street"),
-                                            ("locality", "address_locality"),
-                                            ("region", "address_region"),
-                                            ("postal_code", "address_postal_code"),
-                                            ("country", "address_country"),
-                                        ] {
-                                            let value = user
-                                                .attributes
-                                                .get(attr_key)
-                                                .and_then(|vals| vals.first().cloned());
-                                            address.insert(
-                                                field.to_string(),
-                                                serde_json::json!(value),
-                                            );
-                                        }
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::Value::Object(address),
-                                        );
-                                    }
-                                    _ => {}
+                                if crate::claims::is_known_requested_claim(claim_name) {
+                                    resp.insert(
+                                        claim_name.clone(),
+                                        crate::claims::requested_claim_value(&user, claim_name)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    );
                                 }
                             }
                         }

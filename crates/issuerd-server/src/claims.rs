@@ -578,6 +578,106 @@ pub(crate) fn bind_authorization_details_overlay(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Requested claims (OIDC Core §5.5 `claims` parameter)
+// ---------------------------------------------------------------------------
+
+/// Claim names the `claims` request parameter resolves from the user profile
+/// (the OIDC Core standard profile claim set). Unknown names are ignored by
+/// the evaluation.
+const REQUESTABLE_CLAIMS: &[&str] = &[
+    "name",
+    "given_name",
+    "family_name",
+    "middle_name",
+    "nickname",
+    "preferred_username",
+    "profile",
+    "picture",
+    "website",
+    "gender",
+    "birthdate",
+    "zoneinfo",
+    "locale",
+    "updated_at",
+    "email",
+    "email_verified",
+    "phone_number",
+    "phone_number_verified",
+    "address",
+];
+
+/// Whether `claim` has a resolver (the OIDC Core standard profile set).
+pub fn is_known_requested_claim(claim: &str) -> bool {
+    REQUESTABLE_CLAIMS.contains(&claim)
+}
+
+/// Resolve a requestable claim (OIDC Core §5.5) to its value for `user`.
+/// `None` means the underlying data is missing; callers choose the shape of
+/// that absence (the userinfo endpoint preserves its null-entry shape, token
+/// overlays omit the entry entirely).
+pub fn requested_claim_value(user: &User, claim: &str) -> Option<Value> {
+    fn attribute(user: &User, key: &str) -> Option<Value> {
+        user.attributes
+            .get(key)
+            .and_then(|vals| vals.first())
+            .map(|v| Value::String(v.clone()))
+    }
+    match claim {
+        "name" => Some(Value::String(full_name(user))),
+        "given_name" => user.first_name.as_ref().map(|n| Value::String(n.to_string())),
+        "family_name" => user.last_name.as_ref().map(|n| Value::String(n.to_string())),
+        "preferred_username" => Some(Value::String(user.username.to_string())),
+        "email" => user.email.as_ref().map(|e| Value::String(e.to_string())),
+        "email_verified" => Some(Value::Bool(user.email_verified)),
+        "updated_at" => Some(Value::from(user.updated_at.timestamp())),
+        "phone_number_verified" => user
+            .attributes
+            .get("phone_number_verified")
+            .and_then(|vals| vals.first())
+            .map(|v| Value::Bool(v.parse::<bool>().unwrap_or(false))),
+        "address" => {
+            let mut address = Map::new();
+            for (field, attr_key) in ADDRESS_FIELDS {
+                address.insert(field.to_string(), attribute(user, attr_key).unwrap_or(Value::Null));
+            }
+            Some(Value::Object(address))
+        }
+        a @ ("middle_name" | "nickname" | "profile" | "picture" | "website" | "gender"
+        | "birthdate" | "zoneinfo" | "locale" | "phone_number") => attribute(user, a),
+        _ => None,
+    }
+}
+
+/// Evaluate the `claims` request parameter's `userinfo` section into a
+/// claims overlay (OIDC Core §5.5): known entries resolve from the user's
+/// profile; mapper-produced entries win (never overwritten); unresolvable
+/// entries are omitted. Essential/voluntary marks and `value`/`values` pins
+/// do not change the content (presence-based, matching the userinfo
+/// endpoint).
+///
+/// Used by the pure-implicit authorization flow (`response_type=id_token`),
+/// where no access token is minted and the userinfo endpoint is unreachable,
+/// so userinfo-targeted requested claims must ride the ID token.
+pub fn apply_requested_userinfo_claims(
+    overlay: &mut Map<String, Value>,
+    user: &User,
+    claims: Option<&Value>,
+) {
+    let Some(claims) = claims else { return };
+    let Some(userinfo_claims) = claims.get("userinfo").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for claim_name in userinfo_claims.keys() {
+        if overlay.contains_key(claim_name) {
+            continue;
+        }
+        if let Some(value) = requested_claim_value(user, claim_name) {
+            overlay.insert(claim_name.clone(), value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

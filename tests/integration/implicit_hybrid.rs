@@ -851,3 +851,95 @@ async fn hybrid_and_code_flows_keep_userinfo_claims_out_of_id_tokens() {
         assert!(claims.get(key).is_none(), "code-flow id_token must not carry {key}: {claims}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `claims` request parameter in pure-implicit flows (OIDC Core §5.5)
+// ---------------------------------------------------------------------------
+
+/// URL-encode an authorization query from pairs (the `claims` JSON needs
+/// real percent-encoding).
+fn encoded_query(pairs: &[(&str, &str)]) -> String {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        ser.append_pair(k, v);
+    }
+    ser.finish()
+}
+
+/// Pure implicit with `claims={"userinfo":{...}}`: with no access token
+/// minted, userinfo is unreachable, so the requested userinfo-targeted
+/// claims must ride the ID token (essential and voluntary entries alike).
+#[tokio::test]
+async fn claims_parameter_userinfo_entries_ride_the_pure_implicit_id_token() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    // scope=openid only: the mapper overlay contributes nothing profile-
+    // shaped, so every asserted claim comes from the §5.5 evaluation.
+    let claims = serde_json::json!({"userinfo": {
+        "name": {"essential": true},
+        "nickname": null
+    }});
+    let query = encoded_query(&[
+        ("response_type", "id_token"),
+        ("client_id", client.client_id.as_ref()),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "s-1"),
+        ("nonce", "n-1"),
+        ("claims", &claims.to_string()),
+    ]);
+    let resp = run_flow(&harness, "test", &query, "alice").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let id_claims = jwt_payload(&params["id_token"]);
+    // The harness user is "Test User"; nickname rides from the attributes.
+    assert_eq!(id_claims["name"], "Test User", "{id_claims}");
+    assert_eq!(id_claims["nickname"], "ali", "{id_claims}");
+}
+
+/// Regression guard: the code flow's token-endpoint ID token must NOT gain
+/// the `claims.userinfo` entries (the userinfo endpoint serves them — that
+/// channel is unchanged).
+#[tokio::test]
+async fn claims_parameter_userinfo_entries_stay_out_of_code_flow_id_tokens() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    let claims = serde_json::json!({"userinfo": {
+        "name": {"essential": true},
+        "nickname": null
+    }});
+    let query = encoded_query(&[
+        ("response_type", "code"),
+        ("client_id", client.client_id.as_ref()),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "s-1"),
+        ("claims", &claims.to_string()),
+    ]);
+    let resp = run_flow(&harness, "test", &query, "alice").await;
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let resp = harness
+        .post_form(
+            &token_path("test"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &params["code"]),
+                ("redirect_uri", REDIRECT_URI),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let id_claims = jwt_payload(json["id_token"].as_str().unwrap());
+    assert!(
+        id_claims.get("name").is_none(),
+        "code-flow id_token must not gain it: {id_claims}"
+    );
+    assert!(id_claims.get("nickname").is_none(), "{id_claims}");
+}
