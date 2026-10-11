@@ -77,13 +77,6 @@ echo "=== Creating client 'conformance-client' ==="
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
-        "attributes": {
-            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
-            "frontchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/frontchannel_logout",
-            "frontchannel_logout_session_required": "true",
-            "backchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/backchannel_logout",
-            "backchannel_logout_session_required": "true"
-        },
         "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"],
         "optional_scopes": [],
         "standard_flow_enabled": true,
@@ -107,19 +100,81 @@ echo "=== Creating client 'conformance-client-2' ==="
         "redirect_uris": [
             "https://suite.conformance.test:8443/test/a/issuerd/callback"
         ],
-        "attributes": {
-            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
-            "frontchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/frontchannel_logout",
-            "frontchannel_logout_session_required": "true",
-            "backchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/backchannel_logout",
-            "backchannel_logout_session_required": "true"
-        },
         "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"],
         "optional_scopes": [],
         "standard_flow_enabled": true,
         "implicit_flow_enabled": true,
         "direct_access_grants_enabled": true,
         "service_accounts_enabled": true
+    }' || { echo "Client may already exist, continuing..."; }
+
+# Dedicated logout-profile clients: the RP-initiated plan must NOT see
+# front/back-channel logout calls (the suite fails on requests to paths the
+# module does not serve), while the front/back-channel plans require exactly
+# those client registrations. One client per logout plan keeps them isolated.
+echo "=== Creating logout-profile clients ==="
+"${CURL[@]}" "$BASE_URL/admin/realms/conformance/clients" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{
+        "client_id": "conformance-client-rpi",
+        "name": "conformance-client-rpi",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "public_client": false,
+        "secret": "conformance-secret-rpi",
+        "redirect_uris": [
+            "https://suite.conformance.test:8443/test/a/issuerd/callback"
+        ],
+        "attributes": {
+            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]"
+        },
+        "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"]
+    }' || { echo "Client may already exist, continuing..."; }
+
+"${CURL[@]}" "$BASE_URL/admin/realms/conformance/clients" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{
+        "client_id": "conformance-client-fc",
+        "name": "conformance-client-fc",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "public_client": false,
+        "secret": "conformance-secret-fc",
+        "redirect_uris": [
+            "https://suite.conformance.test:8443/test/a/issuerd/callback"
+        ],
+        "attributes": {
+            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
+            "frontchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/frontchannel_logout",
+            "frontchannel_logout_session_required": "true"
+        },
+        "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"]
+    }' || { echo "Client may already exist, continuing..."; }
+
+"${CURL[@]}" "$BASE_URL/admin/realms/conformance/clients" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{
+        "client_id": "conformance-client-bc",
+        "name": "conformance-client-bc",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "public_client": false,
+        "secret": "conformance-secret-bc",
+        "redirect_uris": [
+            "https://suite.conformance.test:8443/test/a/issuerd/callback"
+        ],
+        "attributes": {
+            "post_logout_redirect_uris": "[\"https://suite.conformance.test:8443/test/a/issuerd/post_logout_redirect\"]",
+            "backchannel_logout_uri": "https://suite.conformance.test:8443/test/a/issuerd/backchannel_logout",
+            "backchannel_logout_session_required": "true"
+        },
+        "default_scopes": ["openid", "profile", "email", "offline_access", "address", "phone"]
     }' || { echo "Client may already exist, continuing..."; }
 
 echo "=== Creating user 'conformance-user' ==="

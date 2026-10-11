@@ -5,8 +5,8 @@
     "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
   },
   "client": {
-    "client_id": "conformance-client",
-    "client_secret": "conformance-secret"
+    "client_id": "conformance-client-fc",
+    "client_secret": "conformance-secret-fc"
   },
   "client2": {
     "client_id": "conformance-client-2",
@@ -96,6 +96,18 @@
               10,
               "(?s).*",
               "update-image-placeholder-optional"
+            ]
+          ]
+        },
+        {
+          "task": "Continue after front-channel logout",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/realms/*/protocol/openid-connect/logout*",
+          "commands": [
+            [
+              "click",
+              "xpath",
+              "//a[text()='Continue']"
             ]
           ]
         },

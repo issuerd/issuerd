@@ -5,8 +5,8 @@
     "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
   },
   "client": {
-    "client_id": "conformance-client",
-    "client_secret": "conformance-secret"
+    "client_id": "conformance-client-rpi",
+    "client_secret": "conformance-secret-rpi"
   },
   "client2": {
     "client_id": "conformance-client-2",
