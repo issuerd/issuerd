@@ -404,7 +404,10 @@ impl ServerState {
             info!(count = extra_roots.len(), "outbound HTTP: additional root CAs configured");
         }
         let broker_client: Arc<dyn issuerd_core::BrokerClient> =
-            Arc::new(crate::broker::ReqwestBrokerClient::new(&extra_roots)?);
+            Arc::new(crate::broker::ReqwestBrokerClient::new(
+                &extra_roots,
+                config.outbound_http.allow_private_addresses,
+            )?);
 
         let plugin_registry: Arc<dyn PluginRegistry> = {
             let mut reg = SimplePluginRegistry::new();
@@ -908,6 +911,7 @@ mod tests {
         let cfg = ServerConfig {
             outbound_http: crate::config::OutboundHttpConfig {
                 extra_ca_bundle: Some(std::path::PathBuf::from("/nonexistent/roots.pem")),
+                allow_private_addresses: false,
             },
             ..Default::default()
         };
@@ -931,6 +935,7 @@ mod tests {
         let cfg = ServerConfig {
             outbound_http: crate::config::OutboundHttpConfig {
                 extra_ca_bundle: Some(bundle),
+                allow_private_addresses: false,
             },
             ..Default::default()
         };

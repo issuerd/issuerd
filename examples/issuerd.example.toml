@@ -53,6 +53,7 @@ lifetime_secs = 30
 [crypto]
 
 [outbound_http]
+allow_private_addresses = false
 
 [themes]
 dir = "themes"

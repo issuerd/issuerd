@@ -595,6 +595,16 @@ pub struct OutboundHttpConfig {
     /// zero valid certificates aborts the boot (fail closed — an operator
     /// typo must not silently fall back to public roots only).
     pub extra_ca_bundle: Option<PathBuf>,
+    /// **Test rigs only** — allow the SSRF-guarded outbound fetches (client
+    /// `jwks_url` documents, pairwise `sector_identifier_uri` documents,
+    /// JAR-by-reference `request_uri` objects) to dial private, loopback,
+    /// link-local, and otherwise non-publicly-routable addresses. The
+    /// https-only scheme check, the no-redirect policy, the body-size cap,
+    /// and the timeout stay enforced. Never enable in production: the guard
+    /// is what keeps those attacker-influenced URLs from probing the
+    /// internal network. Default false.
+    #[serde(default)]
+    pub allow_private_addresses: bool,
 }
 
 impl OutboundHttpConfig {
@@ -1100,6 +1110,28 @@ key_base64 = "{}"
         assert!(cfg.outbound_http.extra_ca_bundle.is_none());
         assert!(cfg.outbound_http.load_extra_roots().unwrap().is_empty());
         assert!(ServerConfig::generate_example().outbound_http.extra_ca_bundle.is_none());
+        // The SSRF guard's public-IP check is on unless explicitly lifted.
+        assert!(!cfg.outbound_http.allow_private_addresses);
+        assert!(!ServerConfig::generate_example().outbound_http.allow_private_addresses);
+    }
+
+    #[test]
+    fn outbound_http_allow_private_addresses_loads() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("outbound_http_private_toml", "toml");
+        fs::write(&path, "[outbound_http]\nallow_private_addresses = true\n").unwrap();
+        let cfg = ServerConfig::load(Some(path.clone())).unwrap();
+        assert!(cfg.outbound_http.allow_private_addresses);
+        // Absent in the file: the default (false) applies.
+        fs::write(&path, "[outbound_http]\nextra_ca_bundle = \"/etc/ssl/corp.pem\"\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(!cfg.outbound_http.allow_private_addresses);
+        let _ = fs::remove_dir_all(&dir);
+
+        std::env::set_var("ISSUERD_OUTBOUND_HTTP__ALLOW_PRIVATE_ADDRESSES", "true");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_OUTBOUND_HTTP__ALLOW_PRIVATE_ADDRESSES");
+        assert!(cfg.outbound_http.allow_private_addresses);
     }
 
     #[test]
@@ -1134,6 +1166,7 @@ key_base64 = "{}"
         // Missing file.
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(PathBuf::from("/nonexistent/roots.pem")),
+            allow_private_addresses: false,
         };
         let err = cfg.load_extra_roots().unwrap_err();
         assert!(err.to_string().contains("extra_ca_bundle"), "{err}");
@@ -1149,6 +1182,7 @@ key_base64 = "{}"
         .unwrap();
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(path.clone()),
+            allow_private_addresses: false,
         };
         let err = cfg.load_extra_roots().unwrap_err();
         assert!(err.to_string().contains("not a valid PEM"), "{err}");
@@ -1159,6 +1193,7 @@ key_base64 = "{}"
             fs::write(&path, content).unwrap();
             let cfg = OutboundHttpConfig {
                 extra_ca_bundle: Some(path.clone()),
+                allow_private_addresses: false,
             };
             let err = cfg.load_extra_roots().unwrap_err();
             assert!(err.to_string().contains("no certificates"), "{err}");
@@ -1174,6 +1209,7 @@ key_base64 = "{}"
         fs::write(&path, TEST_CA_BUNDLE).unwrap();
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(path.clone()),
+            allow_private_addresses: false,
         };
         let certs = cfg.load_extra_roots().unwrap();
         assert_eq!(certs.len(), 2, "both bundle certificates load");

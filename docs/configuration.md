@@ -551,13 +551,14 @@ inspection, an internal CA, a hermetic test rig) adds its roots here.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `extra_ca_bundle` | path | unset | PEM file with additional root CA certificates (the file may hold several). **Additive** to the public roots. A missing file, unparseable content, or a bundle with zero valid certificates aborts the boot — fail closed, so a typo never silently falls back to public roots only. |
+| `allow_private_addresses` | bool | `false` | **Test rigs only.** Lifts the public-IP check of the SSRF-guarded outbound fetches (client `jwks_url` documents, pairwise `sector_identifier_uri` documents, JAR-by-reference `request_uri` objects), so they may dial private/loopback/link-local addresses — e.g. the hermetic OIDC conformance network. The https-only scheme check, the no-redirect policy, the body-size cap, and the timeout stay enforced. **Never enable in production**: that check is what keeps those attacker-influenced URLs from probing the internal network. |
 
 ```toml
 [outbound_http]
 extra_ca_bundle = "/etc/issuerd/corp-root-ca.pem"
 ```
 
-Environment equivalent: `ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE`.
+Environment equivalent: `ISSUERD_OUTBOUND_HTTP__EXTRA_CA_BUNDLE` (and `ISSUERD_OUTBOUND_HTTP__ALLOW_PRIVATE_ADDRESSES` for the test-rig flag).
 
 ## [themes]
 
