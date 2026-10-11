@@ -14,5 +14,13 @@
     "condition": "*",
     "current-block": "*",
     "comment": "Self-skips for the same signed-only reason."
+  },
+  {
+    "test-name": "oidcc-idtoken-unsigned",
+    "configuration-filename": "*",
+    "variant": "*",
+    "condition": "*",
+    "current-block": "*",
+    "comment": "Self-skips on signed-only OPs: 'none' is not advertised in id_token_signing_alg_values_supported."
   }
 ]
