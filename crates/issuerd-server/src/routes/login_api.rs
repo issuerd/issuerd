@@ -104,6 +104,9 @@ pub struct LoginResponse {
     pub token_type: Option<String>,
     /// Access-token validity in seconds, when an access token is present.
     pub expires_in: Option<u64>,
+    /// OIDC Session Management 1.0: the SSO session id (the value the
+    /// RP-facing `session_state` authorization-response parameter carries).
+    pub session_state: Option<String>,
     pub state: Option<String>,
 }
 
@@ -607,7 +610,12 @@ pub async fn logout_api_handler(
         let Some((name, value)) = cookie.trim().split_once('=') else {
             continue;
         };
-        if name == "issuerd_session" || name.starts_with("issuerd_session_") {
+        if name.starts_with("issuerd_session_state_") {
+            // The session-state companion cookie (OIDC Session Management):
+            // its value is a bare session id, not a token — clear, never
+            // validate.
+            clear_names.push(name.to_string());
+        } else if name == "issuerd_session" || name.starts_with("issuerd_session_") {
             clear_names.push(name.to_string());
             // Validate and destroy the referenced session (resolving the
             // realm from the realm-NAME based issuer), then fan out the
@@ -769,11 +777,13 @@ pub(crate) async fn complete_login(
 /// submissions (state first, then the minted legs — code, id_token,
 /// access_token + token_type/expires_in — the pre-24.7 order, extended).
 /// Delivery (query/fragment/form_post/JARM) is decided from the pending
-/// entry's response_mode at response time.
+/// entry's response_mode at response time. OIDC Session Management 1.0:
+/// `session_state` (the SSO session id) always rides along.
 fn response_params<'a>(
     pending: &'a super::oidc::PendingAuthData,
     artifacts: &'a super::oidc::AuthorizationArtifacts,
     expires_in: &'a str,
+    session_state: &'a str,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params: Vec<(&str, &str)> = Vec::new();
     if let Some(ref s) = pending.state {
@@ -790,6 +800,7 @@ fn response_params<'a>(
         params.push(("token_type", "Bearer"));
         params.push(("expires_in", expires_in));
     }
+    params.push(("session_state", session_state));
     params
 }
 
@@ -1089,7 +1100,7 @@ pub(crate) async fn complete_login_with_method(
             state,
             &realm,
             &pending,
-            &response_params(&pending, &artifacts, &expires_in),
+            &response_params(&pending, &artifacts, &expires_in, session_id.as_ref()),
             &cookie_value,
         )
         .await
@@ -1103,11 +1114,24 @@ pub(crate) async fn complete_login_with_method(
                 token_type: artifacts.access_token.as_ref().map(|_| "Bearer".to_string()),
                 expires_in: artifacts.access_token.as_ref().map(|_| artifacts.expires_in),
                 access_token: artifacts.access_token,
+                session_state: Some(session_id.to_string()),
                 state: pending.state,
             }),
         )
             .into_response()
     };
+    // OIDC Session Management 1.0: the companion cookie carrying the current
+    // `session_state` (the SSO session id) rides every login completion. NOT
+    // HttpOnly — the check_session_iframe page's JS reads it. Re-auth
+    // refreshes it.
+    let mut resp = resp;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&super::oidc::session_state_cookie_header(
+        realm.name.as_str(),
+        session_id.as_ref(),
+        state.config.secure_cookies(),
+    )) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
     with_remember_cookie(resp)
 }
 

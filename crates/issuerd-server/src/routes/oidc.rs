@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
 use issuerd_auth_flow::typestate::FlowOutput;
@@ -253,6 +253,61 @@ pub(crate) fn session_cookie_name(realm_id: &RealmId) -> String {
 /// Name of the per-realm remember-me cookie (see [`session_cookie_name`]).
 pub(crate) fn remember_cookie_name(realm_id: &RealmId) -> String {
     format!("issuerd_remember_{realm_id}")
+}
+
+/// Name of the per-realm session-state companion cookie (OIDC Session
+/// Management 1.0). Realm-NAME scoped: the `check_session_iframe` route
+/// resolves realms by name, and a valid [`RealmName`] is always a safe
+/// cookie-name component.
+pub(crate) fn session_state_cookie_name(realm_name: &str) -> String {
+    format!("issuerd_session_state_{realm_name}")
+}
+
+/// `Set-Cookie` value for the session-state companion cookie. NOT HttpOnly —
+/// the OP iframe's JS reads it (`document.cookie`). `SameSite=None; Secure`
+/// under TLS so the RP's cross-site iframe context keeps it; plain-HTTP
+/// development rigs keep `SameSite=Lax` (browsers reject `SameSite=None`
+/// without `Secure`).
+pub(crate) fn session_state_cookie_header(
+    realm_name: &str,
+    session_state: &str,
+    secure: bool,
+) -> String {
+    let same_site = if secure {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    };
+    format!("{}={session_state}; Path=/; {same_site}", session_state_cookie_name(realm_name))
+}
+
+/// `Set-Cookie` clear for the companion cookie. The SameSite/Secure posture
+/// matches the write so the browser honors the clear in the same contexts.
+pub(crate) fn session_state_cookie_clear(realm_name: &str, secure: bool) -> String {
+    let same_site = if secure {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    };
+    format!("{}=; Path=/; Max-Age=0; {same_site}", session_state_cookie_name(realm_name))
+}
+
+/// Append the session-state companion-cookie clear to a logout response
+/// (OIDC Session Management 1.0): after a logout the RP iframe's next poll
+/// must answer "changed". Teardowns with no response channel (admin session
+/// delete, SSO idle cleanup) leave the cookie stale by design — the next
+/// browser-present logout or login refreshes it.
+pub(crate) fn with_session_state_cleared(
+    mut resp: Response,
+    realm_name: &str,
+    secure: bool,
+) -> Response {
+    if let Ok(v) =
+        axum::http::HeaderValue::from_str(&session_state_cookie_clear(realm_name, secure))
+    {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    resp
 }
 
 /// Look up a realm-scoped cookie value: the per-realm name first, then the
@@ -1827,6 +1882,10 @@ pub(crate) async fn finish_sso_login(
     if let Some(ref s) = pending.state {
         redirect_params.push(("state", s));
     }
+    // OIDC Session Management 1.0: every success authorization response
+    // carries `session_state` (the SSO session id — the same value the `sid`
+    // claim exposes), so an RP iframe can poll session liveness.
+    redirect_params.push(("session_state", session_id.as_ref()));
     crate::routes::auth_response::authorization_response(
         state,
         &pending.redirect_uri,
@@ -5827,14 +5886,20 @@ async fn logout_inner(
             })
             .unwrap_or(false);
         if !registered {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_request",
-                    "error_description": "invalid post_logout_redirect_uri"
-                })),
-            )
-                .into_response();
+            // The session was still destroyed above — the companion cookie
+            // must not outlive it.
+            return with_session_state_cleared(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "invalid post_logout_redirect_uri"
+                    })),
+                )
+                    .into_response(),
+                realm.name.as_str(),
+                state.config.secure_cookies(),
+            );
         }
         let mut redirect_params: Vec<(&str, &str)> = Vec::new();
         if let Some(s) = params.get("state") {
@@ -5844,13 +5909,25 @@ async fn logout_inner(
         // Front-channel logout: give the client iframes a chance to run before
         // the browser continues to the post-logout target.
         if !frontchannel_urls.is_empty() {
-            return crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls);
+            return with_session_state_cleared(
+                crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls),
+                realm.name.as_str(),
+                state.config.secure_cookies(),
+            );
         }
-        return Redirect::to(&url).into_response();
+        return with_session_state_cleared(
+            Redirect::to(&url).into_response(),
+            realm.name.as_str(),
+            state.config.secure_cookies(),
+        );
     }
 
     if !frontchannel_urls.is_empty() {
-        return crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls);
+        return with_session_state_cleared(
+            crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+            realm.name.as_str(),
+            state.config.secure_cookies(),
+        );
     }
 
     // No redirect target and no front-channel interstitial: render the
@@ -5858,7 +5935,101 @@ async fn logout_inner(
     // human-readable feedback instead of an empty 204 (which would leave it
     // on the previous page — the OIDC RP-Initiated Logout negative modules
     // capture exactly this page). No links, no scripts, no further actions.
-    crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls)
+    with_session_state_cleared(
+        crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+        realm.name.as_str(),
+        state.config.secure_cookies(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Session Management iframe (OIDC Session Management 1.0 §4.2)
+// ---------------------------------------------------------------------------
+
+/// The OP-iframe page: per-realm static content — only the companion cookie
+/// name varies. ES5-grade JS (the conformance suite's HtmlUnit executes it):
+/// no modules, no `fetch`, no WebCrypto. `realm_name` is validated
+/// (`RealmName`); it lands in the JS as a JSON-quoted string literal, so a
+/// `"` in a name cannot break out of the string.
+pub(crate) fn check_session_iframe_page(realm_name: &str) -> String {
+    let cookie_name = serde_json::to_string(&session_state_cookie_name(realm_name))
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
+    format!(
+        "<!DOCTYPE html>\n\
+         <html>\n\
+         <head><meta charset=\"utf-8\"/><title>check_session_iframe</title></head>\n\
+         <body>\n\
+         <script>\n\
+         // OP iframe of OIDC Session Management 1.0 (§4.2): an RP iframe posts\n\
+         // \"<client_id> <session_state>\"; the OP compares session_state against\n\
+         // its own session cookie and answers via postMessage to the message\n\
+         // origin: \"unchanged\" (session matches), \"changed\" (no cookie or a\n\
+         // different session), \"error\" (malformed message).\n\
+         (function () {{\n\
+         \x20   var COOKIE_NAME = {cookie_name};\n\
+         \x20   function readCookie() {{\n\
+         \x20       var prefix = COOKIE_NAME + \"=\";\n\
+         \x20       var parts = document.cookie ? document.cookie.split(\";\") : [];\n\
+         \x20       for (var i = 0; i < parts.length; i++) {{\n\
+         \x20           var c = parts[i].replace(/^\\s+/, \"\");\n\
+         \x20           if (c.indexOf(prefix) === 0) {{\n\
+         \x20               return c.substring(prefix.length);\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20       return null;\n\
+         \x20   }}\n\
+         \x20   function onMessage(e) {{\n\
+         \x20       if (!e.source || typeof e.data !== \"string\") {{\n\
+         \x20           return;\n\
+         \x20       }}\n\
+         \x20       var reply = \"error\";\n\
+         \x20       var parts = e.data.split(\" \");\n\
+         \x20       if (parts.length === 2 && parts[0].length > 0 && parts[1].length > 0) {{\n\
+         \x20           var current = readCookie();\n\
+         \x20           reply = current !== null && current === parts[1] ? \"unchanged\" : \"changed\";\n\
+         \x20       }}\n\
+         \x20       e.source.postMessage(reply, e.origin);\n\
+         \x20   }}\n\
+         \x20   if (window.addEventListener) {{\n\
+         \x20       window.addEventListener(\"message\", onMessage, false);\n\
+         \x20   }} else if (window.attachEvent) {{\n\
+         \x20       window.attachEvent(\"onmessage\", onMessage);\n\
+         \x20   }}\n\
+         }})();\n\
+         </script>\n\
+         </body>\n\
+         </html>"
+    )
+}
+
+/// `GET /realms/{realm}/protocol/openid-connect/check_session_iframe` — the
+/// OP iframe of OIDC Session Management 1.0 §4.2. The page performs no
+/// writes and reads only the realm's own session-state cookie, so it is
+/// frameable by RP origins (no `X-Frame-Options` anywhere in this server).
+#[instrument(skip(state), fields(realm = ?realm))]
+pub async fn check_session_iframe_handler(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
+) -> Response {
+    let Some(realm_name) = realm.as_deref() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing realm"})))
+            .into_response();
+    };
+    // Same 404 posture as the other protocol endpoints: unknown realm.
+    match state.resolve_realm(realm_name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "realm not found"})))
+                .into_response();
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
+    }
+    let mut resp = Html(check_session_iframe_page(realm_name)).into_response();
+    // Per-realm content; must never be cached cross-version.
+    resp.headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -6830,6 +7001,66 @@ mod tests {
         );
         assert!(location.contains("error=unsupported_response_type"), "location: {}", location);
         assert!(location.contains("state=xyz"), "location: {}", location);
+    }
+
+    #[test]
+    fn session_state_cookie_shapes() {
+        assert_eq!(session_state_cookie_name("master"), "issuerd_session_state_master");
+
+        // Plain HTTP: SameSite=Lax, no Secure, never HttpOnly (the OP
+        // iframe's JS must read it).
+        let header = session_state_cookie_header("master", "sess-1", false);
+        assert_eq!(
+            header, "issuerd_session_state_master=sess-1; Path=/; SameSite=Lax",
+            "got: {header}"
+        );
+        assert!(!header.contains("HttpOnly"), "the iframe JS reads this cookie");
+
+        // TLS: SameSite=None; Secure (cross-site RP iframe contexts).
+        let header = session_state_cookie_header("master", "sess-1", true);
+        assert_eq!(
+            header, "issuerd_session_state_master=sess-1; Path=/; SameSite=None; Secure",
+            "got: {header}"
+        );
+
+        // The clear matches the write's SameSite/Secure posture.
+        assert_eq!(
+            session_state_cookie_clear("master", true),
+            "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=None; Secure"
+        );
+        assert_eq!(
+            session_state_cookie_clear("master", false),
+            "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn check_session_iframe_page_is_static_and_self_contained() {
+        let page = check_session_iframe_page("master");
+        // The postMessage protocol of OIDC Session Management 1.0 §4.2.
+        assert!(page.contains("addEventListener"), "{page}");
+        assert!(page.contains("\"message\""), "{page}");
+        assert!(page.contains("postMessage"), "{page}");
+        assert!(page.contains("\"changed\""), "{page}");
+        assert!(page.contains("\"unchanged\""), "{page}");
+        assert!(page.contains("\"error\""), "{page}");
+        // The companion cookie name is baked in (JSON-quoted).
+        assert!(page.contains("\"issuerd_session_state_master\""), "{page}");
+        // Self-contained: no external assets, no fetch, no modules.
+        assert!(!page.contains("src="), "{page}");
+        assert!(!page.contains("fetch("), "{page}");
+        assert!(!page.contains("import("), "{page}");
+        assert!(!page.contains("subtle"), "{page}");
+    }
+
+    #[test]
+    fn check_session_iframe_page_escapes_the_realm_name() {
+        // A realm name may contain a `"` (RealmName only forbids control
+        // chars, whitespace, and URL-reserved characters) — it must not
+        // break out of the JS string literal.
+        let page = check_session_iframe_page("we\"ird");
+        assert!(page.contains("issuerd_session_state_we\\\"ird"), "{page}");
+        assert!(!page.contains("\"issuerd_session_state_we\"ird\""), "{page}");
     }
 
     #[tokio::test]

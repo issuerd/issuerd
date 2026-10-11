@@ -118,6 +118,9 @@ pub struct DiscoveryResponse {
     pub introspection_endpoint: Url,
     pub revocation_endpoint: Url,
     pub end_session_endpoint: Url,
+    /// The OP iframe URL (OIDC Session Management 1.0 §4.2). Always
+    /// advertised: the endpoint exists on every realm.
+    pub check_session_iframe: Url,
     pub device_authorization_endpoint: Url,
     pub backchannel_authentication_endpoint: Url,
     /// PAR endpoint per RFC 9126 §5.
@@ -201,6 +204,11 @@ impl DiscoveryResponse {
                 .unwrap(),
             end_session_endpoint: Url::parse(&format!("{}/protocol/openid-connect/logout", issuer))
                 .unwrap(),
+            check_session_iframe: Url::parse(&format!(
+                "{}/protocol/openid-connect/check_session_iframe",
+                issuer
+            ))
+            .unwrap(),
             device_authorization_endpoint: Url::parse(&format!(
                 "{}/protocol/openid-connect/auth/device",
                 issuer
@@ -378,6 +386,10 @@ mod tests {
             "https://auth.example.com/realms/test-realm/protocol/openid-connect/logout"
         );
         assert_eq!(
+            d.check_session_iframe.as_str(),
+            "https://auth.example.com/realms/test-realm/protocol/openid-connect/check_session_iframe"
+        );
+        assert_eq!(
             d.device_authorization_endpoint.as_str(),
             "https://auth.example.com/realms/test-realm/protocol/openid-connect/auth/device"
         );
@@ -505,8 +517,9 @@ mod tests {
         assert!(json.contains("\"authorization_signing_alg_values_supported\""));
         // Pairwise subjects are implemented and advertised.
         assert!(json.contains("\"subject_types_supported\":[\"public\",\"pairwise\"]"));
-        // Unimplemented features must NOT be advertised (truthful discovery).
-        assert!(!json.contains("\"check_session_iframe\""));
+        // Session management (the OP iframe endpoint) is implemented and
+        // therefore advertised (OIDC Session Management 1.0 §4.2).
+        assert!(json.contains("\"check_session_iframe\""));
         // Registration is implemented but per-realm opt-in — the
         // default (`None`) keeps the metadata out of the document.
         assert!(!json.contains("\"registration_endpoint\""));

@@ -228,13 +228,13 @@ pub async fn account_sessions_handler(
     ),
     security(("bearer_auth" = [])),
 )]
-#[instrument(skip(state, headers, _realm, session_id))]
+#[instrument(skip(state, headers, realm_segment, session_id))]
 pub async fn account_logout_session_handler(
     State(state): State<Arc<ServerState>>,
     axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
     headers: axum::http::HeaderMap,
     // The realm segment is resolved by middleware; only the session id is used.
-    Path((_realm, session_id)): Path<(String, String)>,
+    Path((realm_segment, session_id)): Path<(String, String)>,
 ) -> Response {
     let guard = match extract_auth(&state, &realm, &headers).await {
         Ok(v) => v,
@@ -294,7 +294,27 @@ pub async fn account_logout_session_handler(
     if let Ok(Some(realm)) = state.storage.get_realm(&guard.realm_id).await {
         state.logout_notifier.notify_session_destroyed(&realm, &session).await;
     }
-    StatusCode::NO_CONTENT.into_response()
+    // OIDC Session Management: when the deleted session IS the caller's
+    // current one (the bearer token's sid), the browser's session-state
+    // companion cookie must be cleared too; deleting a different session
+    // must not touch it.
+    let deleted_current = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|token| state.token_service.validate_access_token(token).ok())
+        .and_then(|v| v.claims.sid)
+        .is_some_and(|current| current == sid);
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    if deleted_current {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&super::oidc::session_state_cookie_clear(
+            &realm_segment,
+            state.config.secure_cookies(),
+        )) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
 #[utoipa::path(

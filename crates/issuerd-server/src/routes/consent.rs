@@ -163,6 +163,7 @@ pub(crate) async fn begin_consent(
                 access_token: None,
                 token_type: None,
                 expires_in: None,
+                session_state: None,
                 state: entry.pending.state.clone(),
             }),
         )

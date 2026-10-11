@@ -274,6 +274,8 @@ GET /realms/myrealm/protocol/openid-connect/logout
 
 Both capabilities are advertised in discovery (`backchannel_logout_supported`, `frontchannel_logout_supported`, each with `_session_supported`).
 
+**Session Management (OIDC Session Management 1.0).** Every successful authorization response carries `session_state` (the SSO session id — the same value as the `sid` claim in issued tokens), and login sets a JS-readable companion cookie `issuerd_session_state_{realm}` holding it (`Path=/`; `SameSite=None; Secure` on TLS, `SameSite=Lax` otherwise; refreshed on re-auth, cleared on logout). An RP polls session liveness by iframing `{issuer}/protocol/openid-connect/check_session_iframe` (advertised in discovery as `check_session_iframe`) and posting `<client_id> <session_state>` from its own iframe: the page answers `unchanged` / `changed` / `error` via `postMessage` to the message origin. Note the cookie tracks the *browser's* session, not per-client state — a session ended only out-of-band (admin deletion, idle expiry) flips the answer at the next browser-present login or logout.
+
 ## Client authentication methods
 
 Confidential clients authenticate at the token, PAR, revocation, and introspection endpoints — the same verifier backs all four. Discovery advertises the supported set in `token_endpoint_auth_methods_supported`:

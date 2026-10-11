@@ -200,6 +200,7 @@ pub(crate) async fn dispatch_actions_continuation(
                 access_token: None,
                 token_type: None,
                 expires_in: None,
+                session_state: None,
                 state: state_param,
             }),
         )

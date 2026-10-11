@@ -77,6 +77,8 @@ mod pairwise_subjects;
 mod par;
 #[path = "integration/rar.rs"]
 mod rar;
+#[path = "integration/session_management.rs"]
+mod session_management;
 #[path = "integration/spec_conformance.rs"]
 mod spec_conformance;
 #[path = "integration/token_exchange.rs"]

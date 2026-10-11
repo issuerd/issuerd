@@ -147,7 +147,6 @@ bootstrap-minted initial access token.
 
 | Feature | Status | Impact |
 |---------|--------|--------|
-| **Session Management** (`check_session_iframe`, `session_state` iframe polling) | Not implemented; not advertised in discovery | Session-management plans cannot pass |
 | **PKCE `plain`** | S256 only — `code_challenge_methods_supported` advertises `["S256"]` | plain-PKCE variants cannot pass |
 
 ## Expected Failures
