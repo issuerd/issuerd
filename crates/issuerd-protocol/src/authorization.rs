@@ -191,7 +191,11 @@ impl AuthorizationRequest {
             .collect();
 
         for scope in &self.scope {
-            if !available_scopes.contains(scope) {
+            // `openid` is the OIDC protocol marker, not a client scope:
+            // every client may request it (Keycloak parity — otherwise a
+            // client registered via DCR without a `scope` field could never
+            // run an OIDC flow).
+            if scope != "openid" && !available_scopes.contains(scope) {
                 return Err(IssuerdError::InvalidScope);
             }
         }
@@ -1435,6 +1439,24 @@ mod tests {
             request_uri: None,
         };
         assert!(req.validate(&Realm::default(), &client).is_err());
+    }
+
+    /// `openid` is the OIDC protocol marker, not a client scope: it is
+    /// allowed even when the client's scope lists omit it (Keycloak parity —
+    /// a DCR client registered without `scope` metadata must still be able to
+    /// run OIDC flows).
+    #[test]
+    fn validate_openid_always_allowed() {
+        let client = Client {
+            redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+            default_scopes: Scope::parse("profile"),
+            optional_scopes: Scope::empty(),
+            public_client: false,
+            attributes: std::collections::HashMap::new(),
+            ..make_client_defaults()
+        };
+        let req = auth_req(ResponseType::Code, "openid profile", vec![]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
     }
 
     #[test]
