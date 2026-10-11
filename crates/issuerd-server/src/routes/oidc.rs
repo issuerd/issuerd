@@ -1538,9 +1538,10 @@ pub(crate) enum MintFailure {
 ///   endpoint (access-token mapper overlay + granted RAR authorization
 ///   details); implicit/hybrid access tokens never come with a refresh
 ///   token;
-/// - the ID-token leg gets the IdToken-target claims overlay only for the
-///   PURE implicit flow (OIDC Core §5.4: when a code or access token rides
-///   along, the userinfo endpoint serves the claims) and carries
+/// - the ID-token leg carries the FULL scope claim set (IdToken- AND
+///   UserInfo-targeted claims) for the PURE implicit flow — no access token
+///   is issued there, so userinfo is unreachable (OIDC Core §5.4) — and no
+///   overlay when a code/access token rides along; it carries
 ///   `at_hash`/`c_hash` whenever an access token / code is issued alongside
 ///   (OIDC Core §3.3.2.11 — `issue_id_token` computes both from the minted
 ///   artifacts).
@@ -1613,20 +1614,25 @@ pub(crate) async fn mint_authorization_artifacts(
 
     // The ID-token leg.
     let id_token = if response_type.has_id_token() {
-        // OIDC Core §5.4: the IdToken-target claims overlay rides only the
-        // PURE implicit flow (no code/access token alongside); the other
-        // flows serve userinfo claims from the userinfo endpoint.
+        // OIDC Core §5.4: when a code or access token rides along, the
+        // userinfo endpoint serves the claims (no overlay). Pure implicit
+        // (`id_token` alone) mints NO access token, so userinfo is
+        // unreachable and the ID token carries the FULL scope claim set:
+        // IdToken- AND UserInfo-targeted claims (Keycloak parity).
         let overlay = if response_type.has_code() || response_type.has_token() {
             None
         } else {
             Some(
-                crate::claims::build_claims_overlay(
+                crate::claims::build_claims_overlay_for_targets(
                     state,
                     &realm.id,
                     Some(client),
                     user,
                     &pending.scope,
-                    issuerd_core::ClaimTarget::IdToken,
+                    &[
+                        issuerd_core::ClaimTarget::IdToken,
+                        issuerd_core::ClaimTarget::UserInfo,
+                    ],
                 )
                 .await
                 .unwrap_or_default(),
@@ -5983,7 +5989,12 @@ async fn logout_inner(
         return crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls);
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    // No redirect target and no front-channel interstitial: render the
+    // sign-out confirmation page (200 OK) so a browser lands on
+    // human-readable feedback instead of an empty 204 (which would leave it
+    // on the previous page — the OIDC RP-Initiated Logout negative modules
+    // capture exactly this page). No links, no scripts, no further actions.
+    crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls)
 }
 
 // ---------------------------------------------------------------------------
@@ -8215,7 +8226,8 @@ mod tests {
             format!("refresh_token={refresh_token}"),
         )
         .await;
-        assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+        // No post-logout redirect target: a 200 sign-out confirmation page.
+        assert_eq!(logout_resp.status(), StatusCode::OK);
         assert!(
             state.cache.get(&key).await.unwrap().is_none(),
             "logout invalidated the cached snapshot"
@@ -8497,7 +8509,12 @@ mod tests {
             "refresh_token=some_token".to_string(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // No post_logout_redirect_uri target: the browser lands on the
+        // sign-out confirmation page (200), not an empty 204.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("You have been signed out"), "confirmation page: {body}");
     }
 
     #[tokio::test]
@@ -12855,7 +12872,8 @@ mod tests {
             "".to_string(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // No params at all: the confirmation page is still the answer.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -12916,7 +12934,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
 
         // The SSO session must be gone, not just the token blacklisted.
         assert!(state.storage.get_user_session(&realm_id, &session_id).await.unwrap().is_none());
@@ -13017,7 +13035,7 @@ mod tests {
             Query(params),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
 
         // The offline session (and thus the offline refresh token) survives…
         assert!(state.storage.get_user_session(&realm_id, &offline_id).await.unwrap().is_some());
@@ -13086,7 +13104,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(state.storage.get_user_session(&realm_id, &offline_id).await.unwrap().is_none());
     }
 
@@ -16579,7 +16597,7 @@ mod tests {
         let state = logout_state_with_stub_tokens(cache.clone(), 1000).await;
 
         let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
 
         let ttls = cache.set_ttls("revoked_refresh:");
         assert_eq!(ttls.len(), 1, "exactly one blacklist write");
@@ -16598,7 +16616,7 @@ mod tests {
         let state = logout_state_with_stub_tokens(cache.clone(), 0).await;
 
         let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             cache.set_ttls("revoked_refresh:").is_empty(),
             "an already-expired refresh token needs no blacklist entry"
@@ -16642,7 +16660,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             state.storage.get_user_session(&realm_id, &sid_a).await.unwrap().is_none(),
             "the refresh token's session is destroyed"

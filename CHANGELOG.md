@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pure-implicit ID tokens now carry the full scope claim set.** With `response_type=id_token` no access token is minted, so the userinfo endpoint is unreachable for the client — the authorization-endpoint ID token now includes the UserInfo-targeted mapper claims (`website`, `zoneinfo`, `birthdate`, `gender`, `profile`, `middle_name`, `locale`, `picture`, `updated_at`, `nickname`, ...) alongside the IdToken-targeted ones (OIDC Core §5.4 permits this when userinfo cannot be reached; Keycloak behaves the same way). Hybrid and code flows are unchanged: their ID tokens stay lean and userinfo serves the rest.
+- **RP-initiated logout without a redirect target now renders a sign-out confirmation page** (`200 OK` HTML, "You have been signed out") instead of an empty `204 No Content` — a browser-driven logout with no validated `post_logout_redirect_uri` leaves the user on human-readable feedback (the OIDF conformance suite's negative logout modules capture this page; Keycloak renders an equivalent info page). The front-channel interstitial and the redirect branches are unchanged; non-browser callers (form POST) get the same small HTML body.
+
 ### Changed
 
 - **Standard-compliance tightening: `nonce` is now required for implicit and hybrid authorization requests** (OIDC Core §3.2.2.1/§3.3.2.1 — `response_type` = `id_token`, `id_token token`, `code id_token`, `code id_token token`). A request without `nonce` fails at the authorization endpoint with an `invalid_request` error redirect (error description naming the nonce, `state` echoed, fragment-delivered per the response type's default mode) to the registered `redirect_uri`. `code` and `code token` requests stay nonce-optional. **Migration:** deployments with clients sending nonce-less implicit/hybrid requests can restore the previous acceptance per realm with the `compat.nonceless_hybrid=true` realm attribute during the deprecation window.

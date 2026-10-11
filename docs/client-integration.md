@@ -264,7 +264,7 @@ GET /realms/myrealm/protocol/openid-connect/logout
 
 - The `id_token_hint` is cryptographically validated (signature, expiry, issuer) and identifies both the session to destroy and the client whose registration constrains `post_logout_redirect_uri`: the client's `post_logout_redirect_uris` attribute (a JSON array of URI strings) when set, otherwise its `redirect_uris`. Without a recognized client (hint or explicit `client_id` parameter), the redirect is refused rather than risking an open redirector.
 - `state` is echoed to the post-logout target, like in the authorization response.
-- Without a `post_logout_redirect_uri`, the endpoint answers `204 No Content` (a POST variant with form parameters exists for non-browser callers).
+- Without a `post_logout_redirect_uri`, the endpoint renders a "You have been signed out" confirmation page (`200 OK`; a POST variant with form parameters exists for non-browser callers).
 - Logout destroys the server-side session identified by the hint **and** the browser SSO session from the realm's `issuerd_session_{realm-id}` cookie, so subsequent userinfo and refresh calls fail — this is stronger than discarding tokens locally.
 
 **Front-channel and back-channel logout** tell *your* application about sessions that end elsewhere (admin action, another client's logout, idle expiry):

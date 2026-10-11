@@ -737,3 +737,117 @@ async fn jar_shares_response_type_acceptance_and_nonce_rules() {
         "{location}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pure-implicit claim completeness (OIDC Core §5.4)
+// ---------------------------------------------------------------------------
+
+/// Give the fixture's `alice` the extended profile attributes the `profile`
+/// scope's built-in mappers read.
+async fn profiled_user(harness: &TestHarness, realm: &str) {
+    let realm_id = issuerd_core::RealmId::new(realm).unwrap();
+    let mut user = harness
+        .storage
+        .get_user_by_username(&realm_id, "alice")
+        .await
+        .unwrap()
+        .expect("alice exists");
+    for (key, value) in [
+        ("website", "https://alice.example.com"),
+        ("zoneinfo", "Europe/Berlin"),
+        ("birthdate", "1990-05-15"),
+        ("nickname", "ali"),
+    ] {
+        user.attributes.insert(key.to_string(), vec![value.to_string()]);
+    }
+    harness.storage.update_user(&realm_id, &user).await.unwrap();
+}
+
+/// With `response_type=id_token` no access token is minted, so userinfo is
+/// unreachable: the authorization-endpoint ID token must carry the FULL
+/// scope claim set — the UserInfo-targeted mapper claims (`website`,
+/// `zoneinfo`, `birthdate`, `nickname`, `updated_at`, ...) alongside the
+/// IdToken-targeted ones (Keycloak parity; OIDC Core §5.4 permits this when
+/// userinfo cannot be reached).
+#[tokio::test]
+async fn pure_implicit_id_token_carries_the_full_scope_claim_set() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    let resp = run_flow(
+        &harness,
+        "test",
+        &format!(
+            "response_type=id_token&client_id={}&redirect_uri={REDIRECT_URI}&scope=openid%20profile&state=s-1&nonce=n-1",
+            client.client_id
+        ),
+        "alice",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let claims = jwt_payload(&params["id_token"]);
+
+    // The UserInfo-targeted profile claims are present with their values.
+    assert_eq!(claims["website"], "https://alice.example.com");
+    assert_eq!(claims["zoneinfo"], "Europe/Berlin");
+    assert_eq!(claims["birthdate"], "1990-05-15");
+    assert_eq!(claims["nickname"], "ali");
+    assert!(claims["updated_at"].is_number(), "updated_at: {claims}");
+    // The IdToken-targeted set stays.
+    for key in ["preferred_username", "name", "given_name", "family_name"] {
+        assert!(claims.get(key).is_some(), "missing claim {key}: {claims}");
+    }
+}
+
+/// Regression guard for the 0-warning hybrid/code legs: their ID tokens must
+/// NOT gain the UserInfo-targeted claims (the userinfo endpoint serves them
+/// there).
+#[tokio::test]
+async fn hybrid_and_code_flows_keep_userinfo_claims_out_of_id_tokens() {
+    let (harness, client) = fresh_fixture().await;
+    profiled_user(&harness, "test").await;
+
+    // code id_token (hybrid): no userinfo-targeted claims in the ID token.
+    let resp = run_flow(
+        &harness,
+        "test",
+        &format!(
+            "response_type=code%20id_token&client_id={}&redirect_uri={REDIRECT_URI}&scope=openid%20profile&state=s-1&nonce=n-1",
+            client.client_id
+        ),
+        "alice",
+    )
+    .await;
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let claims = jwt_payload(&params["id_token"]);
+    for key in ["website", "zoneinfo", "birthdate", "nickname", "updated_at"] {
+        assert!(claims.get(key).is_none(), "hybrid id_token must not carry {key}: {claims}");
+    }
+
+    // code (authorization-code flow): the token-endpoint ID token is
+    // likewise lean.
+    let resp = run_flow(&harness, "test", &authz_query(&client, "code", ""), "alice").await;
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let params = params_of(&location);
+    let resp = harness
+        .post_form(
+            &token_path("test"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &params["code"]),
+                ("redirect_uri", REDIRECT_URI),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let claims = jwt_payload(json["id_token"].as_str().unwrap());
+    for key in ["website", "zoneinfo", "birthdate", "nickname", "updated_at"] {
+        assert!(claims.get(key).is_none(), "code-flow id_token must not carry {key}: {claims}");
+    }
+}

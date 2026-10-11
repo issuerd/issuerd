@@ -466,11 +466,33 @@ pub async fn build_claims_overlay(
     granted_scope_names: &[String],
     target: ClaimTarget,
 ) -> Result<Map<String, Value>, IssuerdError> {
+    build_claims_overlay_for_targets(state, realm_id, client, user, granted_scope_names, &[target])
+        .await
+}
+
+/// [`build_claims_overlay`] over several targets at once: the overlay covers
+/// claims whose mappers apply to ANY of `targets` (union). Each mapper still
+/// evaluates once per target it applies to, later targets overwriting shared
+/// keys (values are identical for a shared mapper+key pair anyway).
+///
+/// Used by the pure-implicit authorization flow (`response_type=id_token`),
+/// where the ID token must carry the FULL scope claim set — IdToken- AND
+/// UserInfo-targeted claims — because no access token is issued and the
+/// userinfo endpoint is unreachable (OIDC Core §5.4 allows claims in the ID
+/// token when userinfo cannot be reached; Keycloak behaves the same way).
+pub async fn build_claims_overlay_for_targets(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    client: Option<&Client>,
+    user: &User,
+    granted_scope_names: &[String],
+    targets: &[ClaimTarget],
+) -> Result<Map<String, Value>, IssuerdError> {
     let reader = ClaimsReader::new(state, realm_id);
     let catalog = reader.realm_catalog().await;
 
     let mut names: Vec<String> = granted_scope_names.to_vec();
-    if target == ClaimTarget::AccessToken {
+    if targets.contains(&ClaimTarget::AccessToken) {
         if let Some(client) = client {
             // Default-assigned scopes always apply: the cached assignment ids
             // resolve to names against the catalog.
@@ -492,7 +514,7 @@ pub async fn build_claims_overlay(
     if let Some(client) = client {
         mappers.extend(client.protocol_mappers.iter());
     }
-    mappers.retain(|m| m.applies_to(target));
+    mappers.retain(|m| targets.iter().any(|t| m.applies_to(*t)));
     if mappers.is_empty() {
         return Ok(Map::new());
     }
@@ -525,7 +547,11 @@ pub async fn build_claims_overlay(
         groups,
         roles: &roles,
     };
-    Ok(evaluate_mappers(&mappers, &input, target))
+    let mut out = Map::new();
+    for target in targets {
+        out.extend(evaluate_mappers(&mappers, &input, *target));
+    }
+    Ok(out)
 }
 
 /// Username of the dedicated service-account user backing a client's

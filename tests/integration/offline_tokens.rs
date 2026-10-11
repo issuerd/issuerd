@@ -575,7 +575,8 @@ async fn http_logout_ends_cookie_sso_session_but_preserves_offline_grant() {
         .body(Body::empty())
         .unwrap();
     let resp = harness.app.clone().oneshot(harness.add_connect_info(req)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // No post_logout_redirect_uri target: the sign-out confirmation page.
+    assert_eq!(resp.status(), StatusCode::OK);
 
     // The online SSO session is gone…
     assert!(
@@ -643,7 +644,8 @@ async fn http_logout_with_refresh_token_terminates_offline_grant() {
             &[("refresh_token", refresh.as_str())],
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // No post_logout_redirect_uri target: the sign-out confirmation page.
+    assert_eq!(resp.status(), StatusCode::OK);
 
     // The offline session is gone and the rotated-token chain is dead.
     assert!(harness

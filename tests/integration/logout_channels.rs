@@ -112,14 +112,17 @@ async fn login(
 }
 
 /// POST the RP-initiated logout endpoint with an `id_token_hint`.
-async fn logout_with_hint(harness: &TestHarness, realm: &str, id_token: &str) -> StatusCode {
-    let resp = harness
+async fn logout_with_hint(
+    harness: &TestHarness,
+    realm: &str,
+    id_token: &str,
+) -> axum::response::Response {
+    harness
         .post_form(
             &format!("/realms/{realm}/protocol/openid-connect/logout"),
             &[("id_token_hint", id_token)],
         )
-        .await;
-    resp.status()
+        .await
 }
 
 /// Poll the admin-event log until an entry matches `pred`.
@@ -171,8 +174,13 @@ async fn backchannel_logout_delivers_signed_logout_token() {
     let id_token = tokens.id_token.expect("id token");
     let sid = jwt_claims(&id_token)["sid"].as_str().expect("sid claim").to_string();
 
-    let status = logout_with_hint(&harness, "bc-basic", &id_token).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    // No post_logout_redirect_uri target: the response is the sign-out
+    // confirmation page (200 HTML), not a bare 204.
+    let resp = logout_with_hint(&harness, "bc-basic", &id_token).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("You have been signed out"), "confirmation page: {body}");
 
     // The session is gone, and exactly one logout token arrived.
     let sid_typed = issuerd_core::SessionId::new(&sid).unwrap();
@@ -230,8 +238,8 @@ async fn backchannel_delivery_failure_never_blocks_logout() {
     let sid = jwt_claims(&id_token)["sid"].as_str().expect("sid claim").to_string();
 
     // The logout itself succeeds normally despite the unreachable client.
-    let status = logout_with_hint(&harness, "bc-down", &id_token).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = logout_with_hint(&harness, "bc-down", &id_token).await;
+    assert_eq!(resp.status(), StatusCode::OK);
     let sid_typed = issuerd_core::SessionId::new(&sid).unwrap();
     assert!(harness.storage.get_user_session(&realm.id, &sid_typed).await.unwrap().is_none());
 
@@ -517,8 +525,8 @@ async fn backchannel_session_required_false_omits_sid() {
 
     let tokens = login(&harness, "bc-nosess", &client, "olga").await;
     let id_token = tokens.id_token.expect("id token");
-    let status = logout_with_hint(&harness, "bc-nosess", &id_token).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = logout_with_hint(&harness, "bc-nosess", &id_token).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let bodies = receiver.wait_for_bodies(1).await;
     assert_eq!(bodies.len(), 1, "expected one delivery, got: {bodies:?}");
