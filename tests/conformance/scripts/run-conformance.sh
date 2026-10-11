@@ -176,9 +176,10 @@ DYNAMIC_CONFIG=/tmp/issuerd-dynamic-op.json
 sed "s/@INITIAL_ACCESS_TOKEN@/$(cat /results/initial-access-token.txt)/" \
     "$CONFIGS/issuerd-dynamic-op.json" > "$DYNAMIC_CONFIG"
 for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
-    # oidcc-idtoken-unsigned exists only in the response_type=code run, and a
-    # listed-but-absent expected skip fails the run — the code run gets its
-    # own skips file with that extra entry.
+    # oidcc-idtoken-unsigned exists (and self-skips) in the code and code
+    # token runs only; a listed-but-absent expected skip fails a run, and a
+    # variant-scoped entry is "used" only in an exactly matching run — so the
+    # split is per-run-type files.
     skips="issuerd-expected-skips-dynamic-other.json"
     if [[ "$rt" == "code" || "$rt" == "code token" ]]; then
         skips="issuerd-expected-skips-dynamic.json"
