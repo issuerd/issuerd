@@ -86,6 +86,15 @@ pub const ATTR_DCR_GRANT_TYPES: &str = "dcr.grant_types";
 /// client identifier was issued via dynamic registration. Stamped once at
 /// creation and carried across RFC 7592 updates.
 pub const ATTR_DCR_CLIENT_ID_ISSUED_AT: &str = "dcr.client_id_issued_at";
+/// Registration bookkeeping (not an RFC field): marks a client created
+/// through the OPEN (unauthenticated) registration endpoint
+/// (`dcr.policy=open`). RFC 7592 updates of such a client re-apply the open
+/// payload policy; the marker itself is re-stamped on every update so the
+/// registrant cannot shed it. Stamped after the payload is converted, so a
+/// caller-supplied value never survives.
+pub const ATTR_DCR_POLICY: &str = "dcr.policy";
+/// The [`ATTR_DCR_POLICY`] value stamped on open-endpoint registrations.
+pub const DCR_POLICY_OPEN: &str = "open";
 
 /// A non-empty attribute value, borrowed.
 fn attribute<'a>(client: &'a Client, key: &str) -> Option<&'a str> {

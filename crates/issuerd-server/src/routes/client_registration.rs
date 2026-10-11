@@ -25,8 +25,11 @@
 //! payload first (`enforce_open_registration_policy`): caller-controlled JWKS
 //! and logout-URI attributes are stripped, service accounts are forced off,
 //! redirect-URI schemes are allowlisted, and the `"*"` web origin is
-//! rejected. The token-gated path trusts its admin-minted initial access
-//! token and honors every field.
+//! rejected. Open-endpoint clients carry the `dcr.policy=open` marker
+//! attribute, so an RFC 7592 update with the registration access token
+//! re-applies the same policy (and re-stamps the marker) — the token can
+//! never resurrect a stripped attribute. The token-gated path trusts its
+//! admin-minted initial access token and honors every field.
 //!
 //! RFC 7591 request metadata (`client_name`, `grant_types`, `response_types`,
 //! `token_endpoint_auth_method`, `jwks`/`jwks_uri`, the logout metadata, …)
@@ -819,7 +822,9 @@ const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 7] = [
 /// honoring every field.
 ///
 /// - the attributes in [`OPEN_REGISTRATION_STRIPPED_ATTRIBUTES`] are
-///   STRIPPED;
+///   STRIPPED — and a logout-URI attribute spelling a scriptable or
+///   plain-remote-http scheme is REJECTED outright
+///   ([`validate_open_registration_logout_uri`]);
 /// - `service_accounts_enabled` is FORCED to false (Keycloak anonymous
 ///   registration parity: no service account without admin approval);
 /// - `redirect_uris` are scheme-vetted (see
@@ -829,12 +834,30 @@ const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 7] = [
 ///   the caller sent;
 /// - `web_origins` REJECTS the literal `"*"` (CORS wildcard) with
 ///   `invalid_client_metadata`.
+///
+/// Runs on open-endpoint creates AND on RFC 7592 updates of clients carrying
+/// the `dcr.policy=open` marker ([`client_metadata::ATTR_DCR_POLICY`]), so a
+/// registration access token can never resurrect a stripped attribute.
 #[allow(clippy::result_large_err)]
 fn enforce_open_registration_policy(
     realm_id: &RealmId,
     rep: &mut ClientRepresentation,
 ) -> Result<(), Response> {
     if let Some(attributes) = &mut rep.attributes {
+        // The logout URIs arrive free-form through the Keycloak-shaped
+        // `attributes` map (the RFC-spelled top-level fields are
+        // https-validated during translation). They are stripped below
+        // either way, but a scriptable or plain-remote-http spelling is
+        // rejected loudly instead of silently dropped — the same scheme
+        // rules as `validate_post_logout_redirect_uri`.
+        for key in [
+            crate::routes::logout::CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI,
+            crate::routes::logout::CLIENT_ATTR_BACKCHANNEL_LOGOUT_URI,
+        ] {
+            if let Some(uri) = attributes.get(key) {
+                validate_open_registration_logout_uri(key, uri)?;
+            }
+        }
         let before = attributes.len();
         for key in OPEN_REGISTRATION_STRIPPED_ATTRIBUTES {
             attributes.remove(key);
@@ -916,6 +939,35 @@ fn is_loopback_redirect_host(url: &url::Url) -> bool {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
+    }
+}
+
+/// The open-policy scheme check for the logout-URI attributes (the same
+/// acceptance shape as [`validate_post_logout_redirect_uri`]): https,
+/// loopback http, and custom (non-scriptable) schemes pass;
+/// `javascript:`/`data:`/`vbscript:` and non-loopback plain http are
+/// rejected with `invalid_client_metadata`. The open policy strips the
+/// attributes regardless — this makes the dangerous spellings loud instead
+/// of silently dropped.
+#[allow(clippy::result_large_err)]
+fn validate_open_registration_logout_uri(field: &str, uri: &str) -> Result<(), Response> {
+    match url::Url::parse(uri) {
+        Ok(parsed) => match parsed.scheme() {
+            "https" => Ok(()),
+            "http" if is_loopback_redirect_host(&parsed) => Ok(()),
+            "http" => Err(invalid_metadata(format!(
+                "{field} {uri:?} is not allowed on open registration: \
+                 plain http is only accepted for loopback hosts"
+            ))),
+            "javascript" | "data" | "vbscript" => Err(invalid_metadata(format!(
+                "{field} {uri:?} is not allowed on open registration: \
+                 the {} scheme is forbidden",
+                parsed.scheme()
+            ))),
+            // Custom schemes (`myapp://…`) — OIDC native-app practice.
+            _ => Ok(()),
+        },
+        Err(e) => Err(invalid_metadata(format!("{field} {uri:?} is not a valid URL: {e}"))),
     }
 }
 
@@ -1023,6 +1075,16 @@ async fn register_client(
         .attributes
         .entry(client_metadata::ATTR_DCR_CLIENT_ID_ISSUED_AT.to_string())
         .or_insert_with(|| issuerd_core::utils::now_secs().to_string());
+    // Clients created through the open endpoint carry the policy marker:
+    // RFC 7592 updates re-apply the open payload policy (see
+    // update_registered_client_handler). Stamped post-conversion so a
+    // caller-supplied `dcr.policy` attribute never survives.
+    if policy == RegistrationPolicy::Open {
+        client.attributes.insert(
+            client_metadata::ATTR_DCR_POLICY.to_string(),
+            client_metadata::DCR_POLICY_OPEN.to_string(),
+        );
+    }
     // OIDC Core §8.1: pairwise clients must resolve to an
     // unambiguous sector; a configured `sector_identifier_uri` is fetched
     // and validated against the registered redirect URIs.
@@ -1421,6 +1483,18 @@ pub async fn update_registered_client_handler(
             );
         }
     };
+    // A client created through the open endpoint stays under the open
+    // payload policy on update: the registration access token must not
+    // resurrect the stripped attributes (JWKS sources, logout URIs,
+    // `request_uris`) or flip `service_accounts_enabled` back on.
+    let open_registered =
+        existing.attributes.get(client_metadata::ATTR_DCR_POLICY).map(String::as_str)
+            == Some(client_metadata::DCR_POLICY_OPEN);
+    if open_registered {
+        if let Err(resp) = enforce_open_registration_policy(&realm.id, &mut rep) {
+            return resp;
+        }
+    }
     // Same as registration (see register_client): without a
     // client-registration policy engine, mapper attachment is admin-only.
     if rep.protocol_mappers.is_some() {
@@ -1484,6 +1558,14 @@ pub async fn update_registered_client_handler(
                 .attributes
                 .insert(client_metadata::ATTR_DCR_CLIENT_ID_ISSUED_AT.to_string(), stamp.clone());
         }
+    }
+    // The open-policy marker survives updates untouched — the registrant can
+    // neither shed it nor rewrite it through the free-form attributes map.
+    if open_registered {
+        updated.attributes.insert(
+            client_metadata::ATTR_DCR_POLICY.to_string(),
+            client_metadata::DCR_POLICY_OPEN.to_string(),
+        );
     }
     match ensure_client_id_available(
         &state.storage,
@@ -2053,6 +2135,148 @@ mod tests {
         }
         assert_eq!(client.attributes.get("custom").map(String::as_str), Some("kept"));
         assert!(client.web_origins.iter().any(|o| o.as_str() == "https://app.example.com"));
+    }
+
+    #[tokio::test]
+    async fn open_client_update_reapplies_the_open_policy() {
+        let (state, realm) = registration_state().await;
+        let (client, token) = register_test_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-open-put",
+                "redirect_uris": ["http://localhost/cb"],
+            }),
+        )
+        .await;
+        // The open create stamped the policy marker.
+        assert_eq!(
+            client.attributes.get(client_metadata::ATTR_DCR_POLICY).map(String::as_str),
+            Some(client_metadata::DCR_POLICY_OPEN)
+        );
+
+        // PUT back everything the create stripped — plus a marker overwrite
+        // attempt and the service-account flip.
+        let resp = update_registered_client_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            master_path("dcr-open-put"),
+            bearer_headers(&token),
+            serde_json::json!({
+                "client_id": "dcr-open-put",
+                "redirect_uris": ["http://localhost/cb"],
+                "service_accounts_enabled": true,
+                "attributes": {
+                    "jwks.url": "https://attacker.example.com/jwks",
+                    "use.jwks.url": "true",
+                    "backchannel_logout_uri": "https://attacker.example.com/hook",
+                    "frontchannel_logout_uri": "https://attacker.example.com/logout",
+                    "request_uris": "[\"https://attacker.example.com/obj.jwt\"]",
+                    "dcr.policy": "trusted"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = state.storage.get_client(&realm.id, &client.id).await.unwrap().unwrap();
+        for key in [
+            "jwks.url",
+            "use.jwks.url",
+            "backchannel_logout_uri",
+            "frontchannel_logout_uri",
+            "request_uris",
+        ] {
+            assert!(!stored.attributes.contains_key(key), "{key} must be re-stripped on update");
+        }
+        assert!(!stored.service_accounts_enabled, "the service-account flip is refused");
+        assert_eq!(
+            stored.attributes.get(client_metadata::ATTR_DCR_POLICY).map(String::as_str),
+            Some(client_metadata::DCR_POLICY_OPEN),
+            "the marker is re-stamped, never registrant-controlled"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_client_update_keeps_every_field() {
+        let (state, realm) = registration_state().await;
+        let (client, token) = register_test_client_with_policy(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-trusted-put",
+                "redirect_uris": ["http://localhost/cb"],
+                "attributes": {"backchannel_logout_uri": "https://app.example.com/hook"}
+            }),
+            RegistrationPolicy::Trusted,
+        )
+        .await;
+        // No marker on the trusted path.
+        assert!(!client.attributes.contains_key(client_metadata::ATTR_DCR_POLICY));
+        assert_eq!(
+            client.attributes.get("backchannel_logout_uri").map(String::as_str),
+            Some("https://app.example.com/hook")
+        );
+
+        let resp = update_registered_client_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            master_path("dcr-trusted-put"),
+            bearer_headers(&token),
+            serde_json::json!({
+                "client_id": "dcr-trusted-put",
+                "redirect_uris": ["http://localhost/cb"],
+                "service_accounts_enabled": true,
+                "attributes": {"backchannel_logout_uri": "https://app.example.com/hook"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = state.storage.get_client(&realm.id, &client.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.attributes.get("backchannel_logout_uri").map(String::as_str),
+            Some("https://app.example.com/hook"),
+            "the trusted path honors every field"
+        );
+        assert!(stored.service_accounts_enabled);
+    }
+
+    #[test]
+    fn open_policy_rejects_dangerous_logout_uri_schemes() {
+        let realm_id = RealmId::new("policy-test").unwrap();
+        // Scriptable schemes and non-loopback plain http are loud errors.
+        for uri in [
+            "javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
+                "client_id": "policy-test",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "attributes": {"backchannel_logout_uri": uri}
+            }))
+            .unwrap();
+            assert!(enforce_open_registration_policy(&realm_id, &mut rep).is_err(), "{uri}");
+        }
+        // https, loopback http and custom schemes validate (and are still
+        // stripped — the open endpoint never stores logout URIs).
+        for uri in [
+            "https://app.example.com/hook",
+            "http://localhost:8080/hook",
+            "myapp://logout",
+        ] {
+            let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
+                "client_id": "policy-test",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "attributes": {"backchannel_logout_uri": uri}
+            }))
+            .unwrap();
+            enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+            assert!(!rep.attributes.unwrap().contains_key("backchannel_logout_uri"), "{uri}");
+        }
     }
 
     #[tokio::test]
