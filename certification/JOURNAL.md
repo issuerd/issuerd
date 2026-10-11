@@ -169,3 +169,42 @@ cargo test --workspace --lib
   registration) — M4 scope shrinks to sector *confirmation tests* + signed
   userinfo + `jwks_uri` verification.
 - **Next:** M2 — response types & nonce (see "Where we are").
+
+### 2026-10-11 — M2 in flight: implicit/hybrid green, logout fixes applied
+
+- Commit `73928df` — M2 server-side (agent-2): all six OIDC response types
+  accepted at the authorization endpoint (bare `token` still rejected);
+  unified `mint_authorization_artifacts` mints code/access/id_token per leg
+  from both the SSO-resume and fresh-login paths; alg-aware `at_hash`/`c_hash`
+  wired; nonce REQUIRED for id_token-bearing response types (303
+  fragment-delivered `invalid_request` redirect; realm attribute
+  `compat.nonceless_hybrid=true` is the escape hatch, default off);
+  discovery lists all six response types + `implicit` grant. PAR/JAR paths
+  share the one acceptance+nonce gate. Integration: 12 new tests in
+  `tests/integration/implicit_hybrid.rs`, full suite 387/387.
+- Commit `367627b` — M2 harness: implicit/hybrid/formpost-implicit/
+  formpost-hybrid configs cloned from the basic browser profile; three logout
+  plan configs with a logout-page placeholder task; runner wired.
+- **Gate run 1 findings** (exit 1, expected — fixes followed):
+  - Implicit 55 modules 0F/3W; FormPost-implicit same; **Hybrid 97 modules
+    0F/0W; FormPost-hybrid 97 0F/0W** — hybrid fully green on first attempt.
+  - The 3 implicit warnings: `VerifyScopesReturnedInAuthorizationEndpointIdToken`
+    — the pure-implicit id_token carried only IdToken-targeted mapper claims;
+    with no access token, userinfo is unreachable so the id_token must carry
+    the full scope set (OIDCC-5.4).
+  - RP-initiated logout: 6 failures ×6 runs. Root cause 1: the shared static
+    clients carried `frontchannel_logout_uri` (M1 bootstrap), so every logout
+    rendered the front-channel interstitial and the suite counted the
+    (unserved) iframe request as FAILURE. Root cause 2: the interstitial's
+    1.5s `setTimeout` continue never fires under the suite's HtmlUnit
+    WebRunner (no timer pumping after page load) → 240s hangs.
+  - Front-channel plan: main module hung 240s → UNKNOWN (same timer issue).
+- Fixes: commit `579c4bf` (agent-2) — pure-implicit id_token overlay now
+  unions IdToken+UserInfo targets (`build_claims_overlay_for_targets`,
+  regression-guarded for hybrid/code); logout without redirect target renders
+  a 200 "signed out" confirmation page instead of bare 204 (placeholder
+  modules get a capturable page). Commit `944bbf1` (harness) — dedicated
+  per-plan logout clients (`conformance-client-rpi/-fc/-bc`), base clients
+  cleaned, front-channel config clicks the interstitial's Continue link.
+- Gate run 2 in progress at commit `944bbf1`+`579c4bf`.
+- **Next:** evaluate gate 2; close out M2 (journal + COVERAGE) when green.
