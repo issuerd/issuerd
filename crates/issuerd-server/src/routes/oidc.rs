@@ -2364,10 +2364,13 @@ pub async fn ciba_auth_handler(
         }
     };
 
-    let client_id = body_params.get("client_id").map(|s| s.as_str()).unwrap_or("");
-    let client_identifier = match ClientIdentifier::new(client_id) {
-        Ok(id) => id,
-        Err(_) => {
+    // The client is identified by `client_id` or — absent that, per RFC 7523
+    // §2.2 — by its JWT client assertion's iss/sub (verified afterwards).
+    let client_identifier = match crate::client_assertion::resolve_form_client_id(&body_params)
+        .and_then(|id| ClientIdentifier::new(id).ok())
+    {
+        Some(id) => id,
+        None => {
             emit_oidc_event(
                 &state,
                 &realm_id,
@@ -2986,13 +2989,24 @@ pub async fn token_handler(
         }
     };
 
-    let client_id = token_req.client_id.as_deref().unwrap_or("");
-    let client_identifier = match ClientIdentifier::new(client_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"})))
-                .into_response();
-        }
+    let client_identifier = match token_req.client_id.clone() {
+        Some(id) => id,
+        // RFC 7523 §2.2: without a `client_id` form field, a JWT client
+        // assertion identifies the client from its (unverified) iss/sub —
+        // signature verification against the resolved client's keys still
+        // gates below.
+        None => match crate::client_assertion::resolve_form_client_id(&body_params)
+            .and_then(|id| ClientIdentifier::new(id).ok())
+        {
+            Some(id) => id,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_client"})),
+                )
+                    .into_response();
+            }
+        },
     };
     let client = match state.storage.get_client_by_client_id(&realm_id, &client_identifier).await {
         // A disabled client must not redeem codes, passwords, or refresh
@@ -6449,8 +6463,10 @@ pub(crate) async fn persist_session(
     })
 }
 
-/// Authenticate the calling client for RFC 7009/7662 endpoints: `client_id`
-/// is required, and confidential clients authenticate per their configured
+/// Authenticate the calling client for RFC 7009/7662 endpoints: the client is
+/// identified by the `client_id` parameter or — absent that, per RFC 7523
+/// §2.2 — by its JWT client assertion's iss/sub, and confidential clients
+/// authenticate per their configured
 /// `client_authenticator_type` — shared secret (constant-time compared) or a
 /// JWT client assertion (`private_key_jwt` / `client_secret_jwt`).
 ///
@@ -6477,8 +6493,11 @@ pub(crate) async fn authenticate_form_client(
         }
         resp
     };
-    let raw = params.get("client_id").filter(|s| !s.is_empty()).ok_or_else(invalid_client)?;
-    let identifier = ClientIdentifier::new(raw).map_err(|_| invalid_client())?;
+    // RFC 7523 §2.2: without a `client_id` parameter, a JWT client assertion
+    // identifies the client from its (unverified) iss/sub — the assertion is
+    // verified against the resolved client's keys below, unchanged.
+    let raw = crate::client_assertion::resolve_form_client_id(params).ok_or_else(invalid_client)?;
+    let identifier = ClientIdentifier::new(&raw).map_err(|_| invalid_client())?;
     // The claims read-model cache answers warm lookups without a storage
     // round trip (client updates precise-delete the entry, so secret
     // rotation and disable take effect on the next request). On a miss —

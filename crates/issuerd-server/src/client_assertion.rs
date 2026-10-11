@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use issuerd_core::{Client, ClientAuthenticatorType, IssuerdError, RealmId};
 use tracing::{debug, warn};
 
@@ -137,6 +138,44 @@ fn unauthorized(reason: &str) -> IssuerdError {
     // pre-existing shapes are unchanged).
     debug!(reason, "client authentication failed");
     IssuerdError::UnauthorizedClient
+}
+
+/// Resolve the client identifier for a client-authenticated form request:
+/// the `client_id` parameter when present and non-empty; otherwise — RFC
+/// 7523 §2.2 allows identifying the client from the assertion itself — the
+/// UNVERIFIED `client_assertion`'s `iss` (falling back to `sub` when `iss`
+/// is absent; when both are present they must agree, so identification can
+/// never diverge from the verified identity).
+///
+/// Identification only: the assertion's signature is verified against the
+/// resolved client's keys afterwards, exactly as when `client_id` is sent
+/// (the validators additionally require `iss` == `sub` == the resolved
+/// client id, so a `sub`-only fallback cannot authenticate without `iss`).
+///
+/// `None` when the request carries neither a usable `client_id` nor a
+/// well-formed JWT-bearer assertion — the caller renders its uniform
+/// `invalid_client`.
+pub(crate) fn resolve_form_client_id(params: &HashMap<String, String>) -> Option<String> {
+    if let Some(id) = params.get("client_id").filter(|s| !s.is_empty()) {
+        return Some(id.clone());
+    }
+    if params.get("client_assertion_type").map(String::as_str)
+        != Some(issuerd_protocol::token::CLIENT_ASSERTION_TYPE_JWT_BEARER)
+    {
+        return None;
+    }
+    let assertion = params.get("client_assertion").filter(|s| !s.is_empty())?;
+    let payload = assertion.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let iss = value.get("iss").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let sub = value.get("sub").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    match (iss, sub) {
+        (Some(iss), Some(sub)) => (iss == sub).then(|| iss.to_string()),
+        (Some(iss), None) => Some(iss.to_string()),
+        (None, Some(sub)) => Some(sub.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Authenticate a confidential client on a form-posted endpoint. `params` are
@@ -889,5 +928,77 @@ mod tests {
             .unwrap();
         let params = assertion_params(&assertion);
         assert!(verify_client_auth(&state, &realm_id, "master", &client, &params).await.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_form_client_id (RFC 7523 §2.2 identification fallback)
+    // -----------------------------------------------------------------------
+
+    /// Build form params without `client_id`: only the assertion pair.
+    fn assertion_only_params(assertion: &str) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "client_assertion_type".to_string(),
+                issuerd_protocol::token::CLIENT_ASSERTION_TYPE_JWT_BEARER.to_string(),
+            ),
+            ("client_assertion".to_string(), assertion.to_string()),
+        ])
+    }
+
+    #[test]
+    fn resolve_form_client_id_prefers_the_client_id_parameter() {
+        let assertion = sign_hs256(valid_claims("jti-ident"), SECRET);
+        let mut params = assertion_only_params(&assertion);
+        params.insert("client_id".to_string(), "explicit-client".to_string());
+        assert_eq!(resolve_form_client_id(&params).as_deref(), Some("explicit-client"));
+    }
+
+    #[test]
+    fn resolve_form_client_id_reads_the_unverified_assertion_iss() {
+        // The payload is not signed-verified here — identification only.
+        let assertion = sign_hs256(valid_claims("jti-ident"), "any-key");
+        let params = assertion_only_params(&assertion);
+        assert_eq!(resolve_form_client_id(&params).as_deref(), Some("jwt-test-client"));
+    }
+
+    #[test]
+    fn resolve_form_client_id_falls_back_to_sub() {
+        let mut claims = valid_claims("jti-ident");
+        claims.as_object_mut().unwrap().remove("iss");
+        let assertion = sign_hs256(claims, SECRET);
+        let params = assertion_only_params(&assertion);
+        assert_eq!(resolve_form_client_id(&params).as_deref(), Some("jwt-test-client"));
+    }
+
+    #[test]
+    fn resolve_form_client_id_rejects_disagreeing_iss_sub() {
+        // iss=clientA, sub=clientB must not identify anyone: identification
+        // and verification must never diverge (RFC 7523 §3 pins iss == sub).
+        let mut claims = valid_claims("jti-ident");
+        claims["sub"] = serde_json::json!("someone-else");
+        let assertion = sign_hs256(claims, SECRET);
+        let params = assertion_only_params(&assertion);
+        assert_eq!(resolve_form_client_id(&params), None);
+    }
+
+    #[test]
+    fn resolve_form_client_id_rejects_garbage_and_missing_claims() {
+        // Not a JWT at all.
+        let params = assertion_only_params("not-a-jwt");
+        assert_eq!(resolve_form_client_id(&params), None);
+        // Well-formed JWT without iss/sub.
+        let assertion = sign_hs256(serde_json::json!({"aud": "x", "exp": now() + 60}), SECRET);
+        let params = assertion_only_params(&assertion);
+        assert_eq!(resolve_form_client_id(&params), None);
+        // Wrong assertion type.
+        let assertion = sign_hs256(valid_claims("jti-ident"), SECRET);
+        let mut params = assertion_only_params(&assertion);
+        params.insert("client_assertion_type".to_string(), "urn:other".to_string());
+        assert_eq!(resolve_form_client_id(&params), None);
+        // Nothing at all.
+        assert_eq!(resolve_form_client_id(&HashMap::new()), None);
+        // An empty client_id counts as absent and falls through.
+        let params = HashMap::from([("client_id".to_string(), String::new())]);
+        assert_eq!(resolve_form_client_id(&params), None);
     }
 }

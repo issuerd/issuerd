@@ -676,3 +676,147 @@ async fn discovery_advertises_jwt_client_auth() {
         assert!(algs.iter().any(|a| a == alg), "missing {alg}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Assertion-only client identification (RFC 7523 §2.2, no client_id field)
+// ---------------------------------------------------------------------------
+
+/// Drive a browser login for the pending flow and return the issued
+/// authorization code.
+async fn authorize_code(
+    harness: &TestHarness,
+    realm: &str,
+    client: &issuerd_core::Client,
+    username: &str,
+) -> String {
+    let resp = harness
+        .get(&format!(
+            "/realms/{realm}/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb&scope=openid&state=s-1",
+            client.client_id
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    assert!(location.contains("/login.html"), "expected the login page: {location}");
+    let execution_id =
+        TestHarness::extract_query_param(&location, "execution_id").expect("missing execution_id");
+    let resp = harness
+        .post_form_with_cookie(
+            &format!("/api/v1/auth/login?realm={realm}"),
+            &[
+                ("execution_id", &execution_id),
+                ("username", username),
+                ("password", "Password123!"),
+            ],
+            &TestHarness::flow_cookie(&execution_id),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    TestHarness::extract_query_param(&location, "code").expect("no code issued")
+}
+
+/// RFC 7523 §2.2: the authorization-code exchange needs no `client_id` form
+/// field — the assertion's iss/sub identifies the client, and verification
+/// against the resolved client's JWKS gates as usual.
+#[tokio::test]
+async fn private_key_jwt_code_exchange_without_client_id_form_field() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("jwt-noid").await;
+    let key = rsa_key().await;
+    let jwks_string = serde_json::to_string(&key.jwks).unwrap();
+    let client = create_jwt_client(
+        &harness,
+        "jwt-noid",
+        ClientAuthenticatorType::ClientJwt,
+        &[("use.jwks.string", "true"), ("jwks.string", &jwks_string)],
+    )
+    .await;
+    harness.create_user("jwt-noid", "alice", "Password123!").await;
+
+    let code = authorize_code(&harness, "jwt-noid", &client, "alice").await;
+
+    let claims = assertion_claims(&harness, "jwt-noid", client.client_id.as_ref());
+    let assertion = key.sign(&claims).await;
+    let resp = harness
+        .post_form(
+            &token_path("jwt-noid"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", "http://localhost:8080/cb"),
+                ("client_assertion_type", ASSERTION_TYPE),
+                ("client_assertion", assertion.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert!(json["access_token"].as_str().unwrap().len() > 10);
+    assert!(json["id_token"].as_str().is_some(), "{json}");
+}
+
+/// Same shape with an assertion signed by a key the client's JWKS does not
+/// cover: identification resolves the client, verification rejects it.
+#[tokio::test]
+async fn private_key_jwt_without_client_id_wrong_key_fails() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("jwt-noid-bad").await;
+    let key = rsa_key().await;
+    let wrong_key = rsa_key().await;
+    let jwks_string = serde_json::to_string(&key.jwks).unwrap();
+    let client = create_jwt_client(
+        &harness,
+        "jwt-noid-bad",
+        ClientAuthenticatorType::ClientJwt,
+        &[("use.jwks.string", "true"), ("jwks.string", &jwks_string)],
+    )
+    .await;
+    harness.create_user("jwt-noid-bad", "alice", "Password123!").await;
+
+    let code = authorize_code(&harness, "jwt-noid-bad", &client, "alice").await;
+
+    let claims = assertion_claims(&harness, "jwt-noid-bad", client.client_id.as_ref());
+    let assertion = wrong_key.sign(&claims).await;
+    let resp = harness
+        .post_form(
+            &token_path("jwt-noid-bad"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", "http://localhost:8080/cb"),
+                ("client_assertion_type", ASSERTION_TYPE),
+                ("client_assertion", assertion.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "invalid_client");
+}
+
+/// `client_secret_jwt` resolves the same way (HMAC assertion, no client_id).
+#[tokio::test]
+async fn client_secret_jwt_without_client_id_form_field() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("jwt-noid-hs").await;
+    let client =
+        create_jwt_client(&harness, "jwt-noid-hs", ClientAuthenticatorType::ClientSecretJwt, &[])
+            .await;
+
+    let claims = assertion_claims(&harness, "jwt-noid-hs", client.client_id.as_ref());
+    let assertion = sign_hs256(&claims, client.secret.as_deref().unwrap());
+    let resp = harness
+        .post_form(
+            &token_path("jwt-noid-hs"),
+            &[
+                ("grant_type", "client_credentials"),
+                ("scope", "openid"),
+                ("client_assertion_type", ASSERTION_TYPE),
+                ("client_assertion", assertion.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert!(json["access_token"].as_str().unwrap().len() > 10);
+}
