@@ -167,6 +167,23 @@ for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "
         "oidcc-3rdparty-init-login-certification-test-plan-${rt// /-}-output.log"
 done
 
+# Dynamic OP (M4): the plan pins discovery + dynamic_client + private_key_jwt;
+# only response_type is user-selected. Each run registers its clients via DCR
+# with the bootstrap-minted initial access token. oidcc-server-rotate-keys is
+# an expected failure in-plan (operator-step module; real rotation evidence is
+# produced by scripts/run-rotation-check.sh).
+DYNAMIC_CONFIG=/tmp/issuerd-dynamic-op.json
+sed "s/@INITIAL_ACCESS_TOKEN@/$(cat /results/initial-access-token.txt)/" \
+    "$CONFIGS/issuerd-dynamic-op.json" > "$DYNAMIC_CONFIG"
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-dynamic-certification-test-plan[response_type=$rt]" \
+        "$DYNAMIC_CONFIG" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-dynamic-certification-test-plan-${rt// /-}-output.log" \
+        "issuerd-expected-failures-dynamic.json"
+done
+
 echo ""
 echo "=== Exporting HTML reports ==="
 python3 /harness-scripts/export-html.py /results/exports || true

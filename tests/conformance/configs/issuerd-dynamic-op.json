@@ -1,0 +1,98 @@
+{
+  "description": "Issuerd Dynamic OP test (dynamic registration)",
+  "server": {
+    "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
+  },
+  "client": {
+    "client_name": "issuerd-dynamic",
+    "initial_access_token": "@INITIAL_ACCESS_TOKEN@"
+  },
+  "browser": [
+    {
+      "match": "https://op.conformance.test:8443/*",
+      "tasks": [
+        {
+          "task": "Login",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/*execution_id*",
+          "commands": [
+            [
+              "text",
+              "id",
+              "username",
+              "conformance-user"
+            ],
+            [
+              "text",
+              "id",
+              "password",
+              "conformance-password"
+            ],
+            [
+              "click",
+              "css",
+              "button[type=submit]"
+            ]
+          ]
+        },
+        {
+          "task": "Authorization Error Page",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/realms/*/protocol/openid-connect/auth*",
+          "commands": [
+            [
+              "wait",
+              "xpath",
+              "//body",
+              10,
+              "(?s).*error.*",
+              "update-image-placeholder-optional"
+            ]
+          ]
+        },
+        {
+          "task": "Login Page Error",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/*login.html*error*",
+          "commands": [
+            [
+              "wait",
+              "contains",
+              "error=",
+              10
+            ]
+          ]
+        },
+        {
+          "task": "Consent",
+          "optional": true,
+          "match": "https://op.conformance.test:8443/realms/*/login/consent/*",
+          "commands": [
+            [
+              "click",
+              "css",
+              "button[value=allow]"
+            ]
+          ]
+        },
+        {
+          "task": "Verify Complete",
+          "optional": true,
+          "match": "https://suite.conformance.test:8443/test/*/callback*",
+          "commands": [
+            [
+              "wait",
+              "id",
+              "submission_complete",
+              10
+            ]
+          ]
+        },
+        {
+          "task": "Terminal Page Reached",
+          "match": "*"
+        }
+      ]
+    }
+  ]
+}

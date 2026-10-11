@@ -2,7 +2,7 @@
   {
     "test-name": "oidcc-backchannel-rp-initiated-logout",
     "variant": "*",
-    "configuration-filename": "issuerd-backchannel-logout-op.json",
+    "configuration-filename": "*issuerd-backchannel-logout-op.json",
     "current-block": "*",
     "condition": "EnsureIncomingTls13",
     "expected-result": "warning",
@@ -11,7 +11,7 @@
   {
     "test-name": "oidcc-backchannel-rp-initiated-logout",
     "variant": "*",
-    "configuration-filename": "issuerd-backchannel-logout-op.json",
+    "configuration-filename": "*issuerd-backchannel-logout-op.json",
     "current-block": "*",
     "condition": "EnsureIncomingTls12WithSecureCipherOrTls13",
     "expected-result": "warning",

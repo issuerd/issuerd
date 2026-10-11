@@ -113,6 +113,19 @@
           ]
         },
         {
+          "task": "Wait for session check dance",
+          "optional": true,
+          "match": "https://suite.conformance.test:8443/test/a/issuerd/*session_verify*",
+          "commands": [
+            [
+              "wait",
+              "contains",
+              "session_result",
+              30
+            ]
+          ]
+        },
+        {
           "task": "Terminal Page Reached",
           "match": "*"
         }
