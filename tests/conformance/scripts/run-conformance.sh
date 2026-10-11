@@ -46,7 +46,7 @@ echo "=== Bootstrapping Issuerd realm ==="
 ISSUERD_URL="$OP" ISSUERD_CACERT="$CACERT" bash /usr/local/bin/issuerd-bootstrap
 
 run_plan() {
-    local plan="$1" config="$2" skips="$3" logname="$4"
+    local plan="$1" config="$2" skips="$3" logname="$4" expected="${5:-issuerd-expected-failures.json}"
     # Absolute config paths (rendered configs under /tmp) pass through;
     # relative ones resolve in the mounted configs directory.
     local config_path="$config"
@@ -58,7 +58,7 @@ run_plan() {
     echo "Running: $plan"
     echo "=========================================="
     python3 /upstream-scripts/run-test-plan.py \
-        --expected-failures-file "$CONFIGS/issuerd-expected-failures.json" \
+        --expected-failures-file "$CONFIGS/$expected" \
         --expected-skips-file "$CONFIGS/$skips" \
         --export-dir /results/export-json \
         "$plan" \
@@ -133,7 +133,20 @@ for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "
         "oidcc-backchannel-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=$rt]" \
         "issuerd-backchannel-logout-op.json" \
         "issuerd-expected-skips-config.json" \
-        "oidcc-backchannel-rp-initiated-logout-certification-test-plan-${rt// /-}-output.log"
+        "oidcc-backchannel-rp-initiated-logout-certification-test-plan-${rt// /-}-output.log" \
+        "issuerd-expected-warnings-backchannel.json"
+done
+
+# Session Management OP (M3): session_state + check_session_iframe. Runs on
+# the RP-initiated logout's static client (post_logout_redirect_uris, no
+# front/back-channel URIs) — the module does the iframe postMessage dance
+# against the OP's check_session_iframe from the suite's own page.
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-session-management-certification-test-plan[client_registration=static_client][response_type=$rt]" \
+        "issuerd-session-op.json" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-session-management-certification-test-plan-${rt// /-}-output.log"
 done
 
 # 3rd-Party-Init OP: the plan pins server_metadata=discovery,
