@@ -1,0 +1,18 @@
+[
+  {
+    "test-name": "oidcc-request-uri-unsigned",
+    "configuration-filename": "*",
+    "variant": "*",
+    "condition": "*",
+    "current-block": "*",
+    "comment": "Self-skips: the OP is signed-only for request objects ('none' is not in request_object_signing_alg_values_supported)."
+  },
+  {
+    "test-name": "oidcc-ensure-request-object-with-redirect-uri",
+    "configuration-filename": "*",
+    "variant": "*",
+    "condition": "*",
+    "current-block": "*",
+    "comment": "Self-skips for the same signed-only reason."
+  }
+]
