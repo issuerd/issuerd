@@ -443,7 +443,7 @@ pub mod tests {
             _user: &issuerd_core::User,
             _client: &Client,
             _realm: &issuerd_core::Realm,
-            _session_id: &issuerd_core::SessionId,
+            _session_id: Option<&issuerd_core::SessionId>,
         ) -> Result<issuerd_core::LogoutToken, issuerd_core::IssuerdError> {
             unimplemented!("stub does not issue logout tokens")
         }

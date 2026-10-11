@@ -405,12 +405,17 @@ impl<C: CryptoProvider> TokenManager<C> {
     }
 
     /// Issue a logout token for backchannel logout.
+    ///
+    /// `session_id` lands in the `sid` claim; pass `None` for clients that
+    /// registered `backchannel_logout_session_required = false` (OIDC
+    /// Back-Channel Logout 1.0 §2.4: the token then correlates the
+    /// logged-out session by `sub` alone).
     pub async fn issue_logout_token(
         &self,
         user: &User,
         client: &Client,
         realm: &Realm,
-        session_id: &SessionId,
+        session_id: Option<&SessionId>,
     ) -> Result<LogoutToken, IssuerdError> {
         let now = Utc::now().timestamp();
         let claims = LogoutTokenClaims {
@@ -425,7 +430,7 @@ impl<C: CryptoProvider> TokenManager<C> {
             events: serde_json::json!({
                 "http://schemas.openid.net/event/backchannel-logout": {}
             }),
-            sid: session_id.clone(),
+            sid: session_id.cloned(),
         };
 
         let (token, _) = self.sign_claims(&claims, self.signing_alg_for_realm(realm)).await?;
@@ -949,13 +954,15 @@ pub trait TokenIssuer: Send + Sync {
         claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<IdToken, IssuerdError>;
 
-    /// Issue a logout token for OIDC back-channel logout.
+    /// Issue a logout token for OIDC back-channel logout. `None` for
+    /// `session_id` omits the `sid` claim (clients registered with
+    /// `backchannel_logout_session_required = false`).
     async fn issue_logout_token(
         &self,
         user: &User,
         client: &Client,
         realm: &Realm,
-        session_id: &SessionId,
+        session_id: Option<&SessionId>,
     ) -> Result<LogoutToken, IssuerdError>;
 
     /// Sign an authorization response as a JARM JWT: the
@@ -1063,7 +1070,7 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
         user: &User,
         client: &Client,
         realm: &Realm,
-        session_id: &SessionId,
+        session_id: Option<&SessionId>,
     ) -> Result<LogoutToken, IssuerdError> {
         self.issue_logout_token(user, client, realm, session_id).await
     }
@@ -2195,7 +2202,7 @@ mod tests {
                 &test_user(),
                 &test_client(),
                 &test_realm(),
-                &SessionId::new("s1").unwrap(),
+                Some(&SessionId::new("s1").unwrap()),
             )
             .await
             .unwrap();
@@ -2205,7 +2212,43 @@ mod tests {
             .events
             .get("http://schemas.openid.net/event/backchannel-logout")
             .is_some());
-        assert_eq!(logout.claims.sid, SessionId::new("s1").unwrap());
+        assert_eq!(logout.claims.sid, Some(SessionId::new("s1").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn logout_token_without_session_id_omits_sid() {
+        // Clients registered with `backchannel_logout_session_required =
+        // false` receive a logout token that correlates by `sub` alone.
+        let mut mock = issuerd_core::MockCryptoProvider::new();
+        mock.expect_sign().times(1).returning(|_, _, _| Ok("header.payload.sig".into()));
+        mock.expect_get_public_keys().returning(|| {
+            Ok(JwkSet {
+                keys: vec![test_jwk(Algorithm::Rs256)],
+            })
+        });
+
+        let tm = TokenManager::new(
+            Arc::new(mock),
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            JwkSet {
+                keys: vec![test_jwk(Algorithm::Rs256)],
+            },
+        );
+
+        let logout = tm
+            .issue_logout_token(&test_user(), &test_client(), &test_realm(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(logout.claims.sid, None);
+        // `sub` remains: without `sid` it is the only session correlation.
+        assert_eq!(logout.claims.sub, UserId::new("user-1").unwrap());
+        assert!(logout
+            .claims
+            .events
+            .get("http://schemas.openid.net/event/backchannel-logout")
+            .is_some());
     }
 
     // ------------------------------------------------------------------

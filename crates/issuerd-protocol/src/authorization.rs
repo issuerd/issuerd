@@ -160,23 +160,23 @@ impl AuthorizationRequest {
             ));
         }
 
-        // Response type check against client attributes
-        let allowed = client
-            .attributes
-            .get("response_types")
-            .map(|s| s.split_whitespace().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                vec![
-                    "code",
-                    "id_token",
-                    "token",
-                    "code id_token",
-                    "code token",
-                    "id_token token",
-                    "code id_token token",
-                ]
-            });
-        if !allowed.contains(&self.response_type.as_str()) {
+        // Response type check against client attributes. Read via
+        // `Client::allowed_response_types`, which honors both the JSON array
+        // encoding stored by dynamic client registration (lossless for
+        // multi-token combinations such as `code id_token`) and the legacy
+        // space-separated word list.
+        let allowed = client.allowed_response_types().unwrap_or_else(|| {
+            vec![
+                "code".to_string(),
+                "id_token".to_string(),
+                "token".to_string(),
+                "code id_token".to_string(),
+                "code token".to_string(),
+                "id_token token".to_string(),
+                "code id_token token".to_string(),
+            ]
+        });
+        if !allowed.iter().any(|t| t == self.response_type.as_str()) {
             return Err(IssuerdError::InvalidRequest(
                 "response_type not allowed for client".into(),
             ));
@@ -986,6 +986,64 @@ mod tests {
         assert!(req.validate(&Realm::default(), &client).is_err());
         req.redirect_uri = "https://evil.example.com/app/cb".parse().unwrap();
         assert!(req.validate(&Realm::default(), &client).is_err());
+    }
+
+    /// The response-type allowlist attribute honors the JSON encoding DCR
+    /// stores (multi-token combinations stay intact) as well as the legacy
+    /// space-separated word list.
+    #[test]
+    fn validate_response_type_allowlist_json_and_legacy() {
+        fn client_with_attribute(value: &str) -> Client {
+            Client {
+                redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+                default_scopes: Scope::parse("openid"),
+                optional_scopes: Scope::empty(),
+                public_client: false,
+                attributes: std::collections::HashMap::from([(
+                    "response_types".to_string(),
+                    value.to_string(),
+                )]),
+                ..make_client_defaults()
+            }
+        }
+        fn hybrid_request() -> AuthorizationRequest {
+            AuthorizationRequest {
+                response_type: ResponseType::CodeIdToken,
+                client_id: ClientIdentifier::new("client1").unwrap(),
+                redirect_uri: "https://client.example.com/cb".parse().unwrap(),
+                scope: Scope::parse("openid"),
+                state: None,
+                nonce: Some(issuerd_core::Nonce::new("n-1").unwrap()),
+                response_mode: None,
+                prompt: vec![],
+                max_age: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                login_hint: None,
+                id_token_hint: None,
+                acr_values: vec![],
+                ui_locales: vec![],
+                claims: None,
+                authorization_details: None,
+                registration: false,
+                request: None,
+                request_uri: None,
+            }
+        }
+
+        // JSON encoding: `code id_token` is one allowlist entry.
+        let client = client_with_attribute("[\"code id_token\"]");
+        assert!(hybrid_request().validate(&Realm::default(), &client).is_ok());
+        // ...and bare `code` is NOT smuggled in by the shared prefix.
+        let mut code_request = hybrid_request();
+        code_request.response_type = ResponseType::Code;
+        assert!(code_request.validate(&Realm::default(), &client).is_err());
+
+        // Legacy word list: `code` allowed, the combination is not
+        // expressible in this encoding (and therefore not allowed).
+        let client = client_with_attribute("code");
+        assert!(code_request.validate(&Realm::default(), &client).is_ok());
+        assert!(hybrid_request().validate(&Realm::default(), &client).is_err());
     }
 
     #[test]

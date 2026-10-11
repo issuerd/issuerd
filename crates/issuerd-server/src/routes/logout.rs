@@ -15,7 +15,8 @@
 //! **Front-channel:** the RP-initiated logout endpoint renders an
 //! interstitial page embedding a hidden iframe per client session whose
 //! client configured a `frontchannel_logout_uri` attribute (called with the
-//! `iss` and `sid` query parameters per OIDC Front-Channel Logout 1.0), then
+//! `iss` and `sid` query parameters per OIDC Front-Channel Logout 1.0, unless
+//! the client registered `frontchannel_logout_session_required = false`), then
 //! continues to the validated `post_logout_redirect_uri`.
 
 use std::sync::Arc;
@@ -166,9 +167,14 @@ impl BackchannelLogoutDispatcher {
             else {
                 continue;
             };
+            // OIDC Back-Channel Logout 1.0 §2.4: clients registered with
+            // `backchannel_logout_session_required = false` get a logout
+            // token WITHOUT `sid` (it correlates by `sub` alone, which is
+            // always present).
+            let include_sid = crate::client_metadata::backchannel_logout_session_required(&client);
             let token = match self
                 .token_manager
-                .issue_logout_token(&user, &client, realm, &session.id)
+                .issue_logout_token(&user, &client, realm, include_sid.then_some(&session.id))
                 .await
             {
                 Ok(t) => t.token,
@@ -219,7 +225,10 @@ impl SessionLogoutNotifier for BackchannelLogoutDispatcher {
 
 /// Collect the front-channel logout iframe URLs for a session being torn
 /// down: one per client session whose client configured
-/// `frontchannel_logout_uri`, called with `iss` + `sid` query parameters.
+/// `frontchannel_logout_uri`. The URL is called with the `iss` + `sid` query
+/// parameters unless the client registered
+/// `frontchannel_logout_session_required = false` (OIDC Front-Channel Logout
+/// 1.0 §2), in which case the bare URI is used.
 ///
 /// `issuer` must be the token issuer URL for the realm
 /// (`{issuer_url}/realms/{realm_name}`) so RPs can match it against token
@@ -241,11 +250,15 @@ pub async fn frontchannel_logout_urls(
             .get(CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI)
             .filter(|u| !u.is_empty())
         {
-            urls.push(super::oidc::build_redirect_url(
-                uri,
-                &[("iss", issuer), ("sid", &session.id.0)],
-                false,
-            ));
+            if crate::client_metadata::frontchannel_logout_session_required(&client) {
+                urls.push(super::oidc::build_redirect_url(
+                    uri,
+                    &[("iss", issuer), ("sid", &session.id.0)],
+                    false,
+                ));
+            } else {
+                urls.push(uri.clone());
+            }
         }
     }
     urls
@@ -364,7 +377,7 @@ mod tests {
             _user: &issuerd_core::User,
             _client: &Client,
             _realm: &Realm,
-            _session_id: &SessionId,
+            _session_id: Option<&SessionId>,
         ) -> Result<issuerd_core::LogoutToken, IssuerdError> {
             Err(IssuerdError::ServerError("mock".into()))
         }
@@ -499,6 +512,231 @@ mod tests {
         assert!(
             events[0].error.as_deref().unwrap_or("").contains("token issuance failed"),
             "the configured client must reach logout-token issuance: {events:?}"
+        );
+    }
+
+    /// TokenIssuer double recording whether each `issue_logout_token` call
+    /// carried a session id, so tests can assert the
+    /// `backchannel_logout_session_required` wiring without network I/O.
+    struct SidRecordingTokenIssuer {
+        calls: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl TokenIssuer for SidRecordingTokenIssuer {
+        async fn issue_access_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _scope: &[String],
+            _session_id: &SessionId,
+        ) -> Result<AccessToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_access_token_with_roles(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _scope: &[String],
+            _session_id: &SessionId,
+            _realm_access: Option<issuerd_core::RealmAccess>,
+            _claims: Option<serde_json::Value>,
+            _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<AccessToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_refresh_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _session_id: &SessionId,
+            _scope: &[String],
+            _offline: bool,
+            _dpop_jkt: Option<&str>,
+            _authorization_details: Option<&[serde_json::Value]>,
+        ) -> Result<RefreshToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_id_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            _nonce: Option<&str>,
+            _auth_time: chrono::DateTime<chrono::Utc>,
+            _session_id: &SessionId,
+            _access_token: Option<&AccessToken>,
+            _code: Option<&str>,
+            _acr_values: Option<&[String]>,
+            _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<IdToken, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn issue_logout_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &Client,
+            _realm: &Realm,
+            session_id: Option<&SessionId>,
+        ) -> Result<issuerd_core::LogoutToken, IssuerdError> {
+            self.calls.lock().unwrap().push(session_id.is_some());
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn sign_authorization_response(
+            &self,
+            _realm: &Realm,
+            _client_id: &str,
+            _params: &[(String, String)],
+        ) -> Result<String, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+    }
+
+    fn user(realm_id: &RealmId) -> User {
+        User {
+            id: UserId::new("u-1").unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new("alice").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn session_for(realm_id: &RealmId, user: &User, clients: &[&Client]) -> UserSession {
+        let session_id = SessionId::new("sess-1").unwrap();
+        UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: chrono::Utc::now(),
+            last_session_refresh: chrono::Utc::now(),
+            auth_time: chrono::Utc::now(),
+            impersonator: None,
+            clients: clients
+                .iter()
+                .map(|c| ClientSession {
+                    id: ClientSessionId::new(issuerd_core::utils::generate_id()).unwrap(),
+                    client_id: c.id.clone(),
+                    session_id: session_id.clone(),
+                    redirect_uri: None,
+                    state: None,
+                    auth_method: AuthMethod::Password,
+                    timestamp: chrono::Utc::now(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_omits_sid_when_backchannel_session_not_required() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let realm = Realm {
+            id: RealmId::new("master").unwrap(),
+            ..Default::default()
+        };
+        let user = user(&realm.id);
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let default_client =
+            client("c-default", "default-client", Some("http://client.example.com/logout"));
+        let mut opted_out =
+            client("c-opted-out", "opted-out-client", Some("http://client.example.com/logout"));
+        opted_out.attributes.insert(
+            crate::client_metadata::ATTR_BACKCHANNEL_LOGOUT_SESSION_REQUIRED.to_string(),
+            "false".to_string(),
+        );
+        for c in [&default_client, &opted_out] {
+            storage.create_client(&realm.id, c).await.unwrap();
+        }
+        let session = session_for(&realm.id, &user, &[&default_client, &opted_out]);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let issuer = SidRecordingTokenIssuer {
+            calls: Arc::clone(&calls),
+        };
+        let dispatcher =
+            BackchannelLogoutDispatcher::new(storage.clone(), Arc::new(issuer)).unwrap();
+        dispatcher.dispatch(&realm, &session).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "both configured clients are dispatched to");
+        let default_call = recorded[0];
+        let opted_out_call = recorded[1];
+        assert!(default_call, "default client keeps the sid claim");
+        assert!(!opted_out_call, "opted-out client's logout token omits sid");
+    }
+
+    #[tokio::test]
+    async fn frontchannel_urls_omit_iss_and_sid_when_session_not_required() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let realm_id = RealmId::new("master").unwrap();
+
+        let mut default_client = client("c-fc-default", "fc-default-client", None);
+        default_client.attributes.insert(
+            CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI.to_string(),
+            "https://client.example.com/fc-logout".to_string(),
+        );
+        let mut opted_out = client("c-fc-opted-out", "fc-opted-out-client", None);
+        opted_out.attributes.insert(
+            CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI.to_string(),
+            "https://client.example.com/fc-plain".to_string(),
+        );
+        opted_out.attributes.insert(
+            crate::client_metadata::ATTR_FRONTCHANNEL_LOGOUT_SESSION_REQUIRED.to_string(),
+            "false".to_string(),
+        );
+        for c in [&default_client, &opted_out] {
+            storage.create_client(&realm_id, c).await.unwrap();
+        }
+        let user = user(&realm_id);
+        let session = session_for(&realm_id, &user, &[&default_client, &opted_out]);
+
+        let urls = frontchannel_logout_urls(
+            &storage,
+            &realm_id,
+            "https://issuer.example.com/realms/master",
+            &session,
+        )
+        .await;
+
+        assert_eq!(urls.len(), 2);
+        let with_session = urls
+            .iter()
+            .find(|u| u.starts_with("https://client.example.com/fc-logout"))
+            .expect("default client URL");
+        assert!(
+            with_session.starts_with("https://client.example.com/fc-logout?iss="),
+            "default client keeps iss+sid: {with_session}"
+        );
+        assert!(with_session.contains("&sid=sess-1"), "sid appended: {with_session}");
+        let bare = urls
+            .iter()
+            .find(|u| u.starts_with("https://client.example.com/fc-plain"))
+            .expect("opted-out client URL");
+        assert_eq!(
+            bare, "https://client.example.com/fc-plain",
+            "opted-out client is called with the bare URI"
         );
     }
 }

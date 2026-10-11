@@ -2482,6 +2482,29 @@ pub struct Client {
     pub attributes: HashMap<String, String>,
 }
 
+impl Client {
+    /// Client attribute carrying the per-client response-type allowlist
+    /// consulted by the authorization endpoint. Two encodings are honored:
+    /// a JSON array of response-type strings (what dynamic client
+    /// registration stores — lossless for multi-token combinations such as
+    /// `code id_token`) and the legacy space-separated word list (admin
+    /// consoles and older rows).
+    pub const RESPONSE_TYPES_ATTRIBUTE: &'static str = "response_types";
+
+    /// The client's configured response-type allowlist (`None` when the
+    /// attribute is absent → the authorization endpoint's default allowlist
+    /// applies). A JSON array value is taken verbatim; any other value falls
+    /// back to the legacy whitespace split (which cannot express multi-token
+    /// combinations — register those via the JSON form).
+    pub fn allowed_response_types(&self) -> Option<Vec<String>> {
+        let raw = self.attributes.get(Self::RESPONSE_TYPES_ATTRIBUTE)?;
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(raw) {
+            return Some(list);
+        }
+        Some(raw.split_whitespace().map(str::to_string).collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Role
 // ---------------------------------------------------------------------------
@@ -2956,7 +2979,11 @@ pub struct LogoutTokenClaims {
     pub iat: i64,
     pub jti: JwtId,
     pub events: serde_json::Value,
-    pub sid: SessionId,
+    /// Session identifier (OIDC Back-Channel Logout 1.0 §2.4). Omitted when
+    /// the client registered `backchannel_logout_session_required = false`;
+    /// the token then correlates by `sub` alone (which is always present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<SessionId>,
 }
 
 /// RFC 7800 `cnf` (confirmation) claim — the sender-constraining material of
@@ -3842,6 +3869,54 @@ mod tests {
         roundtrip(&c);
     }
 
+    #[test]
+    fn allowed_response_types_json_and_legacy_encodings() {
+        fn client_with_attribute(value: Option<&str>) -> Client {
+            let mut attributes = HashMap::new();
+            if let Some(value) = value {
+                attributes.insert(Client::RESPONSE_TYPES_ATTRIBUTE.to_string(), value.to_string());
+            }
+            Client {
+                id: ClientId::new("client-1").unwrap(),
+                realm_id: RealmId::new("realm-1").unwrap(),
+                client_id: ClientIdentifier::new("my-app").unwrap(),
+                name: None,
+                description: None,
+                enabled: true,
+                protocol: ClientProtocol::OpenIdConnect,
+                public_client: false,
+                bearer_only: false,
+                client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+                secret: None,
+                redirect_uris: vec![],
+                web_origins: vec![],
+                default_scopes: Scope::empty(),
+                optional_scopes: Scope::empty(),
+                consent_required: false,
+                full_scope_allowed: true,
+                service_accounts_enabled: false,
+                protocol_mappers: Vec::new(),
+                scope_mappings: Default::default(),
+                attributes,
+            }
+        }
+
+        // Absent attribute → no restriction (caller applies its default).
+        assert_eq!(client_with_attribute(None).allowed_response_types(), None);
+        // JSON array (the DCR encoding) keeps multi-token combinations intact.
+        assert_eq!(
+            client_with_attribute(Some("[\"code\", \"code id_token\"]")).allowed_response_types(),
+            Some(vec!["code".to_string(), "code id_token".to_string()])
+        );
+        // Legacy space-separated words keep working (single-token types only).
+        assert_eq!(
+            client_with_attribute(Some("code id_token")).allowed_response_types(),
+            Some(vec!["code".to_string(), "id_token".to_string()])
+        );
+        // An empty legacy value denies everything, as before.
+        assert_eq!(client_with_attribute(Some("")).allowed_response_types(), Some(vec![]));
+    }
+
     // ------------------------------------------------------------------
     // Role
     // ------------------------------------------------------------------
@@ -4144,9 +4219,28 @@ mod tests {
             iat: 1234567890,
             jti: JwtId::new("jti-1").unwrap(),
             events: serde_json::json!({"http://schemas.openid.net/event/backchannel-logout": {}}),
-            sid: SessionId::new("session-1").unwrap(),
+            sid: Some(SessionId::new("session-1").unwrap()),
         };
         roundtrip(&ltc);
+    }
+
+    #[test]
+    fn logout_token_claims_without_sid_roundtrip() {
+        // `backchannel_logout_session_required = false` clients get a logout
+        // token without `sid`; the claim must stay absent on the wire.
+        let ltc = LogoutTokenClaims {
+            iss: Issuer::new("https://auth.example.com").unwrap(),
+            sub: UserId::new("user-1").unwrap(),
+            aud: Audience::new("client-1").unwrap(),
+            iat: 1234567890,
+            jti: JwtId::new("jti-1").unwrap(),
+            events: serde_json::json!({"http://schemas.openid.net/event/backchannel-logout": {}}),
+            sid: None,
+        };
+        let json = serde_json::to_string(&ltc).unwrap();
+        assert!(!json.contains("\"sid\""), "sid must be omitted, not null: {json}");
+        let back: LogoutTokenClaims = serde_json::from_str(&json).unwrap();
+        assert_eq!(ltc, back);
     }
 
     // ------------------------------------------------------------------
@@ -5650,7 +5744,7 @@ mod tests {
                 iat: 1234567890,
                 jti: JwtId::new("jti-1").unwrap(),
                 events: serde_json::json!({"http://schemas.openid.net/event/backchannel-logout": {}}),
-                sid: SessionId::new("session-1").unwrap(),
+                sid: Some(SessionId::new("session-1").unwrap()),
             },
         };
         roundtrip(&lt);

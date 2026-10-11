@@ -10,6 +10,7 @@ pub mod broker;
 pub mod claims;
 pub mod claims_cache;
 pub mod client_assertion;
+pub mod client_metadata;
 pub mod config;
 pub mod discovery_cache;
 pub mod dpop;

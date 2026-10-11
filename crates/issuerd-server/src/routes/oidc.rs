@@ -5826,8 +5826,11 @@ async fn logout_inner(
     )
     .await;
 
-    // Optional post-logout redirect, validated against the client's registered
-    // redirect URIs. Without a recognized client we cannot validate the target,
+    // Optional post-logout redirect, validated against the client's
+    // `post_logout_redirect_uris` attribute when that list is registered
+    // (OIDC RP-Initiated Logout; RFC 7591 metadata), falling back to the
+    // registered `redirect_uris` for clients that predate/do not set it.
+    // Without a recognized client we cannot validate the target,
     // so we refuse the redirect rather than acting as an open redirector.
     if let Some(target) = params.get("post_logout_redirect_uri") {
         let registered = client
@@ -5836,9 +5839,19 @@ async fn logout_inner(
                 // Same Keycloak-compatible matching as the authorization
                 // endpoint (exact or trailing-`*` wildcard); an unparseable
                 // target never matches.
-                issuerd_core::RedirectUri::new(target)
-                    .ok()
-                    .is_some_and(|t| c.redirect_uris.iter().any(|u| u.matches(t.as_str())))
+                let Some(target) = issuerd_core::RedirectUri::new(target).ok() else {
+                    return false;
+                };
+                let post_logout_uris = crate::client_metadata::post_logout_redirect_uris(c);
+                if post_logout_uris.is_empty() {
+                    c.redirect_uris.iter().any(|u| u.matches(target.as_str()))
+                } else {
+                    post_logout_uris.iter().any(|registered| {
+                        issuerd_core::RedirectUri::new(registered)
+                            .ok()
+                            .is_some_and(|u| u.matches(target.as_str()))
+                    })
+                }
             })
             .unwrap_or(false);
         if !registered {

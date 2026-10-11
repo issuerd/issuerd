@@ -80,14 +80,20 @@ fn jwt_claims(token: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// Register a logout URI attribute on the client.
+/// Register a logout URI attribute on the client. Read-modify-write against
+/// storage, so successive calls on the same client compose.
 async fn set_client_attr(
     harness: &TestHarness,
     client: &issuerd_core::Client,
     key: &str,
     value: &str,
 ) {
-    let mut client = client.clone();
+    let mut client = harness
+        .storage
+        .get_client(&client.realm_id, &client.id)
+        .await
+        .unwrap()
+        .expect("client exists");
     client.attributes.insert(key.to_string(), value.to_string());
     harness.storage.update_client(&client.realm_id.clone(), &client).await.unwrap();
 }
@@ -386,4 +392,147 @@ async fn logout_without_frontchannel_clients_keeps_plain_redirect_behavior() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     assert_eq!(location, "http://localhost:8080/cb?state=s1");
+}
+
+// ---------------------------------------------------------------------------
+// Client metadata: post_logout_redirect_uris + logout *_session_required
+// ---------------------------------------------------------------------------
+
+/// A client with a registered `post_logout_redirect_uris` list validates
+/// logout targets against THAT list (not its `redirect_uris`): a listed
+/// target redirects, a redirect-URI-only target is refused.
+#[tokio::test]
+async fn post_logout_redirect_uris_take_precedence_over_redirect_uris() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-pref").await;
+    // The harness client registers `redirect_uris = [http://localhost:8080/cb]`.
+    let client = harness.create_client("plru-pref", false).await;
+    set_client_attr(
+        &harness,
+        &client,
+        "post_logout_redirect_uris",
+        "[\"https://app.example.com/logout-done\"]",
+    )
+    .await;
+    harness.create_user("plru-pref", "mats", "Password123!").await;
+
+    // A target from the dedicated list is accepted (with state echo).
+    let tokens = login(&harness, "plru-pref", &client, "mats").await;
+    let id_token = tokens.id_token.expect("id token");
+    let resp = logout_get(
+        &harness,
+        "plru-pref",
+        &[
+            ("id_token_hint", &id_token),
+            ("post_logout_redirect_uri", "https://app.example.com/logout-done"),
+            ("state", "s-plru"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(location, "https://app.example.com/logout-done?state=s-plru");
+
+    // A target that only exists in `redirect_uris` is refused: the dedicated
+    // list fully replaces the fallback.
+    let tokens = login(&harness, "plru-pref", &client, "mats").await;
+    let id_token = tokens.id_token.expect("id token");
+    let resp = logout_get(
+        &harness,
+        "plru-pref",
+        &[
+            ("id_token_hint", &id_token),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A client WITHOUT the attribute keeps the redirect_uris fallback.
+    let realm = harness.create_realm("plru-fallback").await;
+    let client = harness.create_client("plru-fallback", false).await;
+    harness.create_user("plru-fallback", "nora", "Password123!").await;
+    let tokens = login(&harness, "plru-fallback", &client, "nora").await;
+    let id_token = tokens.id_token.expect("id token");
+    let resp = logout_get(
+        &harness,
+        "plru-fallback",
+        &[
+            ("id_token_hint", &id_token),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let sid = jwt_claims(&id_token)["sid"].as_str().unwrap().to_string();
+    let sid_typed = issuerd_core::SessionId::new(&sid).unwrap();
+    assert!(harness.storage.get_user_session(&realm.id, &sid_typed).await.unwrap().is_none());
+}
+
+/// `frontchannel_logout_session_required = false`: the iframe URL is called
+/// WITHOUT the `iss`/`sid` query parameters (OIDC Front-Channel Logout 1.0).
+#[tokio::test]
+async fn frontchannel_session_required_false_omits_iss_and_sid() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("fc-nosess").await;
+    let client = harness.create_client("fc-nosess", false).await;
+    set_client_attr(
+        &harness,
+        &client,
+        "frontchannel_logout_uri",
+        "http://localhost:8080/fc-logout",
+    )
+    .await;
+    set_client_attr(&harness, &client, "frontchannel_logout_session_required", "false").await;
+    harness.create_user("fc-nosess", "nina", "Password123!").await;
+
+    let tokens = login(&harness, "fc-nosess", &client, "nina").await;
+    let id_token = tokens.id_token.expect("id token");
+
+    let resp = logout_get(&harness, "fc-nosess", &[("id_token_hint", &id_token)]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        body.contains("<iframe src=\"http://localhost:8080/fc-logout\""),
+        "the bare URI is iframed: {body}"
+    );
+    assert!(!body.contains("fc-logout?iss="), "no iss param: {body}");
+    assert!(!body.contains("sid="), "no sid param: {body}");
+}
+
+/// `backchannel_logout_session_required = false`: the logout token omits the
+/// `sid` claim and correlates by `sub` alone (OIDC Back-Channel Logout 1.0
+/// §2.4).
+#[tokio::test]
+async fn backchannel_session_required_false_omits_sid() {
+    let receiver = start_receiver().await;
+    let harness = TestHarness::new().await;
+    harness.create_realm("bc-nosess").await;
+    let client = harness.create_client("bc-nosess", false).await;
+    set_client_attr(&harness, &client, "backchannel_logout_uri", &receiver.base_url).await;
+    set_client_attr(&harness, &client, "backchannel_logout_session_required", "false").await;
+    let user = harness.create_user("bc-nosess", "olga", "Password123!").await;
+
+    let tokens = login(&harness, "bc-nosess", &client, "olga").await;
+    let id_token = tokens.id_token.expect("id token");
+    let status = logout_with_hint(&harness, "bc-nosess", &id_token).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let bodies = receiver.wait_for_bodies(1).await;
+    assert_eq!(bodies.len(), 1, "expected one delivery, got: {bodies:?}");
+    let form: std::collections::HashMap<String, String> =
+        serde_urlencoded::from_str(&bodies[0]).unwrap();
+    let claims = jwt_claims(form.get("logout_token").expect("logout_token form field"));
+    assert!(claims.get("sid").is_none(), "sid must be omitted: {claims}");
+    // Without sid, sub is the only session correlation and must be present.
+    assert_eq!(claims["sub"].as_str().unwrap(), user.id.as_ref());
+    assert_eq!(claims["aud"].as_str().unwrap(), client.client_id.as_ref());
+    assert!(
+        claims["events"]
+            .get("http://schemas.openid.net/event/backchannel-logout")
+            .is_some(),
+        "backchannel event claim missing: {claims}"
+    );
 }

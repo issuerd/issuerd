@@ -4740,7 +4740,7 @@ pub(crate) mod tests {
             _user: &issuerd_core::User,
             _client: &issuerd_core::Client,
             _realm: &issuerd_core::Realm,
-            _session_id: &issuerd_core::SessionId,
+            _session_id: Option<&issuerd_core::SessionId>,
         ) -> Result<issuerd_core::LogoutToken, issuerd_core::IssuerdError> {
             Err(issuerd_core::IssuerdError::ServerError("mock".into()))
         }
