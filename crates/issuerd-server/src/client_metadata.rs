@@ -48,13 +48,17 @@ pub const ATTR_BACKCHANNEL_LOGOUT_SESSION_REQUIRED: &str = "backchannel_logout_s
 pub const ATTR_TOKEN_ENDPOINT_AUTH_METHOD: &str = "token_endpoint_auth_method";
 
 /// RFC 7591 (OIDC registration): the JWS algorithm the client wants its ID
-/// tokens signed with. Stored and echoed; signing enforcement is a separate
-/// feature.
-pub const ATTR_ID_TOKEN_SIGNED_RESPONSE_ALG: &str = "id_token_signed_response_alg";
+/// tokens signed with. ID-token issuance honors it (strict: the keyset must
+/// have an active key for it — never a silent fallback). The constant is the
+/// `issuerd_core` one — `issuerd_token` reads the attribute directly.
+pub const ATTR_ID_TOKEN_SIGNED_RESPONSE_ALG: &str =
+    issuerd_core::Client::ID_TOKEN_SIGNED_RESPONSE_ALG_ATTRIBUTE;
 
 /// RFC 7591 (OIDC registration): the JWS algorithm the client wants userinfo
-/// responses signed with. Stored and echoed; signing is a separate feature.
-pub const ATTR_USERINFO_SIGNED_RESPONSE_ALG: &str = "userinfo_signed_response_alg";
+/// responses signed with. When set, userinfo answers with a signed JWT
+/// (`application/jwt`). The constant is the `issuerd_core` one.
+pub const ATTR_USERINFO_SIGNED_RESPONSE_ALG: &str =
+    issuerd_core::Client::USERINFO_SIGNED_RESPONSE_ALG_ATTRIBUTE;
 
 /// RFC 7591: URL of the client's logo (https only at registration).
 pub const ATTR_LOGO_URI: &str = "logo_uri";
@@ -65,10 +69,19 @@ pub const ATTR_POLICY_URI: &str = "policy_uri";
 /// RFC 7591: URL of the client's terms of service (https only).
 pub const ATTR_TOS_URI: &str = "tos_uri";
 
+/// OIDC registration: the client's pre-registered `request_uri` values
+/// (JAR-by-reference, OIDC Core §6.2), stored as a JSON array of URI
+/// strings. The authorization endpoint only ever fetches URIs on this list
+/// (exact string match).
+pub const ATTR_REQUEST_URIS: &str = "request_uris";
+
+/// OIDC registration: the JWS algorithm the client's Request Objects must be
+/// signed with (`request_object_signing_alg`). Stored and echoed.
+pub const ATTR_REQUEST_OBJECT_SIGNING_ALG: &str = "request_object_signing_alg";
+
 /// Registration bookkeeping (not an RFC field): the `grant_types` list the
 /// client registered, stored as a JSON array of strings.
 pub const ATTR_DCR_GRANT_TYPES: &str = "dcr.grant_types";
-
 /// Registration bookkeeping (not an RFC field): unix seconds at which the
 /// client identifier was issued via dynamic registration. Stamped once at
 /// creation and carried across RFC 7592 updates.
@@ -150,6 +163,16 @@ pub fn policy_uri(client: &Client) -> Option<&str> {
 /// The registered `tos_uri`, when set.
 pub fn tos_uri(client: &Client) -> Option<&str> {
     attribute(client, ATTR_TOS_URI)
+}
+
+/// The client's pre-registered `request_uri` list (empty when unset).
+pub fn request_uris(client: &Client) -> Vec<String> {
+    attribute(client, ATTR_REQUEST_URIS).map(parse_string_list).unwrap_or_default()
+}
+
+/// The registered `request_object_signing_alg`, when set.
+pub fn request_object_signing_alg(client: &Client) -> Option<&str> {
+    attribute(client, ATTR_REQUEST_OBJECT_SIGNING_ALG)
 }
 
 /// The grant types the client registered (`dcr.grant_types`), `None` when

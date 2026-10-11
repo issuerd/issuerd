@@ -143,7 +143,10 @@ pub async fn discovery_handler(
                 Ok(algs) if !algs.is_empty() => {
                     discovery.id_token_signing_alg_values_supported = algs.clone();
                     // JARM responses sign with the same key set.
-                    discovery.authorization_signing_alg_values_supported = algs;
+                    discovery.authorization_signing_alg_values_supported = algs.clone();
+                    // Signed userinfo (per-client `userinfo_signed_response_alg`)
+                    // signs with the same key set.
+                    discovery.userinfo_signing_alg_values_supported = algs;
                 }
                 _ => {}
             }
@@ -795,13 +798,28 @@ async fn handle_auth_request(
         Err(resp) => return resp,
     };
 
-    // JAR (RFC 9101): a signed `request` object carries the
-    // authorization request. Validate it against the client's verification
-    // material and merge its claims (they win per-key over the query
-    // parameters) before normal parsing. Failures render an error page/JSON —
+    // JAR (RFC 9101): a signed Request Object carries the
+    // authorization request — inline via `request`, or by reference via a
+    // client-registered `request_uri` (OIDC Core §6.2: fetched SSRF-guarded,
+    // then taking the exact same validation + merge path). The two parameters
+    // never combine (RFC 9101 §4). Failures render an error page/JSON —
     // nothing inside an unvalidated object (including redirect_uri) may be
     // trusted, so no client redirect is possible.
-    let params = if params.contains_key("request") {
+    if params.contains_key("request") && params.contains_key("request_uri") {
+        return crate::routes::jar::jar_resolution_error(
+            &state,
+            &realm,
+            &realm_name,
+            &ip,
+            &headers,
+            &params,
+            IssuerdError::InvalidRequest(
+                "the request and request_uri parameters are mutually exclusive".into(),
+            ),
+        )
+        .await;
+    }
+    let params = if params.contains_key("request") || params.contains_key("request_uri") {
         let jar_result = async {
             let client_id_str = params.get("client_id").cloned().ok_or_else(|| {
                 IssuerdError::InvalidRequest(
@@ -814,8 +832,30 @@ async fn handle_auth_request(
                 .get_client_by_client_id(&realm_id, &identifier)
                 .await?
                 .ok_or_else(|| IssuerdError::InvalidRequest("unknown client".into()))?;
-            crate::routes::jar::extract_request_object_params(&state, &realm, &client, &params)
-                .await
+            match params.get("request_uri") {
+                // By reference: fetch the object from the client-registered
+                // URI, then run the shared inline-object path.
+                Some(uri) => {
+                    let object =
+                        crate::routes::jar::fetch_request_uri(&state, &client, uri).await?;
+                    let mut with_object = params.clone();
+                    with_object.remove("request_uri");
+                    with_object.insert("request".to_string(), object);
+                    crate::routes::jar::extract_request_object_params(
+                        &state,
+                        &realm,
+                        &client,
+                        &with_object,
+                    )
+                    .await
+                }
+                None => {
+                    crate::routes::jar::extract_request_object_params(
+                        &state, &realm, &client, &params,
+                    )
+                    .await
+                }
+            }
         }
         .await;
         match jar_result {
@@ -5480,24 +5520,61 @@ async fn userinfo_handler_inner(
                 }
             }
 
+            // A client registered with `userinfo_signed_response_alg` gets the
+            // claims as a signed JWT (OIDC Core §5.3.2) instead of JSON —
+            // resolved before the rendered-response cache so a signed body is
+            // never served from (or written into) the JSON cache. The client
+            // resolved here is reused by the claims assembly below.
+            let resolved_client = match issuer_realm.as_ref() {
+                Some(realm) => match ClientIdentifier::new(claims.aud.as_str()) {
+                    Ok(cid) => {
+                        crate::claims_cache::ClaimsReader::new(&state, &realm.id).client(&cid).await
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let signed_userinfo_alg: Option<issuerd_core::Algorithm> = match resolved_client
+                .as_ref()
+                .and_then(|c| {
+                    c.attributes.get(issuerd_core::Client::USERINFO_SIGNED_RESPONSE_ALG_ATTRIBUTE)
+                }) {
+                None => None,
+                Some(raw) => match raw.parse::<issuerd_core::Algorithm>() {
+                    Ok(alg) => Some(alg),
+                    Err(_) => {
+                        error!(client_id = %resolved_client.as_ref().unwrap().client_id, "client has an unparseable userinfo_signed_response_alg");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "server_error"})),
+                        )
+                            .into_response();
+                    }
+                },
+            };
+
             // Rendered-response cache: the body built below is a pure
             // function of the resolved user, the issuing client, the token's
             // scope set, and its claims/authz parameters (see
             // `userinfo_cache`). The read is consulted only after every
             // validity gate above has passed, so a logged-out, revoked, or
             // expired token never reaches it.
-            let cache_ctx = issuer_realm.as_ref().map(|realm| {
-                let user_id = session
-                    .as_ref()
-                    .map(|s| s.user_id.clone())
-                    .unwrap_or_else(|| claims.sub.clone());
-                (
-                    realm.id.clone(),
-                    user_id,
-                    claims.aud.as_str().to_string(),
-                    crate::userinfo_cache::fingerprint(&claims),
-                )
-            });
+            let cache_ctx = if signed_userinfo_alg.is_some() {
+                None
+            } else {
+                issuer_realm.as_ref().map(|realm| {
+                    let user_id = session
+                        .as_ref()
+                        .map(|s| s.user_id.clone())
+                        .unwrap_or_else(|| claims.sub.clone());
+                    (
+                        realm.id.clone(),
+                        user_id,
+                        claims.aud.as_str().to_string(),
+                        crate::userinfo_cache::fingerprint(&claims),
+                    )
+                })
+            };
             if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
                 if let Some(body) =
                     crate::userinfo_cache::read(&state, realm_id, user_id, client_id, fp).await
@@ -5529,6 +5606,10 @@ async fn userinfo_handler_inner(
             // realm-NAME based: resolve the segment as a realm name. A
             // lookup failure fails open (serving userinfo must not depend on
             // this storage read).
+            //
+            // The realm is cloned for the signed-userinfo path below: the
+            // branch consumes the option.
+            let signing_realm = issuer_realm.clone();
             if let Some(realm) = issuer_realm {
                 let realm_id = realm.id.clone();
                 // Pairwise `sub` values cannot be reversed to a
@@ -5538,17 +5619,10 @@ async fn userinfo_handler_inner(
                     cacheable = true;
                     // Scope claims are produced by protocol mappers
                     // on the client scopes matching the token's granted scope
-                    // names (+ client-local mappers). The issuing client is
-                    // resolved from `aud`; if it was deleted since issuance,
-                    // scope-resource mappers still apply.
-                    let client = match ClientIdentifier::new(claims.aud.as_str()) {
-                        Ok(cid) => {
-                            crate::claims_cache::ClaimsReader::new(&state, &realm_id)
-                                .client(&cid)
-                                .await
-                        }
-                        Err(_) => None,
-                    };
+                    // names (+ client-local mappers). The issuing client was
+                    // resolved from `aud` above; if it was deleted since
+                    // issuance, scope-resource mappers still apply.
+                    let client = resolved_client.clone();
                     let scope_names = claims.scope.to_vec();
                     let overlay = crate::claims::build_claims_overlay(
                         &state,
@@ -5588,6 +5662,36 @@ async fn userinfo_handler_inner(
             }
 
             let value = serde_json::Value::Object(resp);
+
+            // Signed userinfo (OIDC Core §5.3.2): the JWT body is exactly
+            // the JSON response's claims, signed with the client-registered
+            // algorithm.
+            if let (Some(alg), Some(client), Some(realm)) =
+                (signed_userinfo_alg, resolved_client, signing_realm)
+            {
+                let claims_map = match &value {
+                    serde_json::Value::Object(map) => map.clone(),
+                    _ => unreachable!("the userinfo body is always a JSON object"),
+                };
+                let jwt = match state
+                    .token_manager
+                    .sign_userinfo_response(&client, &realm, &claims_map, alg)
+                    .await
+                {
+                    Ok(token) => token,
+                    Err(e) => {
+                        error!(realm = %realm.id, client_id = %client.client_id, error = %e, "userinfo signing failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                            .into_response();
+                    }
+                };
+                let mut response = jwt.into_response();
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, "application/jwt".parse().unwrap());
+                return crate::dpop::with_nonce_header(response, dpop_response_nonce.as_deref());
+            }
+
             if cacheable {
                 if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
                     if let Ok(body) = serde_json::to_vec(&value) {

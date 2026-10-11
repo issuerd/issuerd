@@ -452,6 +452,15 @@ pub enum ResponseType {
     IdTokenToken,
     #[serde(rename = "code id_token token")]
     CodeIdTokenToken,
+    /// Discovery-only alias of [`ResponseType::IdTokenToken`]: OIDC Core §3
+    /// defines response types as space-delimited SETS, so both spellings are
+    /// the same type — but the OIDF Dynamic profile's discovery check
+    /// (OIDCD-3) looks for the token-first spelling. The parser normalizes
+    /// `"token id_token"` to `IdTokenToken`, so this variant is never
+    /// constructed from a request; it exists purely to advertise both
+    /// spellings.
+    #[serde(rename = "token id_token")]
+    TokenIdToken,
 }
 
 impl ResponseType {
@@ -464,6 +473,7 @@ impl ResponseType {
             ResponseType::CodeToken => "code token",
             ResponseType::IdTokenToken => "id_token token",
             ResponseType::CodeIdTokenToken => "code id_token token",
+            ResponseType::TokenIdToken => "token id_token",
         }
     }
 
@@ -483,6 +493,7 @@ impl ResponseType {
             ResponseType::Token
                 | ResponseType::CodeToken
                 | ResponseType::IdTokenToken
+                | ResponseType::TokenIdToken
                 | ResponseType::CodeIdTokenToken
         )
     }
@@ -493,6 +504,7 @@ impl ResponseType {
             ResponseType::IdToken
                 | ResponseType::CodeIdToken
                 | ResponseType::IdTokenToken
+                | ResponseType::TokenIdToken
                 | ResponseType::CodeIdTokenToken
         )
     }
@@ -508,7 +520,10 @@ impl std::str::FromStr for ResponseType {
             "token" => Ok(ResponseType::Token),
             "code id_token" => Ok(ResponseType::CodeIdToken),
             "code token" => Ok(ResponseType::CodeToken),
-            "id_token token" => Ok(ResponseType::IdTokenToken),
+            // The two spellings of the implicit pair are the same type
+            // (a space-delimited set); normalize to the id_token-first
+            // spelling so per-client allowlists compare one way.
+            "id_token token" | "token id_token" => Ok(ResponseType::IdTokenToken),
             "code id_token token" => Ok(ResponseType::CodeIdTokenToken),
             _ => Err(IssuerdError::InvalidRequest("unsupported response_type".into())),
         }
@@ -532,6 +547,9 @@ mod tests {
     #[case("code id_token", ResponseType::CodeIdToken)]
     #[case("code token", ResponseType::CodeToken)]
     #[case("id_token token", ResponseType::IdTokenToken)]
+    // The token-first spelling of the implicit pair normalizes to the same
+    // type (OIDC Core §3: response types are space-delimited sets).
+    #[case("token id_token", ResponseType::IdTokenToken)]
     #[case("code id_token token", ResponseType::CodeIdTokenToken)]
     fn response_type_parsing(#[case] input: &str, #[case] expected: ResponseType) {
         assert_eq!(ResponseType::from_str(input).unwrap(), expected);
@@ -563,6 +581,11 @@ mod tests {
         assert!(ResponseType::CodeIdTokenToken.has_code());
         assert!(ResponseType::CodeIdTokenToken.has_token());
         assert!(ResponseType::CodeIdTokenToken.has_id_token());
+
+        // The discovery-only token-first alias behaves like its pair.
+        assert!(ResponseType::TokenIdToken.has_token());
+        assert!(ResponseType::TokenIdToken.has_id_token());
+        assert!(!ResponseType::TokenIdToken.has_code());
     }
 
     #[rstest]

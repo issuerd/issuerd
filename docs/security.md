@@ -566,8 +566,11 @@ PKCE for defense in depth.
 - **JAR (RFC 9101):** the `request` parameter carries a signed Request Object, verified against
   the client's JWKS (inline via `use.jwks.string` + `jwks.string`, or fetched via
   `use.jwks.url` + `jwks.url`) or the client secret for HMAC. Unsigned objects are always
-  rejected; `iss` must equal the query `client_id`; JAR-by-reference (`request_uri` URLs) is not
-  implemented — use PAR instead.
+  rejected; `iss` must equal the query `client_id`. JAR-by-reference (`request_uri`, OIDC Core
+  §6.2) is restricted to client-registered URIs: the value must exactly match an entry of the
+  client's `request_uris` attribute (https-only), and the object is fetched through the same
+  SSRF guard as `jwks.url` (https only, publicly routable IPs, no redirects, capped body) —
+  an unregistered URI is refused before any fetch.
 
 ### Pairwise subject identifiers
 

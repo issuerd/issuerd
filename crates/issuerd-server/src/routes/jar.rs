@@ -23,9 +23,12 @@
 //!
 //! Unsigned Request Objects are always rejected (FAPI-aligned; Keycloak
 //! tolerates them unless the client pins a signature algorithm — recorded in
-//! `tests/KEYCLOAK_DIFFS.md`). JAR-by-reference from arbitrary URLs
-//! (`request_uri`) is not implemented; PAR references are consumed earlier
-//! (by the PAR endpoint) and a pushed `request` object is validated at push time.
+//! `tests/KEYCLOAK_DIFFS.md`). JAR-by-reference is implemented for
+//! client-REGISTERED `request_uri`s only (the DCR `request_uris` metadata
+//! list): the URI is fetched SSRF-guarded and the object then takes the exact
+//! same validation + merge path as the inline `request` parameter. PAR
+//! references are consumed earlier (by the PAR endpoint) and a pushed
+//! `request` object is validated at push time.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -182,6 +185,35 @@ pub(crate) async fn extract_request_object_params(
     }
     params.insert("client_id".to_string(), query_client_id.clone());
     Ok(params)
+}
+
+/// Fetch a `request_uri` request object (JAR-by-reference, OIDC Core §6.2):
+/// the URI must be one the client pre-registered (the DCR `request_uris`
+/// metadata list — exact string match), and the fetch rides the SSRF-guarded
+/// text client (https-only, public IPs, no redirects, capped body).
+pub(crate) async fn fetch_request_uri(
+    state: &Arc<ServerState>,
+    client: &Client,
+    uri: &str,
+) -> Result<String, IssuerdError> {
+    // Only client-registered URIs are ever fetched: an unregistered
+    // `request_uri` would otherwise let any caller point the server at an
+    // arbitrary URL.
+    let registered = crate::client_metadata::request_uris(client);
+    if !registered.iter().any(|u| u == uri) {
+        debug!(
+            client_id = %client.client_id,
+            "request_uri is not in the client's registered request_uris list"
+        );
+        return Err(IssuerdError::InvalidRequest(
+            "request_uri is not registered for this client".into(),
+        ));
+    }
+    let body = state.broker_client.get_text_ssrf_guarded(uri).await.map_err(|e| {
+        debug!(client_id = %client.client_id, error = %e, "request_uri fetch failed");
+        IssuerdError::InvalidRequest("request_uri could not be fetched".into())
+    })?;
+    Ok(body.trim().to_string())
 }
 
 /// Render a JAR validation failure like the PAR resolution failures: an
@@ -407,6 +439,42 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn request_uri_fetch_only_for_registered_uris() {
+        let base = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let mut client = make_client();
+        client.attributes.insert(
+            crate::client_metadata::ATTR_REQUEST_URIS.to_string(),
+            "[\"https://rp.example.com/object.jwt\"]".to_string(),
+        );
+
+        // An unregistered URI is refused before any fetch (mockall verifies:
+        // never called).
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        broker.expect_get_text_ssrf_guarded().never();
+        let state = Arc::new(ServerState {
+            broker_client: Arc::new(broker),
+            ..base
+        });
+        let result = fetch_request_uri(&state, &client, "https://evil.example.com/obj.jwt").await;
+        assert!(result.is_err());
+
+        // A registered URI is fetched through the guarded text client.
+        let base = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let mut broker = issuerd_core::MockBrokerClient::new();
+        broker
+            .expect_get_text_ssrf_guarded()
+            .returning(|_| Ok("the.request.object".to_string()));
+        let state = Arc::new(ServerState {
+            broker_client: Arc::new(broker),
+            ..base
+        });
+        let object = fetch_request_uri(&state, &client, "https://rp.example.com/object.jwt")
+            .await
+            .unwrap();
+        assert_eq!(object, "the.request.object");
     }
 
     #[tokio::test]

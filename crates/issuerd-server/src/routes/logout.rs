@@ -393,6 +393,16 @@ mod tests {
         ) -> Result<String, IssuerdError> {
             Err(IssuerdError::ServerError("mock".into()))
         }
+
+        async fn sign_userinfo_response(
+            &self,
+            _client: &Client,
+            _realm: &Realm,
+            _claims: &serde_json::Map<String, serde_json::Value>,
+            _alg: issuerd_core::Algorithm,
+        ) -> Result<String, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
     }
 
     fn client(uuid: &str, identifier: &str, backchannel_uri: Option<&str>) -> Client {
@@ -598,6 +608,16 @@ mod tests {
             _realm: &Realm,
             _client_id: &str,
             _params: &[(String, String)],
+        ) -> Result<String, IssuerdError> {
+            Err(IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn sign_userinfo_response(
+            &self,
+            _client: &Client,
+            _realm: &Realm,
+            _claims: &serde_json::Map<String, serde_json::Value>,
+            _alg: issuerd_core::Algorithm,
         ) -> Result<String, IssuerdError> {
             Err(IssuerdError::ServerError("mock".into()))
         }

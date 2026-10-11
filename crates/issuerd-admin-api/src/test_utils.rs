@@ -456,5 +456,15 @@ pub mod tests {
         ) -> Result<String, issuerd_core::IssuerdError> {
             unimplemented!("stub does not sign authorization responses")
         }
+
+        async fn sign_userinfo_response(
+            &self,
+            _client: &Client,
+            _realm: &issuerd_core::Realm,
+            _claims: &serde_json::Map<String, serde_json::Value>,
+            _alg: issuerd_core::Algorithm,
+        ) -> Result<String, issuerd_core::IssuerdError> {
+            unimplemented!("stub does not sign userinfo responses")
+        }
     }
 }

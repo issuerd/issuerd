@@ -180,12 +180,13 @@ async fn par_unknown_request_uri_rejected() {
 }
 
 #[tokio::test]
-async fn par_foreign_request_uri_scheme_rejected() {
+async fn non_par_request_uri_unregistered_rejected() {
     let harness = TestHarness::new().await;
     harness.create_realm("par-foreign").await;
     let client = harness.create_client("par-foreign", false).await;
 
-    // A JAR-by-reference URL stays unsupported.
+    // A JAR-by-reference URL for a client that registered no request_uris is
+    // refused (invalid_request) before any fetch.
     let resp = authorize(
         &harness,
         "par-foreign",
@@ -197,7 +198,7 @@ async fn par_foreign_request_uri_scheme_rejected() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = json_body(resp).await;
-    assert_eq!(json["error"], "request_not_supported");
+    assert_eq!(json["error"], "invalid_request");
 }
 
 #[tokio::test]
@@ -612,8 +613,8 @@ async fn par_discovery_advertises_endpoint() {
     );
     // Default policy is false (PAR optional).
     assert_eq!(json["require_pushed_authorization_requests"], false);
-    // JAR via `request` is implemented; JAR-by-reference is
-    // advertised truthfully as unsupported.
+    // JAR via `request` is implemented, and JAR-by-reference for
+    // client-registered URIs as well (OIDC Core §6.2).
     assert_eq!(json["request_parameter_supported"], true);
-    assert_eq!(json["request_uri_parameter_supported"], false);
+    assert_eq!(json["request_uri_parameter_supported"], true);
 }

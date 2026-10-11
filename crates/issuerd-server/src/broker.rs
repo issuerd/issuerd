@@ -231,7 +231,7 @@ impl BrokerClient for ReqwestBrokerClient {
     /// Hardened fetch for attacker-influenced URLs (the pairwise
     /// `sector_identifier_uri` from open dynamic client registration, a
     /// client's configured `jwks.url` presented to unauthenticated client
-    /// assertions / JAR request objects).
+    /// assertions / JAR request objects, a pre-registered `request_uri`).
     ///
     /// Every failure mode — scheme, DNS, non-public address, connect,
     /// redirect, non-success status, oversize body, JSON parse — collapses
@@ -244,11 +244,32 @@ impl BrokerClient for ReqwestBrokerClient {
     /// mitigation would be a pinning connector that dials the validated IP
     /// directly.
     async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
-        // One generic, leak-free error for every failure mode.
-        let fail = |why: &str| {
-            warn!(url, why, "SSRF-guarded fetch rejected/failed");
-            IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
-        };
+        let body = self.guarded_get_bytes(url).await?;
+        serde_json::from_slice(&body).map_err(|e| guarded_fetch_fail(&format!("json parse: {e}")))
+    }
+
+    /// The text variant of [`Self::get_json_ssrf_guarded`] (a pre-registered
+    /// `request_uri` serves a JWT, not JSON).
+    async fn get_text_ssrf_guarded(&self, url: &str) -> Result<String, IssuerdError> {
+        let body = self.guarded_get_bytes(url).await?;
+        String::from_utf8(body).map_err(|e| guarded_fetch_fail(&format!("utf8: {e}")))
+    }
+}
+
+/// One generic, leak-free error for every failure mode of the SSRF-guarded
+/// fetch: the real cause is logged only, so callers cannot serve as a blind
+/// host/port oracle into the internal network.
+fn guarded_fetch_fail(why: &str) -> IssuerdError {
+    warn!(why, "SSRF-guarded fetch rejected/failed");
+    IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
+}
+
+impl ReqwestBrokerClient {
+    /// The shared guarded GET: https-only, publicly routable resolved IPs,
+    /// no redirects, body capped at [`MAX_UNTRUSTED_BODY_BYTES`]. Both the
+    /// JSON and the text surface parse from this.
+    async fn guarded_get_bytes(&self, url: &str) -> Result<Vec<u8>, IssuerdError> {
+        let fail = guarded_fetch_fail;
 
         // Never fetch untrusted URLs over plain http. (For
         // `sector_identifier_uri` the pairwise validator enforces https too,
@@ -306,7 +327,7 @@ impl BrokerClient for ReqwestBrokerClient {
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body).map_err(|e| fail(&format!("json parse: {e}")))
+        Ok(body)
     }
 }
 

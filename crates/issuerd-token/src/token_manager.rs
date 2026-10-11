@@ -357,7 +357,25 @@ impl<C: CryptoProvider> TokenManager<C> {
     ) -> Result<IdToken, IssuerdError> {
         let now = Utc::now().timestamp();
         let alg = self.signing_alg_for_realm(realm);
-        let alg = self.active_alg(alg).await?;
+        // Per-client override (OIDC registration §2
+        // `id_token_signed_response_alg`): a registered algorithm pins the
+        // ID-token signature. Strict: the keyset must contain an ACTIVE key
+        // for it — a registered alg with no live key fails issuance loudly,
+        // never falling back silently.
+        let alg = match client
+            .attributes
+            .get(issuerd_core::Client::ID_TOKEN_SIGNED_RESPONSE_ALG_ATTRIBUTE)
+        {
+            Some(raw) => {
+                let alg = raw.parse::<Algorithm>().map_err(|_| {
+                    IssuerdError::ServerError(format!(
+                        "client registered an unknown id_token_signed_response_alg: {raw:?}"
+                    ))
+                })?;
+                self.active_alg_strict(alg).await?
+            }
+            None => self.active_alg(alg).await?,
+        };
 
         let mut claims = IdTokenClaims {
             iss: self.issuer_for_realm(realm),
@@ -728,6 +746,52 @@ impl<C: CryptoProvider> TokenManager<C> {
         Ok(jwk.alg)
     }
 
+    /// Strict variant of [`Self::active_alg`] for per-client pinned
+    /// algorithms (`id_token_signed_response_alg` /
+    /// `userinfo_signed_response_alg`): the keyset must contain an ACTIVE key
+    /// for exactly this algorithm — there is no fallback to the newest key.
+    async fn active_alg_strict(&self, alg: Algorithm) -> Result<Algorithm, IssuerdError> {
+        let jwks = self
+            .active_jwks
+            .read()
+            .map_err(|_| IssuerdError::ServerError("JWKS cache poisoned".into()))?;
+        if jwks.keys.iter().any(|k| k.alg == alg) {
+            Ok(alg)
+        } else {
+            Err(IssuerdError::ServerError(format!(
+                "no active signing key for the client-pinned algorithm {alg}"
+            )))
+        }
+    }
+
+    /// Sign the userinfo response body as a JWT (OIDC Core §5.3.2): the
+    /// claims map is exactly what the JSON response would carry; the envelope
+    /// (`iss`/`aud`/`iat`) wins on collision. `alg` is the client's
+    /// registered `userinfo_signed_response_alg` — strict: the keyset must
+    /// have an active key for it.
+    pub async fn sign_userinfo_response(
+        &self,
+        client: &Client,
+        realm: &Realm,
+        claims: &serde_json::Map<String, serde_json::Value>,
+        alg: Algorithm,
+    ) -> Result<String, IssuerdError> {
+        let alg = self.active_alg_strict(alg).await?;
+        let now = Utc::now().timestamp();
+        let mut full = claims.clone();
+        full.insert(
+            "iss".to_string(),
+            serde_json::Value::String(self.issuer_for_realm(realm).as_str().to_string()),
+        );
+        full.insert(
+            "aud".to_string(),
+            serde_json::Value::String(client.client_id.as_str().to_string()),
+        );
+        full.insert("iat".to_string(), serde_json::Value::from(now));
+        let (token, _) = self.sign_claims(&full, alg).await?;
+        Ok(token)
+    }
+
     async fn sign_claims<T: serde::Serialize>(
         &self,
         claims: &T,
@@ -965,6 +1029,17 @@ pub trait TokenIssuer: Send + Sync {
         session_id: Option<&SessionId>,
     ) -> Result<LogoutToken, IssuerdError>;
 
+    /// Sign the userinfo response body as a JWT (OIDC Core §5.3.2), with the
+    /// client's registered `userinfo_signed_response_alg` (strict: no active
+    /// key for it is an error, never a fallback).
+    async fn sign_userinfo_response(
+        &self,
+        client: &Client,
+        realm: &Realm,
+        claims: &serde_json::Map<String, serde_json::Value>,
+        alg: issuerd_core::Algorithm,
+    ) -> Result<String, IssuerdError>;
+
     /// Sign an authorization response as a JARM JWT: the
     /// response parameters become claims under the JARM envelope
     /// (`iss`/`aud`/`exp`/`iat`), signed with the realm's signing key.
@@ -1073,6 +1148,16 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
         session_id: Option<&SessionId>,
     ) -> Result<LogoutToken, IssuerdError> {
         self.issue_logout_token(user, client, realm, session_id).await
+    }
+
+    async fn sign_userinfo_response(
+        &self,
+        client: &Client,
+        realm: &Realm,
+        claims: &serde_json::Map<String, serde_json::Value>,
+        alg: issuerd_core::Algorithm,
+    ) -> Result<String, IssuerdError> {
+        self.sign_userinfo_response(client, realm, claims, alg).await
     }
 
     async fn sign_authorization_response(
@@ -2249,6 +2334,162 @@ mod tests {
             .events
             .get("http://schemas.openid.net/event/backchannel-logout")
             .is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-client signing-algorithm overrides (OIDC registration §2)
+    // ------------------------------------------------------------------
+
+    /// A crypto provider holding the fresh-boot pair (EdDSA + RS256), and its
+    /// public JWKS.
+    async fn paired_crypto() -> (Arc<RingCryptoProvider>, JwkSet) {
+        let crypto_config = CryptoConfig::default();
+        let keys: Vec<_> =
+            crate::KeyStore::generate_initial_key_set(crypto_config.default_alg, 2048)
+                .unwrap()
+                .iter()
+                .map(|g| g.to_stored(true))
+                .collect();
+        let crypto = Arc::new(RingCryptoProvider::from_signing_keys(crypto_config, &keys).unwrap());
+        let jwks = crypto.get_public_keys().await.unwrap();
+        (crypto, jwks)
+    }
+
+    fn client_pinned_alg(alg: &str) -> Client {
+        let mut client = test_client();
+        client.attributes.insert(
+            issuerd_core::Client::ID_TOKEN_SIGNED_RESPONSE_ALG_ATTRIBUTE.to_string(),
+            alg.to_string(),
+        );
+        client
+    }
+
+    fn header_alg(token: &str) -> String {
+        use base64::Engine;
+        let segment = token.split('.').next().unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        header["alg"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn id_token_per_client_alg_override() {
+        let (crypto, jwks) = paired_crypto().await;
+        let tm = TokenManager::with_default_alg(
+            crypto,
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            jwks,
+            Algorithm::EdDsa,
+        );
+        let session_id = SessionId::new("s1").unwrap();
+
+        // Default: the realm/server default (EdDSA here).
+        let token = tm
+            .issue_id_token(
+                &test_user(),
+                &test_client(),
+                &test_realm(),
+                None,
+                Utc::now(),
+                &session_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(header_alg(&token.token), "EdDSA");
+
+        // Pinned RS256: the override wins.
+        let token = tm
+            .issue_id_token(
+                &test_user(),
+                &client_pinned_alg("RS256"),
+                &test_realm(),
+                None,
+                Utc::now(),
+                &session_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(header_alg(&token.token), "RS256");
+
+        // Pinned to an algorithm with no active key: loud failure, never a
+        // silent fallback to the default.
+        let result = tm
+            .issue_id_token(
+                &test_user(),
+                &client_pinned_alg("ES256"),
+                &test_realm(),
+                None,
+                Utc::now(),
+                &session_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(IssuerdError::ServerError(_))));
+
+        // A garbage attribute value set out-of-band: also a loud failure.
+        let result = tm
+            .issue_id_token(
+                &test_user(),
+                &client_pinned_alg("not-an-alg"),
+                &test_realm(),
+                None,
+                Utc::now(),
+                &session_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(IssuerdError::ServerError(_))));
+    }
+
+    #[tokio::test]
+    async fn sign_userinfo_response_envelope_and_alg() {
+        let (crypto, jwks) = paired_crypto().await;
+        let tm = TokenManager::with_default_alg(
+            crypto,
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            jwks,
+            Algorithm::EdDsa,
+        );
+
+        let mut claims = serde_json::Map::new();
+        claims.insert("sub".to_string(), serde_json::json!("user-1"));
+        claims.insert("name".to_string(), serde_json::json!("Alice Smith"));
+        // Envelope wins on collision (same rule as JARM).
+        claims.insert("aud".to_string(), serde_json::json!("spoofed"));
+
+        let token = tm
+            .sign_userinfo_response(&test_client(), &test_realm(), &claims, Algorithm::Rs256)
+            .await
+            .unwrap();
+        assert_eq!(header_alg(&token), "RS256");
+        let payload = decode_payload(&token);
+        assert_eq!(payload["iss"], "https://issuer/realms/test");
+        assert_eq!(payload["aud"], "my-app");
+        assert_eq!(payload["sub"], "user-1");
+        assert_eq!(payload["name"], "Alice Smith");
+        assert!(payload["iat"].as_i64().unwrap() > 0);
+
+        // Strict: no active key for the pinned alg → loud failure.
+        let result = tm
+            .sign_userinfo_response(&test_client(), &test_realm(), &claims, Algorithm::Es256)
+            .await;
+        assert!(matches!(result, Err(IssuerdError::ServerError(_))));
     }
 
     // ------------------------------------------------------------------

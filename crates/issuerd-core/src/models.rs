@@ -2507,6 +2507,18 @@ impl Client {
     /// consoles and older rows).
     pub const RESPONSE_TYPES_ATTRIBUTE: &'static str = "response_types";
 
+    /// Client attribute pinning the ID-token signing algorithm (OIDC
+    /// registration §2 `id_token_signed_response_alg`). Registration
+    /// validates the value (a known asymmetric JWS alg); an
+    /// unparseable/garbage value set out-of-band fails issuance loudly,
+    /// never silently.
+    pub const ID_TOKEN_SIGNED_RESPONSE_ALG_ATTRIBUTE: &'static str = "id_token_signed_response_alg";
+
+    /// Client attribute pinning the userinfo signing algorithm (OIDC
+    /// registration §2 `userinfo_signed_response_alg`): when set, userinfo
+    /// answers with a signed JWT (`application/jwt`) instead of JSON.
+    pub const USERINFO_SIGNED_RESPONSE_ALG_ATTRIBUTE: &'static str = "userinfo_signed_response_alg";
+
     /// The client's configured response-type allowlist (`None` when the
     /// attribute is absent → the authorization endpoint's default allowlist
     /// applies). A JSON array value is taken verbatim; any other value falls

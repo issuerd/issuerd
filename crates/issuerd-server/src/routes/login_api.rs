@@ -4660,6 +4660,16 @@ pub(crate) mod tests {
         ) -> Result<String, issuerd_core::IssuerdError> {
             Err(issuerd_core::IssuerdError::ServerError("mock".into()))
         }
+
+        async fn sign_userinfo_response(
+            &self,
+            _client: &issuerd_core::Client,
+            _realm: &issuerd_core::Realm,
+            _claims: &serde_json::Map<String, serde_json::Value>,
+            _alg: issuerd_core::Algorithm,
+        ) -> Result<String, issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("mock".into()))
+        }
     }
 
     #[tokio::test]

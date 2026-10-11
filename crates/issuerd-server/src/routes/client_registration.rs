@@ -144,6 +144,10 @@ struct ClientRegistrationResponse {
     id_token_signed_response_alg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     userinfo_signed_response_alg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_object_signing_alg: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    request_uris: Vec<String>,
 }
 
 /// RFC 7591 §3.2.2 error body.
@@ -235,7 +239,7 @@ fn parse_client_representation(body: &serde_json::Value) -> Result<ClientReprese
 /// RFC 7591 request field names the translation layer consumes. A body
 /// carrying none of them takes the pre-existing (Keycloak-shaped) path
 /// bit-for-bit.
-const RFC7591_REQUEST_FIELDS: [&str; 21] = [
+const RFC7591_REQUEST_FIELDS: [&str; 23] = [
     "client_name",
     "grant_types",
     "response_types",
@@ -256,6 +260,8 @@ const RFC7591_REQUEST_FIELDS: [&str; 21] = [
     "tos_uri",
     "id_token_signed_response_alg",
     "userinfo_signed_response_alg",
+    "request_object_signing_alg",
+    "request_uris",
     "client_secret",
 ];
 
@@ -699,6 +705,7 @@ fn translate_rfc7591_request(mut body: serde_json::Value) -> Result<serde_json::
             "userinfo_signed_response_alg",
             client_metadata::ATTR_USERINFO_SIGNED_RESPONSE_ALG,
         ),
+        ("request_object_signing_alg", client_metadata::ATTR_REQUEST_OBJECT_SIGNING_ALG),
     ] {
         if let Some(value) = obj.remove(field) {
             let Some(alg) = value.as_str() else {
@@ -707,6 +714,31 @@ fn translate_rfc7591_request(mut body: serde_json::Value) -> Result<serde_json::
             validate_signed_response_alg(field, alg)?;
             insert_body_attribute(obj, attribute, serde_json::Value::String(alg.to_string()))?;
         }
+    }
+
+    // request_uris (OIDC registration; JAR-by-reference): the URIs the
+    // authorization endpoint may fetch a request object from. https-only
+    // (the SSRF-guarded fetch never dials anything else), stored as JSON.
+    if let Some(value) = obj.remove("request_uris") {
+        let Some(list) = value.as_array() else {
+            return Err(invalid_metadata(
+                "request_uris must be an array of URI strings".to_string(),
+            ));
+        };
+        let mut uris = Vec::with_capacity(list.len());
+        for entry in list {
+            let Some(uri) = entry.as_str() else {
+                return Err(invalid_metadata("request_uris entries must be strings".to_string()));
+            };
+            require_https_uri("request_uris", uri)?;
+            uris.push(uri.to_string());
+        }
+        let encoded = serde_json::to_string(&uris).expect("uri list serialization");
+        insert_body_attribute(
+            obj,
+            client_metadata::ATTR_REQUEST_URIS,
+            serde_json::Value::String(encoded),
+        )?;
     }
 
     // client_secret: the registrant-suggested secret (RFC 7591 allows the
@@ -739,14 +771,18 @@ enum RegistrationPolicy {
 /// outbound JWKS fetch at a caller-controlled URL, and the inline
 /// `jwks.string` would make the registrant its own key authority — anonymous
 /// clients authenticate with `client_secret`. The logout URIs are
-/// server-initiated POST/redirect targets dispatched at session teardown.
-const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 6] = [
+/// server-initiated POST/redirect targets dispatched at session teardown, and
+/// `request_uris` names URLs the authorization endpoint fetches (all
+/// SSRF-guarded fetches, but the open endpoint takes no caller-controlled
+/// fetch targets).
+const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 7] = [
     crate::client_assertion::ATTR_JWKS_URL,
     crate::client_assertion::ATTR_USE_JWKS_URL,
     crate::client_assertion::ATTR_JWKS_STRING,
     crate::client_assertion::ATTR_USE_JWKS_STRING,
     crate::routes::logout::CLIENT_ATTR_BACKCHANNEL_LOGOUT_URI,
     crate::routes::logout::CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI,
+    client_metadata::ATTR_REQUEST_URIS,
 ];
 
 /// Apply the payload policy of the open (unauthenticated) client
@@ -1137,6 +1173,9 @@ fn build_registration_response(
                 .map(str::to_string),
             userinfo_signed_response_alg: client_metadata::userinfo_signed_response_alg(&client)
                 .map(str::to_string),
+            request_object_signing_alg: client_metadata::request_object_signing_alg(&client)
+                .map(str::to_string),
+            request_uris: client_metadata::request_uris(&client),
         }),
     )
         .into_response()
@@ -2570,5 +2609,77 @@ mod tests {
         assert!(!client.attributes.contains_key(client_metadata::ATTR_DCR_GRANT_TYPES));
         assert!(!client.attributes.contains_key(client_metadata::ATTR_INITIATE_LOGIN_URI));
         assert!(client.attributes.contains_key(client_metadata::ATTR_DCR_CLIENT_ID_ISSUED_AT));
+    }
+
+    /// `request_uris` (OIDC registration, JAR-by-reference): https-only at
+    /// registration, stored as JSON, echoed in responses.
+    #[tokio::test]
+    async fn request_uris_registration_roundtrip() {
+        let (state, realm) = registration_state().await;
+        let resp = register_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-request-uris",
+                "request_uris": ["https://rp.example.com/object.jwt"],
+                "request_object_signing_alg": "RS256"
+            }),
+            RegistrationPolicy::Trusted,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = response_json(resp).await;
+        assert_eq!(json["request_uris"], serde_json::json!(["https://rp.example.com/object.jwt"]));
+        assert_eq!(json["request_object_signing_alg"], "RS256");
+
+        let identifier = issuerd_core::ClientIdentifier::new("dcr-request-uris").unwrap();
+        let stored = state
+            .storage
+            .get_client_by_client_id(&realm.id, &identifier)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client_metadata::request_uris(&stored),
+            vec!["https://rp.example.com/object.jwt".to_string()]
+        );
+        assert_eq!(client_metadata::request_object_signing_alg(&stored), Some("RS256"));
+    }
+
+    /// `request_uris` entries must be https; non-https and non-array shapes
+    /// are `invalid_client_metadata`.
+    #[tokio::test]
+    async fn request_uris_rejects_non_https_and_bad_shapes() {
+        let (state, realm) = registration_state().await;
+        for body in [
+            serde_json::json!({"request_uris": ["http://rp.example.com/object.jwt"]}),
+            serde_json::json!({"request_uris": ["not a url"]}),
+            serde_json::json!({"request_uris": "https://rp.example.com/object.jwt"}),
+            serde_json::json!({"request_uris": [42]}),
+        ] {
+            let desc = body.to_string();
+            let resp = register_client(&state, &realm, body, RegistrationPolicy::Trusted).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{desc}");
+            let json = response_json(resp).await;
+            assert_eq!(json["error"], "invalid_client_metadata", "{desc}");
+        }
+    }
+
+    /// The open endpoint strips `request_uris` (a caller-controlled fetch
+    /// target), like the JWKS/logout attributes.
+    #[tokio::test]
+    async fn open_policy_strips_request_uris() {
+        let (state, realm) = registration_state().await;
+        let (client, _token) = register_test_client(
+            &state,
+            &realm,
+            serde_json::json!({
+                "client_id": "dcr-open-request-uris",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "request_uris": ["https://attacker.example.com/object.jwt"]
+            }),
+        )
+        .await;
+        assert!(!client.attributes.contains_key(client_metadata::ATTR_REQUEST_URIS));
     }
 }

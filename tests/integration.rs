@@ -31,6 +31,8 @@ mod cross_realm_auth;
 mod dpop;
 #[path = "integration/dynamic_client_registration.rs"]
 mod dynamic_client_registration;
+#[path = "integration/dynamic_op.rs"]
+mod dynamic_op;
 #[path = "integration/email_code_login.rs"]
 mod email_code_login;
 #[path = "integration/federation_ad.rs"]
@@ -77,6 +79,8 @@ mod pairwise_subjects;
 mod par;
 #[path = "integration/rar.rs"]
 mod rar;
+#[path = "integration/request_uri.rs"]
+mod request_uri;
 #[path = "integration/session_management.rs"]
 mod session_management;
 #[path = "integration/spec_conformance.rs"]
