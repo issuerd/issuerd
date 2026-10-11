@@ -18,9 +18,9 @@
   {
     "test-name": "oidcc-idtoken-unsigned",
     "configuration-filename": "*",
-    "variant": "*",
+    "variant": {"response_type": "code"},
     "condition": "*",
     "current-block": "*",
-    "comment": "Self-skips on signed-only OPs: 'none' is not advertised in id_token_signing_alg_values_supported."
+    "comment": "Self-skips on signed-only OPs ('none' not advertised). Only exists in the response_type=code run — N/A for id_token-bearing variants, and a listed-but-absent skip fails the run."
   }
 ]
