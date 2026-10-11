@@ -84,6 +84,58 @@ run_plan \
     "issuerd-expected-skips.json" \
     "oidcc-formpost-basic-certification-test-plan-output.log"
 
+# Implicit / Hybrid OP (M2): one run each covers all of the plan's response
+# types. Form Post legs mirror them with response_mode pinned by the plan.
+run_plan \
+    "oidcc-implicit-certification-test-plan[server_metadata=discovery][client_registration=static_client]" \
+    "issuerd-implicit-op.json" \
+    "issuerd-expected-skips.json" \
+    "oidcc-implicit-certification-test-plan-output.log"
+
+run_plan \
+    "oidcc-hybrid-certification-test-plan[server_metadata=discovery][client_registration=static_client]" \
+    "issuerd-hybrid-op.json" \
+    "issuerd-expected-skips.json" \
+    "oidcc-hybrid-certification-test-plan-output.log"
+
+run_plan \
+    "oidcc-formpost-implicit-certification-test-plan[server_metadata=discovery][client_registration=static_client]" \
+    "issuerd-formpost-implicit-op.json" \
+    "issuerd-expected-skips.json" \
+    "oidcc-formpost-implicit-certification-test-plan-output.log"
+
+run_plan \
+    "oidcc-formpost-hybrid-certification-test-plan[server_metadata=discovery][client_registration=static_client]" \
+    "issuerd-formpost-hybrid-op.json" \
+    "issuerd-expected-skips.json" \
+    "oidcc-formpost-hybrid-certification-test-plan-output.log"
+
+# Logout profiles (M2 gate): the plans pin server_metadata=discovery /
+# client_auth_type / response_mode; client_registration and response_type are
+# user-selected. Static clients carry the logout URIs from bootstrap. Each
+# plan runs once per response type.
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=$rt]" \
+        "issuerd-rpinitiated-logout-op.json" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-rp-initiated-logout-certification-test-plan-${rt// /-}-output.log"
+done
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-frontchannel-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=$rt]" \
+        "issuerd-frontchannel-logout-op.json" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-frontchannel-rp-initiated-logout-certification-test-plan-${rt// /-}-output.log"
+done
+for rt in "code" "code id_token" "code id_token token" "code token" "id_token" "id_token token"; do
+    run_plan \
+        "oidcc-backchannel-rp-initiated-logout-certification-test-plan[client_registration=static_client][response_type=$rt]" \
+        "issuerd-backchannel-logout-op.json" \
+        "issuerd-expected-skips-config.json" \
+        "oidcc-backchannel-rp-initiated-logout-certification-test-plan-${rt// /-}-output.log"
+done
+
 # 3rd-Party-Init OP: the plan pins server_metadata=discovery,
 # client_registration=dynamic_client, client_auth_type=client_secret_basic and
 # response_mode=default itself (passing them on the command line is an
