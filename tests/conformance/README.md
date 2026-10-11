@@ -7,7 +7,7 @@ Automated runs of the [OpenID Foundation Conformance Suite](https://gitlab.com/o
 ```bash
 # 1. Clone the conformance suite source (once; gitignored):
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.2.4 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.2 && cd -
 
 # 2. Run everything:
 cd tests/conformance
@@ -85,7 +85,7 @@ downloads). The test environment itself never touches the internet —
 | `oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-basic-op.json` | Authorization code flow — **PASSED** |
 | `oidcc-formpost-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-formpost-op.json` | Code flow via `response_mode=form_post` — **PASSED** |
 
-Suite version `release-v5.2.4`. Latest full run: **0 failures, 0 warnings** on all three plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all three plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 
@@ -115,7 +115,7 @@ tests/conformance/
 
 ```bash
 conformance)
-  git clone --depth 1 --branch release-v5.2.4 https://gitlab.com/openid/conformance-suite.git 
+  git clone --depth 1 --branch release-v5.3.2 https://gitlab.com/openid/conformance-suite.git 
   tests/conformance/run.sh   # exits non-zero on unexpected failures
   ;;
 ```

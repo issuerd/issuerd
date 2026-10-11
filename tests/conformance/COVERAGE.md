@@ -1,7 +1,7 @@
 # Issuerd OIDC Conformance Test Coverage
 
-> Latest full run: **2026-09-13** (suite `release-v5.2.4`) — Config OP 39 conditions, Basic OP 36 modules / 1858 conditions, Form Post OP 36 modules / 2010 conditions; **0 failures and 0 warnings** across all three plans. Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
-> Conformance Suite version: release-v5.2.4
+> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — Config OP 39 conditions, Basic OP 36 modules / 1858 conditions, Form Post OP 36 modules / 2010 conditions; **0 failures and 0 warnings** across all three plans. Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run.
+> Conformance Suite version: release-v5.3.2
 
 ## Test Environment
 
@@ -27,7 +27,7 @@
 
 Validates discovery metadata and JWKS. Requires no browser automation.
 
-**Latest run**: 2026-09-13 (suite `release-v5.2.4`) — 2 test modules, 39 successes, 0 failures, 0 warnings (0.3s)
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 2 test modules, 39 successes, 0 failures, 0 warnings (0.3s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
@@ -39,7 +39,7 @@ Validates discovery metadata and JWKS. Requires no browser automation.
 
 Validates authorization code flow with `response_type=code`.
 
-**Latest run**: 2026-09-13 (suite `release-v5.2.4`) — 36 test modules, 1858 successes, 0 failures, 0 warnings (47.3s)
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 1858 successes, 0 failures, 0 warnings (47.3s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
@@ -83,7 +83,7 @@ Validates authorization code flow with `response_type=code`.
 
 Runs the same module set as Basic OP with `response_mode=form_post` — the authorization response is delivered as an auto-submitted HTML form instead of a query redirect.
 
-**Latest run**: 2026-09-13 (suite `release-v5.2.4`) — 36 test modules, 2010 successes, 0 failures, 0 warnings (46.2s)
+**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 2010 successes, 0 failures, 0 warnings (46.2s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
