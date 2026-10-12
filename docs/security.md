@@ -527,7 +527,8 @@ deletion — registered clients are notified:
   `logout_token` POST. Delivery is fire-and-forget (5 s timeout, one retry) and never blocks the
   user's logout; each delivery outcome is recorded as an admin event.
 - **Front-channel:** the logout page embeds a hidden iframe per client with a
-  `frontchannel_logout_uri` attribute (called with `iss` and `sid`), then continues to the
+  `frontchannel_logout_uri` attribute (called with `iss` and `sid` unless the client set
+  `frontchannel_logout_session_required = false`), then continues to the
   validated `post_logout_redirect_uri`.
 
 ### DPoP sender-constraining
@@ -552,7 +553,8 @@ captured proof can no longer be replayed even with a freshly minted `iat`/`jti`.
 Public clients must use PKCE on the authorization-code flow: the authorization endpoint (and the
 SPNEGO code path) reject a public client's request without `code_challenge`
 (`issuerd-protocol/src/authorization.rs`), and the verifier is checked at code exchange per RFC 7636
-(43–128 characters; `S256` and `plain` methods — always use `S256`). Confidential clients may add
+(43–128 characters; `S256` only — `plain`, and a challenge sent without a method, are rejected,
+matching the S256-only discovery advertisement). Confidential clients may add
 PKCE for defense in depth.
 
 ### PAR and JAR for authorization-request integrity

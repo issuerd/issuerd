@@ -38,7 +38,7 @@ Issuerd is a modular Identity and Access Management (IAM) server implementing Op
 - **Horizontally scalable from day one.** Access-token validation is stateless (no database lookup on the hot path), signing keys are shared cluster-wide through PostgreSQL, and transient coordination state lives in Redis. No sticky sessions — put any number of nodes behind any load balancer.
 - **Built for real directories.** LDAP (Samba AD, OpenLDAP, MS Active Directory) and Kerberos/SPNEGO federation with full user and group sync — a complete 100,000-user import from a live MS AD finishes in ~30 seconds (~3,300 users/s). Password validation via bind, password write-through, and group-membership reconciliation included.
 - **Batteries included.** Embedded React admin console and end-user account console served same-origin, themable login pages, per-realm i18n with localized emails, declarative YAML provisioning, one-command OpenAPI export, Prometheus metrics, health/readiness probes, TLS.
-- **Engineered for testability.** 2,690+ automated tests; every public function is testable without network or database; authentication state transitions are proven at compile time via typestate markers. The discovery document advertises exactly what is implemented and tested — nothing more.
+- **Engineered for testability.** 3,460+ automated tests; every public function is testable without network or database; authentication state transitions are proven at compile time via typestate markers. The discovery document advertises exactly what is implemented and tested — nothing more.
 
 ---
 
@@ -80,7 +80,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 ## Feature Overview
 
 **Protocols & grants**
-- OpenID Connect Core: authorization code flow with PKCE (S256/plain), implicit/hybrid response types, all response modes (`query`, `fragment`, `form_post`, and the JARM `*jwt` family)
+- OpenID Connect Core: authorization code flow with PKCE (S256-only), implicit/hybrid response types, all response modes (`query`, `fragment`, `form_post`, and the JARM `*jwt` family)
 - OAuth2 grants: `password`, `client_credentials` (service accounts), refresh token rotation with reuse detection, device authorization (RFC 8628), CIBA (poll mode)
 - Advanced OAuth: PAR (RFC 9126), JAR (RFC 9101), JARM, RAR `authorization_details` (RFC 9396), token exchange & impersonation (RFC 8693), DPoP sender-constraining (RFC 9449), dynamic client registration (RFC 7591/7592), pairwise subjects (OIDC Core §8)
 - Client authentication: `client_secret_basic/post`, `private_key_jwt`, `client_secret_jwt`
@@ -121,7 +121,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 | OpenID Connect Discovery | Full metadata, truthful capability advertisement |
 | OIDC RP-Initiated, Front-Channel & Back-Channel Logout | Implemented |
 | OAuth 2.0 (RFC 6749) + Bearer Tokens (RFC 6750) | Implemented |
-| PKCE (RFC 7636) | S256 + plain, enforced for public clients |
+| PKCE (RFC 7636) | S256-only, enforced for public clients |
 | Token Introspection (RFC 7662) | Implemented |
 | Device Authorization Grant (RFC 8628) | Implemented |
 | Token Exchange (RFC 8693) | Implemented, incl. impersonation |
@@ -250,7 +250,7 @@ Design contracts (stateless validation, testability rule, typestate auth boundar
 
 ## Testing & Quality
 
-- **2,690+ automated tests.** Unit tests live next to the code; every public function is testable without network I/O or database via trait-based fakes (`InMemoryStorage`, `InMemoryCache`, mock crypto).
+- **3,460+ automated tests.** Unit tests live next to the code; every public function is testable without network I/O or database via trait-based fakes (`InMemoryStorage`, `InMemoryCache`, mock crypto).
 
   ```bash
   cargo test --workspace --lib   # unit tests, fast, no I/O
