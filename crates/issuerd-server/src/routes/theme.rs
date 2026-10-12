@@ -198,6 +198,8 @@ mod tests {
         std::fs::create_dir_all(base.join("acme")).unwrap();
         std::fs::create_dir_all(base.join("empty-theme")).unwrap();
         std::fs::write(base.join("acme").join("messages_fr.json"), b"{}").unwrap();
+        // A regional (full-tag) bundle is discovered under its full tag.
+        std::fs::write(base.join("acme").join("messages_de-AT.json"), b"{}").unwrap();
         // A bundle for a shipped locale changes nothing (deduped).
         std::fs::write(base.join("acme").join("messages_en.json"), b"{}").unwrap();
         // Files outside the `messages_<locale>.json` shape are ignored.
@@ -207,12 +209,12 @@ mod tests {
         std::fs::write(base.join("messages_fr.json"), b"{}").unwrap();
 
         let locales = available_locales(&base);
-        assert_eq!(locales, vec!["de", "en", "fr"]);
+        assert_eq!(locales, vec!["de", "de-AT", "en", "fr", "zh"]);
 
         std::fs::remove_dir_all(&base).unwrap();
 
         // A missing directory still yields the shipped built-ins.
-        assert_eq!(available_locales(&base), vec!["de", "en"]);
+        assert_eq!(available_locales(&base), vec!["de", "en", "zh"]);
     }
 
     #[tokio::test]

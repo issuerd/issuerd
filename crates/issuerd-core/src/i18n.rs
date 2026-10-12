@@ -9,5 +9,7 @@
 //! module holds only the data both `issuerd-server` and `issuerd-admin-api` need.
 
 /// Locales with a built-in message bundle (embedded at compile time by the
-/// server).
-pub const SHIPPED_LOCALES: &[&str] = &["en", "de"];
+/// server). `zh` is Simplified-script Chinese and serves as the generic
+/// fallback for every `zh-*` region; regional refinements come from theme
+/// bundle layers.
+pub const SHIPPED_LOCALES: &[&str] = &["en", "de", "zh"];

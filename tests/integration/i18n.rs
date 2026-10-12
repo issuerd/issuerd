@@ -79,8 +79,8 @@ impl issuerd_core::EmailSender for RecordingSender {
 
 /// Write a scratch themes dir whose default `issuerd` theme carries a minimal
 /// French bundle. `fr` is NOT one of the compiled-in locales
-/// (`SHIPPED_LOCALES` is en + de), so every French string in these tests must
-/// come from this theme file. Returns the temp dir (caller cleans up).
+/// (`SHIPPED_LOCALES` is en + de + zh), so every French string in these tests
+/// must come from this theme file. Returns the temp dir (caller cleans up).
 fn write_fr_theme() -> std::path::PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("issuerd-i18n-fr-{}", issuerd_core::utils::generate_id()));
@@ -304,9 +304,9 @@ async fn login_context_supports_theme_supplied_locale() {
     let (harness, dir) = fr_theme_harness().await;
     create_fr_i18n_realm(&harness, "i18n-fr-ctx").await;
 
-    // `fr` is not compiled in (SHIPPED_LOCALES is en + de): the bundle must
-    // come from the theme's messages_fr.json via the default-theme fallback —
-    // the realm has no login_theme set.
+    // `fr` is not compiled in (SHIPPED_LOCALES is en + de + zh): the bundle
+    // must come from the theme's messages_fr.json via the default-theme
+    // fallback — the realm has no login_theme set.
     let resp = get_with_language(&harness, "/realms/i18n-fr-ctx/login/context", Some("fr")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
