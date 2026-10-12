@@ -381,3 +381,34 @@ rotation", archived at `results/rotate-check-output.log`), the evidence
 tarball carries no credentials, and the stack started from a clean slate.
 Evidence: `tests/conformance/results/html-reports-20261011-221213`.
 Branch is merge-ready.
+
+### 2026-10-12 — review round 2 (verification + regression + blind spots)
+
+Round 1's fixes got a second adversarial pass (run in-loop; the agent pool
+was quota-limited). Scope: `certification/REVIEW.md` round-2 section.
+
+- **R1 — every round-1 fix verified against its finding** (commit-by-commit,
+  call-site-audited): the F1 open-policy marker cannot be shed or forged
+  (stamped post-conversion on open creates, force-restored from the stored
+  client on PUT; trusted→open only self-restricts), scheme validation is
+  consistent create/update, F2 shares the fragment-default helper across all
+  three call sites (+integration test), F3 normalizes `token id_token` and
+  rejects bare `token`, F4/F6/F7/F8 confirmed with their tests.
+- **R2 — no regressions found in the fix diffs.** Checked: marker
+  shed/forge paths, PUT policy consistency, the single computed cookie name
+  across writers/clearers/the iframe page, the token_handler wrapper (no
+  double headers; the nested instrument span is cosmetic), login-error body
+  consumers (none read the old detail string), run.sh `down -v` ordering
+  (interactive run-focus/sidecar re-bootstrap cleanly), the in-run rotation
+  sidecar (runs after all plans; repeated interactive runs start clean).
+- **R3 — blind spots adjudicated:** new client metadata is provisionable via
+  the generic YAML attributes map (provisioner passes attributes through) —
+  acceptable, DCR covers certification; the admin SPA exposes them through
+  the attributes map only — accepted for now (dedicated fields can follow);
+  in-repo TokenIssuer/BrokerClient implementors all updated (TokenManager +
+  3 mocks, ReqwestBrokerClient + stub); the session-state cookie/iframe are
+  node-agnostic by construction (client-side comparison); the
+  discovery-cache rolling-upgrade window (stale document for up to one
+  read-cache TTL) is now documented in docs/CLUSTERING.md; OpenAPI re-verified
+  in sync after the fix batch.
+- Verdict: **branch merge-ready**; gate v11 (post-fix) green, exit 0.
