@@ -13,7 +13,7 @@
   <a href="https://github.com/issuerd/issuerd/actions/workflows/ci.yml"><img src="https://github.com/issuerd/issuerd/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV: 1.95"></a>
-  <a href="tests/conformance/README.md"><img src="https://img.shields.io/badge/OIDC%20conformance-Basic%20%C2%B7%20Form%20Post%20%C2%B7%20Config%20OP-brightgreen" alt="OIDC Conformance: Basic · Form Post · Config OP"></a>
+  <a href="tests/conformance/README.md"><img src="https://img.shields.io/badge/OIDF%20conformance-11%20OP%20profiles-brightgreen" alt="OIDF Conformance: 11 OP profiles"></a>
   <a href="https://github.com/rust-secure-code/safety-dance/"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
@@ -22,7 +22,7 @@
   <a href="https://hub.docker.com/r/issuerd/issuerd"><img src="https://img.shields.io/docker/pulls/issuerd/issuerd" alt="Docker pulls"></a>
 </p>
 
-> **Proof, not promises:** 3,907 conformance conditions with 0 failures and 0 warnings · 100,000-user LDAP sync in ~30 s · 2,690+ automated tests · one self-contained binary.
+> **Proof, not promises:** 31,000+ conformance conditions with 0 failures and 0 unexpected warnings across the full OIDF OP certification matrix · 100,000-user LDAP sync in ~30 s · 3,460+ automated tests · one self-contained binary.
 
 Issuerd is a modular Identity and Access Management (IAM) server implementing OpenID Connect and OAuth 2.x. It delivers the feature surface you expect from a mature identity provider — single sign-on, MFA and passkeys, user federation, social login, a full admin console and management API — with the operational profile of a Rust service: one self-contained binary, predictable latency, and no JVM to babysit. Keycloak is used throughout as the baseline reference implementation: protocol behavior, JSON shapes, and Admin API responses are continuously validated against a real Keycloak 24.0.
 
@@ -32,7 +32,7 @@ Issuerd is a modular Identity and Access Management (IAM) server implementing Op
 
 ## Why Issuerd?
 
-- **Conformance-proven, not "spec-inspired".** Issuerd passes the official [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.2.4) with **zero failures and zero warnings** across the Basic OP, Form Post OP, and Config OP profiles — 3,907 conditions verified, run in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
+- **Conformance-proven, not "spec-inspired".** Issuerd passes the official [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.2) with **zero failures and zero unexpected warnings** across the full OP certification matrix — Basic, Implicit, Hybrid, Config, Dynamic, Form Post, and 3rd-Party-Init OP, plus all four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel) — 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
 - **Keycloak-compatible where it counts.** Realms, clients, roles, client scopes, protocol mappers, authentication flows, and the Admin REST API follow the Keycloak model, so existing OIDC clients and Keycloak-hardened operational knowledge transfer directly. A dual-target test suite runs the same protocol assertions against Issuerd and a live Keycloak 24.0 container, and [every deliberate difference is documented](tests/KEYCLOAK_DIFFS.md).
 - **Rust, end to end.** Memory safety without a garbage collector, async I/O on Tokio, constant-time secret handling, ~127k lines of Rust across 9 tightly-scoped crates with a strictly acyclic dependency graph. The entire server — including the embedded admin and account consoles — deploys as one binary.
 - **Horizontally scalable from day one.** Access-token validation is stateless (no database lookup on the hot path), signing keys are shared cluster-wide through PostgreSQL, and transient coordination state lives in Redis. No sticky sessions — put any number of nodes behind any load balancer.
@@ -117,7 +117,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 
 | Specification | Status |
 |---|---|
-| OpenID Connect Core 1.0 | Conformance-suite verified (Basic OP, Form Post OP, Config OP) |
+| OpenID Connect Core 1.0 | Conformance-suite verified (Basic, Implicit, Hybrid, Config, Dynamic, Form Post, 3rd-Party-Init OP) |
 | OpenID Connect Discovery | Full metadata, truthful capability advertisement |
 | OIDC RP-Initiated, Front-Channel & Back-Channel Logout | Implemented |
 | OAuth 2.0 (RFC 6749) + Bearer Tokens (RFC 6750) | Implemented |
@@ -139,13 +139,23 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 
 ## OIDC Conformance
 
-Tested against the [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.2.4), running in a hermetic TLS environment against a pristine, unpatched suite:
+Tested against the [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.2), running in a hermetic TLS environment against a pristine, unpatched suite — the full OP certification matrix, 43 plan invocations, **612 test modules, 31,000+ conditions, 0 failures and 0 unexpected warnings**:
 
-| Plan | Result |
-|------|--------|
-| Config OP | **PASSED** — 39 conditions, 0 failures, 0 warnings |
-| Basic OP | **PASSED** — 36 modules, 1,858 conditions, 0 failures, 0 warnings |
-| Form Post OP | **PASSED** — 36 modules, 2,010 conditions, 0 failures, 0 warnings |
+| Profile | Result |
+|---------|--------|
+| Config OP | **PASSED** |
+| Basic OP | **PASSED** |
+| Implicit OP | **PASSED** (`id_token`, `id_token token`) |
+| Hybrid OP | **PASSED** (all three hybrid types) |
+| Dynamic OP | **PASSED** — 6 response types × DCR (RFC 7591/7592), per-client signing algs, signed userinfo, JAR-by-reference |
+| Form Post OP | **PASSED** (basic / implicit / hybrid legs) |
+| 3rd Party-Init OP | **PASSED** (×6) |
+| RP-Initiated Logout OP | **PASSED** (×6) |
+| Session Management OP | **PASSED** (×6) — `session_state` + `check_session_iframe` |
+| Front-Channel Logout OP | **PASSED** (×6) |
+| Back-Channel Logout OP | **PASSED** (×6) — signed logout tokens |
+
+`oidcc-server-rotate-keys` is the one manual-step module the pristine runner cannot exercise in-plan (upstream's own CI lists it identically) — the harness produces real evidence instead: `tests/conformance/run-rotation-check.sh` drives it standalone with a live admin-API key rotation (PASSED on every full run).
 
 Setup and per-module results: `tests/conformance/README.md`, `tests/conformance/COVERAGE.md`; logs are written to the (gitignored) `tests/conformance/results/` directory when the suite runs.
 
