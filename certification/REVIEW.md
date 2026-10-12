@@ -103,3 +103,23 @@ certification/, docs/, AGENTS.md, CHANGELOG.md, webclientsrc.
 2. Findings merged by severity; every major+ gets its own fix commit (or a
    journal entry with a rejection rationale).
 3. Final gate rerun if code moved; journal + review closeout.
+
+---
+
+## Round 2 (2026-10-12) — verification + regression pass
+
+Round 1 produced 19 fix/docs commits. Round 2 reviews the review:
+
+- **R1 — Fix verification.** Every round-1 finding ↔ its fix commit
+  (`fdabf80`, `8c9b333`, `3ac5c00`, `c8193f5`, `18934c8`, `72ec83c`,
+  `742fbbc`, `6a8e146`, `06aaa42`, `88e835c`, `8b54962`): does the fix
+  actually close the finding (not cosmetically), and is it complete across
+  all call sites?
+- **R2 — Regression on the fix diffs.** Adversarial re-read of the fix
+  commits themselves for NEW bugs (marker-stamping semantics, PUT policy
+  re-application, cookie-fallback call sites, the token_handler wrapper,
+  the run.sh down -v ordering, the in-run rotation sidecar).
+- **R3 — Blind spots of round 1.** New lens: provision-YAML coverage of the
+  new client metadata, admin SPA surface, cluster/multi-node interactions
+  (discovery-cache version blindness), storage-backend attribute semantics,
+  published-trait consumers, and any first-review misses.
