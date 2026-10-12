@@ -11,7 +11,6 @@ feature-depth = 1
 # --- Advisory checks ---
 [advisories]
 yanked = "deny"
-# No advisory ignores: the feature-resolved dependency graph is clean.
 # - RUSTSEC-2023-0071 (rsa/Marvin) — resolved by removing the rsa crate from
 #   the compiled graph: jsonwebtoken uses the aws_lc_rs backend, RSA key
 #   generation uses OpenSSL (see workspace Cargo.toml). rsa lingers in
@@ -21,7 +20,16 @@ yanked = "deny"
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained) — resolved by the redis
 #   0.29 upgrade (rustls-native-certs 0.8 moved to rustls-pki-types); the
 #   crate is out of the lockfile entirely.
-ignore = []
+# - RUSTSEC-2024-0449 (unsafe-libyaml unmaintained) — advisory entered the
+#   RustSec DB on 2026-10-12 (upstream repo archived 2024-03-25); reached via
+#   figment → serde_yaml. Unmaintained is not a vulnerability: the parser
+#   only ever sees operator-controlled local files (server config, provision
+#   YAML) — never network input. No safe upgrade path exists (serde_yaml_ng
+#   keeps unsafe-libyaml); the safe-Rust migration (saphyr/serde-saphyr as
+#   figment's YAML provider) is tracked separately.
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not vulnerable: parses only operator-controlled config/provision YAML via figment→serde_yaml; no safe upgrade (serde_yaml_ng still uses unsafe-libyaml); saphyr migration tracked separately" },
+]
 
 # --- License checks ---
 [licenses]
