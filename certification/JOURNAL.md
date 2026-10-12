@@ -412,3 +412,13 @@ was quota-limited). Scope: `certification/REVIEW.md` round-2 section.
   read-cache TTL) is now documented in docs/CLUSTERING.md; OpenAPI re-verified
   in sync after the fix batch.
 - Verdict: **branch merge-ready**; gate v11 (post-fix) green, exit 0.
+
+### 2026-10-12 — full test sweep (final, post-review)
+
+- Unit: `cargo test --workspace --lib` — 10/10 suites, 3048 tests, 0 failures.
+- E2E: `cargo test --test integration` — 416/416 (21 ignored: Docker-gated
+  federation/cluster suites skip gracefully without their labs).
+- Doctests green; fmt/clippy clean (verified throughout the review batches).
+- Conformance (the full matrix): `run.sh` exit 0 — all 43 plan invocations
+  green + the in-run rotation sidecar PASSED. Evidence:
+  `tests/conformance/results/html-reports-20261012-044304`.
