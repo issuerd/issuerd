@@ -4,11 +4,14 @@
 //! Login theme asset serving.
 //!
 //! `GET /realms/{realm}/theme/{*path}` serves static assets (the login page
-//! CSS today) from `{themes.dir}/{theme}/{path}`, where `theme` is the
-//! realm's `login_theme` or the built-in [`DEFAULT_THEME`]. A custom theme
-//! only needs to ship the files it overrides: anything missing falls back to
-//! the default theme's file. Paths containing `..` (and theme names with
-//! path separators) are rejected; unknown files 404.
+//! CSS today) in three layers: `{themes.dir}/{theme}/{path}` first (where
+//! `theme` is the realm's `login_theme` or the built-in [`DEFAULT_THEME`]),
+//! then `{themes.dir}/{default}/{path}`, and finally the default theme
+//! compiled into the binary (see `build.rs`) — so container deployments
+//! without a mounted themes directory still serve the default `login.css`.
+//! A custom theme only needs to ship the files it overrides. Paths containing
+//! `..` (and theme names with path separators) are rejected; unknown files
+//! 404.
 
 use std::sync::Arc;
 
@@ -20,6 +23,25 @@ use crate::state::ServerState;
 
 /// Built-in default theme; also the fallback layer for custom themes.
 pub const DEFAULT_THEME: &str = "issuerd";
+
+/// The default theme's `login.css`, compiled into the binary by `build.rs`
+/// (crate-local `builtin-theme/` copy staged by `scripts/publish.py` for the
+/// packaged crate, `<repo>/themes/` in the development workspace).
+#[cfg(builtin_theme_present)]
+const BUILTIN_LOGIN_CSS: &str = include_str!(env!("ISSUERD_BUILTIN_LOGIN_CSS"));
+
+/// Last-resort layer: assets of the built-in default theme that are compiled
+/// into the binary, served when neither the realm's theme nor the on-disk
+/// default theme ships the file (e.g. container images without a mounted
+/// themes directory).
+fn builtin_theme_asset(asset_path: &str) -> Option<&'static str> {
+    #[cfg(builtin_theme_present)]
+    if asset_path == "login.css" {
+        return Some(BUILTIN_LOGIN_CSS);
+    }
+    let _ = asset_path;
+    None
+}
 
 /// Reject path segments that could escape the theme directory.
 fn is_safe_asset_path(path: &str) -> bool {
@@ -54,15 +76,19 @@ pub async fn theme_asset_handler(
     let path = [primary, fallback]
         .into_iter()
         .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false));
-    let Some(path) = path else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let mime = mime_guess::from_path(&path).first_or_octet_stream();
-    ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
+    if let Some(path) = path {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        return ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response();
+    }
+    if let Some(contents) = builtin_theme_asset(&asset_path) {
+        let mime = mime_guess::from_path(&asset_path).first_or_octet_stream();
+        return ([(header::CONTENT_TYPE, mime.as_ref().to_string())], contents).into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Discover available login themes: subdirectories of `dir` plus the
@@ -280,6 +306,89 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"custom-theme", "a valid custom theme must win over the default");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(builtin_theme_present)]
+    #[tokio::test]
+    async fn builtin_theme_serves_login_css_when_disk_is_empty() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-theme-builtin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = ServerConfig::default();
+        cfg.themes.dir = base.clone();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let resp = theme_asset_handler(
+            State(state.clone()),
+            Path(("master".to_string(), "login.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(content_type.starts_with("text/css"), "content-type: {content_type}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], BUILTIN_LOGIN_CSS.as_bytes());
+
+        // Assets the built-in theme does not ship stay 404.
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "no-such.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(builtin_theme_present)]
+    #[tokio::test]
+    async fn custom_theme_falls_back_to_builtin_when_disk_is_empty() {
+        let base = std::env::temp_dir()
+            .join(format!("issuerd-theme-builtin-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+
+        let state = state_with_login_theme(&themes, "acme").await;
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "login.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], BUILTIN_LOGIN_CSS.as_bytes());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(builtin_theme_present)]
+    #[tokio::test]
+    async fn on_disk_default_theme_wins_over_builtin() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-theme-builtin-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(themes.join("issuerd")).unwrap();
+        std::fs::write(themes.join("issuerd").join("login.css"), b"/* on-disk */").unwrap();
+
+        let state = state_with_login_theme(&themes, "issuerd").await;
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "login.css".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"/* on-disk */", "the on-disk default theme must win");
 
         std::fs::remove_dir_all(&base).unwrap();
     }

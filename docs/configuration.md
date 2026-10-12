@@ -575,7 +575,10 @@ built-in default theme at `themes/issuerd`.
   directory; assets are served at `/realms/{realm}/theme/{path}`.
 - Fallback is per file: anything a custom theme does not provide is served
   from the built-in `issuerd` theme, so a custom theme only ships the files
-  it overrides (e.g. just `login.css`).
+  it overrides (e.g. just `login.css`). The default theme's `login.css` is
+  also compiled into the binary, so deployments without a mounted themes
+  directory (the container image, `cargo install`) still serve it; a
+  `{themes.dir}/issuerd/login.css` on disk takes precedence when present.
 - A theme may also carry `messages_{locale}.json` bundles that merge over the
   built-in login/email translations — see the next section.
 
