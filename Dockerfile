@@ -51,6 +51,11 @@ COPY crates/ ./crates/
 COPY src/ ./src/
 COPY build.rs ./
 
+# Default login theme — the release build embeds themes/issuerd/login.css into
+# the binary (issuerd-server build.rs) as the last-resort theme fallback, and
+# panics without it.
+COPY themes/ ./themes/
+
 # Build the embedded web client first — the release build embeds
 # webclientsrc/dist via include_dir!. The SDK under webclientsrc/generated is
 # gitignored and excluded via .dockerignore, so it is always regenerated here
