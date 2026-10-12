@@ -595,9 +595,14 @@ overrides the keys it defines:
 
 1. built-in English (compiled in, always complete — the canonical key list is
    the source-tree `crates/issuerd-server/i18n/messages_en.json`),
-2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`),
+2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`, `zh` — the
+   `zh` bundle is Simplified-script Chinese and serves every `zh-*` region),
 3. theme English override (`{themes.dir}/{theme}/messages_en.json`),
-4. theme locale override (`{themes.dir}/{theme}/messages_{locale}.json`).
+4. theme locale override (`{themes.dir}/{theme}/messages_{locale}.json`),
+5. theme full-tag override (`messages_{locale-with-region}.json`, e.g.
+   `messages_de-AT.json`) — when the resolved locale carries region/script
+   subtags, its full tag layers over the primary subtag (Keycloak's lookup
+   order), so a regional variant only ships the keys it refines.
 
 `theme` is the realm's `login_theme` for pages and `email_theme` for emails;
 when unset, the **default theme `issuerd`** is read, so dropping a bundle into
@@ -627,6 +632,10 @@ To add a locale, drop a `messages_<locale>.json` into a theme directory —
 e.g. `{themes.dir}/issuerd/messages_fr.json` with `{ "login.title": "Connexion" }` —
 then enable internationalization on the realm and add the locale to its
 supported locales (it appears in the console checkbox list automatically).
+To refine a locale for one region, add a full-tag bundle next to it —
+`messages_de-AT.json` overrides `messages_de.json` per key for `de-AT`
+requests only, and regional file names surface in the locale lists under
+their full tag.
 Theme bundle files are plain JSON, re-read on every request, and treated as
 deployment-local content: the `[themes] dir` is data, not code, and
 `themes/*/messages_*.json` is gitignored by default. Note the admin console

@@ -12,16 +12,23 @@
 //!
 //! Message bundles are flat JSON key→text maps. Loading is layered with
 //! per-key fallback, so a partial custom bundle only overrides the keys it
-//! defines:
+//! defines. For a resolved locale carrying region/script subtags (e.g.
+//! `de-AT`) the layers are, lowest to highest precedence:
 //!
 //! 1. built-in `en` (embedded, always complete)
-//! 2. built-in `{locale}` (embedded; shipped locales: [`SHIPPED_LOCALES`])
-//! 3. theme `en` override (`{themes_dir}/{theme}/messages_en.json`)
-//! 4. theme `{locale}` override (`{themes_dir}/{theme}/messages_{locale}.json`)
+//! 2. built-in primary subtag (`de`; shipped locales: [`SHIPPED_LOCALES`])
+//! 3. built-in full tag (none shipped today — the slot mirrors the theme
+//!    layers, so a future compiled-in regional bundle needs no loader change)
+//! 4. theme `en` override (`{themes_dir}/{theme}/messages_en.json`)
+//! 5. theme primary-subtag override (`messages_de.json`)
+//! 6. theme full-tag override (`messages_de-AT.json`)
+//!
+//! The full-tag → primary-subtag order matches Keycloak's lookup.
 //!
 //! Locale strings are request-controlled (`ui_locales`, `Accept-Language`,
-//! the user `locale` attribute); only strict ASCII-alphanumeric language
-//! subtags may become filesystem path components (see [`safe_layer_name`]).
+//! the user `locale` attribute); only strict BCP-47-ish tags — non-empty
+//! ASCII-alphanumeric subtags joined by single hyphens — may become
+//! filesystem path components (see [`safe_layer_name`]).
 //!
 //! A `None` theme falls back to the default theme
 //! ([`crate::routes::theme::DEFAULT_THEME`]), matching the theme asset
@@ -50,6 +57,9 @@ mod bundles {
     pub const EN: &str = include_str!("../i18n/messages_en.json");
     /// Built-in German bundle.
     pub const DE: &str = include_str!("../i18n/messages_de.json");
+    /// Built-in Chinese bundle (Simplified script) — the generic fallback
+    /// for every `zh-*` region; regional refinements come from theme layers.
+    pub const ZH: &str = include_str!("../i18n/messages_zh.json");
 }
 
 /// A flat message key → text map.
@@ -63,6 +73,7 @@ fn builtin_bundle(locale: &str) -> Option<MessageBundle> {
     match locale {
         "en" => Some(parse_bundle(bundles::EN)),
         "de" => Some(parse_bundle(bundles::DE)),
+        "zh" => Some(parse_bundle(bundles::ZH)),
         _ => None,
     }
 }
@@ -73,17 +84,17 @@ fn language_subtag(tag: &str) -> &str {
 }
 
 /// A language tag that is safe to use as a filesystem path component:
-/// non-empty and strictly ASCII alphanumeric (what a BCP-47 primary subtag
-/// looks like once split on `-`/`_`). Locale strings are request-controlled
-/// (`ui_locales`, `Accept-Language`, the user `locale` attribute), so
-/// anything containing separators, dots, or other bytes must never reach the
+/// one or more non-empty ASCII-alphanumeric subtags joined by single
+/// hyphens (a strict BCP-47-ish shape — `de`, `de-AT`, `sr-Cyrl-RS`).
+/// Locale strings are request-controlled (`ui_locales`, `Accept-Language`,
+/// the user `locale` attribute), so anything with dots, slashes, empty
+/// subtags, or leading/trailing/double hyphens must never reach the
 /// filesystem — it is rejected here, at the sink.
 fn safe_layer_name(tag: &str) -> Option<&str> {
-    if !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        Some(tag)
-    } else {
-        None
-    }
+    let safe = tag
+        .split('-')
+        .all(|subtag| !subtag.is_empty() && subtag.bytes().all(|b| b.is_ascii_alphanumeric()));
+    safe.then_some(tag)
 }
 
 /// Parse an `Accept-Language` header value into quality-ordered tags.
@@ -189,8 +200,10 @@ pub fn user_locale(realm: &Realm, user: &User) -> String {
 }
 
 /// Load the layered message bundle for `locale` (with per-key English
-/// fallback). `themes_dir`/`theme` add the theme override layers when the
-/// files exist on disk; a `None` theme reads the default theme
+/// fallback). A locale with region/script subtags layers its full tag over
+/// its primary subtag (`de-AT` over `de`) — Keycloak's lookup order.
+/// `themes_dir`/`theme` add the theme override layers when the files exist
+/// on disk; a `None` theme reads the default theme
 /// ([`crate::routes::theme::DEFAULT_THEME`]), the same fallback the theme
 /// asset handler applies.
 pub fn message_bundle(
@@ -205,6 +218,20 @@ pub fn message_bundle(
             bundle.extend(overlay);
         }
     }
+    // The full tag is its own layer above the primary subtag — but only when
+    // it carries more information than the subtag and is safe to embed in a
+    // path. No built-in full-tag bundle ships today; the lookup exists so a
+    // future one needs no loader change.
+    let full_tag = if locale != lang {
+        safe_layer_name(locale)
+    } else {
+        None
+    };
+    if let Some(full) = full_tag {
+        if let Some(overlay) = builtin_bundle(full) {
+            bundle.extend(overlay);
+        }
+    }
     if let Some(dir) = themes_dir {
         // A malformed stored theme name must never become a path component
         // (same guard as the theme asset handler).
@@ -213,9 +240,13 @@ pub fn message_bundle(
             Some(_) => crate::routes::theme::DEFAULT_THEME,
             None => crate::routes::theme::DEFAULT_THEME,
         };
-        for layer in [DEFAULT_LOCALE, lang] {
+        let mut layers = vec![DEFAULT_LOCALE, lang];
+        if let Some(full) = full_tag {
+            layers.push(full);
+        }
+        for layer in layers {
             // The locale string is request-controlled; only a strict
-            // alphanumeric subtag may become a path component. An unsafe
+            // BCP-47-ish tag may become a path component. An unsafe
             // layer is skipped — the built-in English layer is already
             // loaded, so the bundle simply stays at the fallback.
             let Some(layer) = safe_layer_name(layer) else {
@@ -431,6 +462,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_locale_matches_supported_by_exact_tag_or_subtag() {
+        // An exact supported full tag passes through as-is.
+        let realm = realm_with(true, &["de-AT"], None);
+        assert_eq!(resolve_locale(&realm, &["de-AT".to_string()], None), "de-AT");
+        // Subtag matching works in both directions: a bare-language candidate
+        // against a supported full tag, and a full-tag candidate against a
+        // supported bare language.
+        assert_eq!(resolve_locale(&realm, &["de".to_string()], None), "de");
+        let realm = realm_with(true, &["de"], None);
+        assert_eq!(resolve_locale(&realm, &["de-AT".to_string()], None), "de-AT");
+        // A sibling region under the same language also matches by subtag.
+        let realm = realm_with(true, &["de-AT"], None);
+        assert_eq!(resolve_locale(&realm, &["de-CH".to_string()], None), "de-CH");
+        // An unrelated language does not match at all.
+        assert_eq!(resolve_locale(&realm, &["fr".to_string()], None), "en");
+    }
+
+    #[test]
     fn wildcard_accept_language_is_skipped() {
         // A bare wildcard is not a locale: it must never be returned, even
         // with unrestricted supported_locales.
@@ -442,10 +491,12 @@ mod tests {
 
     #[test]
     fn builtin_bundles_cover_same_keys() {
-        let en = builtin_bundle("en").unwrap();
-        let de = builtin_bundle("de").unwrap();
-        let missing: Vec<_> = en.keys().filter(|k| !de.contains_key(*k)).collect();
-        assert!(missing.is_empty(), "de bundle missing keys: {missing:?}");
+        let en = builtin_bundle(DEFAULT_LOCALE).unwrap();
+        for locale in SHIPPED_LOCALES {
+            let bundle = builtin_bundle(locale).unwrap();
+            let missing: Vec<_> = en.keys().filter(|k| !bundle.contains_key(*k)).collect();
+            assert!(missing.is_empty(), "{locale} bundle missing keys: {missing:?}");
+        }
     }
 
     #[test]
@@ -493,6 +544,48 @@ mod tests {
     }
 
     #[test]
+    fn regional_theme_bundle_layers_over_primary_subtag_bundle() {
+        // Full-tag theme bundles layer over the primary-subtag bundle, which
+        // layers over the built-ins: `de-AT` sees its own override, while
+        // `de-CH` (no full-tag file) falls back to the primary `de` layer.
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd-i18n-test-{}", issuerd_core::utils::generate_id()));
+        let theme_dir = dir.join(crate::routes::theme::DEFAULT_THEME);
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(theme_dir.join("messages_de.json"), r#"{"login.title":"THEME-DE"}"#)
+            .unwrap();
+        std::fs::write(theme_dir.join("messages_de-AT.json"), r#"{"login.title":"THEME-AT"}"#)
+            .unwrap();
+
+        let bundle = message_bundle(Some(&dir), None, "de-AT");
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("THEME-AT"));
+        // Untouched keys still fall through the layers to the built-in German.
+        assert_ne!(
+            bundle.get("login.password").map(String::as_str),
+            builtin_bundle("en").unwrap().get("login.password").map(String::as_str)
+        );
+
+        let bundle = message_bundle(Some(&dir), None, "de-CH");
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("THEME-DE"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chinese_builtin_bundle_serves_every_zh_region() {
+        // The built-in `zh` bundle is the generic fallback for all Chinese
+        // regions: a `zh-CN` request gets the same compiled-in bundle even
+        // though no region-specific built-in exists.
+        let generic = message_bundle(None, None, "zh");
+        let regional = message_bundle(None, None, "zh-CN");
+        assert_eq!(generic.get("login.title"), regional.get("login.title"));
+        // ... and it is the Chinese text, not the English fallback.
+        assert_ne!(regional.get("login.title").map(String::as_str), Some("Sign In"));
+        // Full per-key coverage of the English key list is pinned by
+        // `builtin_bundles_cover_same_keys`.
+    }
+
+    #[test]
     fn message_bundle_rejects_request_controlled_path_traversal() {
         // A crafted locale with separators must never become a path
         // component. The `messages_x` directory is created on purpose: the OS
@@ -514,15 +607,25 @@ mod tests {
     }
 
     #[test]
-    fn safe_layer_name_accepts_only_strict_subtags() {
+    fn safe_layer_name_accepts_bcp47_subtag_chains() {
         assert_eq!(safe_layer_name("de"), Some("de"));
         assert_eq!(safe_layer_name("zh419"), Some("zh419"));
+        // Hyphen-joined subtag chains pass whole (regional/script variants).
+        assert_eq!(safe_layer_name("de-AT"), Some("de-AT"));
+        assert_eq!(safe_layer_name("pt-BR"), Some("pt-BR"));
+        assert_eq!(safe_layer_name("sr-Cyrl-RS"), Some("sr-Cyrl-RS"));
         assert_eq!(safe_layer_name(""), None);
         assert_eq!(safe_layer_name("../evil"), None);
         assert_eq!(safe_layer_name("x/../../evil"), None);
-        // Already subtag-split by `language_subtag`; a raw tag must not pass.
-        assert_eq!(safe_layer_name("de-DE"), None);
+        assert_eq!(safe_layer_name("zh/../../evil"), None);
+        // Dots, empty subtags, leading/trailing/double hyphens stay rejected.
+        assert_eq!(safe_layer_name("de..AT"), None);
+        assert_eq!(safe_layer_name("-de"), None);
+        assert_eq!(safe_layer_name("de-"), None);
+        assert_eq!(safe_layer_name("de--AT"), None);
         assert_eq!(safe_layer_name("evil.json"), None);
+        // Underscores are not BCP-47 separators; rejected at the sink.
+        assert_eq!(safe_layer_name("de_AT"), None);
     }
 
     #[test]
