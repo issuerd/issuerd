@@ -36,6 +36,8 @@ certs
 
 # Crate-local web client copy staged by scripts/publish.py (packaging artifact)
 /crates/issuerd-server/webclient-dist/
+# Crate-local default login theme copy staged by scripts/publish.py (packaging artifact)
+/crates/issuerd-server/builtin-theme/
 
 # Embedded build artifacts (own git repos / extracted suites)
 tests/conformance/conformance-suite/

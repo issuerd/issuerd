@@ -11,7 +11,9 @@ Steps:
   1. Copy the publishable file set into a temp staging dir (manifests, sources,
      migrations, build scripts, README/LICENSE, root bin + integration tests).
   2. Copy the built web client (webclientsrc/dist) into the staged issuerd-server
-     crate as webclient-dist/ so the packaged crate can embed the SPA.
+     crate as webclient-dist/ so the packaged crate can embed the SPA, and the
+     default login theme (themes/issuerd) as builtin-theme/ so it can embed the
+     fallback login.css.
   3. Strip the flux-rs git dependency from the staged issuerd-core manifest and
      the `#[flux_rs::...]` attribute lines from its models.rs.
   4. Run `cargo publish` per crate in dependency order.
@@ -101,6 +103,15 @@ def stage(stage_dir: Path) -> Path:
         sys.exit("error: webclientsrc/dist is missing or empty; "
                  "run `npm run build` in webclientsrc/ first")
     shutil.copytree(dist, root / "crates" / "issuerd-server" / "webclient-dist")
+
+    # Same for the built-in default login theme (crates.io builds have no
+    # ../../themes): build.rs embeds this crate-local copy as the last-resort
+    # /realms/{realm}/theme/login.css.
+    theme = REPO_ROOT / "themes" / "issuerd"
+    if not (theme / "login.css").is_file():
+        sys.exit("error: themes/issuerd/login.css is missing; "
+                 "the built-in default login theme cannot be embedded")
+    shutil.copytree(theme, root / "crates" / "issuerd-server" / "builtin-theme" / "issuerd")
 
     return root
 
