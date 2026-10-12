@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-10-12
+
 ### Added
 
 - **Built-in Chinese (Simplified) message bundle (`zh`).** The login-flow pages and outbound email now ship a compiled-in Simplified-Chinese translation alongside English and German; it serves as the generic fallback for every `zh-*` region (e.g. `zh-CN`, `zh-HK`) until a regional theme bundle refines it. `GET /admin/enums/locales` and `GET /admin/serverinfo` list it as a built-in (`Chinese`); enable it per realm via `supported_locales` once internationalization is on.
