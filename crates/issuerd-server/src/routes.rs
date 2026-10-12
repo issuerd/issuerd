@@ -46,12 +46,15 @@ pub use oidc::PendingAuthData;
 pub use system::init_metrics;
 
 /// Returns `true` for "noisy" paths whose successful responses should be logged at
-/// DEBUG instead of INFO (static files, discovery, JWKS, health, readiness, metrics).
+/// DEBUG instead of INFO (static files, discovery, JWKS, the session-management
+/// iframe, health, readiness, metrics).
 fn is_noisy_path(path: &str) -> bool {
     if path.starts_with("/assets/")
         || path.starts_with("/.well-known")
         // The JWKS endpoint is the highest-frequency polled path in production.
         || path.ends_with("/protocol/openid-connect/certs")
+        // The session-management iframe is polled by RP iframes on a timer.
+        || path.ends_with("/protocol/openid-connect/check_session_iframe")
         || path == "/"
         || path == "/config.js"
         || path == "/favicon.ico"
@@ -225,6 +228,11 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .route(
             "/realms/{realm}/protocol/openid-connect/logout",
             post(oidc::logout_handler).get(oidc::logout_handler_get),
+        )
+        // OIDC Session Management 1.0 §4.2 OP iframe.
+        .route(
+            "/realms/{realm}/protocol/openid-connect/check_session_iframe",
+            get(oidc::check_session_iframe_handler),
         )
         .route("/realms/{realm}/protocol/openid-connect/revoke", post(oidc::revoke_handler))
         .route(
@@ -416,6 +424,7 @@ mod tests {
         assert!(is_noisy_path("/.well-known/openid-configuration"));
         assert!(is_noisy_path("/realms/master/protocol/openid-connect/certs"));
         assert!(is_noisy_path("/realms/demo/protocol/openid-connect/certs"));
+        assert!(is_noisy_path("/realms/demo/protocol/openid-connect/check_session_iframe"));
         assert!(is_noisy_path("/assets/main.js"));
         assert!(is_noisy_path("/login.html"));
         assert!(!is_noisy_path("/realms/master/protocol/openid-connect/token"));

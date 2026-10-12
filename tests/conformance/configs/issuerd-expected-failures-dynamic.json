@@ -1,0 +1,11 @@
+[
+  {
+    "test-name": "oidcc-server-rotate-keys",
+    "variant": "*",
+    "configuration-filename": "*issuerd-dynamic-op.json",
+    "current-block": "*",
+    "condition": "VerifyNewJwksHasNewSigningKey",
+    "expected-result": "failure",
+    "comment": "The module requires a human/operator to rotate OP keys between CONFIGURED and start (upstream's own CI lists it as expected failure for the same reason). The pristine runner force-starts it without rotating. Real rotation evidence: tests/conformance/scripts/run-rotation-check.sh drives the module standalone via the suite API with an admin-API key rotation interposed."
+  }
+]

@@ -63,8 +63,8 @@ pub(crate) fn client_requires_par(client: &Client) -> bool {
 }
 
 /// `true` when `request_uri` is a PAR reference minted by this server (and not
-/// a JAR-by-reference URL, which stays unsupported — JAR implements
-/// only the `request` parameter).
+/// a JAR-by-reference URL, which the authorization endpoint resolves against
+/// the client's registered `request_uris` instead — see `routes::jar`).
 pub(crate) fn is_par_request_uri(request_uri: &str) -> bool {
     request_uri.starts_with(PAR_REQUEST_URI_PREFIX)
 }
@@ -169,9 +169,15 @@ pub async fn par_handler(
         return par_endpoint_error(&e);
     }
     // Reject unimplemented response types at push time, mirroring the
-    // authorization endpoint.
+    // authorization endpoint (bare `token` is OAuth2-only; every
+    // implicit/hybrid combination is accepted).
     match &auth_req.response_type {
-        ResponseType::Code | ResponseType::IdToken | ResponseType::CodeIdToken => {}
+        ResponseType::Code
+        | ResponseType::IdToken
+        | ResponseType::IdTokenToken
+        | ResponseType::CodeIdToken
+        | ResponseType::CodeToken
+        | ResponseType::CodeIdTokenToken => {}
         _ => return par_endpoint_error(&IssuerdError::UnsupportedResponseType),
     }
 
@@ -245,7 +251,10 @@ fn par_endpoint_error(error: &IssuerdError) -> Response {
 
 /// Resolve a PAR `request_uri` into the stored authorization request
 /// parameters, or enforce the realm-wide require-PAR policy when the request
-/// carries no `request_uri`.
+/// carries no `request_uri`. A non-PAR `request_uri` (an https URL) is
+/// JAR-by-reference (OIDC Core §6.2): it passes through untouched for the
+/// JAR branch downstream, except under the require-PAR policy, which a
+/// by-reference object does not satisfy.
 ///
 /// Returns the (possibly replaced) parameter map plus a flag telling the
 /// caller whether the request came through PAR (the per-client require-PAR
@@ -289,9 +298,16 @@ pub(crate) async fn resolve_par_params(
         ));
     }
     if !is_par_request_uri(&request_uri) {
-        // A non-PAR request_uri is JAR-by-reference — not implemented (24.7
-        // implements only the `request` parameter).
-        reject!(IssuerdError::RequestNotSupported);
+        // A non-PAR request_uri is JAR-by-reference (OIDC Core §6.2): leave
+        // the parameter map untouched for the JAR branch downstream — unless
+        // the realm mandates PAR, which a by-reference object does not
+        // satisfy.
+        if realm_requires_par(realm) {
+            reject!(IssuerdError::InvalidRequest(
+                "pushed authorization request required (request_uri is not a PAR reference)".into(),
+            ));
+        }
+        return Ok((params, false));
     }
     // Only client_id may accompany a PAR reference; the stored request is the
     // complete authorization request (stricter than Keycloak, which merges —
@@ -601,12 +617,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_par_request_uri_is_rejected_as_unsupported() {
+    async fn non_par_request_uri_passes_through_for_the_jar_branch() {
         let cfg = ServerConfig::default();
         let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
         let realm = state.resolve_realm("master").await.unwrap().unwrap();
 
-        // A non-PAR request_uri is JAR-by-reference, which is not implemented.
+        // A non-PAR request_uri is JAR-by-reference (OIDC Core §6.2): the PAR
+        // resolver leaves the parameter map untouched for the JAR branch.
         let mut params = HashMap::new();
         params.insert("client_id".to_string(), "admin-cli".to_string());
         params.insert("request_uri".to_string(), "https://example.com/request.jwt".to_string());
@@ -619,13 +636,9 @@ mod tests {
             params,
         )
         .await;
-        let Err(resp) = result else {
-            panic!("a non-PAR request_uri must be rejected");
-        };
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "request_not_supported");
+        let (passed, used_par) = result.expect("a non-PAR request_uri passes through");
+        assert!(!used_par);
+        assert_eq!(passed["request_uri"], "https://example.com/request.jwt");
     }
 
     #[tokio::test]

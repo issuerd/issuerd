@@ -1002,3 +1002,274 @@ async fn admin_client_creation_honors_full_payload() {
     );
     assert!(client.web_origins.iter().any(|o| o.as_str() == "*"));
 }
+
+// ---------------------------------------------------------------------------
+// RFC 7591/7592 request metadata and response shape
+// ---------------------------------------------------------------------------
+
+/// Full RFC 7591 lifecycle: register with RFC metadata → 201 with the RFC
+/// response fields and the metadata echo → RFC 7592 read echoes everything
+/// (incl. `initiate_login_uri`) → update keeps `client_id_issued_at` →
+/// delete burns the client and the token.
+#[tokio::test]
+async fn rfc7591_registration_lifecycle_with_metadata_echo() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-rfc").await;
+    enable_registration(&harness, &realm).await;
+
+    let minted = mint_initial_access(&harness, realm.name.as_ref(), 3600, 5).await;
+    let initial_token = minted["token"].as_str().unwrap().to_string();
+
+    let resp = harness
+        .post_json_auth(
+            &registrations_path(realm.name.as_ref(), "openid-connect"),
+            &initial_token,
+            serde_json::json!({
+                "client_name": "RFC 7591 Client",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code", "code id_token"],
+                "token_endpoint_auth_method": "private_key_jwt",
+                "scope": "openid profile",
+                "subject_type": "public",
+                "jwks": {"keys": [{"kty": "RSA", "kid": "suite-key", "n": "0vx7agoe", "e": "AQAB"}]},
+                "initiate_login_uri": "https://app.example.com/login",
+                "post_logout_redirect_uris": ["https://app.example.com/logout-done"],
+                "frontchannel_logout_uri": "https://app.example.com/fc-logout",
+                "frontchannel_logout_session_required": true,
+                "backchannel_logout_uri": "https://app.example.com/bc-logout",
+                "backchannel_logout_session_required": false,
+                "logo_uri": "https://app.example.com/logo.png",
+                "policy_uri": "https://app.example.com/policy",
+                "tos_uri": "https://app.example.com/tos",
+                "id_token_signed_response_alg": "ES256",
+                "userinfo_signed_response_alg": "RS256"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = json_body(resp).await;
+
+    // RFC 7591 §3.2.1 / RFC 7592 response fields.
+    let client_id = json["client_id"].as_str().unwrap().to_string();
+    let registration_client_uri = json["registration_client_uri"].as_str().unwrap().to_string();
+    assert_eq!(
+        registration_client_uri,
+        format!(
+            "{}/realms/{}/clients-registrations/openid-connect/{client_id}",
+            harness.base_url, realm.name
+        )
+    );
+    let registration_access_token = json["registration_access_token"]
+        .as_str()
+        .expect("RFC token spelling")
+        .to_string();
+    assert_eq!(json["registrationAccessToken"].as_str().unwrap(), registration_access_token);
+    let client_id_issued_at = json["client_id_issued_at"].clone();
+    assert!(client_id_issued_at.as_i64().unwrap() > 0);
+    assert_eq!(json["client_secret_expires_at"], 0);
+    // A private_key_jwt client still gets a generated secret (Keycloak
+    // parity), echoed under both spellings.
+    assert!(json["client_secret"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(json["client_secret"], json["secret"]);
+
+    // Metadata echo on the 201.
+    assert_eq!(json["client_name"], "RFC 7591 Client");
+    assert_eq!(json["grant_types"], serde_json::json!(["authorization_code", "refresh_token"]));
+    assert_eq!(
+        json["response_types"],
+        serde_json::json!(["code", "code id_token"]),
+        "multi-token response types echo intact"
+    );
+    assert_eq!(json["token_endpoint_auth_method"], "private_key_jwt");
+    assert_eq!(json["scope"], "openid profile");
+    assert_eq!(json["subject_type"], "public");
+    assert_eq!(json["initiate_login_uri"], "https://app.example.com/login");
+    assert_eq!(
+        json["post_logout_redirect_uris"],
+        serde_json::json!(["https://app.example.com/logout-done"])
+    );
+    assert_eq!(json["frontchannel_logout_uri"], "https://app.example.com/fc-logout");
+    assert_eq!(json["frontchannel_logout_session_required"], true);
+    assert_eq!(json["backchannel_logout_uri"], "https://app.example.com/bc-logout");
+    assert_eq!(json["backchannel_logout_session_required"], false);
+    assert_eq!(json["logo_uri"], "https://app.example.com/logo.png");
+    assert_eq!(json["policy_uri"], "https://app.example.com/policy");
+    assert_eq!(json["tos_uri"], "https://app.example.com/tos");
+    assert_eq!(json["id_token_signed_response_alg"], "ES256");
+    assert_eq!(json["userinfo_signed_response_alg"], "RS256");
+    assert_eq!(json["jwks"]["keys"][0]["kid"], "suite-key");
+
+    // RFC 7592 read through the returned registration_client_uri: the token
+    // is echoed (not rotated) and every registered field comes back.
+    let read_path = registration_client_uri
+        .strip_prefix(&harness.base_url)
+        .expect("same-origin URI");
+    let resp = harness.get_auth(read_path, &registration_access_token).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let read = json_body(resp).await;
+    assert_eq!(read["registration_access_token"], registration_access_token);
+    assert_eq!(read["registration_client_uri"], registration_client_uri);
+    assert_eq!(read["client_id_issued_at"], client_id_issued_at);
+    assert_eq!(read["client_name"], "RFC 7591 Client");
+    assert_eq!(read["initiate_login_uri"], "https://app.example.com/login");
+    assert_eq!(read["grant_types"], serde_json::json!(["authorization_code", "refresh_token"]));
+    assert_eq!(read["response_types"], serde_json::json!(["code", "code id_token"]));
+    assert_eq!(read["jwks"]["keys"][0]["kid"], "suite-key");
+    assert_eq!(read["backchannel_logout_session_required"], false);
+
+    // RFC 7592 update: the token rotates, the creation stamp survives.
+    let resp = put_json_auth(
+        &harness,
+        read_path,
+        serde_json::json!({
+            "client_name": "RFC 7591 Client (renamed)",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "initiate_login_uri": "https://app.example.com/login",
+            "tos_uri": "https://app.example.com/tos-v2"
+        }),
+        &registration_access_token,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated = json_body(resp).await;
+    assert_eq!(updated["client_name"], "RFC 7591 Client (renamed)");
+    assert_eq!(updated["tos_uri"], "https://app.example.com/tos-v2");
+    assert_eq!(updated["client_id_issued_at"], client_id_issued_at);
+    let rotated = updated["registration_access_token"].as_str().unwrap().to_string();
+    assert_ne!(rotated, registration_access_token);
+
+    // The old token is dead; the rotated one reads; DELETE burns both.
+    let resp = harness.get_auth(read_path, &registration_access_token).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = harness.get_auth(read_path, &rotated).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = harness.delete_auth(read_path, &rotated).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = harness.get_auth(read_path, &rotated).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// RFC 7591 §3.2.2 validation failures at the registration endpoint.
+#[tokio::test]
+async fn rfc7591_registration_rejects_invalid_metadata() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-rfc-400").await;
+    enable_registration(&harness, &realm).await;
+
+    // Non-https URL metadata → 400 invalid_client_metadata (this is the
+    // oidcc-3rd_party-init-login-nohttps case for initiate_login_uri).
+    for (field, value) in [
+        ("initiate_login_uri", "http://app.example.com/login"),
+        ("jwks_uri", "http://app.example.com/jwks.json"),
+        ("frontchannel_logout_uri", "http://app.example.com/fc"),
+        ("backchannel_logout_uri", "http://app.example.com/bc"),
+        ("logo_uri", "http://app.example.com/logo.png"),
+        ("policy_uri", "http://app.example.com/policy"),
+        ("tos_uri", "http://app.example.com/tos"),
+    ] {
+        let resp = harness
+            .post_json(
+                &registrations_path(realm.name.as_ref(), "default"),
+                serde_json::json!({
+                    "redirect_uris": ["https://app.example.com/cb"],
+                    field: value,
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(json_body(resp).await["error"], "invalid_client_metadata", "{field}");
+    }
+
+    // Unknown grant/response types, a bad subject type, and `none`/symmetric
+    // signing algs are rejected with invalid_client_metadata.
+    for body in [
+        serde_json::json!({"grant_types": ["authorization_code", "made-up-grant"]}),
+        serde_json::json!({"response_types": ["code", "code token token"]}),
+        serde_json::json!({"subject_type": "weird"}),
+        serde_json::json!({"id_token_signed_response_alg": "none"}),
+        serde_json::json!({"userinfo_signed_response_alg": "HS256"}),
+    ] {
+        let resp = harness
+            .post_json(&registrations_path(realm.name.as_ref(), "default"), body)
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_client_metadata");
+    }
+
+    // post_logout_redirect_uris: syntax errors are invalid_redirect_uri,
+    // scheme violations invalid_client_metadata.
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({"post_logout_redirect_uris": ["not a url at all"]}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "invalid_redirect_uri");
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({"post_logout_redirect_uris": ["http://app.example.com/done"]}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "invalid_client_metadata");
+}
+
+/// RFC fields on the OPEN endpoint are translated first and then vetted by
+/// the open-registration payload policy: caller-controlled JWKS and logout
+/// URIs are stripped, the rest of the metadata is honored.
+#[tokio::test]
+async fn rfc7591_open_registration_applies_payload_policy_after_translation() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-rfc-open").await;
+    enable_registration(&harness, &realm).await;
+
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({
+                "client_name": "Open RFC App",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "response_types": ["code id_token"],
+                "jwks": {"keys": [{"kty": "RSA", "kid": "attacker", "n": "0vx7agoe", "e": "AQAB"}]},
+                "jwks_uri": "https://attacker.example.com/jwks",
+                "frontchannel_logout_uri": "https://attacker.example.com/fc",
+                "backchannel_logout_uri": "https://attacker.example.com/bc",
+                "initiate_login_uri": "https://app.example.com/login"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = json_body(resp).await;
+    let client_id = json["client_id"].as_str().unwrap().to_string();
+
+    // The echo shows the honored metadata and omits the stripped fields.
+    assert_eq!(json["client_name"], "Open RFC App");
+    assert_eq!(json["response_types"], serde_json::json!(["code id_token"]));
+    assert_eq!(json["initiate_login_uri"], "https://app.example.com/login");
+    assert!(json.get("jwks").is_none(), "stripped fields are not echoed");
+    assert!(json.get("jwks_uri").is_none());
+    assert!(json.get("frontchannel_logout_uri").is_none());
+    assert!(json.get("backchannel_logout_uri").is_none());
+
+    // Storage agrees: the stripped attributes never landed.
+    let client = stored_client(&harness, &realm, &client_id)
+        .await
+        .expect("registered client persisted");
+    for key in [
+        "jwks.url",
+        "use.jwks.url",
+        "jwks.string",
+        "use.jwks.string",
+        "backchannel_logout_uri",
+        "frontchannel_logout_uri",
+    ] {
+        assert!(!client.attributes.contains_key(key), "{key} must be stripped");
+    }
+    assert_eq!(
+        client.attributes.get("initiate_login_uri").map(String::as_str),
+        Some("https://app.example.com/login")
+    );
+}

@@ -197,6 +197,10 @@ pub(crate) async fn dispatch_actions_continuation(
                 redirect_uri: url,
                 code: None,
                 id_token: None,
+                access_token: None,
+                token_type: None,
+                expires_in: None,
+                session_state: None,
                 state: state_param,
             }),
         )

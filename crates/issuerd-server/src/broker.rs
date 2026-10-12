@@ -15,7 +15,8 @@
 //! attacker-influenced URLs (pairwise `sector_identifier_uri`, client
 //! `jwks.url`) behind an SSRF guard: https-only, public-IP-only against an
 //! explicit non-public CIDR blocklist, no redirects, capped body, and a
-//! single generic error for every failure mode.
+//! single generic error for every failure mode. The public-IP check lifts
+//! only under `[outbound_http] allow_private_addresses` (test rigs only).
 
 use issuerd_core::{
     BrokerClient, BrokerDiscoveryDocument, BrokerIdpSettings, BrokerTokenResponse,
@@ -44,6 +45,10 @@ pub struct ReqwestBrokerClient {
     /// redirect following is disabled so a public URL cannot bounce the
     /// fetch into the internal network (SSRF hardening).
     untrusted_client: reqwest::Client,
+    /// `[outbound_http] allow_private_addresses`: skip the public-IP check on
+    /// resolved addresses in the guarded fetch (test rigs only — see the
+    /// config key's warning).
+    allow_private_addresses: bool,
 }
 
 /// Body-size cap for documents fetched from untrusted URLs (64 KiB) — both
@@ -52,12 +57,19 @@ pub struct ReqwestBrokerClient {
 const MAX_UNTRUSTED_BODY_BYTES: usize = 64 * 1024;
 
 impl ReqwestBrokerClient {
-    pub fn new() -> Result<Self, IssuerdError> {
-        let client = reqwest::Client::builder()
+    /// Build the broker client. `extra_roots` are the additional root CAs from
+    /// `[outbound_http] extra_ca_bundle` (empty = public webpki roots only).
+    /// `allow_private_addresses` lifts the SSRF guard's public-IP check
+    /// (test rigs only).
+    pub fn new(
+        extra_roots: &[reqwest::Certificate],
+        allow_private_addresses: bool,
+    ) -> Result<Self, IssuerdError> {
+        let client = crate::outbound_http::client_builder(extra_roots)
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
-        let untrusted_client = reqwest::Client::builder()
+        let untrusted_client = crate::outbound_http::client_builder(extra_roots)
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -65,6 +77,7 @@ impl ReqwestBrokerClient {
         Ok(Self {
             client,
             untrusted_client,
+            allow_private_addresses,
         })
     }
 }
@@ -229,7 +242,7 @@ impl BrokerClient for ReqwestBrokerClient {
     /// Hardened fetch for attacker-influenced URLs (the pairwise
     /// `sector_identifier_uri` from open dynamic client registration, a
     /// client's configured `jwks.url` presented to unauthenticated client
-    /// assertions / JAR request objects).
+    /// assertions / JAR request objects, a pre-registered `request_uri`).
     ///
     /// Every failure mode — scheme, DNS, non-public address, connect,
     /// redirect, non-success status, oversize body, JSON parse — collapses
@@ -242,11 +255,34 @@ impl BrokerClient for ReqwestBrokerClient {
     /// mitigation would be a pinning connector that dials the validated IP
     /// directly.
     async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
-        // One generic, leak-free error for every failure mode.
-        let fail = |why: &str| {
-            warn!(url, why, "SSRF-guarded fetch rejected/failed");
-            IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
-        };
+        let body = self.guarded_get_bytes(url).await?;
+        serde_json::from_slice(&body).map_err(|e| guarded_fetch_fail(&format!("json parse: {e}")))
+    }
+
+    /// The text variant of [`Self::get_json_ssrf_guarded`] (a pre-registered
+    /// `request_uri` serves a JWT, not JSON).
+    async fn get_text_ssrf_guarded(&self, url: &str) -> Result<String, IssuerdError> {
+        let body = self.guarded_get_bytes(url).await?;
+        String::from_utf8(body).map_err(|e| guarded_fetch_fail(&format!("utf8: {e}")))
+    }
+}
+
+/// One generic, leak-free error for every failure mode of the SSRF-guarded
+/// fetch: the real cause is logged only, so callers cannot serve as a blind
+/// host/port oracle into the internal network.
+fn guarded_fetch_fail(why: &str) -> IssuerdError {
+    warn!(why, "SSRF-guarded fetch rejected/failed");
+    IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
+}
+
+impl ReqwestBrokerClient {
+    /// The shared guarded GET: https-only, publicly routable resolved IPs
+    /// (unless the server's `[outbound_http] allow_private_addresses` test
+    /// escape hatch is on), no redirects, body capped at
+    /// [`MAX_UNTRUSTED_BODY_BYTES`]. Both the JSON and the text surface parse
+    /// from this.
+    async fn guarded_get_bytes(&self, url: &str) -> Result<Vec<u8>, IssuerdError> {
+        let fail = guarded_fetch_fail;
 
         // Never fetch untrusted URLs over plain http. (For
         // `sector_identifier_uri` the pairwise validator enforces https too,
@@ -259,19 +295,23 @@ impl BrokerClient for ReqwestBrokerClient {
         let port = parsed.port_or_known_default().ok_or_else(|| fail("no port"))?;
 
         // Resolve the host and refuse the request if ANY resolved address is
-        // not publicly routable.
-        let addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| fail(&format!("dns: {e}")))?;
-        let mut resolved_any = false;
-        for addr in addrs {
-            resolved_any = true;
-            if !is_publicly_routable(&addr.ip()) {
-                return Err(fail(&format!("non-public address {}", addr.ip())));
+        // not publicly routable. `[outbound_http] allow_private_addresses`
+        // skips this check wholesale (test rigs only; the scheme, redirect,
+        // size-cap and timeout rules still apply).
+        if !self.allow_private_addresses {
+            let addrs = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| fail(&format!("dns: {e}")))?;
+            let mut resolved_any = false;
+            for addr in addrs {
+                resolved_any = true;
+                if !is_publicly_routable(&addr.ip()) {
+                    return Err(fail(&format!("non-public address {}", addr.ip())));
+                }
             }
-        }
-        if !resolved_any {
-            return Err(fail("dns: no addresses"));
+            if !resolved_any {
+                return Err(fail("dns: no addresses"));
+            }
         }
 
         // Redirects are disabled on this client, so a 3xx surfaces as the
@@ -304,7 +344,7 @@ impl BrokerClient for ReqwestBrokerClient {
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body).map_err(|e| fail(&format!("json parse: {e}")))
+        Ok(body)
     }
 }
 
@@ -565,12 +605,12 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_client_builds() {
-        assert!(ReqwestBrokerClient::new().is_ok());
+        assert!(ReqwestBrokerClient::new(&[], false).is_ok());
     }
 
     #[tokio::test]
     async fn guarded_fetch_rejects_non_https_before_any_network_io() {
-        let client = ReqwestBrokerClient::new().unwrap();
+        let client = ReqwestBrokerClient::new(&[], false).unwrap();
         let err = client.get_json_ssrf_guarded("http://app.example.com/jwks").await.unwrap_err();
         assert!(
             matches!(err, IssuerdError::InvalidRequest(_)),
@@ -706,5 +746,85 @@ mod tests {
             let ip = IpAddr::from_str(accepted).unwrap();
             assert!(is_publicly_routable(&ip), "{accepted} must be accepted");
         }
+    }
+
+    /// A tiny HTTPS server on loopback (an rcgen-minted CA signs the
+    /// `localhost` server certificate) serving a JSON document; returns the
+    /// base URL and the CA certificate the client must trust.
+    async fn start_loopback_tls_json() -> (String, reqwest::Certificate) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // aws-lc's webpki fork requires the CA key-usage bits explicitly.
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        // A distinct DN: with rcgen's default the CA and the leaf would share
+        // "CN=rcgen self signed cert", making the leaf look self-signed.
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "issuerd test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            server_cert.pem().into_bytes(),
+            server_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // axum_server registers the socket with the tokio runtime.
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"keys": []})) }),
+        );
+        tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
+        (format!("https://127.0.0.1:{port}"), root)
+    }
+
+    /// The SSRF guard's public-IP check blocks loopback by default and lifts
+    /// only under `[outbound_http] allow_private_addresses` — the https and
+    /// TLS-trust rules are enforced in both modes (the allowed fetch really
+    /// validates against the rig's CA).
+    #[tokio::test]
+    async fn guarded_fetch_private_addresses_follow_the_config_flag() {
+        let (base, root) = start_loopback_tls_json().await;
+        let url = format!("{base}/jwks");
+
+        // Default posture: loopback is refused by the guard (never dialed).
+        let client = ReqwestBrokerClient::new(std::slice::from_ref(&root), false).unwrap();
+        let err = client.get_json_ssrf_guarded(&url).await.unwrap_err();
+        assert!(matches!(err, IssuerdError::InvalidRequest(_)), "{err}");
+
+        // Test-rig mode: the same fetch succeeds end to end.
+        let client = ReqwestBrokerClient::new(&[root], true).unwrap();
+        let json = client.get_json_ssrf_guarded(&url).await.unwrap();
+        assert_eq!(json["keys"], serde_json::json!([]));
+    }
+
+    /// The allowance lifts ONLY the address check: plain http stays refused
+    /// even with the flag on.
+    #[tokio::test]
+    async fn guarded_fetch_allow_private_keeps_the_https_rule() {
+        let client = ReqwestBrokerClient::new(&[], true).unwrap();
+        let err = client.get_json_ssrf_guarded("http://127.0.0.1/jwks").await.unwrap_err();
+        assert!(matches!(err, IssuerdError::InvalidRequest(_)), "{err}");
     }
 }

@@ -131,6 +131,16 @@ pub trait BrokerClient: Send + Sync {
     /// strip every protection from any implementor that forgot to override
     /// it.
     async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError>;
+
+    /// GET a **text** document (not JSON) from an untrusted,
+    /// attacker-influenced URL — the `request_uri` a client pre-registered
+    /// for JAR-by-reference (OIDC Core §6.2), which serves a JWT.
+    ///
+    /// Identical hardening contract to [`BrokerClient::get_json_ssrf_guarded`]
+    /// (https-only, publicly routable resolved IPs, no redirects, capped body,
+    /// one generic error) — only the parse step differs (the body is returned
+    /// verbatim). Required method, no default body, for the same reason.
+    async fn get_text_ssrf_guarded(&self, url: &str) -> Result<String, IssuerdError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -886,11 +896,17 @@ mod tests {
             ) -> Result<serde_json::Value, IssuerdError> {
                 Ok(serde_json::json!({"fetched": url}))
             }
+
+            async fn get_text_ssrf_guarded(&self, url: &str) -> Result<String, IssuerdError> {
+                Ok(format!("fetched:{url}"))
+            }
         }
 
         let client = StubBrokerClient;
         let value = client.get_json_ssrf_guarded("https://idp.example.com/jwks").await.unwrap();
         assert_eq!(value, serde_json::json!({"fetched": "https://idp.example.com/jwks"}));
+        let text = client.get_text_ssrf_guarded("https://idp.example.com/obj.jwt").await.unwrap();
+        assert_eq!(text, "fetched:https://idp.example.com/obj.jwt");
     }
 
     #[test]

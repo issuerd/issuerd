@@ -96,6 +96,17 @@ pub struct LoginResponse {
     pub redirect_uri: String,
     pub code: Option<String>,
     pub id_token: Option<String>,
+    /// Access token minted at the authorization endpoint (implicit/hybrid
+    /// `token`-bearing response types); `None` for the code flow and pure
+    /// `id_token` implicit.
+    pub access_token: Option<String>,
+    /// `"Bearer"` when `access_token` is present.
+    pub token_type: Option<String>,
+    /// Access-token validity in seconds, when an access token is present.
+    pub expires_in: Option<u64>,
+    /// OIDC Session Management 1.0: the SSO session id (the value the
+    /// RP-facing `session_state` authorization-response parameter carries).
+    pub session_state: Option<String>,
     pub state: Option<String>,
 }
 
@@ -599,7 +610,12 @@ pub async fn logout_api_handler(
         let Some((name, value)) = cookie.trim().split_once('=') else {
             continue;
         };
-        if name == "issuerd_session" || name.starts_with("issuerd_session_") {
+        if name.starts_with("issuerd_session_state_") {
+            // The session-state companion cookie (OIDC Session Management):
+            // its value is a bare session id, not a token — clear, never
+            // validate.
+            clear_names.push(name.to_string());
+        } else if name == "issuerd_session" || name.starts_with("issuerd_session_") {
             clear_names.push(name.to_string());
             // Validate and destroy the referenced session (resolving the
             // realm from the realm-NAME based issuer), then fan out the
@@ -758,24 +774,33 @@ pub(crate) async fn complete_login(
 }
 
 /// Assemble the authorization-response parameter set for form-based browser
-/// submissions (state first, then code, then id_token — the pre-24.7 order).
+/// submissions (state first, then the minted legs — code, id_token,
+/// access_token + token_type/expires_in — the pre-24.7 order, extended).
 /// Delivery (query/fragment/form_post/JARM) is decided from the pending
-/// entry's response_mode at response time.
+/// entry's response_mode at response time. OIDC Session Management 1.0:
+/// `session_state` (the SSO session id) always rides along.
 fn response_params<'a>(
     pending: &'a super::oidc::PendingAuthData,
-    code: Option<&'a str>,
-    id_token: Option<&'a str>,
+    artifacts: &'a super::oidc::AuthorizationArtifacts,
+    expires_in: &'a str,
+    session_state: &'a str,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params: Vec<(&str, &str)> = Vec::new();
     if let Some(ref s) = pending.state {
         params.push(("state", s.as_str()));
     }
-    if let Some(c) = code {
+    if let Some(ref c) = artifacts.code {
         params.push(("code", c));
     }
-    if let Some(t) = id_token {
+    if let Some(ref t) = artifacts.id_token {
         params.push(("id_token", t));
     }
+    if let Some(ref t) = artifacts.access_token {
+        params.push(("access_token", t));
+        params.push(("token_type", "Bearer"));
+        params.push(("expires_in", expires_in));
+    }
+    params.push(("session_state", session_state));
     params
 }
 
@@ -1027,204 +1052,85 @@ pub(crate) async fn complete_login_with_method(
         resp
     };
 
-    let resp = match pending.response_type.as_str() {
-        "id_token" => {
-            // Implicit flow: issue id_token directly; scope claims embed via
-            // the mapper overlay (no access token is issued alongside).
-            let overlay = crate::claims::build_claims_overlay(
+    // Mint the authorization response's artifacts (code / id_token / access
+    // token per the response type) — the same assembly as the SSO-resume
+    // path (`oidc::finish_sso_login`): pure implicit embeds the IdToken
+    // overlay, flows with an accompanying code/access token serve userinfo
+    // claims from the userinfo endpoint, and `at_hash`/`c_hash` ride along
+    // whenever the corresponding artifact exists.
+    let artifacts = match super::oidc::mint_authorization_artifacts(
+        state,
+        &realm,
+        &client,
+        &user,
+        &pending,
+        &session_id,
+        result_auth_time,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(super::oidc::MintFailure::CodeStore(e)) => {
+            return auth_code_store_failure(
                 state,
-                &realm_id,
-                Some(&client),
-                &user,
-                &pending.scope,
-                issuerd_core::ClaimTarget::IdToken,
-            )
-            .await
-            .unwrap_or_default();
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    &user,
-                    &client,
-                    &realm,
-                    pending.nonce.as_deref(),
-                    result_auth_time,
-                    &session_id,
-                    None,
-                    None,
-                    Some(&pending.acr_values),
-                    Some(overlay),
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, error = %e, "failed to issue ID token");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, None, Some(&id_token.token)),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: None,
-                        id_token: Some(id_token.token),
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
-        }
-        "code id_token" => {
-            // Hybrid flow: issue both code and id_token
-            let code = issuerd_core::utils::generate_id();
-            let code_data = super::oidc::AuthCodeData::from_pending(
+                &realm,
                 &pending,
+                &client,
                 &user_id,
                 &session_id,
-                result_auth_time,
-            );
-            if let Err(e) = super::oidc::store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(&realm),
+                is_browser_form,
+                &cookie_value,
+                &e,
             )
-            .await
-            {
-                return auth_code_store_failure(
-                    state,
-                    &realm,
-                    &pending,
-                    &client,
-                    &user_id,
-                    &session_id,
-                    is_browser_form,
-                    &cookie_value,
-                    &e,
-                )
-                .await;
-            }
-
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    &user,
-                    &client,
-                    &realm,
-                    pending.nonce.as_deref(),
-                    result_auth_time,
-                    &session_id,
-                    None,
-                    Some(&code),
-                    Some(&pending.acr_values),
-                    // Hybrid flow: userinfo claims via the userinfo endpoint.
-                    None,
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, error = %e, "failed to issue ID token");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, Some(&code), Some(&id_token.token)),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: Some(code),
-                        id_token: Some(id_token.token),
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
+            .await;
         }
-        _ => {
-            // Authorization code flow
-            let code = issuerd_core::utils::generate_id();
-            let code_data = super::oidc::AuthCodeData::from_pending(
-                &pending,
-                &user_id,
-                &session_id,
-                result_auth_time,
-            );
-            if let Err(e) = super::oidc::store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(&realm),
-            )
-            .await
-            {
-                return auth_code_store_failure(
-                    state,
-                    &realm,
-                    &pending,
-                    &client,
-                    &user_id,
-                    &session_id,
-                    is_browser_form,
-                    &cookie_value,
-                    &e,
-                )
-                .await;
-            }
-
-            if is_browser_form {
-                browser_auth_response(
-                    state,
-                    &realm,
-                    &pending,
-                    &response_params(&pending, Some(&code), None),
-                    &cookie_value,
-                )
-                .await
-            } else {
-                (
-                    cookie_header,
-                    Json(LoginResponse {
-                        redirect_uri: pending.redirect_uri,
-                        code: Some(code),
-                        id_token: None,
-                        state: pending.state,
-                    }),
-                )
-                    .into_response()
-            }
+        Err(super::oidc::MintFailure::Issuance(e)) => {
+            error!(realm = %realm_id, error = %e, "failed to mint the authorization response");
+            // The body carries the OAuth error code only — the internal
+            // detail (e.g. which signing key is missing) stays in the log.
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(super::oidc::error_response(&e)))
+                .into_response();
         }
     };
+
+    let resp = if is_browser_form {
+        let expires_in = artifacts.expires_in.to_string();
+        browser_auth_response(
+            state,
+            &realm,
+            &pending,
+            &response_params(&pending, &artifacts, &expires_in, session_id.as_ref()),
+            &cookie_value,
+        )
+        .await
+    } else {
+        (
+            cookie_header,
+            Json(LoginResponse {
+                redirect_uri: pending.redirect_uri,
+                code: artifacts.code,
+                id_token: artifacts.id_token,
+                token_type: artifacts.access_token.as_ref().map(|_| "Bearer".to_string()),
+                expires_in: artifacts.access_token.as_ref().map(|_| artifacts.expires_in),
+                access_token: artifacts.access_token,
+                session_state: Some(session_id.to_string()),
+                state: pending.state,
+            }),
+        )
+            .into_response()
+    };
+    // OIDC Session Management 1.0: the companion cookie carrying the current
+    // `session_state` (the SSO session id) rides every login completion. NOT
+    // HttpOnly — the check_session_iframe page's JS reads it. Re-auth
+    // refreshes it.
+    let mut resp = resp;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&super::oidc::session_state_cookie_header(
+        &realm,
+        session_id.as_ref(),
+        state.config.secure_cookies(),
+    )) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
     with_remember_cookie(resp)
 }
 
@@ -1504,6 +1410,18 @@ pub struct LoginContextResponse {
     pub login_theme: Option<String>,
     /// Message bundle for `locale` (per-key English fallback applied).
     pub messages: std::collections::HashMap<String, String>,
+    /// Client branding (OIDC registration §2 metadata): present only when the
+    /// paused flow's client registered the corresponding URI. `client_name`
+    /// is the client's display name (or its client_id) — present whenever the
+    /// flow's client resolves, so the page can label the logo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_logo_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_policy_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_tos_uri: Option<String>,
 }
 
 /// Query parameters for [`login_context_handler`].
@@ -1565,16 +1483,35 @@ pub async fn login_context_handler(
                 .collect();
             // A paused flow pins its locale at the authorize
             // endpoint; reuse it when the login page passes its flow id.
-            let pending_locale = match &query.execution_id {
+            // The same lookup carries the flow's client for the branding
+            // fields below.
+            let pending = match &query.execution_id {
                 Some(execution) => {
                     let key = super::oidc::pending_auth_cache_key(&realm.id, execution);
                     match state.cache.get(&key).await {
-                        Ok(Some(bytes)) => serde_json::from_slice::<PendingAuthData>(&bytes)
-                            .ok()
-                            .and_then(|p| p.locale),
+                        Ok(Some(bytes)) => serde_json::from_slice::<PendingAuthData>(&bytes).ok(),
                         _ => None,
                     }
                 }
+                None => None,
+            };
+            let pending_locale = pending.as_ref().and_then(|p| p.locale.clone());
+            // Client branding (OIDC registration §2 `logo_uri`/`policy_uri`/
+            // `tos_uri`): resolved from the paused flow's client; UI-only
+            // hints, so a deleted/unresolvable client simply omits them.
+            let branding_client = match pending.as_ref() {
+                Some(p) => match ClientIdentifier::new(&p.client_id) {
+                    Ok(identifier) => {
+                        match state.storage.get_client_by_client_id(&realm.id, &identifier).await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                warn!(realm = %realm.id, error = %e, "login-context client lookup failed");
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                },
                 None => None,
             };
             let locale = pending_locale.unwrap_or_else(|| {
@@ -1607,6 +1544,21 @@ pub async fn login_context_handler(
                 supported_locales: realm.supported_locales.clone(),
                 login_theme: realm.login_theme.as_ref().map(|t| t.as_str().to_string()),
                 messages: bundle,
+                client_name: branding_client.as_ref().map(|c| {
+                    c.name
+                        .as_ref()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| c.client_id.to_string())
+                }),
+                client_logo_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::logo_uri(c).map(str::to_string)),
+                client_policy_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::policy_uri(c).map(str::to_string)),
+                client_tos_uri: branding_client
+                    .as_ref()
+                    .and_then(|c| crate::client_metadata::tos_uri(c).map(str::to_string)),
             })
             .into_response()
         }
@@ -4740,7 +4692,7 @@ pub(crate) mod tests {
             _user: &issuerd_core::User,
             _client: &issuerd_core::Client,
             _realm: &issuerd_core::Realm,
-            _session_id: &issuerd_core::SessionId,
+            _session_id: Option<&issuerd_core::SessionId>,
         ) -> Result<issuerd_core::LogoutToken, issuerd_core::IssuerdError> {
             Err(issuerd_core::IssuerdError::ServerError("mock".into()))
         }
@@ -4750,6 +4702,16 @@ pub(crate) mod tests {
             _realm: &issuerd_core::Realm,
             _client_id: &str,
             _params: &[(String, String)],
+        ) -> Result<String, issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("mock".into()))
+        }
+
+        async fn sign_userinfo_response(
+            &self,
+            _client: &issuerd_core::Client,
+            _realm: &issuerd_core::Realm,
+            _claims: &serde_json::Map<String, serde_json::Value>,
+            _alg: issuerd_core::Algorithm,
         ) -> Result<String, issuerd_core::IssuerdError> {
             Err(issuerd_core::IssuerdError::ServerError("mock".into()))
         }

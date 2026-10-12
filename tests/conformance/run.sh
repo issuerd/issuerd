@@ -11,9 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -d "$SCRIPT_DIR/conformance-suite/scripts" ]]; then
     echo "ERROR: conformance suite sources not found at tests/conformance/conformance-suite"
-    echo "Clone them first (currently validated against release-v5.2.4):"
+    echo "Clone them first (currently validated against release-v5.3.2):"
     echo "  git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite"
-    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.2.4"
+    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.3.2"
     exit 1
 fi
 
@@ -42,6 +42,12 @@ cleanup() {
     docker compose down --volumes 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Always start from a clean slate: a stack left running by an interactive
+# `docker compose up` would otherwise be reused — and its suite DB (mongo)
+# carries stale plans that the report export would silently mix into this
+# run's evidence.
+docker compose down --volumes >/dev/null 2>&1 || true
 
 docker compose up -d --wait --build
 

@@ -1,0 +1,10 @@
+{
+  "description": "Issuerd 3rd-Party-Init OP test (dynamic registration)",
+  "server": {
+    "discoveryUrl": "https://op.conformance.test:8443/realms/conformance/.well-known/openid-configuration"
+  },
+  "client": {
+    "client_name": "issuerd-3rdparty-init",
+    "initial_access_token": "@INITIAL_ACCESS_TOKEN@"
+  }
+}

@@ -228,14 +228,15 @@ pub async fn account_sessions_handler(
     ),
     security(("bearer_auth" = [])),
 )]
-#[instrument(skip(state, headers, _realm, session_id))]
+#[instrument(skip(state, headers, realm_segment, session_id))]
 pub async fn account_logout_session_handler(
     State(state): State<Arc<ServerState>>,
     axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
     headers: axum::http::HeaderMap,
     // The realm segment is resolved by middleware; only the session id is used.
-    Path((_realm, session_id)): Path<(String, String)>,
+    Path((realm_segment, session_id)): Path<(String, String)>,
 ) -> Response {
+    let _ = &realm_segment;
     let guard = match extract_auth(&state, &realm, &headers).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -289,12 +290,36 @@ pub async fn account_logout_session_handler(
             .into_response();
     }
     crate::session_cache::invalidate_session(&state, &guard.realm_id, &sid).await;
+    let realm = state.storage.get_realm(&guard.realm_id).await.ok().flatten();
     // Back-channel logout: notify clients with a `backchannel_logout_uri`
     // (fire-and-forget).
-    if let Ok(Some(realm)) = state.storage.get_realm(&guard.realm_id).await {
-        state.logout_notifier.notify_session_destroyed(&realm, &session).await;
+    if let Some(realm) = &realm {
+        state.logout_notifier.notify_session_destroyed(realm, &session).await;
     }
-    StatusCode::NO_CONTENT.into_response()
+    // OIDC Session Management: when the deleted session IS the caller's
+    // current one (the bearer token's sid), the browser's session-state
+    // companion cookie must be cleared too; deleting a different session
+    // must not touch it. The clear needs the realm (the cookie name is
+    // name-scoped with an id fallback) — a transient realm-fetch failure
+    // skips it, matching the notifier's best-effort posture.
+    let deleted_current = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|token| state.token_service.validate_access_token(token).ok())
+        .and_then(|v| v.claims.sid)
+        .is_some_and(|current| current == sid);
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    if deleted_current {
+        if let Some(realm) = &realm {
+            if let Ok(v) = axum::http::HeaderValue::from_str(
+                &super::oidc::session_state_cookie_clear(realm, state.config.secure_cookies()),
+            ) {
+                resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+            }
+        }
+    }
+    resp
 }
 
 #[utoipa::path(
@@ -2424,6 +2449,70 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_logout_own_session_clears_the_session_state_cookie() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let sid = validated.claims.sid.clone().unwrap();
+
+        let resp = account_logout_session_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), sid.0.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // The deleted session IS the bearer's own: the companion cookie
+        // clear rides the response (else the RP iframe keeps answering
+        // "unchanged" for a dead session).
+        let clear = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|v| v.starts_with("issuerd_session_state_master="));
+        let clear = clear.expect("the session-state clear must ride the response");
+        assert!(clear.contains("Max-Age=0"), "got: {clear}");
+    }
+
+    #[tokio::test]
+    async fn account_logout_other_session_keeps_the_session_state_cookie() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let current_sid = validated.claims.sid.clone().unwrap();
+
+        // A second session of the SAME user: deleting it must not clear the
+        // caller's own companion cookie.
+        let admin = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let other_session = make_session(&realm_id, &admin);
+        let other_sid = other_session.id.clone();
+        state.storage.create_user_session(&realm_id, &other_session).await.unwrap();
+
+        let resp = account_logout_session_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Path(("master".to_string(), other_sid.0.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.storage.get_user_session(&realm_id, &other_sid).await.unwrap().is_none());
+        assert!(
+            resp.headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .all(|v| !v.to_str().unwrap().starts_with("issuerd_session_state_")),
+            "no session-state clear for another session: {:?}",
+            resp.headers()
+        );
+        // The caller's own session is untouched.
+        assert!(state.storage.get_user_session(&realm_id, &current_sid).await.unwrap().is_some());
     }
 
     #[tokio::test]

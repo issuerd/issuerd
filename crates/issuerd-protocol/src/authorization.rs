@@ -160,23 +160,23 @@ impl AuthorizationRequest {
             ));
         }
 
-        // Response type check against client attributes
-        let allowed = client
-            .attributes
-            .get("response_types")
-            .map(|s| s.split_whitespace().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                vec![
-                    "code",
-                    "id_token",
-                    "token",
-                    "code id_token",
-                    "code token",
-                    "id_token token",
-                    "code id_token token",
-                ]
-            });
-        if !allowed.contains(&self.response_type.as_str()) {
+        // Response type check against client attributes. Read via
+        // `Client::allowed_response_types`, which honors both the JSON array
+        // encoding stored by dynamic client registration (lossless for
+        // multi-token combinations such as `code id_token`) and the legacy
+        // space-separated word list.
+        let allowed = client.allowed_response_types().unwrap_or_else(|| {
+            vec![
+                "code".to_string(),
+                "id_token".to_string(),
+                "token".to_string(),
+                "code id_token".to_string(),
+                "code token".to_string(),
+                "id_token token".to_string(),
+                "code id_token token".to_string(),
+            ]
+        });
+        if !allowed.iter().any(|t| t == self.response_type.as_str()) {
             return Err(IssuerdError::InvalidRequest(
                 "response_type not allowed for client".into(),
             ));
@@ -191,7 +191,11 @@ impl AuthorizationRequest {
             .collect();
 
         for scope in &self.scope {
-            if !available_scopes.contains(scope) {
+            // `openid` is the OIDC protocol marker, not a client scope:
+            // every client may request it (Keycloak parity — otherwise a
+            // client registered via DCR without a `scope` field could never
+            // run an OIDC flow).
+            if scope != "openid" && !available_scopes.contains(scope) {
                 return Err(IssuerdError::InvalidScope);
             }
         }
@@ -452,6 +456,15 @@ pub enum ResponseType {
     IdTokenToken,
     #[serde(rename = "code id_token token")]
     CodeIdTokenToken,
+    /// Discovery-only alias of [`ResponseType::IdTokenToken`]: OIDC Core §3
+    /// defines response types as space-delimited SETS, so both spellings are
+    /// the same type — but the OIDF Dynamic profile's discovery check
+    /// (OIDCD-3) looks for the token-first spelling. The parser normalizes
+    /// `"token id_token"` to `IdTokenToken`, so this variant is never
+    /// constructed from a request; it exists purely to advertise both
+    /// spellings.
+    #[serde(rename = "token id_token")]
+    TokenIdToken,
 }
 
 impl ResponseType {
@@ -464,6 +477,7 @@ impl ResponseType {
             ResponseType::CodeToken => "code token",
             ResponseType::IdTokenToken => "id_token token",
             ResponseType::CodeIdTokenToken => "code id_token token",
+            ResponseType::TokenIdToken => "token id_token",
         }
     }
 
@@ -483,6 +497,7 @@ impl ResponseType {
             ResponseType::Token
                 | ResponseType::CodeToken
                 | ResponseType::IdTokenToken
+                | ResponseType::TokenIdToken
                 | ResponseType::CodeIdTokenToken
         )
     }
@@ -493,8 +508,17 @@ impl ResponseType {
             ResponseType::IdToken
                 | ResponseType::CodeIdToken
                 | ResponseType::IdTokenToken
+                | ResponseType::TokenIdToken
                 | ResponseType::CodeIdTokenToken
         )
+    }
+
+    /// Whether the response type's default response mode is the fragment
+    /// (OAuth 2.0 Multiple Response Types §3: any token-bearing type — an
+    /// id_token and/or an access token; only the pure code flow defaults to
+    /// query).
+    pub fn default_response_mode_is_fragment(&self) -> bool {
+        self.has_id_token() || self.has_token()
     }
 }
 
@@ -508,7 +532,10 @@ impl std::str::FromStr for ResponseType {
             "token" => Ok(ResponseType::Token),
             "code id_token" => Ok(ResponseType::CodeIdToken),
             "code token" => Ok(ResponseType::CodeToken),
-            "id_token token" => Ok(ResponseType::IdTokenToken),
+            // The two spellings of the implicit pair are the same type
+            // (a space-delimited set); normalize to the id_token-first
+            // spelling so per-client allowlists compare one way.
+            "id_token token" | "token id_token" => Ok(ResponseType::IdTokenToken),
             "code id_token token" => Ok(ResponseType::CodeIdTokenToken),
             _ => Err(IssuerdError::InvalidRequest("unsupported response_type".into())),
         }
@@ -532,6 +559,9 @@ mod tests {
     #[case("code id_token", ResponseType::CodeIdToken)]
     #[case("code token", ResponseType::CodeToken)]
     #[case("id_token token", ResponseType::IdTokenToken)]
+    // The token-first spelling of the implicit pair normalizes to the same
+    // type (OIDC Core §3: response types are space-delimited sets).
+    #[case("token id_token", ResponseType::IdTokenToken)]
     #[case("code id_token token", ResponseType::CodeIdTokenToken)]
     fn response_type_parsing(#[case] input: &str, #[case] expected: ResponseType) {
         assert_eq!(ResponseType::from_str(input).unwrap(), expected);
@@ -563,6 +593,11 @@ mod tests {
         assert!(ResponseType::CodeIdTokenToken.has_code());
         assert!(ResponseType::CodeIdTokenToken.has_token());
         assert!(ResponseType::CodeIdTokenToken.has_id_token());
+
+        // The discovery-only token-first alias behaves like its pair.
+        assert!(ResponseType::TokenIdToken.has_token());
+        assert!(ResponseType::TokenIdToken.has_id_token());
+        assert!(!ResponseType::TokenIdToken.has_code());
     }
 
     #[rstest]
@@ -988,6 +1023,64 @@ mod tests {
         assert!(req.validate(&Realm::default(), &client).is_err());
     }
 
+    /// The response-type allowlist attribute honors the JSON encoding DCR
+    /// stores (multi-token combinations stay intact) as well as the legacy
+    /// space-separated word list.
+    #[test]
+    fn validate_response_type_allowlist_json_and_legacy() {
+        fn client_with_attribute(value: &str) -> Client {
+            Client {
+                redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+                default_scopes: Scope::parse("openid"),
+                optional_scopes: Scope::empty(),
+                public_client: false,
+                attributes: std::collections::HashMap::from([(
+                    "response_types".to_string(),
+                    value.to_string(),
+                )]),
+                ..make_client_defaults()
+            }
+        }
+        fn hybrid_request() -> AuthorizationRequest {
+            AuthorizationRequest {
+                response_type: ResponseType::CodeIdToken,
+                client_id: ClientIdentifier::new("client1").unwrap(),
+                redirect_uri: "https://client.example.com/cb".parse().unwrap(),
+                scope: Scope::parse("openid"),
+                state: None,
+                nonce: Some(issuerd_core::Nonce::new("n-1").unwrap()),
+                response_mode: None,
+                prompt: vec![],
+                max_age: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                login_hint: None,
+                id_token_hint: None,
+                acr_values: vec![],
+                ui_locales: vec![],
+                claims: None,
+                authorization_details: None,
+                registration: false,
+                request: None,
+                request_uri: None,
+            }
+        }
+
+        // JSON encoding: `code id_token` is one allowlist entry.
+        let client = client_with_attribute("[\"code id_token\"]");
+        assert!(hybrid_request().validate(&Realm::default(), &client).is_ok());
+        // ...and bare `code` is NOT smuggled in by the shared prefix.
+        let mut code_request = hybrid_request();
+        code_request.response_type = ResponseType::Code;
+        assert!(code_request.validate(&Realm::default(), &client).is_err());
+
+        // Legacy word list: `code` allowed, the combination is not
+        // expressible in this encoding (and therefore not allowed).
+        let client = client_with_attribute("code");
+        assert!(code_request.validate(&Realm::default(), &client).is_ok());
+        assert!(hybrid_request().validate(&Realm::default(), &client).is_err());
+    }
+
     #[test]
     fn validate_redirect_uri_not_registered() {
         let client = Client {
@@ -1354,6 +1447,24 @@ mod tests {
             request_uri: None,
         };
         assert!(req.validate(&Realm::default(), &client).is_err());
+    }
+
+    /// `openid` is the OIDC protocol marker, not a client scope: it is
+    /// allowed even when the client's scope lists omit it (Keycloak parity —
+    /// a DCR client registered without `scope` metadata must still be able to
+    /// run OIDC flows).
+    #[test]
+    fn validate_openid_always_allowed() {
+        let client = Client {
+            redirect_uris: vec![RedirectUri::new("https://client.example.com/cb").unwrap()],
+            default_scopes: Scope::parse("profile"),
+            optional_scopes: Scope::empty(),
+            public_client: false,
+            attributes: std::collections::HashMap::new(),
+            ..make_client_defaults()
+        };
+        let req = auth_req(ResponseType::Code, "openid profile", vec![]);
+        assert!(req.validate(&Realm::default(), &client).is_ok());
     }
 
     #[test]

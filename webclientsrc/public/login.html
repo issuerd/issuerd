@@ -284,6 +284,34 @@
             border-color: var(--issuerd-accent, #00E5FF);
             background: var(--issuerd-input-bg, rgba(255, 255, 255, 0.05));
         }
+        .client-logo {
+            display: block;
+            max-height: 48px;
+            max-width: 100%;
+            width: auto;
+            margin: 0 auto 16px;
+            border-radius: var(--issuerd-input-radius, 8px);
+        }
+        .client-links {
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--issuerd-card-border, #262626);
+            text-align: center;
+            font-size: 12px;
+        }
+        .client-links a {
+            color: var(--issuerd-muted, #a3a3a3);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+        .client-links a:hover {
+            color: var(--issuerd-fg, #fafafa);
+        }
+        .client-links a + a::before {
+            content: '·';
+            margin: 0 10px;
+            color: var(--issuerd-muted, #a3a3a3);
+        }
     </style>
 </head>
 <body>
@@ -303,6 +331,7 @@
             </svg>
         </div>
         <div id="login-card" class="card">
+            <img id="client-logo" class="client-logo" style="display:none;" alt="">
             <h2 class="card-title" id="card-title">Sign In</h2>
             <p id="realm-display" class="realm-display"></p>
             <div id="banner" class="banner"></div>
@@ -342,6 +371,11 @@
             <div id="userinfo-card" class="userinfo-card">
                 <div id="userinfo-content"></div>
                 <button type="button" class="secondary-btn" id="sign-out-btn">Sign Out</button>
+            </div>
+
+            <div id="client-links" class="client-links" style="display:none;">
+                <a id="client-policy-link" href="#" style="display:none;" target="_blank" rel="noopener noreferrer">Privacy Policy</a>
+                <a id="client-tos-link" href="#" style="display:none;" target="_blank" rel="noopener noreferrer">Terms of Service</a>
             </div>
         </div>
     </div>
@@ -723,6 +757,53 @@
                             added += 1;
                         });
                         if (added > 0) idpSection.style.display = 'block';
+                    }
+                }
+
+                // Client branding (OIDC registration §2): the paused flow's
+                // client may carry logo/policy/tos URIs. Only absolute
+                // http(s) URLs render — the attributes are admin/DCR input,
+                // so a `javascript:` href must never make it into the DOM.
+                var brandingUri = function (uri) {
+                    if (!uri) return null;
+                    try {
+                        var u = new URL(uri);
+                        return (u.protocol === 'https:' || u.protocol === 'http:') ? uri : null;
+                    } catch (e) {
+                        return null;
+                    }
+                };
+                var logoUri = brandingUri(ctx.client_logo_uri);
+                if (logoUri) {
+                    var clientLogo = document.getElementById('client-logo');
+                    if (clientLogo) {
+                        clientLogo.src = logoUri;
+                        clientLogo.alt = ctx.client_name || '';
+                        clientLogo.style.display = 'block';
+                    }
+                }
+                var policyUri = brandingUri(ctx.client_policy_uri);
+                var tosUri = brandingUri(ctx.client_tos_uri);
+                if (policyUri || tosUri) {
+                    var clientLinks = document.getElementById('client-links');
+                    if (clientLinks) {
+                        if (policyUri) {
+                            var policyLink = document.getElementById('client-policy-link');
+                            if (policyLink) {
+                                policyLink.href = policyUri;
+                                policyLink.textContent = msg('login.policy', 'Privacy Policy');
+                                policyLink.style.display = 'inline';
+                            }
+                        }
+                        if (tosUri) {
+                            var tosLink = document.getElementById('client-tos-link');
+                            if (tosLink) {
+                                tosLink.href = tosUri;
+                                tosLink.textContent = msg('login.termsOfService', 'Terms of Service');
+                                tosLink.style.display = 'inline';
+                            }
+                        }
+                        clientLinks.style.display = 'block';
                     }
                 }
             }

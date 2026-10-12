@@ -466,11 +466,33 @@ pub async fn build_claims_overlay(
     granted_scope_names: &[String],
     target: ClaimTarget,
 ) -> Result<Map<String, Value>, IssuerdError> {
+    build_claims_overlay_for_targets(state, realm_id, client, user, granted_scope_names, &[target])
+        .await
+}
+
+/// [`build_claims_overlay`] over several targets at once: the overlay covers
+/// claims whose mappers apply to ANY of `targets` (union). Each mapper still
+/// evaluates once per target it applies to, later targets overwriting shared
+/// keys (values are identical for a shared mapper+key pair anyway).
+///
+/// Used by the pure-implicit authorization flow (`response_type=id_token`),
+/// where the ID token must carry the FULL scope claim set — IdToken- AND
+/// UserInfo-targeted claims — because no access token is issued and the
+/// userinfo endpoint is unreachable (OIDC Core §5.4 allows claims in the ID
+/// token when userinfo cannot be reached; Keycloak behaves the same way).
+pub async fn build_claims_overlay_for_targets(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    client: Option<&Client>,
+    user: &User,
+    granted_scope_names: &[String],
+    targets: &[ClaimTarget],
+) -> Result<Map<String, Value>, IssuerdError> {
     let reader = ClaimsReader::new(state, realm_id);
     let catalog = reader.realm_catalog().await;
 
     let mut names: Vec<String> = granted_scope_names.to_vec();
-    if target == ClaimTarget::AccessToken {
+    if targets.contains(&ClaimTarget::AccessToken) {
         if let Some(client) = client {
             // Default-assigned scopes always apply: the cached assignment ids
             // resolve to names against the catalog.
@@ -492,7 +514,7 @@ pub async fn build_claims_overlay(
     if let Some(client) = client {
         mappers.extend(client.protocol_mappers.iter());
     }
-    mappers.retain(|m| m.applies_to(target));
+    mappers.retain(|m| targets.iter().any(|t| m.applies_to(*t)));
     if mappers.is_empty() {
         return Ok(Map::new());
     }
@@ -525,7 +547,11 @@ pub async fn build_claims_overlay(
         groups,
         roles: &roles,
     };
-    Ok(evaluate_mappers(&mappers, &input, target))
+    let mut out = Map::new();
+    for target in targets {
+        out.extend(evaluate_mappers(&mappers, &input, *target));
+    }
+    Ok(out)
 }
 
 /// Username of the dedicated service-account user backing a client's
@@ -548,6 +574,139 @@ pub(crate) fn bind_authorization_details_overlay(
             let mut map = overlay.unwrap_or_default();
             map.insert("authorization_details".to_string(), Value::Array(details.to_vec()));
             Some(map)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requested claims (OIDC Core §5.5 `claims` parameter)
+// ---------------------------------------------------------------------------
+
+/// Claim names the `claims` request parameter resolves from the user profile
+/// (the OIDC Core standard profile claim set). Unknown names are ignored by
+/// the evaluation.
+const REQUESTABLE_CLAIMS: &[&str] = &[
+    "name",
+    "given_name",
+    "family_name",
+    "middle_name",
+    "nickname",
+    "preferred_username",
+    "profile",
+    "picture",
+    "website",
+    "gender",
+    "birthdate",
+    "zoneinfo",
+    "locale",
+    "updated_at",
+    "email",
+    "email_verified",
+    "phone_number",
+    "phone_number_verified",
+    "address",
+];
+
+/// Whether `claim` has a resolver (the OIDC Core standard profile set).
+pub fn is_known_requested_claim(claim: &str) -> bool {
+    REQUESTABLE_CLAIMS.contains(&claim)
+}
+
+/// Resolve a requestable claim (OIDC Core §5.5) to its value for `user`.
+/// `None` means the underlying data is missing; callers choose the shape of
+/// that absence (the userinfo endpoint preserves its null-entry shape, token
+/// overlays omit the entry entirely).
+pub fn requested_claim_value(user: &User, claim: &str) -> Option<Value> {
+    fn attribute(user: &User, key: &str) -> Option<Value> {
+        user.attributes
+            .get(key)
+            .and_then(|vals| vals.first())
+            .map(|v| Value::String(v.clone()))
+    }
+    match claim {
+        "name" => Some(Value::String(full_name(user))),
+        "given_name" => user.first_name.as_ref().map(|n| Value::String(n.to_string())),
+        "family_name" => user.last_name.as_ref().map(|n| Value::String(n.to_string())),
+        "preferred_username" => Some(Value::String(user.username.to_string())),
+        "email" => user.email.as_ref().map(|e| Value::String(e.to_string())),
+        "email_verified" => Some(Value::Bool(user.email_verified)),
+        "updated_at" => Some(Value::from(user.updated_at.timestamp())),
+        "phone_number_verified" => user
+            .attributes
+            .get("phone_number_verified")
+            .and_then(|vals| vals.first())
+            .map(|v| Value::Bool(v.parse::<bool>().unwrap_or(false))),
+        "address" => {
+            let mut address = Map::new();
+            for (field, attr_key) in ADDRESS_FIELDS {
+                address.insert(field.to_string(), attribute(user, attr_key).unwrap_or(Value::Null));
+            }
+            Some(Value::Object(address))
+        }
+        a @ ("middle_name" | "nickname" | "profile" | "picture" | "website" | "gender"
+        | "birthdate" | "zoneinfo" | "locale" | "phone_number") => attribute(user, a),
+        _ => None,
+    }
+}
+
+/// Evaluate the `claims` request parameter's `userinfo` section into a
+/// claims overlay (OIDC Core §5.5): known entries resolve from the user's
+/// profile; mapper-produced entries win (never overwritten); unresolvable
+/// entries are omitted. Essential/voluntary marks and `value`/`values` pins
+/// do not change the content (presence-based, matching the userinfo
+/// endpoint).
+///
+/// Used by the pure-implicit authorization flow (`response_type=id_token`),
+/// where no access token is minted and the userinfo endpoint is unreachable,
+/// so userinfo-targeted requested claims must ride the ID token.
+pub fn apply_requested_userinfo_claims(
+    overlay: &mut Map<String, Value>,
+    user: &User,
+    claims: Option<&Value>,
+) {
+    let Some(claims) = claims else { return };
+    let Some(userinfo_claims) = claims.get("userinfo").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for claim_name in userinfo_claims.keys() {
+        if overlay.contains_key(claim_name) {
+            continue;
+        }
+        if let Some(value) = requested_claim_value(user, claim_name) {
+            overlay.insert(claim_name.clone(), value);
+        }
+    }
+}
+
+/// Evaluate the `claims` request parameter's `id_token` section into a
+/// claims overlay (OIDC Core §5.5). Identical resolution and precedence as
+/// the userinfo section ([`apply_requested_userinfo_claims`]): mapper-produced
+/// entries win, unresolvable entries are omitted (token overlays never carry
+/// null entries), essential/voluntary marks and `value`/`values` pins do not
+/// change the content.
+///
+/// Applies wherever an ID token is issued for a request that carried the
+/// `claims` parameter: the authorization endpoint (implicit and hybrid
+/// response types, via `PendingAuthData::claims`) and the token endpoint's
+/// authorization-code grant (via `AuthCodeData::claims`). The refresh,
+/// password, device and CIBA grants issue ID tokens without a `claims`
+/// context (the token request does not parse the parameter and the grant
+/// state does not retain it), so the section has no effect there.
+pub fn apply_requested_id_token_claims(
+    overlay: &mut Map<String, Value>,
+    user: &User,
+    claims: Option<&Value>,
+) {
+    let Some(claims) = claims else { return };
+    let Some(id_token_claims) = claims.get("id_token").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for claim_name in id_token_claims.keys() {
+        if overlay.contains_key(claim_name) {
+            continue;
+        }
+        if let Some(value) = requested_claim_value(user, claim_name) {
+            overlay.insert(claim_name.clone(), value);
         }
     }
 }
@@ -1076,5 +1235,47 @@ mod tests {
             ClaimTarget::UserInfo,
         );
         assert!(ui.contains_key("updated_at"));
+    }
+
+    #[test]
+    fn id_token_section_resolves_present_claims() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        let claims = serde_json::json!({
+            "id_token": {
+                "name": {"essential": true},
+                "email": null,
+                "unknown_custom_claim": null,
+                // Known but not set on the user: omitted, not null.
+                "birthdate": {"value": "1970-01-01"}
+            }
+        });
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert_eq!(overlay.get("name"), Some(&Value::String("Alice Smith".into())));
+        assert_eq!(overlay.get("email"), Some(&Value::String("alice@example.com".into())));
+        assert!(!overlay.contains_key("unknown_custom_claim"), "unknown names are ignored");
+        assert!(!overlay.contains_key("birthdate"), "unresolvable entries are omitted");
+    }
+
+    #[test]
+    fn id_token_section_never_overwrites_mapper_output() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        overlay.insert("name".to_string(), Value::String("From Mapper".into()));
+        let claims = serde_json::json!({"id_token": {"name": {"essential": true}}});
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert_eq!(overlay.get("name"), Some(&Value::String("From Mapper".into())));
+    }
+
+    #[test]
+    fn id_token_section_ignores_the_userinfo_section_and_absent_claims() {
+        let user = test_user();
+        let mut overlay = Map::new();
+        // Only a userinfo section: the id_token evaluation is a no-op.
+        let claims = serde_json::json!({"userinfo": {"name": null}});
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        assert!(overlay.is_empty());
+        apply_requested_id_token_claims(&mut overlay, &user, None);
+        assert!(overlay.is_empty());
     }
 }

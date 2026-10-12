@@ -14,6 +14,8 @@
   "login.signedOut": "You have been signed out.",
   "login.redirecting": "Redirecting to sign in...",
   "login.continueWith": "Continue with {0}",
+  "login.policy": "Privacy Policy",
+  "login.termsOfService": "Terms of Service",
   "login.authFailed": "Authentication failed. Please try again.",
   "login.error.invalid_grant": "Invalid username or password.",
   "login.error.access_denied": "Access denied.",

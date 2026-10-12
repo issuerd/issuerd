@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
 use issuerd_auth_flow::typestate::FlowOutput;
@@ -143,7 +143,10 @@ pub async fn discovery_handler(
                 Ok(algs) if !algs.is_empty() => {
                     discovery.id_token_signing_alg_values_supported = algs.clone();
                     // JARM responses sign with the same key set.
-                    discovery.authorization_signing_alg_values_supported = algs;
+                    discovery.authorization_signing_alg_values_supported = algs.clone();
+                    // Signed userinfo (per-client `userinfo_signed_response_alg`)
+                    // signs with the same key set.
+                    discovery.userinfo_signing_alg_values_supported = algs;
                 }
                 _ => {}
             }
@@ -253,6 +256,77 @@ pub(crate) fn session_cookie_name(realm_id: &RealmId) -> String {
 /// Name of the per-realm remember-me cookie (see [`session_cookie_name`]).
 pub(crate) fn remember_cookie_name(realm_id: &RealmId) -> String {
     format!("issuerd_remember_{realm_id}")
+}
+
+/// Whether `name` is a valid RFC 6265 cookie-name component: RFC 7230 token
+/// chars only. `RealmName` allows characters browsers reject in cookie names
+/// (`;`, `,`, `"`, whitespace, …) — a Set-Cookie with such a name is silently
+/// dropped, which would strand the session-state companion cookie.
+fn is_cookie_token_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(b,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'
+                | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+        })
+}
+
+/// Name of the per-realm session-state companion cookie (OIDC Session
+/// Management 1.0). Realm-NAME scoped (the `check_session_iframe` route
+/// resolves realms by name) when the name is cookie-safe; otherwise falls
+/// back to the realm id (a UUID — always cookie-name safe).
+pub(crate) fn session_state_cookie_name(realm: &Realm) -> String {
+    let name = realm.name.as_str();
+    if is_cookie_token_safe(name) {
+        format!("issuerd_session_state_{name}")
+    } else {
+        format!("issuerd_session_state_{}", realm.id)
+    }
+}
+
+/// `Set-Cookie` value for the session-state companion cookie. NOT HttpOnly —
+/// the OP iframe's JS reads it (`document.cookie`). `SameSite=None; Secure`
+/// under TLS so the RP's cross-site iframe context keeps it; plain-HTTP
+/// development rigs keep `SameSite=Lax` (browsers reject `SameSite=None`
+/// without `Secure`).
+pub(crate) fn session_state_cookie_header(
+    realm: &Realm,
+    session_state: &str,
+    secure: bool,
+) -> String {
+    let same_site = if secure {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    };
+    format!("{}={session_state}; Path=/; {same_site}", session_state_cookie_name(realm))
+}
+
+/// `Set-Cookie` clear for the companion cookie. The SameSite/Secure posture
+/// matches the write so the browser honors the clear in the same contexts.
+pub(crate) fn session_state_cookie_clear(realm: &Realm, secure: bool) -> String {
+    let same_site = if secure {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    };
+    format!("{}=; Path=/; Max-Age=0; {same_site}", session_state_cookie_name(realm))
+}
+
+/// Append the session-state companion-cookie clear to a logout response
+/// (OIDC Session Management 1.0): after a logout the RP iframe's next poll
+/// must answer "changed". Teardowns with no response channel (admin session
+/// delete, SSO idle cleanup) leave the cookie stale by design — the next
+/// browser-present logout or login refreshes it.
+pub(crate) fn with_session_state_cleared(
+    mut resp: Response,
+    realm: &Realm,
+    secure: bool,
+) -> Response {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&session_state_cookie_clear(realm, secure)) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    resp
 }
 
 /// Look up a realm-scoped cookie value: the per-realm name first, then the
@@ -565,7 +639,7 @@ async fn try_auth_error_redirect(
     let default_fragment = params
         .get("response_type")
         .and_then(|s| s.parse::<ResponseType>().ok())
-        .is_some_and(|rt| rt.has_id_token());
+        .is_some_and(|rt| rt.default_response_mode_is_fragment());
     let packaging = crate::routes::auth_response::ResponsePackaging {
         realm: &realm,
         client_id: client.client_id.as_str(),
@@ -740,13 +814,28 @@ async fn handle_auth_request(
         Err(resp) => return resp,
     };
 
-    // JAR (RFC 9101): a signed `request` object carries the
-    // authorization request. Validate it against the client's verification
-    // material and merge its claims (they win per-key over the query
-    // parameters) before normal parsing. Failures render an error page/JSON —
+    // JAR (RFC 9101): a signed Request Object carries the
+    // authorization request — inline via `request`, or by reference via a
+    // client-registered `request_uri` (OIDC Core §6.2: fetched SSRF-guarded,
+    // then taking the exact same validation + merge path). The two parameters
+    // never combine (RFC 9101 §4). Failures render an error page/JSON —
     // nothing inside an unvalidated object (including redirect_uri) may be
     // trusted, so no client redirect is possible.
-    let params = if params.contains_key("request") {
+    if params.contains_key("request") && params.contains_key("request_uri") {
+        return crate::routes::jar::jar_resolution_error(
+            &state,
+            &realm,
+            &realm_name,
+            &ip,
+            &headers,
+            &params,
+            IssuerdError::InvalidRequest(
+                "the request and request_uri parameters are mutually exclusive".into(),
+            ),
+        )
+        .await;
+    }
+    let params = if params.contains_key("request") || params.contains_key("request_uri") {
         let jar_result = async {
             let client_id_str = params.get("client_id").cloned().ok_or_else(|| {
                 IssuerdError::InvalidRequest(
@@ -759,8 +848,30 @@ async fn handle_auth_request(
                 .get_client_by_client_id(&realm_id, &identifier)
                 .await?
                 .ok_or_else(|| IssuerdError::InvalidRequest("unknown client".into()))?;
-            crate::routes::jar::extract_request_object_params(&state, &realm, &client, &params)
-                .await
+            match params.get("request_uri") {
+                // By reference: fetch the object from the client-registered
+                // URI, then run the shared inline-object path.
+                Some(uri) => {
+                    let object =
+                        crate::routes::jar::fetch_request_uri(&state, &client, uri).await?;
+                    let mut with_object = params.clone();
+                    with_object.remove("request_uri");
+                    with_object.insert("request".to_string(), object);
+                    crate::routes::jar::extract_request_object_params(
+                        &state,
+                        &realm,
+                        &client,
+                        &with_object,
+                    )
+                    .await
+                }
+                None => {
+                    crate::routes::jar::extract_request_object_params(
+                        &state, &realm, &client, &params,
+                    )
+                    .await
+                }
+            }
         }
         .await;
         match jar_result {
@@ -882,12 +993,17 @@ async fn handle_auth_request(
         .await;
     }
 
-    // Reject response types that parse but are not implemented (implicit/hybrid
-    // variants involving `token`) instead of silently falling through to the
-    // code flow. The redirect target is safe here: `validate` already verified
-    // the redirect_uri is registered on this client.
+    // Only bare `token` (OAuth2-only, never part of an OIDC flow) is rejected
+    // among the parseable response types; every implicit/hybrid combination
+    // is implemented. The redirect target is safe here: `validate` already
+    // verified the redirect_uri is registered on this client.
     match &auth_req.response_type {
-        ResponseType::Code | ResponseType::IdToken | ResponseType::CodeIdToken => {}
+        ResponseType::Code
+        | ResponseType::IdToken
+        | ResponseType::IdTokenToken
+        | ResponseType::CodeIdToken
+        | ResponseType::CodeToken
+        | ResponseType::CodeIdTokenToken => {}
         unsupported => {
             let e = IssuerdError::UnsupportedResponseType;
             warn!(realm = %realm_id, client_id = %auth_req.client_id, response_type = %unsupported.as_str(), "unsupported response_type requested");
@@ -918,6 +1034,48 @@ async fn handle_auth_request(
             )
             .await;
         }
+    }
+
+    // OIDC Core §3.2.2.1/§3.3.2.1: response types that issue an ID token
+    // straight from the authorization endpoint (implicit + hybrid) REQUIRE a
+    // nonce — it is the replay binding the pure code flow gets from the
+    // back-channel code redemption. `code` and `code token` stay
+    // nonce-optional. The realm's `compat.nonceless_hybrid` attribute opts
+    // back into the pre-tightening behavior during the deprecation window.
+    if auth_req.response_type.has_id_token()
+        && auth_req.nonce.is_none()
+        && !realm.compat_nonceless_hybrid()
+    {
+        let e = IssuerdError::InvalidRequest(
+            "nonce is required for implicit and hybrid response types".into(),
+        );
+        warn!(realm = %realm_id, client_id = %auth_req.client_id, response_type = %auth_req.response_type.as_str(), "missing nonce for id_token-bearing response type");
+        let mut details = std::collections::HashMap::new();
+        details.insert("error".to_string(), e.to_string());
+        emit_oidc_event(
+            &state,
+            &realm_id,
+            EventType::LoginError,
+            &ip,
+            Some(client.id.clone()),
+            None,
+            None,
+            Some(e.to_string()),
+            details,
+        )
+        .await;
+        return crate::routes::auth_response::oauth_error_redirect(
+            &state,
+            auth_req.redirect_uri.as_ref(),
+            &e,
+            auth_req.state.as_deref(),
+            &crate::routes::auth_response::ResponsePackaging::from_request(
+                &realm,
+                client.client_id.as_str(),
+                &auth_req,
+            ),
+        )
+        .await;
     }
 
     // RFC 9126 §6: a client pinned to PAR may not start a plain authorization
@@ -1462,6 +1620,184 @@ async fn handle_auth_request(
     }
 }
 
+/// The artifacts minted for one authorization response, per the response
+/// type's legs: an authorization code (code-bearing types), an access token
+/// (`token`-bearing types), and an ID token (`id_token`-bearing types).
+pub(crate) struct AuthorizationArtifacts {
+    pub code: Option<String>,
+    pub id_token: Option<String>,
+    pub access_token: Option<String>,
+    /// Access-token validity in seconds (meaningful iff `access_token`).
+    pub expires_in: u64,
+}
+
+/// Minting failure with the stage attached, so callers keep their distinct
+/// error surfaces (a failed code persist is `temporarily_unavailable` via
+/// `auth_code_store_failure`; token-issuance failures are a plain 500).
+pub(crate) enum MintFailure {
+    CodeStore(IssuerdError),
+    Issuance(IssuerdError),
+}
+
+/// Mint the artifacts for the pending flow's response type. Shared by
+/// [`finish_sso_login`] (SSO-resume) and
+/// `login_api::complete_login_with_method` (fresh login) so every path
+/// assembles identical claims:
+///
+/// - the code leg persists a single-use authorization code;
+/// - the access-token leg uses the same claims assembly as the token
+///   endpoint (access-token mapper overlay + granted RAR authorization
+///   details); implicit/hybrid access tokens never come with a refresh
+///   token;
+/// - the ID-token leg carries the FULL scope claim set (IdToken- AND
+///   UserInfo-targeted claims) for the PURE implicit flow — no access token
+///   is issued there, so userinfo is unreachable (OIDC Core §5.4) — and no
+///   overlay when a code/access token rides along; it carries
+///   `at_hash`/`c_hash` whenever an access token / code is issued alongside
+///   (OIDC Core §3.3.2.11 — `issue_id_token` computes both from the minted
+///   artifacts).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mint_authorization_artifacts(
+    state: &Arc<ServerState>,
+    realm: &issuerd_core::Realm,
+    client: &issuerd_core::Client,
+    user: &issuerd_core::User,
+    pending: &PendingAuthData,
+    session_id: &issuerd_core::SessionId,
+    auth_time: chrono::DateTime<chrono::Utc>,
+) -> Result<AuthorizationArtifacts, MintFailure> {
+    // Gated at the authorization endpoint; anything reaching here parses.
+    let response_type = pending
+        .response_type
+        .parse::<ResponseType>()
+        .map_err(|_| MintFailure::Issuance(IssuerdError::UnsupportedResponseType))?;
+
+    // The code leg (code-bearing types): persist the authorization code.
+    let code = if response_type.has_code() {
+        let code = issuerd_core::utils::generate_id();
+        let code_data = AuthCodeData::from_pending(pending, &user.id, session_id, auth_time);
+        store_auth_code(&state.cache, &code, &code_data, state.config.oauth.auth_code_ttl(realm))
+            .await
+            .map_err(MintFailure::CodeStore)?;
+        Some(code)
+    } else {
+        None
+    };
+
+    // The access-token leg (`token`-bearing types): the same claims
+    // assembly as the token endpoint. Front-channel artifact only — no
+    // refresh token is ever minted here.
+    let access_token: Option<issuerd_token::AccessToken> = if response_type.has_token() {
+        let overlay = crate::claims::build_claims_overlay(
+            state,
+            &realm.id,
+            Some(client),
+            user,
+            &pending.scope,
+            issuerd_core::ClaimTarget::AccessToken,
+        )
+        .await
+        .unwrap_or_default();
+        // Attach the granted RAR authorization details, as at the token
+        // endpoint (RFC 9396 §6).
+        let overlay = crate::claims::bind_authorization_details_overlay(
+            Some(overlay),
+            pending.authorization_details.as_deref(),
+        );
+        let token = state
+            .token_manager
+            .issue_access_token_with_roles(
+                user,
+                client,
+                realm,
+                &pending.scope,
+                session_id,
+                None,
+                pending.claims.clone(),
+                overlay,
+            )
+            .await
+            .map_err(MintFailure::Issuance)?;
+        Some(token)
+    } else {
+        None
+    };
+
+    // The ID-token leg.
+    let id_token = if response_type.has_id_token() {
+        // OIDC Core §5.4: when a code or access token rides along, the
+        // userinfo endpoint serves the claims (no overlay). Pure implicit
+        // (`id_token` alone) mints NO access token, so userinfo is
+        // unreachable and the ID token carries the FULL scope claim set:
+        // IdToken- AND UserInfo-targeted claims (Keycloak parity) — plus the
+        // `claims` request parameter's userinfo section (§5.5), which has no
+        // other delivery channel in this flow.
+        let overlay = if response_type.has_code() || response_type.has_token() {
+            // Code/hybrid legs: the scope claims are served by the userinfo
+            // endpoint (OIDC Core §5.4), but the request's `claims.id_token`
+            // section (§5.5) still applies to this ID token.
+            let mut overlay = serde_json::Map::new();
+            crate::claims::apply_requested_id_token_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            (!overlay.is_empty()).then_some(overlay)
+        } else {
+            let mut overlay = crate::claims::build_claims_overlay_for_targets(
+                state,
+                &realm.id,
+                Some(client),
+                user,
+                &pending.scope,
+                &[
+                    issuerd_core::ClaimTarget::IdToken,
+                    issuerd_core::ClaimTarget::UserInfo,
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            crate::claims::apply_requested_userinfo_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            crate::claims::apply_requested_id_token_claims(
+                &mut overlay,
+                user,
+                pending.claims.as_ref(),
+            );
+            Some(overlay)
+        };
+        let token = state
+            .token_manager
+            .issue_id_token(
+                user,
+                client,
+                realm,
+                pending.nonce.as_deref(),
+                auth_time,
+                session_id,
+                access_token.as_ref(),
+                code.as_deref(),
+                Some(&pending.acr_values),
+                overlay,
+            )
+            .await
+            .map_err(MintFailure::Issuance)?;
+        Some(token.token)
+    } else {
+        None
+    };
+
+    Ok(AuthorizationArtifacts {
+        code,
+        id_token,
+        access_token: access_token.map(|t| t.token),
+        expires_in: realm.access_token_lifespan.get(),
+    })
+}
+
 /// SSO/cookie-path login completion: merge the client session into the
 /// (possibly pre-existing) SSO session, persist it, emit the login event, and
 /// mint the response per the requested response type.
@@ -1577,149 +1913,56 @@ pub(crate) async fn finish_sso_login(
         .await;
     }
 
-    match pending.response_type.as_str() {
-        "id_token" => {
-            // Pure implicit flow: no access token is issued, so scope
-            // claims ride in the ID token (OIDC Core §5.4) via the
-            // protocol-mapper overlay.
-            let overlay = crate::claims::build_claims_overlay(
-                state,
-                &realm_id,
-                Some(client),
-                user,
-                pending.scope.as_slice(),
-                issuerd_core::ClaimTarget::IdToken,
+    let artifacts = match mint_authorization_artifacts(
+        state, realm, client, user, pending, session_id, auth_time,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(MintFailure::CodeStore(e)) => {
+            return auth_code_store_failure(
+                state, realm, client, &user_id, session_id, &ip, pending, &e,
             )
-            .await
-            .unwrap_or_default();
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    user,
-                    client,
-                    realm,
-                    pending.nonce.as_deref(),
-                    auth_time,
-                    session_id,
-                    None,
-                    None,
-                    Some(&pending.acr_values),
-                    Some(overlay),
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to issue ID token");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
-                        .into_response();
-                }
-            };
-
-            let mut redirect_params: Vec<(&str, &str)> = vec![("id_token", &id_token.token)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the
-            // fragment is the default for pure implicit).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
+            .await;
         }
-        "code id_token" => {
-            let code = issuerd_core::utils::generate_id();
-            let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(realm),
-            )
-            .await
-            {
-                return auth_code_store_failure(
-                    state, realm, client, &user_id, session_id, &ip, pending, &e,
-                )
-                .await;
-            }
-
-            let id_token = match state
-                .token_manager
-                .issue_id_token(
-                    user,
-                    client,
-                    realm,
-                    pending.nonce.as_deref(),
-                    auth_time,
-                    session_id,
-                    None,
-                    Some(&code),
-                    Some(&pending.acr_values),
-                    // Hybrid flow: userinfo claims are served by the
-                    // userinfo endpoint, not embedded in the ID token.
-                    None,
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to issue ID token");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
-                        .into_response();
-                }
-            };
-
-            let mut redirect_params: Vec<(&str, &str)> =
-                vec![("code", &code), ("id_token", &id_token.token)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the
-            // fragment is the default for hybrid with id_token).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
+        Err(MintFailure::Issuance(e)) => {
+            error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to mint the authorization response");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e))).into_response();
         }
-        _ => {
-            let code = issuerd_core::utils::generate_id();
-            let code_data = AuthCodeData::from_pending(pending, &user_id, session_id, auth_time);
-            if let Err(e) = store_auth_code(
-                &state.cache,
-                &code,
-                &code_data,
-                state.config.oauth.auth_code_ttl(realm),
-            )
-            .await
-            {
-                return auth_code_store_failure(
-                    state, realm, client, &user_id, session_id, &ip, pending, &e,
-                )
-                .await;
-            }
+    };
 
-            let mut redirect_params: Vec<(&str, &str)> = vec![("code", &code)];
-            if let Some(ref s) = pending.state {
-                redirect_params.push(("state", s));
-            }
-            // Packaged per the requested response_mode (the query
-            // is the default for the code flow).
-            crate::routes::auth_response::authorization_response(
-                state,
-                &pending.redirect_uri,
-                &redirect_params,
-                &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
-            )
-            .await
-        }
+    // Assemble the response parameter set for the minted legs; the packaging
+    // (query/fragment/form_post/JARM) honors the requested response_mode —
+    // the fragment is the default whenever an id_token or an access token
+    // rides along (see `ResponsePackaging::from_pending`).
+    let expires_in;
+    let mut redirect_params: Vec<(&str, &str)> = Vec::new();
+    if let Some(ref code) = artifacts.code {
+        redirect_params.push(("code", code));
     }
+    if let Some(ref id_token) = artifacts.id_token {
+        redirect_params.push(("id_token", id_token));
+    }
+    if let Some(ref access_token) = artifacts.access_token {
+        redirect_params.push(("access_token", access_token));
+        redirect_params.push(("token_type", "Bearer"));
+        expires_in = artifacts.expires_in.to_string();
+        redirect_params.push(("expires_in", &expires_in));
+    }
+    if let Some(ref s) = pending.state {
+        redirect_params.push(("state", s));
+    }
+    // OIDC Session Management 1.0: every success authorization response
+    // carries `session_state` (the SSO session id — the same value the `sid`
+    // claim exposes), so an RP iframe can poll session liveness.
+    redirect_params.push(("session_state", session_id.as_ref()));
+    crate::routes::auth_response::authorization_response(
+        state,
+        &pending.redirect_uri,
+        &redirect_params,
+        &crate::routes::auth_response::ResponsePackaging::from_pending(realm, pending),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,10 +2380,13 @@ pub async fn ciba_auth_handler(
         }
     };
 
-    let client_id = body_params.get("client_id").map(|s| s.as_str()).unwrap_or("");
-    let client_identifier = match ClientIdentifier::new(client_id) {
-        Ok(id) => id,
-        Err(_) => {
+    // The client is identified by `client_id` or — absent that, per RFC 7523
+    // §2.2 — by its JWT client assertion's iss/sub (verified afterwards).
+    let client_identifier = match crate::client_assertion::resolve_form_client_id(&body_params)
+        .and_then(|id| ClientIdentifier::new(id).ok())
+    {
+        Some(id) => id,
+        None => {
             emit_oidc_event(
                 &state,
                 &realm_id,
@@ -2716,6 +2962,26 @@ pub async fn token_handler(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
+    // RFC 6749 §5.1: the no-store/no-cache directive applies to error
+    // responses too — decorate every response that does not already carry it
+    // (the success path sets it in `token_response`).
+    let mut resp = token_handler_inner(state, realm, ip, headers, body).await;
+    let h = resp.headers_mut();
+    h.entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    h.entry(axum::http::header::PRAGMA)
+        .or_insert(axum::http::HeaderValue::from_static("no-cache"));
+    resp
+}
+
+#[instrument(skip(state, headers, body, ip), fields(realm = ?realm))]
+async fn token_handler_inner(
+    state: Arc<ServerState>,
+    realm: Option<String>,
+    ip: std::net::IpAddr,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
     let realm_name = match realm {
         Some(r) => r,
         None => {
@@ -2759,13 +3025,24 @@ pub async fn token_handler(
         }
     };
 
-    let client_id = token_req.client_id.as_deref().unwrap_or("");
-    let client_identifier = match ClientIdentifier::new(client_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"})))
-                .into_response();
-        }
+    let client_identifier = match token_req.client_id.clone() {
+        Some(id) => id,
+        // RFC 7523 §2.2: without a `client_id` form field, a JWT client
+        // assertion identifies the client from its (unverified) iss/sub —
+        // signature verification against the resolved client's keys still
+        // gates below.
+        None => match crate::client_assertion::resolve_form_client_id(&body_params)
+            .and_then(|id| ClientIdentifier::new(id).ok())
+        {
+            Some(id) => id,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_client"})),
+                )
+                    .into_response();
+            }
+        },
     };
     let client = match state.storage.get_client_by_client_id(&realm_id, &client_identifier).await {
         // A disabled client must not redeem codes, passwords, or refresh
@@ -3210,6 +3487,16 @@ pub async fn token_handler(
             };
 
             let id_token = if scope.contains(&"openid".to_string()) {
+                // Code flow: userinfo claims via the userinfo endpoint (OIDC
+                // Core §5.4); the request's `claims.id_token` section (§5.5)
+                // applies here — it rode the authorization code along.
+                let mut id_overlay = serde_json::Map::new();
+                crate::claims::apply_requested_id_token_claims(
+                    &mut id_overlay,
+                    &user,
+                    code_data.claims.as_ref(),
+                );
+                let id_overlay = (!id_overlay.is_empty()).then_some(id_overlay);
                 match state
                     .token_manager
                     .issue_id_token(
@@ -3222,8 +3509,7 @@ pub async fn token_handler(
                         Some(&access_token),
                         Some(code),
                         Some(&code_data.acr_values),
-                        // Code flow: userinfo claims via the userinfo endpoint.
-                        None,
+                        id_overlay,
                     )
                     .await
                 {
@@ -5307,24 +5593,61 @@ async fn userinfo_handler_inner(
                 }
             }
 
+            // A client registered with `userinfo_signed_response_alg` gets the
+            // claims as a signed JWT (OIDC Core §5.3.2) instead of JSON —
+            // resolved before the rendered-response cache so a signed body is
+            // never served from (or written into) the JSON cache. The client
+            // resolved here is reused by the claims assembly below.
+            let resolved_client = match issuer_realm.as_ref() {
+                Some(realm) => match ClientIdentifier::new(claims.aud.as_str()) {
+                    Ok(cid) => {
+                        crate::claims_cache::ClaimsReader::new(&state, &realm.id).client(&cid).await
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let signed_userinfo_alg: Option<issuerd_core::Algorithm> = match resolved_client
+                .as_ref()
+                .and_then(|c| {
+                    c.attributes.get(issuerd_core::Client::USERINFO_SIGNED_RESPONSE_ALG_ATTRIBUTE)
+                }) {
+                None => None,
+                Some(raw) => match raw.parse::<issuerd_core::Algorithm>() {
+                    Ok(alg) => Some(alg),
+                    Err(_) => {
+                        error!(client_id = %resolved_client.as_ref().unwrap().client_id, "client has an unparseable userinfo_signed_response_alg");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "server_error"})),
+                        )
+                            .into_response();
+                    }
+                },
+            };
+
             // Rendered-response cache: the body built below is a pure
             // function of the resolved user, the issuing client, the token's
             // scope set, and its claims/authz parameters (see
             // `userinfo_cache`). The read is consulted only after every
             // validity gate above has passed, so a logged-out, revoked, or
             // expired token never reaches it.
-            let cache_ctx = issuer_realm.as_ref().map(|realm| {
-                let user_id = session
-                    .as_ref()
-                    .map(|s| s.user_id.clone())
-                    .unwrap_or_else(|| claims.sub.clone());
-                (
-                    realm.id.clone(),
-                    user_id,
-                    claims.aud.as_str().to_string(),
-                    crate::userinfo_cache::fingerprint(&claims),
-                )
-            });
+            let cache_ctx = if signed_userinfo_alg.is_some() {
+                None
+            } else {
+                issuer_realm.as_ref().map(|realm| {
+                    let user_id = session
+                        .as_ref()
+                        .map(|s| s.user_id.clone())
+                        .unwrap_or_else(|| claims.sub.clone());
+                    (
+                        realm.id.clone(),
+                        user_id,
+                        claims.aud.as_str().to_string(),
+                        crate::userinfo_cache::fingerprint(&claims),
+                    )
+                })
+            };
             if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
                 if let Some(body) =
                     crate::userinfo_cache::read(&state, realm_id, user_id, client_id, fp).await
@@ -5356,6 +5679,10 @@ async fn userinfo_handler_inner(
             // realm-NAME based: resolve the segment as a realm name. A
             // lookup failure fails open (serving userinfo must not depend on
             // this storage read).
+            //
+            // The realm is cloned for the signed-userinfo path below: the
+            // branch consumes the option.
+            let signing_realm = issuer_realm.clone();
             if let Some(realm) = issuer_realm {
                 let realm_id = realm.id.clone();
                 // Pairwise `sub` values cannot be reversed to a
@@ -5365,17 +5692,10 @@ async fn userinfo_handler_inner(
                     cacheable = true;
                     // Scope claims are produced by protocol mappers
                     // on the client scopes matching the token's granted scope
-                    // names (+ client-local mappers). The issuing client is
-                    // resolved from `aud`; if it was deleted since issuance,
-                    // scope-resource mappers still apply.
-                    let client = match ClientIdentifier::new(claims.aud.as_str()) {
-                        Ok(cid) => {
-                            crate::claims_cache::ClaimsReader::new(&state, &realm_id)
-                                .client(&cid)
-                                .await
-                        }
-                        Err(_) => None,
-                    };
+                    // names (+ client-local mappers). The issuing client was
+                    // resolved from `aud` above; if it was deleted since
+                    // issuance, scope-resource mappers still apply.
+                    let client = resolved_client.clone();
                     let scope_names = claims.scope.to_vec();
                     let overlay = crate::claims::build_claims_overlay(
                         &state,
@@ -5390,165 +5710,23 @@ async fn userinfo_handler_inner(
                     resp.extend(overlay);
 
                     // Include claims requested via the `claims` parameter
+                    // (OIDC Core §5.5): presence-based; mapper-produced
+                    // claims win; known-but-missing entries keep their
+                    // null-entry shape; unknown claim names are ignored.
                     if let Some(ref claims_value) = claims.claims {
                         if let Some(userinfo_claims) =
                             claims_value.get("userinfo").and_then(|v| v.as_object())
                         {
-                            for (claim_name, _) in userinfo_claims {
+                            for claim_name in userinfo_claims.keys() {
                                 if resp.contains_key(claim_name) {
                                     continue;
                                 }
-                                match claim_name.as_str() {
-                                    "name" => {
-                                        let name = match (&user.first_name, &user.last_name) {
-                                            (Some(f), Some(l)) => format!("{f} {l}"),
-                                            (Some(f), None) => f.to_string(),
-                                            (None, Some(l)) => l.to_string(),
-                                            (None, None) => user.username.to_string(),
-                                        };
-                                        resp.insert(claim_name.clone(), serde_json::json!(name));
-                                    }
-                                    "given_name" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.first_name.as_deref()),
-                                        );
-                                    }
-                                    "family_name" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.last_name.as_deref()),
-                                        );
-                                    }
-                                    "middle_name" => {
-                                        let v = user
-                                            .attributes
-                                            .get("middle_name")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "nickname" => {
-                                        let v = user
-                                            .attributes
-                                            .get("nickname")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "preferred_username" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.username),
-                                        );
-                                    }
-                                    "profile" => {
-                                        let v = user
-                                            .attributes
-                                            .get("profile")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "picture" => {
-                                        let v = user
-                                            .attributes
-                                            .get("picture")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "website" => {
-                                        let v = user
-                                            .attributes
-                                            .get("website")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "gender" => {
-                                        let v = user
-                                            .attributes
-                                            .get("gender")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "birthdate" => {
-                                        let v = user
-                                            .attributes
-                                            .get("birthdate")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "zoneinfo" => {
-                                        let v = user
-                                            .attributes
-                                            .get("zoneinfo")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "locale" => {
-                                        let v = user
-                                            .attributes
-                                            .get("locale")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "updated_at" => {
-                                        // Truthful source: the User model now
-                                        // tracks modification time (P3-1).
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.updated_at.timestamp()),
-                                        );
-                                    }
-                                    "email" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.email.as_deref()),
-                                        );
-                                    }
-                                    "email_verified" => {
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::json!(user.email_verified),
-                                        );
-                                    }
-                                    "phone_number" => {
-                                        let v = user
-                                            .attributes
-                                            .get("phone_number")
-                                            .and_then(|vals| vals.first().cloned());
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "phone_number_verified" => {
-                                        let v = user
-                                            .attributes
-                                            .get("phone_number_verified")
-                                            .and_then(|vals| vals.first())
-                                            .map(|v| v.parse::<bool>().unwrap_or(false));
-                                        resp.insert(claim_name.clone(), serde_json::json!(v));
-                                    }
-                                    "address" => {
-                                        let mut address = serde_json::Map::new();
-                                        for (field, attr_key) in [
-                                            ("formatted", "address_formatted"),
-                                            ("street_address", "address_street"),
-                                            ("locality", "address_locality"),
-                                            ("region", "address_region"),
-                                            ("postal_code", "address_postal_code"),
-                                            ("country", "address_country"),
-                                        ] {
-                                            let value = user
-                                                .attributes
-                                                .get(attr_key)
-                                                .and_then(|vals| vals.first().cloned());
-                                            address.insert(
-                                                field.to_string(),
-                                                serde_json::json!(value),
-                                            );
-                                        }
-                                        resp.insert(
-                                            claim_name.clone(),
-                                            serde_json::Value::Object(address),
-                                        );
-                                    }
-                                    _ => {}
+                                if crate::claims::is_known_requested_claim(claim_name) {
+                                    resp.insert(
+                                        claim_name.clone(),
+                                        crate::claims::requested_claim_value(&user, claim_name)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    );
                                 }
                             }
                         }
@@ -5557,6 +5735,36 @@ async fn userinfo_handler_inner(
             }
 
             let value = serde_json::Value::Object(resp);
+
+            // Signed userinfo (OIDC Core §5.3.2): the JWT body is exactly
+            // the JSON response's claims, signed with the client-registered
+            // algorithm.
+            if let (Some(alg), Some(client), Some(realm)) =
+                (signed_userinfo_alg, resolved_client, signing_realm)
+            {
+                let claims_map = match &value {
+                    serde_json::Value::Object(map) => map.clone(),
+                    _ => unreachable!("the userinfo body is always a JSON object"),
+                };
+                let jwt = match state
+                    .token_manager
+                    .sign_userinfo_response(&client, &realm, &claims_map, alg)
+                    .await
+                {
+                    Ok(token) => token,
+                    Err(e) => {
+                        error!(realm = %realm.id, client_id = %client.client_id, error = %e, "userinfo signing failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                            .into_response();
+                    }
+                };
+                let mut response = jwt.into_response();
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, "application/jwt".parse().unwrap());
+                return crate::dpop::with_nonce_header(response, dpop_response_nonce.as_deref());
+            }
+
             if cacheable {
                 if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
                     if let Ok(body) = serde_json::to_vec(&value) {
@@ -5826,8 +6034,11 @@ async fn logout_inner(
     )
     .await;
 
-    // Optional post-logout redirect, validated against the client's registered
-    // redirect URIs. Without a recognized client we cannot validate the target,
+    // Optional post-logout redirect, validated against the client's
+    // `post_logout_redirect_uris` attribute when that list is registered
+    // (OIDC RP-Initiated Logout; RFC 7591 metadata), falling back to the
+    // registered `redirect_uris` for clients that predate/do not set it.
+    // Without a recognized client we cannot validate the target,
     // so we refuse the redirect rather than acting as an open redirector.
     if let Some(target) = params.get("post_logout_redirect_uri") {
         let registered = client
@@ -5836,20 +6047,36 @@ async fn logout_inner(
                 // Same Keycloak-compatible matching as the authorization
                 // endpoint (exact or trailing-`*` wildcard); an unparseable
                 // target never matches.
-                issuerd_core::RedirectUri::new(target)
-                    .ok()
-                    .is_some_and(|t| c.redirect_uris.iter().any(|u| u.matches(t.as_str())))
+                let Some(target) = issuerd_core::RedirectUri::new(target).ok() else {
+                    return false;
+                };
+                let post_logout_uris = crate::client_metadata::post_logout_redirect_uris(c);
+                if post_logout_uris.is_empty() {
+                    c.redirect_uris.iter().any(|u| u.matches(target.as_str()))
+                } else {
+                    post_logout_uris.iter().any(|registered| {
+                        issuerd_core::RedirectUri::new(registered)
+                            .ok()
+                            .is_some_and(|u| u.matches(target.as_str()))
+                    })
+                }
             })
             .unwrap_or(false);
         if !registered {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_request",
-                    "error_description": "invalid post_logout_redirect_uri"
-                })),
-            )
-                .into_response();
+            // The session was still destroyed above — the companion cookie
+            // must not outlive it.
+            return with_session_state_cleared(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "invalid post_logout_redirect_uri"
+                    })),
+                )
+                    .into_response(),
+                &realm,
+                state.config.secure_cookies(),
+            );
         }
         let mut redirect_params: Vec<(&str, &str)> = Vec::new();
         if let Some(s) = params.get("state") {
@@ -5859,16 +6086,127 @@ async fn logout_inner(
         // Front-channel logout: give the client iframes a chance to run before
         // the browser continues to the post-logout target.
         if !frontchannel_urls.is_empty() {
-            return crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls);
+            return with_session_state_cleared(
+                crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls),
+                &realm,
+                state.config.secure_cookies(),
+            );
         }
-        return Redirect::to(&url).into_response();
+        return with_session_state_cleared(
+            Redirect::to(&url).into_response(),
+            &realm,
+            state.config.secure_cookies(),
+        );
     }
 
     if !frontchannel_urls.is_empty() {
-        return crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls);
+        return with_session_state_cleared(
+            crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+            &realm,
+            state.config.secure_cookies(),
+        );
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    // No redirect target and no front-channel interstitial: render the
+    // sign-out confirmation page (200 OK) so a browser lands on
+    // human-readable feedback instead of an empty 204 (which would leave it
+    // on the previous page — the OIDC RP-Initiated Logout negative modules
+    // capture exactly this page). No links, no scripts, no further actions.
+    with_session_state_cleared(
+        crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+        &realm,
+        state.config.secure_cookies(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Session Management iframe (OIDC Session Management 1.0 §4.2)
+// ---------------------------------------------------------------------------
+
+/// The OP-iframe page: per-realm static content — only the companion cookie
+/// name varies. ES5-grade JS (the conformance suite's HtmlUnit executes it):
+/// no modules, no `fetch`, no WebCrypto. The realm lands in the JS as a
+/// JSON-quoted string literal, so a `"` in a name cannot break out of the
+/// string.
+pub(crate) fn check_session_iframe_page(realm: &Realm) -> String {
+    let cookie_name = serde_json::to_string(&session_state_cookie_name(realm))
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
+    format!(
+        "<!DOCTYPE html>\n\
+         <html>\n\
+         <head><meta charset=\"utf-8\"/><title>check_session_iframe</title></head>\n\
+         <body>\n\
+         <script>\n\
+         // OP iframe of OIDC Session Management 1.0 (§4.2): an RP iframe posts\n\
+         // \"<client_id> <session_state>\"; the OP compares session_state against\n\
+         // its own session cookie and answers via postMessage to the message\n\
+         // origin: \"unchanged\" (session matches), \"changed\" (no cookie or a\n\
+         // different session), \"error\" (malformed message).\n\
+         (function () {{\n\
+         \x20   var COOKIE_NAME = {cookie_name};\n\
+         \x20   function readCookie() {{\n\
+         \x20       var prefix = COOKIE_NAME + \"=\";\n\
+         \x20       var parts = document.cookie ? document.cookie.split(\";\") : [];\n\
+         \x20       for (var i = 0; i < parts.length; i++) {{\n\
+         \x20           var c = parts[i].replace(/^\\s+/, \"\");\n\
+         \x20           if (c.indexOf(prefix) === 0) {{\n\
+         \x20               return c.substring(prefix.length);\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20       return null;\n\
+         \x20   }}\n\
+         \x20   function onMessage(e) {{\n\
+         \x20       if (!e.source || typeof e.data !== \"string\") {{\n\
+         \x20           return;\n\
+         \x20       }}\n\
+         \x20       var reply = \"error\";\n\
+         \x20       var parts = e.data.split(\" \");\n\
+         \x20       if (parts.length === 2 && parts[0].length > 0 && parts[1].length > 0) {{\n\
+         \x20           var current = readCookie();\n\
+         \x20           reply = current !== null && current === parts[1] ? \"unchanged\" : \"changed\";\n\
+         \x20       }}\n\
+         \x20       e.source.postMessage(reply, e.origin);\n\
+         \x20   }}\n\
+         \x20   if (window.addEventListener) {{\n\
+         \x20       window.addEventListener(\"message\", onMessage, false);\n\
+         \x20   }} else if (window.attachEvent) {{\n\
+         \x20       window.attachEvent(\"onmessage\", onMessage);\n\
+         \x20   }}\n\
+         }})();\n\
+         </script>\n\
+         </body>\n\
+         </html>"
+    )
+}
+
+/// `GET /realms/{realm}/protocol/openid-connect/check_session_iframe` — the
+/// OP iframe of OIDC Session Management 1.0 §4.2. The page performs no
+/// writes and reads only the realm's own session-state cookie, so it is
+/// frameable by RP origins (no `X-Frame-Options` anywhere in this server).
+#[instrument(skip(state), fields(realm = ?realm))]
+pub async fn check_session_iframe_handler(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
+) -> Response {
+    let Some(realm_name) = realm.as_deref() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing realm"})))
+            .into_response();
+    };
+    // Same 404 posture as the other protocol endpoints: unknown realm.
+    let realm = match state.resolve_realm(realm_name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "realm not found"})))
+                .into_response();
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
+    };
+    let mut resp = Html(check_session_iframe_page(&realm)).into_response();
+    // Per-realm content; must never be cached cross-version.
+    resp.headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -6161,8 +6499,10 @@ pub(crate) async fn persist_session(
     })
 }
 
-/// Authenticate the calling client for RFC 7009/7662 endpoints: `client_id`
-/// is required, and confidential clients authenticate per their configured
+/// Authenticate the calling client for RFC 7009/7662 endpoints: the client is
+/// identified by the `client_id` parameter or — absent that, per RFC 7523
+/// §2.2 — by its JWT client assertion's iss/sub, and confidential clients
+/// authenticate per their configured
 /// `client_authenticator_type` — shared secret (constant-time compared) or a
 /// JWT client assertion (`private_key_jwt` / `client_secret_jwt`).
 ///
@@ -6189,8 +6529,11 @@ pub(crate) async fn authenticate_form_client(
         }
         resp
     };
-    let raw = params.get("client_id").filter(|s| !s.is_empty()).ok_or_else(invalid_client)?;
-    let identifier = ClientIdentifier::new(raw).map_err(|_| invalid_client())?;
+    // RFC 7523 §2.2: without a `client_id` parameter, a JWT client assertion
+    // identifies the client from its (unverified) iss/sub — the assertion is
+    // verified against the resolved client's keys below, unchanged.
+    let raw = crate::client_assertion::resolve_form_client_id(params).ok_or_else(invalid_client)?;
+    let identifier = ClientIdentifier::new(&raw).map_err(|_| invalid_client())?;
     // The claims read-model cache answers warm lookups without a storage
     // round trip (client updates precise-delete the entry, so secret
     // rotation and disable take effect on the next request). On a miss —
@@ -6806,8 +7149,11 @@ mod tests {
     #[tokio::test]
     async fn auth_unimplemented_response_type_redirects_unsupported_response_type() {
         // `token` parses and is allowed by the client's default response_types, but is
-        // not implemented; it must be rejected with unsupported_response_type instead
-        // of silently falling through to the code flow.
+        // not implemented (OAuth2-only — never part of an OIDC flow); it must be
+        // rejected with unsupported_response_type instead of silently falling through
+        // to the code flow. The error rides the fragment: `token` is a token-bearing
+        // response type, whose spec default delivery is the fragment (OAuth 2.0
+        // Multiple Response Types §3).
         let state = setup_state().await;
         let mut params = std::collections::HashMap::new();
         params.insert("response_type".to_string(), "token".to_string());
@@ -6831,12 +7177,96 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert!(
-            location.starts_with("http://localhost:8080/admin/console/callback?"),
+            location.starts_with("http://localhost:8080/admin/console/callback#"),
             "location: {}",
             location
         );
         assert!(location.contains("error=unsupported_response_type"), "location: {}", location);
         assert!(location.contains("state=xyz"), "location: {}", location);
+    }
+
+    fn realm_named(name: &str) -> Realm {
+        issuerd_core::Realm {
+            id: RealmId::new("test-realm-id").unwrap(),
+            name: issuerd_core::RealmName::new(name).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_state_cookie_shapes() {
+        let realm = realm_named("master");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_master");
+
+        // Plain HTTP: SameSite=Lax, no Secure, never HttpOnly (the OP
+        // iframe's JS must read it).
+        let header = session_state_cookie_header(&realm, "sess-1", false);
+        assert_eq!(
+            header, "issuerd_session_state_master=sess-1; Path=/; SameSite=Lax",
+            "got: {header}"
+        );
+        assert!(!header.contains("HttpOnly"), "the iframe JS reads this cookie");
+
+        // TLS: SameSite=None; Secure (cross-site RP iframe contexts).
+        let header = session_state_cookie_header(&realm, "sess-1", true);
+        assert_eq!(
+            header, "issuerd_session_state_master=sess-1; Path=/; SameSite=None; Secure",
+            "got: {header}"
+        );
+
+        // The clear matches the write's SameSite/Secure posture.
+        assert_eq!(
+            session_state_cookie_clear(&realm, true),
+            "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=None; Secure"
+        );
+        assert_eq!(
+            session_state_cookie_clear(&realm, false),
+            "issuerd_session_state_master=; Path=/; Max-Age=0; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn session_state_cookie_name_falls_back_for_cookie_unsafe_realm_names() {
+        // `we"ird` is a valid RealmName but not an RFC 6265 cookie-name
+        // component — the name falls back to the (UUID-shaped) realm id.
+        let realm = realm_named("we\"ird");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_test-realm-id");
+        // `;` and `,` are likewise out (RFC 6265 separators).
+        let realm = realm_named("a;b");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_test-realm-id");
+        // Safe names keep the readable name-based cookie.
+        let realm = realm_named("my-realm_1.x");
+        assert_eq!(session_state_cookie_name(&realm), "issuerd_session_state_my-realm_1.x");
+    }
+
+    #[test]
+    fn check_session_iframe_page_is_static_and_self_contained() {
+        let page = check_session_iframe_page(&realm_named("master"));
+        // The postMessage protocol of OIDC Session Management 1.0 §4.2.
+        assert!(page.contains("addEventListener"), "{page}");
+        assert!(page.contains("\"message\""), "{page}");
+        assert!(page.contains("postMessage"), "{page}");
+        assert!(page.contains("\"changed\""), "{page}");
+        assert!(page.contains("\"unchanged\""), "{page}");
+        assert!(page.contains("\"error\""), "{page}");
+        // The companion cookie name is baked in (JSON-quoted).
+        assert!(page.contains("\"issuerd_session_state_master\""), "{page}");
+        // Self-contained: no external assets, no fetch, no modules.
+        assert!(!page.contains("src="), "{page}");
+        assert!(!page.contains("fetch("), "{page}");
+        assert!(!page.contains("import("), "{page}");
+        assert!(!page.contains("subtle"), "{page}");
+    }
+
+    #[test]
+    fn check_session_iframe_page_uses_the_fallback_name_for_unsafe_realm_names() {
+        // A realm name may contain a `"` (RealmName only forbids control
+        // chars, whitespace, and URL-reserved characters). Such a name is not
+        // cookie-safe, so the page embeds the id-based cookie name and the
+        // raw name never reaches the JS at all.
+        let page = check_session_iframe_page(&realm_named("we\"ird"));
+        assert!(page.contains("\"issuerd_session_state_test-realm-id\""), "{page}");
+        assert!(!page.contains("we\"ird"), "the raw name never reaches the JS: {page}");
     }
 
     #[tokio::test]
@@ -8097,7 +8527,8 @@ mod tests {
             format!("refresh_token={refresh_token}"),
         )
         .await;
-        assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+        // No post-logout redirect target: a 200 sign-out confirmation page.
+        assert_eq!(logout_resp.status(), StatusCode::OK);
         assert!(
             state.cache.get(&key).await.unwrap().is_none(),
             "logout invalidated the cached snapshot"
@@ -8379,7 +8810,12 @@ mod tests {
             "refresh_token=some_token".to_string(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // No post_logout_redirect_uri target: the browser lands on the
+        // sign-out confirmation page (200), not an empty 204.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("You have been signed out"), "confirmation page: {body}");
     }
 
     #[tokio::test]
@@ -12594,6 +13030,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // RFC 6749 §5.1: error responses carry the cache directives too.
+        let headers = response.headers();
+        assert_eq!(headers.get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(axum::http::header::PRAGMA).unwrap(), "no-cache");
         let json = extract_json(response).await;
         assert_eq!(json["error"], "unsupported_grant_type");
     }
@@ -12737,7 +13177,8 @@ mod tests {
             "".to_string(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // No params at all: the confirmation page is still the answer.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -12798,7 +13239,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
 
         // The SSO session must be gone, not just the token blacklisted.
         assert!(state.storage.get_user_session(&realm_id, &session_id).await.unwrap().is_none());
@@ -12899,7 +13340,7 @@ mod tests {
             Query(params),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
 
         // The offline session (and thus the offline refresh token) survives…
         assert!(state.storage.get_user_session(&realm_id, &offline_id).await.unwrap().is_some());
@@ -12968,7 +13409,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(state.storage.get_user_session(&realm_id, &offline_id).await.unwrap().is_none());
     }
 
@@ -16461,7 +16902,7 @@ mod tests {
         let state = logout_state_with_stub_tokens(cache.clone(), 1000).await;
 
         let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
 
         let ttls = cache.set_ttls("revoked_refresh:");
         assert_eq!(ttls.len(), 1, "exactly one blacklist write");
@@ -16480,7 +16921,7 @@ mod tests {
         let state = logout_state_with_stub_tokens(cache.clone(), 0).await;
 
         let resp = logout_with_body(&state, "refresh_token=stub-token".to_string()).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             cache.set_ttls("revoked_refresh:").is_empty(),
             "an already-expired refresh token needs no blacklist entry"
@@ -16524,7 +16965,7 @@ mod tests {
             format!("refresh_token={}", refresh.token),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             state.storage.get_user_session(&realm_id, &sid_a).await.unwrap().is_none(),
             "the refresh token's session is destroyed"

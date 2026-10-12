@@ -139,6 +139,7 @@ services:
       - ./issuerd.toml:/etc/issuerd/issuerd.toml:ro
       - ./pki/op.crt:/pki/op.crt:ro
       - ./pki/op.key:/pki/op.key:ro
+      - ./pki/ca.crt:/pki/ca.crt:ro
     networks:
       conformance-net:
         ipv4_address: 172.31.0.12

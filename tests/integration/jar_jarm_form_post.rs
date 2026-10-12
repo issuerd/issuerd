@@ -821,7 +821,17 @@ async fn discovery_advertises_jar_jarm_form_post_truthfully() {
     }
 
     assert_eq!(json["request_parameter_supported"], true);
-    assert_eq!(json["request_uri_parameter_supported"], false);
+    // JAR-by-reference for client-registered URIs is implemented.
+    assert_eq!(json["request_uri_parameter_supported"], true);
+    // Signed userinfo is implemented: the advertised list mirrors the
+    // id_token list (the active signing keys).
+    let userinfo_algs: Vec<&str> = json["userinfo_signing_alg_values_supported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(userinfo_algs.contains(&"RS256"), "userinfo algs missing RS256");
 
     let jar_algs: Vec<&str> = json["request_object_signing_alg_values_supported"]
         .as_array()

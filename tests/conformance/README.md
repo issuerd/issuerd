@@ -7,7 +7,7 @@ Automated runs of the [OpenID Foundation Conformance Suite](https://gitlab.com/o
 ```bash
 # 1. Clone the conformance suite source (once; gitignored):
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.2.4 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.2 && cd -
 
 # 2. Run everything:
 cd tests/conformance
@@ -24,13 +24,12 @@ Actions runner is 1001); on failure it dumps the stack logs before teardown.
 `docker compose up` builds missing images on first run (the suite JAR is
 built in-docker from `conformance-suite/` — maven downloads are cached
 between builds; the OP image builds the full Issuerd release binary),
-generates the local PKI, bootstraps the realm, runs all three test plans
+generates the local PKI, bootstraps the realm, runs the full OP certification matrix (Config, Basic, Implicit, Hybrid, Form Post basic/implicit/hybrid, the Dynamic and 3rd-Party-Init plans once per response type, and the four logout profiles likewise — 43 invocations)
 and exports the reports. Watch for `Conformance test run complete: all
 plans OK` in the log, then Ctrl+C (or `docker compose down --volumes` from
 another shell). Subsequent runs reuse the build cache: a full warm `run.sh`
-(build + PKI + bootstrap + all three plans + report export) measured ~6 min
-wall-clock (2026-10-03; the three plans themselves total ~3.5 min of suite
-time).
+(build + PKI + bootstrap + all plans + report export) measured ~7 min
+wall-clock (2026-10-11).
 
 Results land in `tests/conformance/results/`:
 
@@ -83,9 +82,17 @@ downloads). The test environment itself never touches the internet —
 |------|--------|-------------|
 | `oidcc-config-certification-test-plan` | `configs/issuerd-config-op.json` | Discovery metadata & JWKS — **PASSED** |
 | `oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-basic-op.json` | Authorization code flow — **PASSED** |
-| `oidcc-formpost-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]` | `configs/issuerd-formpost-op.json` | Code flow via `response_mode=form_post` — **PASSED** |
+| `oidcc-implicit-certification-test-plan[…static_client]` | `configs/issuerd-implicit-op.json` | Implicit flow (id_token, id_token token) — **PASSED** |
+| `oidcc-hybrid-certification-test-plan[…static_client]` | `configs/issuerd-hybrid-op.json` | All three hybrid types — **PASSED** |
+| `oidcc-formpost-{basic,implicit,hybrid}-certification-test-plan[…static_client]` | `configs/issuerd-formpost{-implicit,-hybrid}-op.json` | form_post variants — **PASSED** |
+| `oidcc-dynamic-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-dynamic-op.json` (+ initial-access token) | DCR (RFC 7591/7592), per-client algs, signed userinfo, JAR-by-reference — **PASSED** (`oidcc-server-rotate-keys` is the expected in-plan failure; real evidence via `run-rotation-check.sh`) |
+| `oidcc-3rdparty-init-login-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-3rdparty-init-op.json` (rendered) | `initiate_login_uri` DCR handling — **PASSED** |
+| `oidcc-rp-initiated-logout-certification-test-plan[…static_client][response_type=…]` ×6 | `configs/issuerd-rpinitiated-logout-op.json` | RP-initiated logout — **PASSED** |
+| `oidcc-session-management-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-session-op.json` | `session_state` + `check_session_iframe` — **PASSED** |
+| `oidcc-frontchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-frontchannel-logout-op.json` | front-channel iframes with iss+sid — **PASSED** |
+| `oidcc-backchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-backchannel-logout-op.json` | signed logout tokens — **PASSED** (2 expected TLS-header warnings per run — the suite's nginx-proxy header cannot exist in the proxy-less stack) |
 
-Suite version `release-v5.2.4`. Latest full run: **0 failures, 0 warnings** on all three plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 
@@ -96,6 +103,7 @@ tests/conformance/
 ├── docker-compose.yml         # the whole environment (see "How it works")
 ├── run.sh                     # one-command wrapper: compose up with exit-code propagation
 ├── run-focus.sh               # run a single Basic OP module against the stack
+├── run-rotation-check.sh      # standalone evidence for oidcc-server-rotate-keys (real admin-API key rotation between configure and start)
 ├── Dockerfile.suite           # pristine suite image (maven JAR build + temurin JRE)
 ├── Dockerfile.runner          # runner image (python + deps baked in, no runtime internet)
 ├── issuerd.toml             # OP config: port 8443, native TLS, issuer op.conformance.test
@@ -105,7 +113,7 @@ tests/conformance/
 ├── configs/                   # test plan configs + expected skips/failures
 ├── conformance-suite/         # pristine upstream suite clone (gitignored; you create this)
 ├── scripts/
-│   ├── run-conformance.sh     # the one-shot run: checks, bootstrap, 3 plans, reports
+│   ├── run-conformance.sh     # the one-shot run: checks, bootstrap, all plans, reports
 │   ├── suite-entrypoint.sh    # suite container entrypoint: root CA -> JVM cacerts, native HTTPS
 │   └── export-html.py         # HTML report export/extraction (public suite API only)
 └── results/                   # test output (gitignored)
@@ -115,7 +123,7 @@ tests/conformance/
 
 ```bash
 conformance)
-  git clone --depth 1 --branch release-v5.2.4 https://gitlab.com/openid/conformance-suite.git 
+  git clone --depth 1 --branch release-v5.3.2 https://gitlab.com/openid/conformance-suite.git 
   tests/conformance/run.sh   # exits non-zero on unexpected failures
   ;;
 ```

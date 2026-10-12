@@ -118,6 +118,9 @@ pub struct DiscoveryResponse {
     pub introspection_endpoint: Url,
     pub revocation_endpoint: Url,
     pub end_session_endpoint: Url,
+    /// The OP iframe URL (OIDC Session Management 1.0 §4.2). Always
+    /// advertised: the endpoint exists on every realm.
+    pub check_session_iframe: Url,
     pub device_authorization_endpoint: Url,
     pub backchannel_authentication_endpoint: Url,
     /// PAR endpoint per RFC 9126 §5.
@@ -135,9 +138,8 @@ pub struct DiscoveryResponse {
     /// JAR (RFC 9101): signed Request Objects via the `request`
     /// parameter are implemented.
     pub request_parameter_supported: bool,
-    /// JAR-by-reference (`request_uri` pointing at an arbitrary URL) is NOT
-    /// implemented (PAR URNs are not "by-reference" in this sense) — always
-    /// `false`, advertised truthfully.
+    /// JAR-by-reference: `request_uri` is implemented for client-registered
+    /// URIs (fetched SSRF-guarded, signed-only — `none` is never accepted).
     pub request_uri_parameter_supported: bool,
     /// Signing algorithms accepted for Request Objects (RFC 9101 §10.2):
     /// asymmetric against the client's JWKS, HMAC with the client secret.
@@ -154,6 +156,9 @@ pub struct DiscoveryResponse {
     pub acr_values_supported: Vec<issuerd_core::Acr>,
     pub subject_types_supported: Vec<SubjectType>,
     pub id_token_signing_alg_values_supported: Vec<issuerd_core::Algorithm>,
+    /// Algorithms the server may use to sign userinfo responses (OIDC Core
+    /// §5.3.2). Same source as the id_token list: the active signing keys.
+    pub userinfo_signing_alg_values_supported: Vec<issuerd_core::Algorithm>,
     pub token_endpoint_auth_methods_supported: Vec<TokenEndpointAuthMethod>,
     /// Signing algorithms accepted for `private_key_jwt` / `client_secret_jwt`
     /// client assertions (OIDC Discovery 1.0; required when either method is
@@ -201,6 +206,11 @@ impl DiscoveryResponse {
                 .unwrap(),
             end_session_endpoint: Url::parse(&format!("{}/protocol/openid-connect/logout", issuer))
                 .unwrap(),
+            check_session_iframe: Url::parse(&format!(
+                "{}/protocol/openid-connect/check_session_iframe",
+                issuer
+            ))
+            .unwrap(),
             device_authorization_endpoint: Url::parse(&format!(
                 "{}/protocol/openid-connect/auth/device",
                 issuer
@@ -221,9 +231,9 @@ impl DiscoveryResponse {
             registration_endpoint: None,
             require_pushed_authorization_requests: false,
             // JAR (signed request objects) is implemented;
-            // JAR-by-reference from arbitrary URLs is not.
+            // JAR-by-reference for client-registered URIs is implemented too.
             request_parameter_supported: true,
-            request_uri_parameter_supported: false,
+            request_uri_parameter_supported: true,
             request_object_signing_alg_values_supported: vec![
                 issuerd_core::Algorithm::Rs256,
                 issuerd_core::Algorithm::Rs384,
@@ -250,9 +260,18 @@ impl DiscoveryResponse {
                 issuerd_core::Scope::parse("acr"),
             ],
             response_types_supported: vec![
+                // Every OIDC response type the authorization endpoint accepts
+                // (bare `token` is OAuth2-only and deliberately excluded).
                 crate::authorization::ResponseType::Code,
-                crate::authorization::ResponseType::IdToken,
                 crate::authorization::ResponseType::CodeIdToken,
+                crate::authorization::ResponseType::CodeIdTokenToken,
+                crate::authorization::ResponseType::CodeToken,
+                crate::authorization::ResponseType::IdToken,
+                crate::authorization::ResponseType::IdTokenToken,
+                // OIDCD-3 (Dynamic profile) probes for the token-first
+                // spelling of the implicit pair; both are the same type, so
+                // advertise both (Keycloak does the same).
+                crate::authorization::ResponseType::TokenIdToken,
             ],
             response_modes_supported: vec![
                 crate::authorization::ResponseMode::Query,
@@ -266,6 +285,9 @@ impl DiscoveryResponse {
             ],
             grant_types_supported: vec![
                 crate::token::GrantType::AuthorizationCode,
+                // Implicit and hybrid flows are implemented (the
+                // authorization endpoint issues tokens directly).
+                crate::token::GrantType::Implicit,
                 crate::token::GrantType::RefreshToken,
                 crate::token::GrantType::ClientCredentials,
                 crate::token::GrantType::DeviceCode,
@@ -281,6 +303,7 @@ impl DiscoveryResponse {
             // `subject_type` opt-in).
             subject_types_supported: vec![SubjectType::Public, SubjectType::Pairwise],
             id_token_signing_alg_values_supported: vec![issuerd_core::Algorithm::Rs256],
+            userinfo_signing_alg_values_supported: vec![issuerd_core::Algorithm::Rs256],
             token_endpoint_auth_methods_supported: vec![
                 TokenEndpointAuthMethod::ClientSecretPost,
                 TokenEndpointAuthMethod::ClientSecretBasic,
@@ -368,6 +391,10 @@ mod tests {
         assert_eq!(
             d.end_session_endpoint.as_str(),
             "https://auth.example.com/realms/test-realm/protocol/openid-connect/logout"
+        );
+        assert_eq!(
+            d.check_session_iframe.as_str(),
+            "https://auth.example.com/realms/test-realm/protocol/openid-connect/check_session_iframe"
         );
         assert_eq!(
             d.device_authorization_endpoint.as_str(),
@@ -489,16 +516,19 @@ mod tests {
         assert!(json.contains("\"require_pushed_authorization_requests\":false"));
         // Token exchange (RFC 8693) is implemented and advertised.
         assert!(json.contains("\"urn:ietf:params:oauth:grant-type:token-exchange\""));
-        // JAR-by-reference is not implemented — advertised truthfully as
-        // `false` (JAR via the `request` parameter IS implemented).
+        // JAR-by-reference for client-registered URIs is implemented.
         assert!(json.contains("\"request_parameter_supported\":true"));
-        assert!(json.contains("\"request_uri_parameter_supported\":false"));
+        assert!(json.contains("\"request_uri_parameter_supported\":true"));
         assert!(json.contains("\"request_object_signing_alg_values_supported\""));
         assert!(json.contains("\"authorization_signing_alg_values_supported\""));
+        // Signed userinfo (OIDC Core §5.3.2) is implemented: the advertised
+        // list mirrors the id_token list.
+        assert!(json.contains("\"userinfo_signing_alg_values_supported\":[\"RS256\"]"));
         // Pairwise subjects are implemented and advertised.
         assert!(json.contains("\"subject_types_supported\":[\"public\",\"pairwise\"]"));
-        // Unimplemented features must NOT be advertised (truthful discovery).
-        assert!(!json.contains("\"check_session_iframe\""));
+        // Session management (the OP iframe endpoint) is implemented and
+        // therefore advertised (OIDC Session Management 1.0 §4.2).
+        assert!(json.contains("\"check_session_iframe\""));
         // Registration is implemented but per-realm opt-in — the
         // default (`None`) keeps the metadata out of the document.
         assert!(!json.contains("\"registration_endpoint\""));
@@ -547,15 +577,29 @@ mod tests {
     #[test]
     fn discovery_response_types_and_modes_match_implementation() {
         let d = DiscoveryResponse::for_realm("https://auth.example.com", "test-realm");
-        // Only implemented response types are advertised.
+        // Every implemented response type is advertised: the code flow plus
+        // the implicit/hybrid combinations (bare `token` is OAuth2-only and
+        // stays unadvertised — the authorization endpoint rejects it). The
+        // token-first spelling of the implicit pair is the same type
+        // advertised twice (OIDCD-3 probes for it).
         assert_eq!(
             d.response_types_supported,
             vec![
                 crate::authorization::ResponseType::Code,
-                crate::authorization::ResponseType::IdToken,
                 crate::authorization::ResponseType::CodeIdToken,
+                crate::authorization::ResponseType::CodeIdTokenToken,
+                crate::authorization::ResponseType::CodeToken,
+                crate::authorization::ResponseType::IdToken,
+                crate::authorization::ResponseType::IdTokenToken,
+                crate::authorization::ResponseType::TokenIdToken,
             ]
         );
+        // `implicit` is advertised as a grant (OIDCD-3).
+        assert!(d.grant_types_supported.contains(&crate::token::GrantType::Implicit));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"implicit\""));
+        assert!(json.contains("\"id_token token\""));
+        // The typed list above is authoritative: bare `token` is not in it.
         // form_post and the JARM family are implemented and
         // therefore advertised.
         assert_eq!(
@@ -576,7 +620,8 @@ mod tests {
     fn discovery_advertises_jar_truthfully() {
         let d = DiscoveryResponse::for_realm("https://auth.example.com", "test-realm");
         assert!(d.request_parameter_supported);
-        assert!(!d.request_uri_parameter_supported);
+        // JAR-by-reference for client-registered URIs is implemented.
+        assert!(d.request_uri_parameter_supported);
         // The request-object alg list must cover every algorithm the validator
         // accepts (asymmetric against the client JWKS, HMAC with the secret).
         let algs = &d.request_object_signing_alg_values_supported;
