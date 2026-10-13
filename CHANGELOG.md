@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **TOTP enrollment QR code is visible again in the account console.** The inline SVG returned by `POST /realms/{realm}/account/api/credentials/totp/start` carried only a `viewBox` and no intrinsic size, so the account console's React SPA rendered it at 0×0 (an empty white box) while the secret and `otpauth://` link showed fine. The SVG root element now carries explicit `width`/`height` attributes (240 px, scaled by the `viewBox`); the server-rendered required-action enrollment page is unaffected and unchanged. ([#35](https://github.com/issuerd/issuerd/issues/35))
+
 ## [0.1.15] - 2026-10-12
 
 ### Added

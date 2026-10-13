@@ -17,7 +17,9 @@ use issuerd_core::IssuerdError;
 ///
 /// The `qrcodegen` crate ships no SVG serializer, so the path data is built
 /// from the module matrix here (one `M x,y h1 v1 h-1 z` square per dark
-/// module — the same shape Nayuki's reference demo produces).
+/// module — the same shape Nayuki's reference demo produces). The root
+/// element carries explicit `width`/`height` (240 px): without them the SVG
+/// has no intrinsic size and renders at 0×0 inside the account console SPA.
 pub(crate) fn qr_svg(data: &str) -> Result<String, IssuerdError> {
     const BORDER: i32 = 4;
     let qr = qrcodegen::QrCode::encode_text(data, qrcodegen::QrCodeEcc::Medium)
@@ -36,6 +38,7 @@ pub(crate) fn qr_svg(data: &str) -> Result<String, IssuerdError> {
     }
     Ok(format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" \
+         width=\"240\" height=\"240\" \
          viewBox=\"0 0 {dimension} {dimension}\" stroke=\"none\">\
          <rect width=\"100%\" height=\"100%\" fill=\"#FFFFFF\"/>\
          <path d=\"{path}\" fill=\"#000000\"/></svg>"
@@ -52,6 +55,12 @@ mod tests {
         let svg = qr_svg(input).unwrap();
         assert!(svg.starts_with("<svg"), "expected svg element, got: {svg}");
         assert!(svg.contains("<path d=\"M"), "expected qr modules path");
+        // Explicit intrinsic size: without width/height the SVG renders at
+        // 0x0 in the account console SPA (GitHub issue #35).
+        assert!(
+            svg.contains("width=\"240\"") && svg.contains("height=\"240\""),
+            "expected explicit svg width/height: {svg}"
+        );
         // ViewBox must be the module size plus the quiet-zone border on both sides.
         let qr = qrcodegen::QrCode::encode_text(input, qrcodegen::QrCodeEcc::Medium).unwrap();
         let dimension = qr.size() + 8;
