@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Proptest coverage for the introspection/revocation and discovery parsers.** The RFC 7662 introspection and RFC 7009 revocation form parsers (`introspection.rs`) and the discovery wire types (`discovery.rs`: `SubjectType`, `TokenEndpointAuthMethod`, the `scope_vec` serde helper) now carry proptest suites with adversarial generators — empty, whitespace-only, over-long, non-ASCII and control-character values, near-miss parameter keys (`Token`, `token\0`) and near-miss hint spellings (`Access_Token`, `access_token `) — pinning that well-formed bodies parse and roundtrip byte-for-byte, that a missing `token` key is always `invalid_request` (400) regardless of what else the body carries, and that an unregistered `token_type_hint` is rejected with `invalid_request` whatever the token; arbitrary bodies never panic and the identical introspection/revocation parsers agree on every input. The discovery properties assert a string parses iff it is exactly a registered wire name and that `FromStr` and serde agree, with a compile-time guard that fails when a new enum variant is not added to the test lists. No new workspace dependencies: `proptest` was already a dev-dependency of the crate. ([#20](https://github.com/issuerd/issuerd/issues/20), [#34](https://github.com/issuerd/issuerd/pull/34))
+
 ## [0.1.16] - 2026-10-13
 
 ### Fixed
