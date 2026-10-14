@@ -724,3 +724,183 @@ mod tests {
         assert_eq!(d.id_token_signing_alg_values_supported, vec![issuerd_core::Algorithm::Rs256]);
     }
 }
+
+/// Property-based tests for the discovery wire-name parsers and the
+/// `scopes_supported` serde helper.
+///
+/// `SubjectType` / `TokenEndpointAuthMethod`: a string parses iff it is
+/// exactly one variant's `as_str()` wire name, and the documented error for
+/// everything else is `Err(())`. Candidates mix exact wire names, generated
+/// near-misses (case, padding, NUL, `-` for `_`, JSON quoting, truncation)
+/// and arbitrary Unicode. `FromStr` and serde must agree on every input.
+///
+/// `scope_vec`: scope sets built by `Scope::parse` survive the
+/// array-of-space-separated-strings form unchanged, and any array of strings
+/// deserializes to its normalized (`Scope::parse`) form.
+#[cfg(test)]
+mod proptests {
+    use std::fmt::Debug;
+    use std::str::FromStr;
+
+    use super::*;
+    use issuerd_core::Scope;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
+    use serde::de::DeserializeOwned;
+
+    const SUBJECT_TYPES: &[SubjectType] = &[SubjectType::Public, SubjectType::Pairwise];
+
+    const AUTH_METHODS: &[TokenEndpointAuthMethod] = &[
+        TokenEndpointAuthMethod::ClientSecretPost,
+        TokenEndpointAuthMethod::ClientSecretBasic,
+        TokenEndpointAuthMethod::ClientSecretJwt,
+        TokenEndpointAuthMethod::PrivateKeyJwt,
+        TokenEndpointAuthMethod::TlsClientAuth,
+        TokenEndpointAuthMethod::SelfSignedTlsClientAuth,
+        TokenEndpointAuthMethod::None,
+    ];
+
+    /// Any Unicode text of 0–64 chars. `any::<String>()` excludes control
+    /// characters (`\PC*`), so this builds from `any::<char>()` instead.
+    fn arbitrary_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..64).prop_map(|c| c.into_iter().collect())
+    }
+
+    /// A wire name altered just enough that it must no longer parse.
+    fn near_miss(wire: &str, how: usize) -> String {
+        match how {
+            0 => wire.to_uppercase(),
+            1 => format!("{wire} "),
+            2 => format!(" {wire}"),
+            3 => format!("{wire}\0"),
+            4 => wire.replace('_', "-"),
+            5 => format!("\"{wire}\""),
+            6 => wire[..wire.len() - 1].to_string(),
+            _ => wire[..1].to_uppercase() + &wire[1..],
+        }
+    }
+
+    /// Exact wire names, near-misses of them, empty, and arbitrary text.
+    fn wire_candidate(wire: Vec<&'static str>) -> impl Strategy<Value = String> {
+        prop_oneof![
+            1 => Just(String::new()),
+            2 => prop::sample::select(wire.clone()).prop_map(str::to_string),
+            3 => (prop::sample::select(wire), 0..8usize).prop_map(|(w, how)| near_miss(w, how)),
+            3 => arbitrary_text(),
+        ]
+    }
+
+    /// `s` parses iff it is exactly one variant's wire name; otherwise the
+    /// error is `Err(())`. Serde deserialization must give the same answer.
+    fn assert_parses_exactly_wire_names<T>(
+        s: &str,
+        all: &[T],
+        as_str: fn(&T) -> &'static str,
+    ) -> Result<(), TestCaseError>
+    where
+        T: FromStr<Err = ()> + DeserializeOwned + PartialEq + Debug + Copy,
+    {
+        let expected = all.iter().copied().find(|v| as_str(v) == s);
+        prop_assert_eq!(s.parse::<T>(), expected.ok_or(()));
+        let via_serde = serde_json::from_value::<T>(serde_json::Value::String(s.to_string()));
+        prop_assert_eq!(via_serde.ok(), expected);
+        Ok(())
+    }
+
+    /// RFC 6749 §3.3 scope-token characters: `%x21 / %x23-5B / %x5D-7E`.
+    fn scope_token() -> impl Strategy<Value = String> {
+        "[!#-\\[\\]-~]{1,20}"
+    }
+
+    /// ASCII and Unicode whitespace that `Scope::parse` must treat as a separator.
+    fn separator() -> impl Strategy<Value = &'static str> {
+        prop::sample::select(&[" ", "  ", "\t", "\n", "\r\n", "\u{a0}", "\u{3000}"][..])
+    }
+
+    /// A raw scope string: tokens joined by mixed whitespace, or arbitrary text.
+    fn raw_scope_string() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => prop::collection::vec((separator(), scope_token()), 0..8)
+                .prop_map(|parts| parts.into_iter().map(|(sep, tok)| format!("{sep}{tok}")).collect()),
+            1 => arbitrary_text(),
+        ]
+    }
+
+    fn serialize(scopes: &[Scope]) -> serde_json::Value {
+        scope_vec::serialize(scopes, serde_json::value::Serializer).expect("scopes serialize")
+    }
+
+    /// Compile-time guard: a new variant breaks these matches until it is
+    /// added to `SUBJECT_TYPES` / `AUTH_METHODS` above.
+    #[test]
+    fn variant_lists_are_exhaustive() {
+        for v in SUBJECT_TYPES {
+            match v {
+                SubjectType::Public | SubjectType::Pairwise => {}
+            }
+        }
+        for v in AUTH_METHODS {
+            match v {
+                TokenEndpointAuthMethod::ClientSecretPost
+                | TokenEndpointAuthMethod::ClientSecretBasic
+                | TokenEndpointAuthMethod::ClientSecretJwt
+                | TokenEndpointAuthMethod::PrivateKeyJwt
+                | TokenEndpointAuthMethod::TlsClientAuth
+                | TokenEndpointAuthMethod::SelfSignedTlsClientAuth
+                | TokenEndpointAuthMethod::None => {}
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Exactly the two wire names parse; everything else is `Err(())`.
+        #[test]
+        fn subject_type_parses_exactly_wire_names(
+            s in wire_candidate(SUBJECT_TYPES.iter().map(SubjectType::as_str).collect()),
+        ) {
+            assert_parses_exactly_wire_names(&s, SUBJECT_TYPES, SubjectType::as_str)?;
+        }
+
+        /// Exactly the seven wire names parse; everything else is `Err(())`.
+        #[test]
+        fn token_endpoint_auth_method_parses_exactly_wire_names(
+            s in wire_candidate(AUTH_METHODS.iter().map(TokenEndpointAuthMethod::as_str).collect()),
+        ) {
+            assert_parses_exactly_wire_names(&s, AUTH_METHODS, TokenEndpointAuthMethod::as_str)?;
+        }
+
+        /// Normalized scope sets serialize to one space-separated string each
+        /// and deserialize back unchanged.
+        #[test]
+        fn scope_vec_roundtrips(
+            raws in prop::collection::vec(raw_scope_string(), 0..6),
+        ) {
+            let scopes: Vec<Scope> = raws.iter().map(|r| Scope::parse(r)).collect();
+            let wire = serialize(&scopes);
+
+            let expected_wire: Vec<serde_json::Value> =
+                scopes.iter().map(|s| s.to_space_separated().into()).collect();
+            prop_assert_eq!(&wire, &serde_json::Value::Array(expected_wire));
+
+            let back = scope_vec::deserialize(wire).expect("serialized scopes deserialize");
+            prop_assert_eq!(back, scopes);
+        }
+
+        /// Any array of strings deserializes to its `Scope::parse` form, and
+        /// that form is a fixpoint of serialize → deserialize.
+        #[test]
+        fn scope_vec_deserialize_normalizes_any_strings(
+            raws in prop::collection::vec(raw_scope_string(), 0..6),
+        ) {
+            let input = serde_json::Value::Array(raws.iter().map(|r| r.clone().into()).collect());
+            let scopes = scope_vec::deserialize(input).expect("any string array deserializes");
+            let expected: Vec<Scope> = raws.iter().map(|r| Scope::parse(r)).collect();
+            prop_assert_eq!(&scopes, &expected);
+
+            let again = scope_vec::deserialize(serialize(&scopes)).expect("re-deserializes");
+            prop_assert_eq!(again, scopes);
+        }
+    }
+}
