@@ -1,14 +1,19 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
 #
-# deny.toml is EMPTY: cargo-deny checks the feature-resolved dependency graph,
-# which is genuinely free of flagged crates. This file carries ONE entry that
-# exists purely because cargo-audit scans the raw Cargo.lock without feature
-# resolution:
+# deny.toml is EMPTY again: cargo-deny checks the feature-resolved dependency
+# graph, which is genuinely free of flagged crates. This file carries ONE entry
+# that exists purely because cargo-audit scans the raw Cargo.lock without
+# feature resolution:
 #
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained): resolved for real — the
 #   redis 0.29 upgrade moved to rustls-native-certs 0.8 (rustls-pki-types);
 #   the crate is in neither the lockfile nor the build graph. No ignore.
+#
+# - RUSTSEC-2024-0449 (unsafe-libyaml unmaintained): resolved for real —
+#   config/provision YAML moved from serde_yaml to serde-saphyr (pure-Rust
+#   granit-parser); serde_yaml/unsafe-libyaml are out of the lockfile. No
+#   ignore.
 #
 # - RUSTSEC-2023-0071 (rsa/Marvin): resolved in the BUILD graph — jsonwebtoken
 #   uses the aws_lc_rs backend and RSA key generation uses OpenSSL, so rsa is

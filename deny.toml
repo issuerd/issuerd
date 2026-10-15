@@ -20,16 +20,11 @@ yanked = "deny"
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained) — resolved by the redis
 #   0.29 upgrade (rustls-native-certs 0.8 moved to rustls-pki-types); the
 #   crate is out of the lockfile entirely.
-# - RUSTSEC-2024-0449 (unsafe-libyaml unmaintained) — advisory entered the
-#   RustSec DB on 2026-10-12 (upstream repo archived 2024-03-25); reached via
-#   figment → serde_yaml. Unmaintained is not a vulnerability: the parser
-#   only ever sees operator-controlled local files (server config, provision
-#   YAML) — never network input. No safe upgrade path exists (serde_yaml_ng
-#   keeps unsafe-libyaml); the safe-Rust migration (saphyr/serde-saphyr as
-#   figment's YAML provider) is tracked separately.
-ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not vulnerable: parses only operator-controlled config/provision YAML via figment→serde_yaml; no safe upgrade (serde_yaml_ng still uses unsafe-libyaml); saphyr migration tracked separately" },
-]
+# - RUSTSEC-2024-0449 (unsafe-libyaml unmaintained) — resolved by migrating
+#   config/provision YAML parsing from serde_yaml to serde-saphyr
+#   (pure-Rust granit-parser backend, `#![deny(unsafe_code)]`); serde_yaml and
+#   unsafe-libyaml are out of the lockfile entirely.
+ignore = []
 
 # --- License checks ---
 [licenses]

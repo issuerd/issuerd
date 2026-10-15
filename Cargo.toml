@@ -116,7 +116,9 @@ ipnet = "2.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
-serde_yaml = "0.9"
+# Pure-Rust YAML (saphyr-lineage parser, `#![deny(unsafe_code)]`) — replaces
+# serde_yaml, whose unsafe-libyaml backend is unmaintained (RUSTSEC-2024-0449).
+serde-saphyr = "2.0"
 
 # Crypto
 ring = "0.17"
@@ -155,8 +157,10 @@ tracing-log = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
-# Config
-figment = { version = "0.10", features = ["env", "toml", "yaml", "json"] }
+# Config (YAML support comes from the workspace `serde-saphyr` dependency via a
+# custom figment `Format` in issuerd-server — figment's built-in `yaml` feature
+# would pull serde_yaml/unsafe-libyaml back in).
+figment = { version = "0.10", features = ["env", "toml", "json"] }
 
 # Testing
 mockall = "0.13"
