@@ -4,13 +4,31 @@
 // Server configuration types with figment-based layered loading (TOML/YAML/JSON + env).
 
 use figment::{
-    providers::{Env, Format, Json, Serialized, Toml, Yaml},
+    providers::{Env, Format, Json, Serialized, Toml},
     Figment,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::PathBuf;
 
 use issuerd_core::IssuerdError;
+
+/// YAML [`Format`] provider backed by serde-saphyr (pure-Rust parser) instead
+/// of figment's built-in `yaml` feature, which would pull serde_yaml and the
+/// unmaintained unsafe-libyaml (RUSTSEC-2024-0449) into the build graph.
+/// Routed through figment's `Data` provider, so file resolution and profile
+/// semantics are identical to the built-in TOML/JSON formats.
+#[derive(Debug, Clone, Copy)]
+struct YamlSafe;
+
+impl Format for YamlSafe {
+    type Error = serde_saphyr::Error;
+
+    const NAME: &'static str = "YAML";
+
+    fn from_str<T: DeserializeOwned>(string: &str) -> Result<T, Self::Error> {
+        serde_saphyr::from_str(string)
+    }
+}
 
 /// Server configuration with figment-based loading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +108,7 @@ impl ServerConfig {
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("toml").to_lowercase();
                 match ext.as_str() {
                     "yaml" | "yml" => {
-                        figment = figment.merge(Yaml::file(p));
+                        figment = figment.merge(YamlSafe::file(p));
                     }
                     "json" => {
                         figment = figment.merge(Json::file(p));
@@ -183,7 +201,7 @@ pub fn write_example<T: serde::Serialize>(
 ) -> Result<(), IssuerdError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("toml").to_lowercase();
     let content = match ext.as_str() {
-        "yaml" | "yml" => serde_yaml::to_string(value)
+        "yaml" | "yml" => serde_saphyr::to_string(value)
             .map_err(|e| IssuerdError::ServerError(format!("yaml serialization failed: {e}")))?,
         "json" => serde_json::to_string_pretty(value)
             .map_err(|e| IssuerdError::ServerError(format!("json serialization failed: {e}")))?,
@@ -904,6 +922,37 @@ issuer_url = "http://example.com"
         let cfg = ServerConfig::load(Some(path)).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1");
         assert_eq!(cfg.port, 9091);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_empty_yaml_file_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // serde-saphyr reads an empty document as an empty mapping, so an
+        // empty YAML file merges nothing and defaults apply — same lenient
+        // behavior as an empty TOML file (serde_yaml used to reject it).
+        let (path, dir) = temp_path("yaml_empty", "yaml");
+        fs::write(&path, "").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert_eq!(cfg.port, 8080);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_yaml_file_with_null_and_inline_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // YAML `null` maps to `None` for Option fields, and inline flow lists
+        // parse — the two shapes the shipped provision/config examples use.
+        let (path, dir) = temp_path("yaml_null", "yaml");
+        fs::write(
+            &path,
+            "redis: null\nport: 9094\nproxy:\n  trusted_proxies: [\"10.0.0.1\", \"10.0.0.2\"]\n",
+        )
+        .unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert_eq!(cfg.port, 9094);
+        assert_eq!(cfg.redis, None);
+        assert_eq!(cfg.proxy.trusted_proxies, vec!["10.0.0.1", "10.0.0.2"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

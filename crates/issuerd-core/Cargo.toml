@@ -37,5 +37,5 @@ flux-rs = { git = "https://github.com/flux-rs/flux.git" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rstest = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 toml = "0.8"

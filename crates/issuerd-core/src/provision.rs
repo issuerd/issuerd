@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn marker_name_defaults_and_override() {
         // No `marker` key at all: the effective name is "default".
-        let cfg: ProvisionConfig = serde_yaml::from_str("realms: []").unwrap();
+        let cfg: ProvisionConfig = serde_saphyr::from_str("realms: []").unwrap();
         assert_eq!(cfg.marker_name(), "default");
 
         let mut cfg = ProvisionConfig::generate_example();
@@ -456,8 +456,8 @@ mod tests {
     #[test]
     fn example_roundtrip_yaml() {
         let original = ProvisionConfig::generate_example();
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        let loaded: ProvisionConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_saphyr::to_string(&original).unwrap();
+        let loaded: ProvisionConfig = serde_saphyr::from_str(&yaml).unwrap();
         assert_eq!(original.marker, loaded.marker);
         assert_eq!(original.realms.len(), loaded.realms.len());
         assert_eq!(original.realms[0].name, loaded.realms[0].name);
@@ -501,7 +501,7 @@ login_with_email_allowed: false
 browser_flow: custom-browser
 registration_flow: custom-registration
 "#;
-        let realm: ProvisionRealm = serde_yaml::from_str(yaml).unwrap();
+        let realm: ProvisionRealm = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(realm.registration_enabled, Some(true));
         assert_eq!(realm.verify_email_enabled, Some(true));
         assert_eq!(realm.reset_password_allowed, Some(true));
@@ -513,7 +513,7 @@ registration_flow: custom-registration
 
     #[test]
     fn realm_login_flags_and_flow_bindings_default_to_none() {
-        let realm: ProvisionRealm = serde_yaml::from_str("name: minimal").unwrap();
+        let realm: ProvisionRealm = serde_saphyr::from_str("name: minimal").unwrap();
         assert!(realm.registration_enabled.is_none());
         assert!(realm.verify_email_enabled.is_none());
         assert!(realm.reset_password_allowed.is_none());
@@ -531,7 +531,7 @@ internationalization_enabled: true
 supported_locales: [en, de]
 default_locale: en
 "#;
-        let realm: ProvisionRealm = serde_yaml::from_str(yaml).unwrap();
+        let realm: ProvisionRealm = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(realm.internationalization_enabled, Some(true));
         assert_eq!(realm.supported_locales, Some(vec!["en".to_string(), "de".to_string()]));
         assert_eq!(realm.default_locale.as_deref(), Some("en"));
@@ -539,7 +539,7 @@ default_locale: en
 
     #[test]
     fn realm_i18n_fields_default_to_none() {
-        let realm: ProvisionRealm = serde_yaml::from_str("name: minimal").unwrap();
+        let realm: ProvisionRealm = serde_saphyr::from_str("name: minimal").unwrap();
         assert!(realm.internationalization_enabled.is_none());
         assert!(realm.supported_locales.is_none());
         assert!(realm.default_locale.is_none());
@@ -547,11 +547,11 @@ default_locale: en
 
     #[test]
     fn user_and_flow_boolean_defaults() {
-        let user: ProvisionUser = serde_yaml::from_str("realm: r1\nusername: u1").unwrap();
+        let user: ProvisionUser = serde_saphyr::from_str("realm: r1\nusername: u1").unwrap();
         assert!(!user.email_verified);
         assert!(user.enabled);
 
-        let flow: ProvisionFlowConfig = serde_yaml::from_str("realm: r1\nalias: f1").unwrap();
+        let flow: ProvisionFlowConfig = serde_saphyr::from_str("realm: r1\nalias: f1").unwrap();
         assert!(!flow.built_in);
         assert!(flow.top_level);
     }
@@ -573,7 +573,7 @@ default_locale: en
             .join("examples/provision.example.yaml");
         let yaml = std::fs::read_to_string(&example_path)
             .unwrap_or_else(|e| panic!("failed to read examples/provision.example.yaml: {e}"));
-        let loaded: ProvisionConfig = serde_yaml::from_str(&yaml)
+        let loaded: ProvisionConfig = serde_saphyr::from_str(&yaml)
             .unwrap_or_else(|e| panic!("failed to parse examples/provision.example.yaml: {e}"));
         let generated = ProvisionConfig::generate_example();
         assert_eq!(loaded.marker, generated.marker);

@@ -36,7 +36,7 @@ impl Provisioner {
         })?;
 
         let mut config: ProvisionConfig = match ext.as_str() {
-            "yaml" | "yml" => serde_yaml::from_str(&raw).map_err(|e| {
+            "yaml" | "yml" => serde_saphyr::from_str(&raw).map_err(|e| {
                 issuerd_core::IssuerdError::ServerError(format!("provision yaml parse: {e}"))
             })?,
             "json" => serde_json::from_str(&raw).map_err(|e| {
