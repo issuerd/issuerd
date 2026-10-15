@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-10-15
+
 ### Security
 
 - **YAML parsing moved off the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449).** Server-config and provision-file YAML now parse and serialize through `serde-saphyr` (pure-Rust `granit-parser` backend, `#![deny(unsafe_code)]`) instead of the archived `serde_yaml`; figment keeps driving layered config via a custom in-tree `Format` provider, so `Yaml::file` semantics (file resolution, merge precedence with env/TOML/JSON) are unchanged. `serde_yaml`/`unsafe-libyaml` are out of the lockfile and the `deny.toml` advisory ignore for RUSTSEC-2024-0449 is removed. One intentional leniency change: an empty YAML config file now boots with defaults (matching empty TOML) instead of failing to parse. No operator action required — existing config and provision YAML keep loading unchanged.
