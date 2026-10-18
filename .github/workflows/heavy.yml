@@ -126,10 +126,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The suite sources are gitignored (tests/conformance/conformance-suite)
-      # — clone fresh at the pinned, validated release tag.
+      # — clone fresh at the pinned release tag.
       - name: Clone the OIDF conformance suite
         run: >
-          git clone --depth 1 --branch release-v5.3.2
+          git clone --depth 1 --branch release-v5.3.3
           https://gitlab.com/openid/conformance-suite.git
           tests/conformance/conformance-suite
       # run.sh builds images, runs the full OP certification matrix (43 invocations), exports reports into

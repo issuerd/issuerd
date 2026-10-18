@@ -445,7 +445,7 @@ Multi-node contract: `cluster.enabled = true` requires PostgreSQL storage and Re
 ```bash
 # One-time prerequisite: clone the suite (gitignored)
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.2
+cd tests/conformance/conformance-suite && git checkout release-v5.3.3
 
 # Run everything (builds images, generates PKI, bootstraps, runs all plans, exports reports)
 cd tests/conformance && docker compose up        # interactive

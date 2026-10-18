@@ -11,9 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -d "$SCRIPT_DIR/conformance-suite/scripts" ]]; then
     echo "ERROR: conformance suite sources not found at tests/conformance/conformance-suite"
-    echo "Clone them first (currently validated against release-v5.3.2):"
+    echo "Clone the pinned release first:"
     echo "  git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite"
-    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.3.2"
+    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.3.3"
     exit 1
 fi
 

@@ -7,7 +7,7 @@ Automated runs of the [OpenID Foundation Conformance Suite](https://gitlab.com/o
 ```bash
 # 1. Clone the conformance suite source (once; gitignored):
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.2 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.3 && cd -
 
 # 2. Run everything:
 cd tests/conformance
@@ -92,7 +92,7 @@ downloads). The test environment itself never touches the internet —
 | `oidcc-frontchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-frontchannel-logout-op.json` | front-channel iframes with iss+sid — **PASSED** |
 | `oidcc-backchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-backchannel-logout-op.json` | signed logout tokens — **PASSED** (2 expected TLS-header warnings per run — the suite's nginx-proxy header cannot exist in the proxy-less stack) |
 
-Suite version `release-v5.3.2`. Latest full run: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Latest full self-hosted run used suite `release-v5.3.2`: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 
@@ -123,7 +123,7 @@ tests/conformance/
 
 ```bash
 conformance)
-  git clone --depth 1 --branch release-v5.3.2 https://gitlab.com/openid/conformance-suite.git 
+  git clone --depth 1 --branch release-v5.3.3 https://gitlab.com/openid/conformance-suite.git
   tests/conformance/run.sh   # exits non-zero on unexpected failures
   ;;
 ```
