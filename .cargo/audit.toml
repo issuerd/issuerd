@@ -1,10 +1,17 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
 #
-# deny.toml is EMPTY again: cargo-deny checks the feature-resolved dependency
-# graph, which is genuinely free of flagged crates. This file carries ONE entry
-# that exists purely because cargo-audit scans the raw Cargo.lock without
-# feature resolution:
+# Temporary ignores:
+#
+# - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction), added 2026-10-18:
+#   zip 3.0.0 is only a build dependency of utoipa-swagger-ui 9.0.2 and is not
+#   linked into the daemon. Issuerd enables the `vendored` feature, so the build
+#   script reads the static archive compiled into utoipa-swagger-ui-vendored,
+#   not a downloaded or user-supplied archive. Its manual extraction uses
+#   ZipArchive::by_index with enclosed_name, not the affected extract() APIs.
+#   Remove all three ignores when utoipa-swagger-ui upgrades to zip >= 9.0.0.
+#
+# Resolved advisories without ignores:
 #
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained): resolved for real — the
 #   redis 0.29 upgrade moved to rustls-native-certs 0.8 (rustls-pki-types);
@@ -25,11 +32,10 @@
 #   rust-lang/cargo#10801 lockfile quirk; the lock entry is never downloaded,
 #   compiled, or linked into issuerd (postgres-only sqlx feature set — the
 #   `mysql` feature is never enabled, including under --all-features, which
-#   applies to workspace crates only). cargo-deny's feature-resolved
-#   `cargo deny check advisories` passes with zero ignores. The ignore below
-#   exists solely to stop cargo-audit's feature-blind lockfile scan from
-#   flagging a crate the build never sees; drop it if sqlx removes the weak
-#   edges or cargo fixes lockfile pruning.
+#   applies to workspace crates only). The ignore below exists solely to stop
+#   cargo-audit's feature-blind lockfile scan from flagging a crate the build
+#   never sees; drop it if sqlx removes the weak edges or cargo fixes lockfile
+#   pruning.
 
 [advisories]
 ignore = [
@@ -37,4 +43,8 @@ ignore = [
     # --target all); lockfile-only entry via sqlx's inactivated
     # `sqlx-mysql?/...` weak optional deps (cargo#10801). See header comment.
     "RUSTSEC-2023-0071",
+    # Temporary build-only vendored-archive ignores; see header comment.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
