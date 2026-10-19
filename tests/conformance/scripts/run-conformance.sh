@@ -12,6 +12,17 @@ OP=https://op.conformance.test:8443
 CONFIGS=/conformance-suite-configs
 OVERALL_RESULT=0
 
+# Upstream runner circuit breaker (pristine knob, not a patch): abort a plan
+# after N consecutive modules that fail to run to completion. Default 3 is
+# exactly the size of the oidcc-registration-{logo,policy,tos}-uri triple,
+# which sits adjacent in every dynamic plan and, since suite 5.3.3, always
+# ends INTERRUPTED via the placeholder race (upstream issue #854 — see
+# configs/issuerd-expected-failures-dynamic.json). Their failures are
+# declared expected and are judged by the results analysis, so the breaker
+# must not abort the plan first; a genuinely unhealthy server still trips
+# it at 4 consecutive modules.
+export CONFORMANCE_MAX_CONSECUTIVE_FAILURES=4
+
 echo "=== Verifying TLS endpoints (CA trust) ==="
 curl -sf --cacert "$CACERT" "$SUITE/" -o /dev/null
 echo "suite ready at $SUITE"
