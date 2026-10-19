@@ -7,5 +7,32 @@
     "condition": "VerifyNewJwksHasNewSigningKey",
     "expected-result": "failure",
     "comment": "The module requires a human/operator to rotate OP keys between CONFIGURED and start (upstream's own CI lists it as expected failure for the same reason). The pristine runner force-starts it without rotating. Real rotation evidence: tests/conformance/scripts/run-rotation-check.sh drives the module standalone via the suite API with an admin-API key rotation interposed."
+  },
+  {
+    "test-name": "oidcc-registration-logo-uri",
+    "variant": "*",
+    "configuration-filename": "*issuerd-dynamic-op.json",
+    "current-block": "*",
+    "condition": "oidcc-registration-logo-uri",
+    "expected-result": "failure",
+    "comment": "Suite 5.3.3 made the long-known upstream race deterministic (https://gitlab.com/openid/conformance-suite/-/issues/854): the module only waits for its login-page screenshot placeholder, and since 5.3.3 the upload wakes waitForPlaceholders() immediately (ImageAPI/BrowserControl placeholderFilled()), so fireTestFinishedInternal() runs mid-flow; the flow's next inbound request then hits runInBackground after runFinalisationTaskInBackground() and the module dies INTERRUPTED with this module-name 'Unexpected failure' (18/18 on the hermetic stack). The module's real conditions (dynamic-registration checks + the screenshot REVIEW entry) still run and are still asserted. Remove when upstream fixes the race — an unused entry then fails the run as EXPECTED_FAILURES_NOT_HAPPEN, which is the intended reminder."
+  },
+  {
+    "test-name": "oidcc-registration-policy-uri",
+    "variant": "*",
+    "configuration-filename": "*issuerd-dynamic-op.json",
+    "current-block": "*",
+    "condition": "oidcc-registration-policy-uri",
+    "expected-result": "failure",
+    "comment": "Same suite-5.3.3 deterministic race as oidcc-registration-logo-uri (see its entry and https://gitlab.com/openid/conformance-suite/-/issues/854): placeholder wake-up finishes the module mid-flow, the late inbound request crashes on runInBackground after runFinalisationTaskInBackground(), module INTERRUPTED with this module-name 'Unexpected failure'."
+  },
+  {
+    "test-name": "oidcc-registration-tos-uri",
+    "variant": "*",
+    "configuration-filename": "*issuerd-dynamic-op.json",
+    "current-block": "*",
+    "condition": "oidcc-registration-tos-uri",
+    "expected-result": "failure",
+    "comment": "Same suite-5.3.3 deterministic race as oidcc-registration-logo-uri (see its entry and https://gitlab.com/openid/conformance-suite/-/issues/854): placeholder wake-up finishes the module mid-flow, the late inbound request crashes on runInBackground after runFinalisationTaskInBackground(), module INTERRUPTED with this module-name 'Unexpected failure'."
   }
 ]
