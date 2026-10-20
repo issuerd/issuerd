@@ -355,7 +355,7 @@ mod tests {
 
         let bearer = schemes.get("bearer_auth").expect("bearer_auth scheme registered");
         match bearer {
-            utoipa::openapi::security::SecurityScheme::Http(http) => {
+            utoipa::openapi::RefOr::T(utoipa::openapi::security::SecurityScheme::Http(http)) => {
                 assert!(
                     http.scheme == utoipa::openapi::security::HttpAuthScheme::Bearer,
                     "bearer_auth uses the bearer HTTP scheme"
@@ -367,7 +367,9 @@ mod tests {
 
         let oidc = schemes.get("oidc_auth").expect("oidc_auth scheme registered");
         match oidc {
-            utoipa::openapi::security::SecurityScheme::OAuth2(oauth2) => {
+            utoipa::openapi::RefOr::T(utoipa::openapi::security::SecurityScheme::OAuth2(
+                oauth2,
+            )) => {
                 let flow = oauth2
                     .flows
                     .get("authorizationCode")

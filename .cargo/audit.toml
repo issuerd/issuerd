@@ -1,17 +1,14 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
 #
-# Temporary ignores:
+# There are currently no ignores; the list must stay empty. Resolved
+# advisories that once carried (or nearly carried) ignores:
 #
-# - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction), added 2026-10-18:
-#   zip 3.0.0 is only a build dependency of utoipa-swagger-ui 9.0.2 and is not
-#   linked into the daemon. Issuerd enables the `vendored` feature, so the build
-#   script reads the static archive compiled into utoipa-swagger-ui-vendored,
-#   not a downloaded or user-supplied archive. Its manual extraction uses
-#   ZipArchive::by_index with enclosed_name, not the affected extract() APIs.
-#   Remove all three ignores when utoipa-swagger-ui upgrades to zip >= 9.0.0.
-#
-# Resolved advisories without ignores:
+# - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction): resolved for real —
+#   the utoipa 6.0 / utoipa-swagger-ui 10.0.2 upgrade (2026-10) builds with
+#   zip ^9.0 (>= 9.0.0 is the patched line). zip was only ever a build
+#   dependency of utoipa-swagger-ui's `vendored` feature, never linked into
+#   the daemon.
 #
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained): resolved for real — the
 #   redis 0.29 upgrade moved to rustls-native-certs 0.8 (rustls-pki-types);
@@ -31,9 +28,4 @@
 #   lockfile nor the build graph. No ignore.
 
 [advisories]
-ignore = [
-    # Temporary build-only vendored-archive ignores; see header comment.
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-]
+ignore = []

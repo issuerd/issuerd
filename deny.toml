@@ -24,17 +24,12 @@ yanked = "deny"
 #   config/provision YAML parsing from serde_yaml to serde-saphyr
 #   (pure-Rust granit-parser backend, `#![deny(unsafe_code)]`); serde_yaml and
 #   unsafe-libyaml are out of the lockfile entirely.
-# TEMPORARY (added 2026-10-18): zip 3.0.0 is only a build dependency of
-# utoipa-swagger-ui 9.0.2. With `vendored`, its build script extracts the static
-# archive embedded in utoipa-swagger-ui-vendored, not a downloaded or
-# user-supplied ZIP; zip is not linked into the daemon. Remove these ignores
-# when utoipa-swagger-ui upgrades to zip >= 9.0.0. See .cargo/audit.toml for the
-# full dependency and extraction-path rationale.
-ignore = [
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-]
+# - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction) — resolved by the
+#   utoipa 6.0 / utoipa-swagger-ui 10.0.2 upgrade, which builds with zip ^9.0
+#   (>= 9.0.0 is the patched line). zip was only ever a build dependency of
+#   utoipa-swagger-ui's `vendored` feature, never linked into the daemon.
+# The ignore list is empty and must stay that way.
+ignore = []
 
 # --- License checks ---
 [licenses]

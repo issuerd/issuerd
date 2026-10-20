@@ -1970,10 +1970,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/OperationType"
                 },
                 {
-                  "$ref": "#/components/schemas/OperationType"
+                  "type": "null"
                 }
               ]
             }
@@ -1986,10 +1986,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/ResourceType"
                 },
                 {
-                  "$ref": "#/components/schemas/ResourceType"
+                  "type": "null"
                 }
               ]
             }
@@ -2186,10 +2186,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/OperationType"
                 },
                 {
-                  "$ref": "#/components/schemas/OperationType"
+                  "type": "null"
                 }
               ]
             }
@@ -2202,10 +2202,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/ResourceType"
                 },
                 {
-                  "$ref": "#/components/schemas/ResourceType"
+                  "type": "null"
                 }
               ]
             }
@@ -9419,10 +9419,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/EventType"
                 },
                 {
-                  "$ref": "#/components/schemas/EventType"
+                  "type": "null"
                 }
               ]
             }
@@ -9767,10 +9767,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/EventType"
                 },
                 {
-                  "$ref": "#/components/schemas/EventType"
+                  "type": "null"
                 }
               ]
             }
@@ -12681,10 +12681,10 @@
               "schema": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/RotateKeyRequest"
                   },
                   {
-                    "$ref": "#/components/schemas/RotateKeyRequest"
+                    "type": "null"
                   }
                 ]
               }
@@ -12866,10 +12866,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/IfResourceExists"
                 },
                 {
-                  "$ref": "#/components/schemas/IfResourceExists"
+                  "type": "null"
                 }
               ]
             }
@@ -18394,11 +18394,11 @@
           "requirement": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Requirement",
                 "description": "Execution requirement; defaults to `required`."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -18418,11 +18418,11 @@
           "requirement": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Requirement",
                 "description": "Execution requirement; defaults to `required`."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -18801,11 +18801,11 @@
           "client_authenticator_type": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ClientAuthenticatorType",
                 "description": "Client authentication method: `\"client-secret\"`, `\"client-jwt\"`, etc."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -18878,11 +18878,11 @@
           "protocol": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ClientProtocol",
                 "description": "Protocol: `\"openid-connect\"` or `\"saml\"`. Defaults to `\"openid-connect\"`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -18980,11 +18980,11 @@
           "protocol": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ClientProtocol",
                 "description": "Protocol: `\"openid-connect\"` (default) or `\"saml\"`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -19504,11 +19504,11 @@
           "authenticator_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AuthenticatorConfigRepresentation",
                 "description": "Authenticator configuration attached to this stage, if any."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -19539,11 +19539,11 @@
           "sub_flow_alias": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Alias",
                 "description": "Alias of a sub-flow to execute, if this stage represents a sub-flow reference."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -19667,11 +19667,11 @@
           "parent_id": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GroupId",
                 "description": "Parent group id (tri-state): absent = leave the\nstored parent unchanged on update; explicit `null` = move to root;\na value = move under that group. Always populated on read (`null` for\ntop-level groups)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -20027,11 +20027,11 @@
           "credentials": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AdapterCredentials",
                 "description": "Client credentials (secret) — only for confidential clients."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -20370,22 +20370,22 @@
           "ifResourceExists": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/IfResourceExists",
                 "description": "Conflict strategy; the `ifResourceExists` query parameter wins when\nboth are set."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "roles": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PartialImportRolesRepresentation",
                 "description": "Realm and client roles to import."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -21078,11 +21078,11 @@
           "ssl_required": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SslRequired",
                 "description": "SSL enforcement level: `\"none\"`, `\"external\"`, or `\"all\"`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -21776,11 +21776,11 @@
           "requirement": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Requirement",
                 "description": "New execution requirement, if changing."
+              },
+              {
+                "type": "null"
               }
             ]
           }

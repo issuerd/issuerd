@@ -27,7 +27,7 @@ url = { workspace = true }
 async-trait = { workspace = true }
 mockall = { workspace = true }
 zeroize = { workspace = true }
-utoipa = { version = "5.5" }
+utoipa = { version = "6.0" }
 # Flux refinement annotations (e.g. on `SecondsNonZero` in models.rs). The
 # proc-macro shim expands to nothing in normal builds; only `cargo flux`
 # interprets it. Not published on crates.io — scripts/publish.py strips this
