@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`rustls-webpki` 0.103.15 → 0.103.16 and `webpki-roots` 1.0.9 → 1.0.10** fix two freshly published advisories covering the distrusted emSign intermediate CAs whose private keys are now public: RUSTSEC-2026-0382 (rustls-webpki could accept certificate paths containing those intermediates) and RUSTSEC-2026-0381 (webpki-roots bundled `emSign ECC Root CA - G3`). Both are patch-level bumps with no API changes. A second `webpki-roots` 0.26.x copy remains in the lockfile via `sqlx-core` 0.8 (the 0.26 line has no patched release); eliminating it requires the sqlx 0.9 upgrade tracked separately.
+
 ## [0.1.17] - 2026-10-15
 
 ### Security
