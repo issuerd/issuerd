@@ -143,7 +143,10 @@ p521 = "0.13"
 rand = "0.8"
 
 # Storage
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "migrate", "uuid", "chrono", "json"] }
+# 0.9: the combined `runtime-tokio-rustls` feature was deleted upstream — it is
+# now `runtime-tokio` + `tls-rustls` (= tls-rustls-ring → webpki-roots ^1, which
+# drops the unpatched webpki-roots 0.26 line, RUSTSEC-2026-0381).
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "uuid", "chrono", "json"] }
 
 # Cache / Cluster
 # 0.29: drops rustls-pemfile (RUSTSEC-2025-0134) from the tree — native-certs

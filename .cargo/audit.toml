@@ -22,27 +22,16 @@
 #   granit-parser); serde_yaml/unsafe-libyaml are out of the lockfile. No
 #   ignore.
 #
-# - RUSTSEC-2023-0071 (rsa/Marvin): resolved in the BUILD graph — jsonwebtoken
-#   uses the aws_lc_rs backend and RSA key generation uses OpenSSL, so rsa is
-#   never compiled (verifiable: `cargo tree -i rsa --target all` prints
-#   nothing). rsa still appears in Cargo.lock as an *inactivated weak optional
-#   edge*: any sqlx feature that touches its driver crates (migrate, uuid,
-#   chrono, json) records `sqlx-mysql` in the lock via `sqlx-mysql?/...` weak
-#   dependencies, and sqlx-mysql lists rsa. This is the upstream
-#   rust-lang/cargo#10801 lockfile quirk; the lock entry is never downloaded,
-#   compiled, or linked into issuerd (postgres-only sqlx feature set — the
-#   `mysql` feature is never enabled, including under --all-features, which
-#   applies to workspace crates only). The ignore below exists solely to stop
-#   cargo-audit's feature-blind lockfile scan from flagging a crate the build
-#   never sees; drop it if sqlx removes the weak edges or cargo fixes lockfile
-#   pruning.
+# - RUSTSEC-2023-0071 (rsa/Marvin): resolved for real — jsonwebtoken uses the
+#   aws_lc_rs backend and RSA key generation uses OpenSSL, so rsa was never
+#   compiled; the sqlx 0.9 upgrade (2026-10) removed the last lockfile trace
+#   (sqlx-mysql's rsa dependency moved behind the off-by-default `mysql-rsa`
+#   feature, so cargo no longer records the inactivated weak edge — the
+#   cargo#10801 lockfile quirk no longer applies). rsa is in neither the
+#   lockfile nor the build graph. No ignore.
 
 [advisories]
 ignore = [
-    # Not an accepted risk: rsa is absent from the compiled graph (cargo tree
-    # --target all); lockfile-only entry via sqlx's inactivated
-    # `sqlx-mysql?/...` weak optional deps (cargo#10801). See header comment.
-    "RUSTSEC-2023-0071",
     # Temporary build-only vendored-archive ignores; see header comment.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",

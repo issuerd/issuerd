@@ -11,12 +11,12 @@ feature-depth = 1
 # --- Advisory checks ---
 [advisories]
 yanked = "deny"
-# - RUSTSEC-2023-0071 (rsa/Marvin) — resolved by removing the rsa crate from
-#   the compiled graph: jsonwebtoken uses the aws_lc_rs backend, RSA key
-#   generation uses OpenSSL (see workspace Cargo.toml). rsa lingers in
-#   Cargo.lock only as an inactivated weak optional edge of sqlx
-#   (cargo#10801) — never compiled; .cargo/audit.toml carries a scoped
-#   tooling-gap ignore for cargo-audit's feature-blind lockfile scan.
+# - RUSTSEC-2023-0071 (rsa/Marvin) — resolved for real: jsonwebtoken uses the
+#   aws_lc_rs backend and RSA key generation uses OpenSSL, so rsa was never
+#   compiled; the sqlx 0.9 upgrade removed the last lockfile trace (its
+#   sqlx-mysql rsa dependency moved behind the off-by-default `mysql-rsa`
+#   feature, so cargo no longer records the inactivated weak edge). The crate
+#   is in neither the lockfile nor the build graph.
 # - RUSTSEC-2025-0134 (rustls-pemfile unmaintained) — resolved by the redis
 #   0.29 upgrade (rustls-native-certs 0.8 moved to rustls-pki-types); the
 #   crate is out of the lockfile entirely.
