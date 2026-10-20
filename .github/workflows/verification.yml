@@ -57,7 +57,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Flux (z3 + liquid-fixpoint + cargo-flux)
-        run: curl -fsSL https://raw.githubusercontent.com/flux-rs/flux/main/install.sh | bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch the installer through the authenticated GitHub API, not
+          # raw.githubusercontent.com: the raw CDN rate-limits the shared
+          # runner egress IPs with transient 403s (flux job failed on this
+          # 2026-10-20). Fall back to the raw URL with retries if the API
+          # itself hiccups.
+          gh api repos/flux-rs/flux/contents/install.sh \
+            -H "Accept: application/vnd.github.raw" > flux-install.sh \
+            || curl -fsSL --retry 5 --retry-all-errors \
+                https://raw.githubusercontent.com/flux-rs/flux/main/install.sh > flux-install.sh
+          bash flux-install.sh
       # Scoped to the annotated defs (SecondsNonZero, models.rs): the flux
       # driver ICEs on ordinary iterator chains elsewhere in the crate
       # (flux-rs/flux#1666 at projections.rs:382, plus infer.rs:484), so a
