@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Package an issuerd release archive for one platform.
 #
-#   scripts/package-release.sh <linux|linux-arm64|windows|windows-arm64|macos|macos-amd64> <version> <binary-path> <out-dir>
+#   scripts/package-release.sh <linux|linux-arm64|linux-glibc228|windows|windows-arm64|macos|macos-amd64> <version> <binary-path> <out-dir>
 #
 # Produces in <out-dir>:
 #   issuerd_<version>_<platform>.tar.gz   (linux → linux_amd64, linux-arm64 → linux_arm64,
+#                                          linux-glibc228 → linux_amd64_glibc228,
 #                                          macos → macos_arm64, macos-amd64 → macos_amd64)
 #   issuerd_<version>_<platform>.zip      (windows → windows_amd64, windows-arm64 → windows_arm64)
 #   issuerd_<version>_<platform>.sbom.cyclonedx.json
@@ -16,7 +17,7 @@
 # (.act/run-release.sh), so both produce byte-comparable packaging.
 set -euo pipefail
 
-OS="${1:?usage: package-release.sh <linux|linux-arm64|windows|windows-arm64|macos|macos-amd64> <version> <binary-path> <out-dir>}"
+OS="${1:?usage: package-release.sh <linux|linux-arm64|linux-glibc228|windows|windows-arm64|macos|macos-amd64> <version> <binary-path> <out-dir>}"
 VERSION="${2:?missing version (e.g. 0.1.1)}"
 BINARY="${3:?missing path to the built issuerd binary}"
 OUT_DIR="${4:?missing output directory}"
@@ -25,11 +26,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "$OS" in
   linux)       BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=linux_amd64 ;;
   linux-arm64) BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=linux_arm64 ;;
+  linux-glibc228) BIN_NAME=issuerd;  ARCHIVE_EXT=tar.gz; PLATFORM=linux_amd64_glibc228 ;;
   windows)     BIN_NAME=issuerd.exe; ARCHIVE_EXT=zip;    PLATFORM=windows_amd64 ;;
   windows-arm64) BIN_NAME=issuerd.exe; ARCHIVE_EXT=zip;  PLATFORM=windows_arm64 ;;
   macos)       BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=macos_arm64 ;;
   macos-amd64) BIN_NAME=issuerd;     ARCHIVE_EXT=tar.gz; PLATFORM=macos_amd64 ;;
-  *) echo "error: unknown OS '$OS' (linux|linux-arm64|windows|windows-arm64|macos|macos-amd64)" >&2; exit 2 ;;
+  *) echo "error: unknown OS '$OS' (linux|linux-arm64|linux-glibc228|windows|windows-arm64|macos|macos-amd64)" >&2; exit 2 ;;
 esac
 [ -f "$BINARY" ] || { echo "error: binary not found: $BINARY" >&2; exit 2; }
 

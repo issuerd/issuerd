@@ -1,0 +1,123 @@
+# glibc 2.28 compatibility build (linux/amd64) — a best-effort companion to
+# the canonical Dockerfile, driven by the linux-glibc228-binary job in
+# .github/workflows/release.yml. It produces the binary for the
+# issuerd_<version>_linux_amd64_glibc228 release archive; the image itself is
+# NOT published anywhere.
+#
+#   docker build -f Dockerfile.glibc228 -t issuerd:glibc228 .
+#   docker run --rm issuerd:glibc228 --version   # smoke on glibc 2.28
+#
+# *** Best-effort variant *** — it exists only while its upstream build inputs
+# still build on a glibc 2.28 toolchain (the Rust x86_64-unknown-linux-gnu
+# baseline is exactly glibc 2.28 today; official Node 24 linux-x64 builds
+# require >= 2.28; OpenSSL and webauthn-rs already forced the source-built
+# OpenSSL below). When any of those move past this base, the variant may be
+# dropped from future releases without notice.
+#
+# Differences vs the canonical Dockerfile:
+#   - builder base is debian:buster-slim (glibc 2.28) instead of the
+#     Playwright jammy image (glibc 2.35); buster is EOL, so apt points at
+#     archive.debian.org
+#   - Node 24 comes from the official tarball (no bundled Node in this base)
+#   - OpenSSL 3.5 LTS is built from source, static-only: buster ships only
+#     OpenSSL 1.1.1, which webauthn-rs 0.5 refuses at build time. Static
+#     linking means the shipped binary needs no libssl at runtime at all.
+#   - the runtime stage is plain buster-slim + the Kerberos runtime libs (not
+#     distroless): it exists only to smoke-run the binary on a clean glibc
+#     2.28 userland and to hand the binary out to the packaging step.
+
+# -----------------------------------------------------------------------------
+# Stage 1: build environment on glibc 2.28.
+# -----------------------------------------------------------------------------
+FROM debian:buster-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# buster is EOL — the regular mirrors are gone; use the archive and stop apt
+# from rejecting the frozen Release files.
+RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive \
+    && printf '%s\n' \
+        'deb http://archive.debian.org/debian buster main' \
+        'deb http://archive.debian.org/debian-security buster/updates main' \
+        > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils gzip build-essential pkg-config perl \
+        libkrb5-dev libclang-dev clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenSSL 3.5 LTS, static-only, own prefix. The base's 1.1.1 dev package is
+# deliberately NOT installed, so openssl-sys can only ever see this one.
+ARG OPENSSL_VERSION=3.5.9
+ARG OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+RUN curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+    && echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c - \
+    && tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz" \
+    && cd "openssl-${OPENSSL_VERSION}" \
+    && ./Configure no-shared no-tests --prefix=/usr/local/openssl3 --openssldir=/usr/local/openssl3 \
+    && make -j"$(nproc)" \
+    && make install_sw \
+    && cd / && rm -rf "/openssl-${OPENSSL_VERSION}" "openssl-${OPENSSL_VERSION}.tar.gz"
+
+ENV OPENSSL_DIR=/usr/local/openssl3
+ENV OPENSSL_STATIC=1
+
+# Pinned Rust toolchain (same pin as the canonical Dockerfile).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.95.0 \
+    && /root/.cargo/bin/rustc --version
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Node 24 (pinned + verified) for the SPA build; official linux-x64 builds
+# require glibc >= 2.28, i.e. exactly this base.
+ARG NODE_VERSION=24.22.1
+ARG NODE_SHA256=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE_SHA256}  node-v${NODE_VERSION}-linux-x64.tar.xz" | sha256sum -c - \
+    && tar -xJf "node-v${NODE_VERSION}-linux-x64.tar.xz" -C /usr/local --strip-components=1 \
+    && rm -f "node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && node --version && npm --version
+
+WORKDIR /build
+
+# Workspace manifests and source (mirrors the canonical Dockerfile), plus
+# examples/ — issuerd-core's provision unit test reads the committed example
+# files, and the CI job runs the unit suite inside this image.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY src/ ./src/
+COPY build.rs ./
+COPY themes/ ./themes/
+COPY examples/ ./examples/
+
+# Build the embedded web client first — the release build embeds
+# webclientsrc/dist via include_dir! (see the canonical Dockerfile).
+COPY webclientsrc/ ./webclientsrc/
+RUN cd webclientsrc && npm ci && npm run generate-api && npm run build
+
+# Release binary with the Cargo dependency tree embedded (same as the
+# canonical build — scripts/package-release.sh scans the binary for the SBOM).
+RUN cargo install cargo-auditable --locked \
+    && cargo auditable build --bin issuerd --release --locked
+
+# -----------------------------------------------------------------------------
+# Stage 2: smoke runtime on a clean glibc 2.28 userland (Kerberos libs only —
+# OpenSSL is statically linked into the binary). Not published anywhere.
+# -----------------------------------------------------------------------------
+FROM debian:buster-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive \
+    && printf '%s\n' \
+        'deb http://archive.debian.org/debian buster main' \
+        'deb http://archive.debian.org/debian-security buster/updates main' \
+        > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libgssapi-krb5-2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/issuerd /usr/local/bin/issuerd
+
+ENTRYPOINT ["/usr/local/bin/issuerd"]

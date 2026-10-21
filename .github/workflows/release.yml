@@ -92,6 +92,7 @@ jobs:
           ### Archives
 
           - \`issuerd_${VERSION}_linux_amd64.tar.gz\` — Linux x86_64 (requires glibc ≥ 2.35, OpenSSL 3, Kerberos libs; Debian/Ubuntu: \`apt install libssl3 libgssapi-krb5-2\`)
+          - \`issuerd_${VERSION}_linux_amd64_glibc228.tar.gz\` — Linux x86_64 for older systems, built on a glibc 2.28 toolchain (requires glibc ≥ 2.28 + Kerberos libs, \`apt install libgssapi-krb5-2\`; OpenSSL 3 is statically linked)
           - \`issuerd_${VERSION}_linux_arm64.tar.gz\` — Linux arm64/aarch64, built natively (ubuntu-22.04-arm runner) on the same baseline (glibc ≥ 2.35, OpenSSL 3, Kerberos libs)
           - \`issuerd_${VERSION}_windows_amd64.zip\` — Windows x86_64 (self-contained)
           - \`issuerd_${VERSION}_windows_arm64.zip\` — Windows ARM64 (self-contained), built natively (windows-11-arm runner)
@@ -100,6 +101,8 @@ jobs:
           - \`issuerd_${VERSION}_conformance-evidence.tar.gz\` — OIDF conformance suite evidence from this tag's run (HTML reports, JSON exports, runner logs; informational — not needed to run issuerd)
 
           Each archive contains the binary, LICENSE + NOTICE, README + CHANGELOG, example configs, and a CycloneDX SBOM (also attached standalone). Verify downloads against \`SHA256SUMS.txt\`.
+
+          > **Best-effort archive:** \`linux_amd64_glibc228\` is a compatibility build for older systems. It may be discontinued in any future release, without notice, once its upstream build inputs (the Rust toolchain's glibc baseline, Node.js, OpenSSL, webauthn-rs) no longer build on a glibc 2.28 toolchain.
 
           ### Docker (multi-arch: linux/amd64 + linux/arm64)
 
@@ -214,6 +217,55 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-dist
+          path: dist/
+          if-no-files-found: error
+
+  linux-glibc228-binary:
+    name: linux amd64 binary (glibc 2.28 compatibility, best-effort)
+    needs: validate
+    # Compatibility build for systems older than the canonical baseline
+    # (glibc 2.28 vs 2.35), via Dockerfile.glibc228: a Debian buster toolchain
+    # with a statically linked, source-built OpenSSL 3.5 (buster's 1.1.1 is
+    # rejected by webauthn-rs at build time). Best-effort variant: it may be
+    # dropped from a future release when its upstream inputs (Rust toolchain /
+    # Node / OpenSSL baselines) no longer build on that toolchain. No act
+    # gating — plain Docker on an ubuntu runner, rehearses like linux-binary.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the glibc 2.28 image
+        run: docker build -f Dockerfile.glibc228 -t issuerd:glibc228 .
+      # Real execution on a clean glibc 2.28 userland (the runtime stage
+      # carries only the Kerberos libs — OpenSSL is statically linked).
+      - name: Smoke-run the binary on glibc 2.28
+        run: docker run --rm issuerd:glibc228 --version
+      # Per-variant coverage for the divergent crypto stack (static OpenSSL
+      # 3.5 here vs the canonical system OpenSSL 3.0) — same philosophy as
+      # the windows-arm64 unit run. cargo auditable test reuses the deps
+      # already compiled for the binary (plain cargo test would rebuild the
+      # whole tree with a different rustc wrapper).
+      - name: Unit tests on the glibc 2.28 toolchain
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile.glibc228 --target builder -t issuerd:glibc228-builder .
+          docker run --rm issuerd:glibc228-builder sh -c 'cd /build && cargo auditable test --locked --release --workspace --lib'
+      - name: Extract the binary
+        run: |
+          set -euo pipefail
+          cid=$(docker create issuerd:glibc228)
+          docker cp "$cid:/usr/local/bin/issuerd" ./issuerd
+          docker rm "$cid"
+      - name: Install syft (SBOM)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v1.52.0/syft_1.52.0_linux_amd64.tar.gz | tar -xz -C "$HOME/.local/bin" syft
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/syft" version
+      - name: Package the archive
+        run: bash scripts/package-release.sh linux-glibc228 "${{ needs.validate.outputs.version }}" ./issuerd ./dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-glibc228-dist
           path: dist/
           if-no-files-found: error
 
@@ -687,7 +739,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [validate, linux-binary, linux-arm64, windows-binary, windows-arm64-binary, macos-binary, heavy]
+    needs: [validate, linux-binary, linux-glibc228-binary, linux-arm64, windows-binary, windows-arm64-binary, macos-binary, heavy]
     # Gate on every need, tolerating ONLY skips (act leaves out the heavy
     # call and the macos-binary job): a failed suite or packaging job means
     # no GitHub Release.
@@ -718,13 +770,14 @@ jobs:
         with:
           name: conformance-evidence
           path: conformance-evidence
-      # Real runs must ship all six platforms; rehearsal (act) has no macOS
+      # Real runs must ship all seven platforms; rehearsal (act) has no macOS
       # job, so the macOS artifacts are only required by this check, never
       # under act.
       - name: Artifacts complete (real runs)
         if: ${{ env.ACT != 'true' }}
         run: |
           ls linux-dist/*.tar.gz linux-dist/*.sbom.cyclonedx.json \
+             linux-glibc228-dist/*.tar.gz linux-glibc228-dist/*.sbom.cyclonedx.json \
              linux-arm64-dist/*.tar.gz linux-arm64-dist/*.sbom.cyclonedx.json \
              windows-dist/*.zip windows-dist/*.sbom.cyclonedx.json \
              windows-arm64-dist/*.zip windows-arm64-dist/*.sbom.cyclonedx.json \
@@ -736,7 +789,7 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           : > SHA256SUMS.txt
-          for d in linux-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
+          for d in linux-dist linux-glibc228-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
             if [ -d "$d" ]; then (cd "$d" && sha256sum *) >> SHA256SUMS.txt; fi
           done
           # Standalone conformance evidence asset (absent under act).
@@ -752,6 +805,7 @@ jobs:
         with:
           subject-path: |
             linux-dist/*
+            linux-glibc228-dist/*
             linux-arm64-dist/*
             windows-dist/*
             windows-arm64-dist/*
@@ -767,6 +821,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             linux-dist/*
+            linux-glibc228-dist/*
             linux-arm64-dist/*
             windows-dist/*
             windows-arm64-dist/*

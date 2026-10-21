@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **New release archive for older Linux systems (`linux_amd64_glibc228`).** Tag releases now also ship `issuerd_<version>_linux_amd64_glibc228.tar.gz` — an x86_64 binary built on a glibc 2.28 toolchain (the canonical `linux_amd64` build targets glibc ≥ 2.35), for systems too old to run the canonical binary. OpenSSL 3 is statically linked into this variant, so its only runtime requirements are glibc ≥ 2.28 and the Kerberos GSS-API libraries (`libgssapi-krb5-2`); functionality is identical. The variant is best-effort: it may be dropped from future releases without notice once its upstream build inputs (the Rust toolchain's glibc baseline, Node.js, OpenSSL, webauthn-rs) no longer build on a glibc 2.28 toolchain.
+
 ### Security
 
 - **Admin API tenant isolation and credential handling are hardened.** Realm binding now uses the same percent-decoded realm as the handlers, DPoP-bound-as-Bearer, revoked, and session-ended tokens are rejected, and only `admin-cli` or a custom client with `admin_api_access = "true"` can call the Admin API (ordinary relying-party tokens no longer work even with admin roles). Custom automation must be opted in by a `manage-realm` administrator; open dynamic registration cannot self-enable it. Admin-role grants are restricted to callers allowed to hold them, and service-account users are resolved by a deterministic client-UUID-linked identity rather than a username, closing pre-existing `service-account-*` squatting. Once the linked account exists, an unlinked legacy account occupying its conventional name is disabled without copying roles, and the Admin API refuses to re-enable it. **Action:** review legacy service-account users and reassign any intended roles to the new linked accounts once after upgrading.
