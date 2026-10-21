@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-10-21
+
 ### Added
 
 - **New release archive for older Linux systems (`linux_amd64_glibc228`).** Tag releases now also ship `issuerd_<version>_linux_amd64_glibc228.tar.gz` — an x86_64 binary built on a glibc 2.28 toolchain (the canonical `linux_amd64` build targets glibc ≥ 2.35), for systems too old to run the canonical binary. OpenSSL 3 is statically linked into this variant, so its only runtime requirements are glibc ≥ 2.28 and the Kerberos GSS-API libraries (`libgssapi-krb5-2`); functionality is identical. The variant is best-effort: it may be dropped from future releases without notice once its upstream build inputs (the Rust toolchain's glibc baseline, Node.js, OpenSSL, webauthn-rs) no longer build on a glibc 2.28 toolchain.
