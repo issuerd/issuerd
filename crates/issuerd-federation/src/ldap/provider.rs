@@ -267,6 +267,14 @@ impl FederationProvider for LdapFederationProvider {
         username: &str,
         password: &str,
     ) -> Result<bool, FederationError> {
+        // A simple bind with a DN and an empty password is an unauthenticated
+        // bind (RFC 4513 §5.1.2): servers that allow it report success without
+        // checking any password. Never send one; reject before any directory
+        // traffic so the outcome does not depend on whether the user exists.
+        if password.is_empty() {
+            tracing::debug!(provider_id = %self.id, username = %issuerd_core::utils::sanitize_log_str(username), "LDAP password validation failed: empty password");
+            return Ok(false);
+        }
         // Always perform the bind even when the user is not found to avoid a
         // timing side-channel that would reveal whether a username exists.
         let user_exists = match self.search_user(username).await {
@@ -730,6 +738,19 @@ mod tests {
 
         let provider = make_provider(factory, vec![]);
         assert!(!provider.validate_password("missing", "secret").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ldap_provider_validate_password_empty_never_binds() {
+        // An empty password would be an unauthenticated bind that many
+        // directories accept. No client is available: acquiring a connection
+        // (for the search or the bind) would panic the mock factory.
+        let factory = MockFactory {
+            clients: Mutex::new(vec![]),
+        };
+
+        let provider = make_provider(factory, vec![]);
+        assert!(!provider.validate_password("alice", "").await.unwrap());
     }
 
     #[test]

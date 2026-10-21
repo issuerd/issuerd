@@ -8,6 +8,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::{error::AdminApiError, state::AdminApiState};
@@ -38,6 +39,15 @@ pub async fn admin_auth_middleware(
         warn!(error = %e, "admin API authentication failed");
         AdminApiError::Unauthorized
     })?;
+    // Bearer-only API: a DPoP-bound token (`cnf.jkt`) must be presented with
+    // a proof (RFC 9449 §7.1), which this API does not accept — reject the
+    // downgrade instead of letting a stolen proof-bound token authenticate
+    // as plain Bearer (same rule as the account API).
+    if validated.claims.cnf.is_some() {
+        warn!("admin API authentication failed: DPoP-bound token presented as Bearer");
+        return Err(AdminApiError::Unauthorized);
+    }
+    enforce_not_revoked(&state, token).await?;
     enforce_realm_binding(&state, &validated.claims, request.method(), request.uri().path())
         .await?;
     request.extensions_mut().insert(AdminAuth {
@@ -69,6 +79,10 @@ pub async fn admin_auth_middleware(
 /// enforced, so the request is rejected. A realm that simply does not exist
 /// (`Ok(None)`) is not an error — an unknown path realm is left to the
 /// handler to 404.
+///
+/// The token's backing user session must also still exist (see
+/// [`enforce_live_session`]), so logout and session deletion end admin
+/// access immediately.
 async fn enforce_realm_binding(
     state: &AdminApiState,
     claims: &issuerd_core::AccessTokenClaims,
@@ -94,12 +108,14 @@ async fn enforce_realm_binding(
         }
     };
     enforce_not_before(issuing_realm.as_ref(), claims)?;
+    enforce_admin_client(state, issuing_realm.as_ref(), claims).await?;
+    enforce_live_session(state, issuing_realm.as_ref(), claims).await?;
     if issuing_realm.as_ref().is_some_and(|r| r.name.as_str() == MASTER_REALM) {
         // Master tokens administer every realm; when the path names a
         // different realm, that realm's not_before applies too.
-        if let Some(path_realm) = path_realm_segment(path) {
+        if let Some(path_realm) = path_realm_segment(path)? {
             if path_realm != MASTER_REALM {
-                let realm = match state.storage.get_realm_by_name(path_realm).await {
+                let realm = match state.storage.get_realm_by_name(&path_realm).await {
                     Ok(realm) => realm,
                     Err(e) => {
                         warn!(realm = %path_realm, error = %e,
@@ -112,7 +128,7 @@ async fn enforce_realm_binding(
         }
         return Ok(());
     }
-    let Some(path_realm) = path_realm_segment(path) else {
+    let Some(path_realm) = path_realm_segment(path)? else {
         // Server metadata and the enum listings are server-global and
         // realm-agnostic; every realm's admin console reads them, so they are
         // exempt from the master-only rule (the handlers enforce
@@ -127,7 +143,7 @@ async fn enforce_realm_binding(
         warn!("admin API authorization denied: realm-less path requires a master realm token");
         return Err(AdminApiError::Forbidden);
     };
-    match state.storage.get_realm_by_name(path_realm).await {
+    match state.storage.get_realm_by_name(&path_realm).await {
         Ok(Some(realm)) if realm.name.as_str() == token_realm => {
             // Same realm as the issuer — enforce the cutoff from the freshly
             // loaded path-realm row.
@@ -148,6 +164,35 @@ async fn enforce_realm_binding(
             Err(AdminApiError::Internal(anyhow::Error::new(e)))
         }
     }
+}
+
+/// Accept admin credentials only from the built-in admin client or from a
+/// custom client explicitly enabled by a `manage-realm` administrator.
+async fn enforce_admin_client(
+    state: &AdminApiState,
+    issuing_realm: Option<&issuerd_core::Realm>,
+    claims: &issuerd_core::AccessTokenClaims,
+) -> Result<(), AdminApiError> {
+    let Some(realm) = issuing_realm else {
+        warn!("admin API authentication failed: token issuing realm no longer exists");
+        return Err(AdminApiError::Unauthorized);
+    };
+    let client_name = claims.azp.as_deref().unwrap_or_else(|| claims.aud.as_str());
+    let Ok(identifier) = issuerd_core::ClientIdentifier::new(client_name) else {
+        return Err(AdminApiError::Forbidden);
+    };
+    let client = state
+        .storage
+        .get_client_by_client_id(&realm.id, &identifier)
+        .await
+        .map_err(fail_closed)?
+        .ok_or(AdminApiError::Forbidden)?;
+    if client.admin_api_access_allowed() {
+        return Ok(());
+    }
+    warn!(realm = %realm.name, client_id = %client_name,
+        "admin API authorization denied: client is not enabled for admin access");
+    Err(AdminApiError::Forbidden)
 }
 
 /// Reject tokens issued before a realm's revocation cutoff (`not_before`).
@@ -172,16 +217,151 @@ fn enforce_not_before(
     Ok(())
 }
 
+/// Reject tokens on the revocation blocklist (`revoked:{token}`), written by
+/// the RFC 7009 `/revoke` endpoint and authorization-code replay detection.
+///
+/// A cache error fails closed: revocation cannot be evaluated, so the token
+/// must not be treated as valid.
+async fn enforce_not_revoked(state: &AdminApiState, token: &str) -> Result<(), AdminApiError> {
+    match state.cache.get(&format!("revoked:{token}")).await {
+        Ok(Some(_)) => {
+            warn!("admin API authentication failed: token has been revoked");
+            Err(AdminApiError::Unauthorized)
+        }
+        Ok(None) => Ok(()),
+        Err(e) => {
+            warn!(error = %e, "admin API revocation lookup failed; rejecting token (fail-closed)");
+            Err(AdminApiError::Internal(anyhow::Error::new(e)))
+        }
+    }
+}
+
+/// Reject a token whose backing user session (`sid`) no longer exists —
+/// logout, admin session deletion, SSO-idle cleanup — mirroring the server's
+/// `enforce_token_validity` gate used by userinfo and the account API.
+///
+/// Session-less client-credentials tokens carry a synthetic, never-persisted
+/// `sid` and are recognized by shape instead. A token whose issuing realm no
+/// longer exists has no session to back it and is rejected; a storage error
+/// fails closed (500).
+async fn enforce_live_session(
+    state: &AdminApiState,
+    issuing_realm: Option<&issuerd_core::Realm>,
+    claims: &issuerd_core::AccessTokenClaims,
+) -> Result<(), AdminApiError> {
+    let Some(sid) = claims.sid.as_ref() else {
+        return Ok(());
+    };
+    let Some(realm) = issuing_realm else {
+        warn!("admin API authentication failed: token issuing realm no longer exists");
+        return Err(AdminApiError::Unauthorized);
+    };
+    let session = state.storage.get_user_session(&realm.id, sid).await.map_err(fail_closed)?;
+    if session.is_some() || is_sessionless_client_token(state, &realm.id, claims).await? {
+        return Ok(());
+    }
+    warn!(realm = %realm.name, "admin API authentication failed: token session no longer exists");
+    Err(AdminApiError::Unauthorized)
+}
+
+/// Recognize session-less client-credentials tokens by shape: `sub` equals
+/// the requesting client's own `client_id` (legacy synthetic shape), or the
+/// id of the client-linked service-account user. Mirrors
+/// `issuerd_server::routes::oidc::is_sessionless_client_token`.
+async fn is_sessionless_client_token(
+    state: &AdminApiState,
+    realm_id: &issuerd_core::RealmId,
+    claims: &issuerd_core::AccessTokenClaims,
+) -> Result<bool, AdminApiError> {
+    let client_name = claims.azp.clone().unwrap_or_else(|| claims.aud.as_str().to_string());
+    if claims.sub.as_ref() == client_name {
+        return Ok(true);
+    }
+    let Ok(identifier) = issuerd_core::ClientIdentifier::new(&client_name) else {
+        return Ok(false);
+    };
+    let client = match state
+        .storage
+        .get_client_by_client_id(realm_id, &identifier)
+        .await
+        .map_err(fail_closed)?
+    {
+        Some(c) if c.service_accounts_enabled => c,
+        _ => return Ok(false),
+    };
+    Ok(matches!(
+        issuerd_core::service_account::find_service_account_user(
+            state.storage.as_ref(),
+            realm_id,
+            &client,
+        )
+        .await
+        .map_err(fail_closed)?,
+        Some(user) if user.id == claims.sub
+    ))
+}
+
+/// Map a storage failure on a token-validity lookup to a fail-closed
+/// 500: the gate cannot be evaluated, so the request is rejected.
+fn fail_closed(e: issuerd_core::IssuerdError) -> AdminApiError {
+    warn!(error = %e, "admin token validity lookup failed; rejecting request (fail-closed)");
+    AdminApiError::Internal(anyhow::Error::new(e))
+}
+
 /// Extract the `{realm}` segment from `/…/realms/{realm}/…` request paths.
-fn path_realm_segment(path: &str) -> Option<&str> {
+///
+/// The segment is percent-decoded exactly as axum's `Path` extractor decodes
+/// it for the handler, so the binding is checked against the realm the
+/// handler acts on (`mast%65r` binds as `master`). A segment whose escapes
+/// do not decode to UTF-8 is rejected with 400, as the handler's extractor
+/// would reject it.
+fn path_realm_segment(path: &str) -> Result<Option<Cow<'_, str>>, AdminApiError> {
     let mut segments = path.split('/');
     while let Some(segment) = segments.next() {
         if segment == "realms" {
-            // `count` is the `/realms/count` route, not a realm name.
-            return segments.next().filter(|s| !s.is_empty() && *s != "count");
+            // `count` is the `/realms/count` route, not a realm name. The
+            // router matches that static route on the raw segment, so the
+            // check is made before decoding.
+            let Some(raw) = segments.next().filter(|s| !s.is_empty() && *s != "count") else {
+                return Ok(None);
+            };
+            return match percent_decode_utf8(raw) {
+                Some(decoded) => Ok(Some(decoded)),
+                None => {
+                    warn!("admin API request rejected: realm path segment is not valid UTF-8");
+                    Err(AdminApiError::BadRequest("invalid realm path segment".to_string()))
+                }
+            };
         }
     }
-    None
+    Ok(None)
+}
+
+/// Percent-decode like axum's path parameters
+/// (`percent_encoding::percent_decode(..).decode_utf8()`): `%` followed by two
+/// hex digits becomes that byte, any other `%` stays literal, and the result
+/// must be valid UTF-8.
+fn percent_decode_utf8(raw: &str) -> Option<Cow<'_, str>> {
+    if !raw.contains('%') {
+        return Some(Cow::Borrowed(raw));
+    }
+    let hex = |b: Option<&u8>| b.and_then(|&b| char::from(b).to_digit(16));
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok().map(Cow::Owned)
 }
 
 pub fn require_roles(auth: &AdminAuth, allowed: &[&str]) -> Result<(), AdminApiError> {
@@ -195,6 +375,15 @@ pub fn require_roles(auth: &AdminAuth, allowed: &[&str]) -> Result<(), AdminApiE
         warn!(roles = ?allowed, token_roles = ?roles, "admin API authorization denied: insufficient roles");
         Err(AdminApiError::Forbidden)
     }
+}
+
+/// Whether the admin token carries `role`. A silent check for shaping a
+/// response; use [`require_roles`] to authorize.
+pub fn has_realm_role(auth: &AdminAuth, role: &str) -> bool {
+    auth.claims
+        .realm_access
+        .as_ref()
+        .is_some_and(|ra| ra.roles.iter().any(|r| r.as_ref() == role))
 }
 
 /// Require the admin token to be issued by the master realm.
@@ -234,13 +423,13 @@ mod tests {
                 jti: JwtId::new("jti").unwrap(),
                 iss: Issuer::new(iss).unwrap(),
                 sub: issuerd_core::UserId::new("admin").unwrap(),
-                aud: Audience::new("aud").unwrap(),
+                aud: Audience::new("admin-cli").unwrap(),
                 exp: 9999999999,
                 iat: 0,
                 nbf: 0,
                 scope: issuerd_core::Scope::parse("openid"),
                 typ: JwtType::Bearer,
-                azp: None,
+                azp: Some("admin-cli".to_string()),
                 session_state: None,
                 realm_access: Some(RealmAccess { roles }),
                 resource_access: None,
@@ -345,22 +534,20 @@ mod tests {
     }
 
     impl issuerd_core::TokenService for IssMockTokenService {
-        fn validate_access_token(
-            &self,
-            _token: &str,
-        ) -> Result<ValidatedAccessToken, IssuerdError> {
+        fn validate_access_token(&self, token: &str) -> Result<ValidatedAccessToken, IssuerdError> {
+            let client_id = token.strip_prefix("client:").unwrap_or("admin-cli");
             Ok(ValidatedAccessToken {
                 claims: AccessTokenClaims {
                     jti: JwtId::new("jti").unwrap(),
                     iss: Issuer::new(&self.iss).unwrap(),
                     sub: issuerd_core::UserId::new("admin").unwrap(),
-                    aud: Audience::new("aud").unwrap(),
+                    aud: Audience::new(client_id).unwrap(),
                     exp: 9999999999,
                     iat: self.iat,
                     nbf: 0,
                     scope: issuerd_core::Scope::parse("openid"),
                     typ: JwtType::Bearer,
-                    azp: None,
+                    azp: Some(client_id.to_string()),
                     session_state: None,
                     realm_access: Some(RealmAccess {
                         roles: vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
@@ -441,6 +628,9 @@ mod tests {
             ..Default::default()
         };
         state.storage.create_realm(&tenant).await.unwrap();
+        let admin_cli =
+            crate::realms::build_admin_cli_client(&tenant.id, "http://localhost:8080").unwrap();
+        state.storage.create_client(&tenant.id, &admin_cli).await.unwrap();
         state
     }
 
@@ -466,10 +656,14 @@ mod tests {
     }
 
     async fn call(app: Router, uri: &str) -> StatusCode {
+        call_with_token(app, uri, "token").await
+    }
+
+    async fn call_with_token(app: Router, uri: &str, token: &str) -> StatusCode {
         app.oneshot(
             Request::builder()
                 .uri(uri)
-                .header(axum::http::header::AUTHORIZATION, "Bearer token")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -478,14 +672,68 @@ mod tests {
         .status()
     }
 
+    fn segment(path: &str) -> Option<String> {
+        path_realm_segment(path).unwrap().map(Cow::into_owned)
+    }
+
     #[test]
     fn path_realm_segment_extraction() {
-        assert_eq!(path_realm_segment("/admin/realms/master/users"), Some("master"));
-        assert_eq!(path_realm_segment("/admin/realms/tenant"), Some("tenant"));
-        assert_eq!(path_realm_segment("/admin/realms"), None);
-        assert_eq!(path_realm_segment("/admin/realms/count"), None);
-        assert_eq!(path_realm_segment("/admin/serverinfo"), None);
-        assert_eq!(path_realm_segment("/admin/enums/protocols"), None);
+        assert_eq!(segment("/admin/realms/master/users").as_deref(), Some("master"));
+        assert_eq!(segment("/admin/realms/tenant").as_deref(), Some("tenant"));
+        assert_eq!(segment("/admin/realms"), None);
+        assert_eq!(segment("/admin/realms/count"), None);
+        assert_eq!(segment("/admin/serverinfo"), None);
+        assert_eq!(segment("/admin/enums/protocols"), None);
+    }
+
+    #[test]
+    fn path_realm_segment_is_percent_decoded_like_axum_path() {
+        assert_eq!(segment("/admin/realms/mast%65r/users").as_deref(), Some("master"));
+        assert_eq!(segment("/admin/realms/%6D%61%73%74%65%72").as_deref(), Some("master"));
+        // An encoded `count` is routed to `/realms/{realm}`, not `/realms/count`.
+        assert_eq!(segment("/admin/realms/c%6Funt").as_deref(), Some("count"));
+        // `%` without two hex digits stays literal (percent_encoding semantics).
+        assert_eq!(segment("/admin/realms/a%zz%4").as_deref(), Some("a%zz%4"));
+        assert_eq!(segment("/admin/realms/%%41").as_deref(), Some("%A"));
+        assert_eq!(segment("/admin/realms/caf%C3%A9").as_deref(), Some("caf\u{e9}"));
+        assert!(matches!(
+            path_realm_segment("/admin/realms/%FF/users"),
+            Err(AdminApiError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn path_realm_segment_matches_axum_path_extractor() {
+        // The binding must see the same realm value the handler extracts.
+        let app = Router::new().route(
+            "/admin/realms/{realm}/users",
+            get(|axum::extract::Path(realm): axum::extract::Path<String>| async move { realm }),
+        );
+        for raw in [
+            "master",
+            "mast%65r",
+            "%6d%61ster",
+            "a%zz%4",
+            "%%41",
+            "caf%C3%A9",
+            "%FF",
+        ] {
+            let uri = format!("/admin/realms/{raw}/users");
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            match path_realm_segment(&uri) {
+                Ok(Some(decoded)) => {
+                    assert_eq!(response.status(), StatusCode::OK, "{raw}");
+                    let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                    assert_eq!(body, decoded.as_bytes(), "{raw}");
+                }
+                Ok(None) => panic!("{raw}: segment not extracted"),
+                Err(_) => assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{raw}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -502,11 +750,84 @@ mod tests {
         assert_eq!(call(app, "/admin/realms/tenant/users").await, StatusCode::OK);
     }
 
+    async fn state_with_custom_client(enabled: bool, admin_api_access: bool) -> Arc<AdminApiState> {
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let realm_id = issuerd_core::RealmId::new("tenant-uuid").unwrap();
+        let mut client =
+            crate::realms::build_admin_cli_client(&realm_id, "http://localhost:8080").unwrap();
+        client.id = issuerd_core::ClientId::new("shop-uuid").unwrap();
+        client.client_id = issuerd_core::ClientIdentifier::new("shop").unwrap();
+        client.enabled = enabled;
+        if admin_api_access {
+            client.attributes.insert(
+                issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE.to_string(),
+                "true".to_string(),
+            );
+        }
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn ordinary_relying_party_token_is_not_an_admin_credential() {
+        let app = binding_app(state_with_custom_client(true, false).await);
+        assert_eq!(
+            call_with_token(app, "/admin/realms/tenant/users", "client:shop").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_enabled_custom_client_is_an_admin_credential() {
+        let app = binding_app(state_with_custom_client(true, true).await);
+        assert_eq!(
+            call_with_token(app, "/admin/realms/tenant/users", "client:shop").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_custom_client_is_not_an_admin_credential() {
+        let app = binding_app(state_with_custom_client(false, true).await);
+        assert_eq!(
+            call_with_token(app, "/admin/realms/tenant/users", "client:shop").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
     #[tokio::test]
     async fn realm_token_denied_for_other_realm() {
         let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
         let app = binding_app(state);
         assert_eq!(call(app, "/admin/realms/master/users").await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn realm_token_denied_for_percent_encoded_other_realm() {
+        // The handler's `Path` extractor decodes `mast%65r` to `master`, so the
+        // binding must reject it exactly like the plain spelling.
+        for uri in [
+            "/admin/realms/mast%65r/users",
+            "/admin/realms/%6Daster/users",
+        ] {
+            let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+            let app = binding_app(state);
+            assert_eq!(call(app, uri).await, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn realm_token_administers_own_realm_percent_encoded() {
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/realms/tenan%74/users").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_realm_segment_is_rejected() {
+        let state = state_with_tenant("http://localhost:8080/realms/tenant").await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/realms/%FF/users").await, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -667,6 +988,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn not_before_of_percent_encoded_path_realm_rejects_master_token() {
+        let state = state_with_tenant_and_iat("http://localhost:8080/realms/master", 500).await;
+        set_not_before(&state, "tenant", 1000).await;
+        let app = binding_app(state);
+        assert_eq!(call(app, "/admin/realms/tenan%74/users").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn not_before_of_issuing_realm_rejects_master_token() {
         // The issuing (master) realm's cutoff applies to every request.
         let state = state_with_tenant_and_iat("http://localhost:8080/realms/master", 500).await;
@@ -739,6 +1068,11 @@ mod tests {
                 Err(IssuerdError::ServerError("db down".into()))
             }
         });
+        mock.expect_get_client_by_client_id().returning(|realm, _| {
+            Ok(Some(
+                crate::realms::build_admin_cli_client(realm, "http://localhost:8080").unwrap(),
+            ))
+        });
         let app = binding_app(binding_state_with_mock_storage(mock));
         assert_eq!(
             call(app, "/admin/realms/tenant/users").await,
@@ -762,6 +1096,11 @@ mod tests {
             } else {
                 Err(IssuerdError::ServerError("db down".into()))
             }
+        });
+        state_mock.expect_get_client_by_client_id().returning(|realm, _| {
+            Ok(Some(
+                crate::realms::build_admin_cli_client(realm, "http://localhost:8080").unwrap(),
+            ))
         });
         let mut crypto = issuerd_core::MockCryptoProvider::new();
         crypto
@@ -795,5 +1134,292 @@ mod tests {
             call(app, "/admin/realms/tenant/users").await,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    // -- Token lifecycle: DPoP binding, revocation, live session -------------
+
+    const TENANT_ISS: &str = "http://localhost:8080/realms/tenant";
+
+    struct ClaimsMockTokenService(AccessTokenClaims);
+
+    impl issuerd_core::TokenService for ClaimsMockTokenService {
+        fn validate_access_token(
+            &self,
+            _token: &str,
+        ) -> Result<ValidatedAccessToken, IssuerdError> {
+            Ok(ValidatedAccessToken {
+                claims: self.0.clone(),
+                header: issuerd_core::JwsHeader {
+                    alg: issuerd_core::Algorithm::Rs256,
+                    typ: Some(issuerd_core::JwsType::Jwt),
+                    kid: issuerd_core::KeyId::new("key-1").unwrap(),
+                },
+            })
+        }
+
+        fn validate_id_token(
+            &self,
+            _token: &str,
+            _client: &issuerd_core::Client,
+            _nonce: Option<&str>,
+        ) -> Result<issuerd_core::IdTokenClaims, IssuerdError> {
+            unimplemented!()
+        }
+
+        fn validate_refresh_token(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::ValidatedRefreshToken, IssuerdError> {
+            unimplemented!()
+        }
+
+        fn validate_id_token_hint(
+            &self,
+            _token: &str,
+        ) -> Result<issuerd_core::IdTokenClaims, IssuerdError> {
+            unimplemented!()
+        }
+    }
+
+    struct FailingCache;
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for FailingCache {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            Err(IssuerdError::ServerError("cache down".to_string()))
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected: Option<Vec<u8>>,
+            _new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            Ok(false)
+        }
+        async fn publish(&self, _channel: &str, _message: Vec<u8>) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn subscribe(
+            &self,
+            _channel: &str,
+            _handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+    }
+
+    fn tenant_realm() -> issuerd_core::Realm {
+        issuerd_core::Realm {
+            id: issuerd_core::RealmId::new("tenant-uuid").unwrap(),
+            name: issuerd_core::RealmName::new("tenant").unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// Unbound tenant-realm admin token claims (`sub = admin`, no `sid`).
+    fn tenant_claims() -> AccessTokenClaims {
+        let roles = vec![issuerd_core::RoleName::new("manage-realm").unwrap()];
+        auth_with_issuer_and_roles(TENANT_ISS, roles).claims
+    }
+
+    fn sid(id: &str) -> Option<issuerd_core::SessionId> {
+        Some(issuerd_core::SessionId::new(id).unwrap())
+    }
+
+    /// Binding state (master + tenant realms) whose token validates to `claims`.
+    async fn lifecycle_state(claims: AccessTokenClaims) -> AdminApiState {
+        let Ok(mut state) = Arc::try_unwrap(state_with_tenant(TENANT_ISS).await) else {
+            unreachable!("a freshly built state has a single owner");
+        };
+        state.token_service = Arc::new(ClaimsMockTokenService(claims));
+        state
+    }
+
+    async fn call_tenant_users(state: AdminApiState) -> StatusCode {
+        call(binding_app(Arc::new(state)), "/admin/realms/tenant/users").await
+    }
+
+    fn admin_session(id: &str) -> issuerd_core::UserSession {
+        let now = chrono::Utc::now();
+        issuerd_core::UserSession {
+            id: issuerd_core::SessionId::new(id).unwrap(),
+            realm_id: tenant_realm().id,
+            user_id: issuerd_core::UserId::new("admin").unwrap(),
+            login_username: issuerd_core::Username::new("admin").unwrap(),
+            ip_address: "127.0.0.1".parse().unwrap(),
+            auth_method: issuerd_core::AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn dpop_bound_token_presented_as_bearer_is_rejected() {
+        let mut claims = tenant_claims();
+        claims.cnf = Some(issuerd_core::ConfirmationClaim {
+            jkt: "thumbprint".to_string(),
+        });
+        let state = lifecycle_state(claims).await;
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn revoked_token_is_rejected() {
+        let state = lifecycle_state(tenant_claims()).await;
+        // `call` presents the literal access token `token`.
+        state.cache.set("revoked:token", b"1".to_vec(), None).await.unwrap();
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn revocation_lookup_error_fails_closed() {
+        let mut state = lifecycle_state(tenant_claims()).await;
+        state.cache = Arc::new(FailingCache);
+        assert_eq!(call_tenant_users(state).await, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn token_with_live_session_is_accepted() {
+        let mut claims = tenant_claims();
+        claims.sid = sid("sess-1");
+        let state = lifecycle_state(claims).await;
+        state
+            .storage
+            .create_user_session(&tenant_realm().id, &admin_session("sess-1"))
+            .await
+            .unwrap();
+        assert_eq!(call_tenant_users(state).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_whose_session_ended_is_rejected() {
+        // Logout and admin session deletion remove the session row: the token
+        // must stop working immediately, not at expiry.
+        let mut claims = tenant_claims();
+        claims.sid = sid("sess-1");
+        let state = lifecycle_state(claims).await;
+        let realm_id = tenant_realm().id;
+        state
+            .storage
+            .create_user_session(&realm_id, &admin_session("sess-1"))
+            .await
+            .unwrap();
+        let session_id = issuerd_core::SessionId::new("sess-1").unwrap();
+        state.storage.delete_user_session(&realm_id, &session_id).await.unwrap();
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn master_token_whose_session_ended_is_rejected() {
+        let roles = vec![issuerd_core::RoleName::new("manage-realm").unwrap()];
+        let mut claims =
+            auth_with_issuer_and_roles("http://localhost:8080/realms/master", roles).claims;
+        claims.sid = sid("gone");
+        let state = lifecycle_state(claims).await;
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn session_token_from_deleted_realm_is_rejected() {
+        // The issuing realm is gone, so no session can back the token.
+        let roles = vec![issuerd_core::RoleName::new("manage-realm").unwrap()];
+        let mut claims =
+            auth_with_issuer_and_roles("http://localhost:8080/realms/ghost", roles).claims;
+        claims.sid = sid("sess-1");
+        let app = binding_app(Arc::new(lifecycle_state(claims).await));
+        assert_eq!(call(app, "/admin/realms/ghost/users").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn session_lookup_error_fails_closed() {
+        let mut mock = issuerd_core::MockStorage::new();
+        mock.expect_get_realm_by_name().returning(|_| Ok(Some(tenant_realm())));
+        mock.expect_get_client_by_client_id().returning(|realm, _| {
+            Ok(Some(
+                crate::realms::build_admin_cli_client(realm, "http://localhost:8080").unwrap(),
+            ))
+        });
+        mock.expect_get_user_session()
+            .returning(|_, _| Err(IssuerdError::ServerError("db down".into())));
+        let mut claims = tenant_claims();
+        claims.sid = sid("sess-1");
+        let mut state = lifecycle_state(claims).await;
+        state.storage = Arc::new(mock);
+        assert_eq!(call_tenant_users(state).await, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sessionless_client_credentials_token_is_accepted() {
+        // Legacy synthetic shape: `sub` = `azp` = client_id, with a synthetic,
+        // never-persisted `sid`.
+        let mut claims = tenant_claims();
+        claims.sub = issuerd_core::UserId::new("admin-cli").unwrap();
+        claims.azp = Some("admin-cli".to_string());
+        claims.sid = sid("synthetic");
+        let state = lifecycle_state(claims).await;
+        assert_eq!(call_tenant_users(state).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn service_account_token_without_session_is_accepted() {
+        // `sub` is the client-linked service-account user; the
+        // client-credentials grant never persists the token's `sid`.
+        let realm_id = tenant_realm().id;
+        let client = issuerd_core::Client {
+            id: issuerd_core::ClientId::new("automation-uuid").unwrap(),
+            realm_id: realm_id.clone(),
+            client_id: issuerd_core::ClientIdentifier::new("automation").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: issuerd_core::ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: issuerd_core::ClientAuthenticatorType::ClientSecret,
+            secret: Some("secret".to_string()),
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: issuerd_core::Scope::empty(),
+            optional_scopes: issuerd_core::Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: true,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: std::collections::HashMap::from([(
+                issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE.to_string(),
+                "true".to_string(),
+            )]),
+        };
+        let mut claims = tenant_claims();
+        claims.sub = client.service_account_user_id();
+        claims.azp = Some("automation".to_string());
+        claims.sid = sid("synthetic");
+        let state = lifecycle_state(claims).await;
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+        issuerd_core::service_account::ensure_service_account_user(
+            state.storage.as_ref(),
+            &realm_id,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(call_tenant_users(state).await, StatusCode::OK);
     }
 }

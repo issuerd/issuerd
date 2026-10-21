@@ -117,8 +117,8 @@ pub trait BrokerClient: Send + Sync {
     /// configured `jwks.url` (reachable unauthenticated via client
     /// assertions and JAR request objects).
     ///
-    /// Unlike the IdP-facing methods above — which call admin-configured,
-    /// legitimately-internal endpoints — implementations MUST treat `url` as
+    /// Unlike the IdP-facing methods above — whose admin-configured URLs an
+    /// operator may allow to be internal — implementations MUST treat `url` as
     /// hostile (SSRF hardening): require `https`, resolve the host and
     /// reject any non-public IP, disable redirect following, cap the body
     /// size, and collapse every failure mode (DNS, connect, status,
@@ -409,6 +409,11 @@ pub struct IdpMapper {
 pub struct MapperEffects {
     /// Realm role names the mapper rules grant for this login.
     pub roles: Vec<String>,
+    /// Realm role names of role mappers whose claim does not match this
+    /// login (and that no matching mapper grants). Candidates for revocation
+    /// under `syncMode=force`; the caller must only revoke roles this
+    /// provider's mappers actually granted earlier.
+    pub revoked_roles: Vec<String>,
     /// Username produced by a `UsernameTemplate` mapper, if any fired.
     pub username: Option<String>,
 }
@@ -467,8 +472,10 @@ pub fn render_username_template(
 
 /// Apply every mapper to the user / effect set. Attribute mappers overwrite
 /// the mapped attribute with the claim's current values; role mappers collect
-/// role names (duplicates removed); a username template mapper fires at most
-/// once (first in list order).
+/// the role names of matching claims into `roles` and of non-matching claims
+/// into `revoked_roles` (duplicates removed; a role granted by any matching
+/// mapper is never listed for revocation); a username template mapper fires
+/// at most once (first in list order).
 pub fn apply_mappers(
     mappers: &[IdpMapper],
     alias: &str,
@@ -499,10 +506,13 @@ pub fn apply_mappers(
                 ) else {
                     continue;
                 };
-                if claim_strings(claims, claim).iter().any(|v| v == claim_value)
-                    && !effects.roles.contains(role)
-                {
-                    effects.roles.push(role.clone());
+                let target = if claim_strings(claims, claim).iter().any(|v| v == claim_value) {
+                    &mut effects.roles
+                } else {
+                    &mut effects.revoked_roles
+                };
+                if !target.contains(role) {
+                    target.push(role.clone());
                 }
             }
             IdpMapperType::UsernameTemplate => {
@@ -518,6 +528,8 @@ pub fn apply_mappers(
             _ => {}
         }
     }
+    let granted = &effects.roles;
+    effects.revoked_roles.retain(|r| !granted.contains(r));
     effects
 }
 
@@ -685,7 +697,8 @@ impl<'a> BrokerIdpSettings<'a> {
 /// [`IdentityProviderLink`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstBrokerLoginDecision {
-    /// Link to the existing user whose verified email matches (trust_email).
+    /// Link to the existing user whose email matches and is verified on both
+    /// sides (trust_email).
     AutoLink,
     /// Create a new user immediately without the review page.
     AutoCreate,
@@ -699,18 +712,22 @@ pub enum FirstBrokerLoginDecision {
 /// Decide the first-broker-login path.
 ///
 /// - Email conflict (an existing user has the identity's email): auto-link
-///   only when the IdP is trusted (`trustEmail`) **and** the IdP asserted the
-///   email as verified — anything else must prove account ownership via
-///   password re-auth ([`FirstBrokerLoginDecision::LinkOrCreate`]).
+///   only when the IdP is trusted (`trustEmail`), the IdP asserted the email
+///   as verified, **and** the existing local account verified that email too
+///   (`local_email_verified`) — an unverified local address is merely
+///   asserted by whoever set it, so it proves nothing about who owns the
+///   account. Anything else must prove account ownership via password
+///   re-auth ([`FirstBrokerLoginDecision::LinkOrCreate`]).
 /// - No conflict: trusted providers skip the review page; everyone else
 ///   reviews the prefilled profile first.
 pub fn decide_first_broker_login(
     has_email_conflict: bool,
     trust_email: bool,
     email_verified: bool,
+    local_email_verified: bool,
 ) -> FirstBrokerLoginDecision {
     if has_email_conflict {
-        if trust_email && email_verified {
+        if trust_email && email_verified && local_email_verified {
             FirstBrokerLoginDecision::AutoLink
         } else {
             FirstBrokerLoginDecision::LinkOrCreate
@@ -1135,10 +1152,32 @@ mod tests {
         let claims = serde_json::json!({"groups": ["users", "admins"]});
         let effects = apply_mappers(&mappers, "idp", &claims, &mut user);
         assert_eq!(effects.roles, vec!["realm-admin".to_string()]);
+        assert!(effects.revoked_roles.is_empty());
 
         let claims = serde_json::json!({"groups": ["users"]});
         let effects = apply_mappers(&mappers, "idp", &claims, &mut test_user());
         assert!(effects.roles.is_empty());
+        assert_eq!(effects.revoked_roles, vec!["realm-admin".to_string()]);
+    }
+
+    #[test]
+    fn role_mapper_never_revokes_a_role_another_mapper_grants() {
+        let role_mapper = |claim_value: &str| IdpMapper {
+            name: claim_value.into(),
+            mapper_type: IdpMapperType::Role,
+            config: [
+                ("claim".into(), "groups".into()),
+                ("claim_value".into(), claim_value.into()),
+                ("role".into(), "realm-admin".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mappers = vec![role_mapper("admins"), role_mapper("owners")];
+        let claims = serde_json::json!({"groups": ["owners"]});
+        let effects = apply_mappers(&mappers, "idp", &claims, &mut test_user());
+        assert_eq!(effects.roles, vec!["realm-admin".to_string()]);
+        assert!(effects.revoked_roles.is_empty());
     }
 
     #[test]
@@ -1174,16 +1213,17 @@ mod tests {
     #[test]
     fn conflict_decision_table() {
         use FirstBrokerLoginDecision::*;
-        // Conflict: trusted+verified auto-links, everything else re-auths.
-        assert_eq!(decide_first_broker_login(true, true, true), AutoLink);
-        assert_eq!(decide_first_broker_login(true, true, false), LinkOrCreate);
-        assert_eq!(decide_first_broker_login(true, false, true), LinkOrCreate);
-        assert_eq!(decide_first_broker_login(true, false, false), LinkOrCreate);
+        // Conflict: trusted+verified (IdP and local) auto-links, else re-auths.
+        assert_eq!(decide_first_broker_login(true, true, true, true), AutoLink);
+        assert_eq!(decide_first_broker_login(true, true, true, false), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, true, false, true), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, true, true), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, false, false), LinkOrCreate);
         // No conflict: trusted skips review, untrusted reviews.
-        assert_eq!(decide_first_broker_login(false, true, true), AutoCreate);
-        assert_eq!(decide_first_broker_login(false, true, false), AutoCreate);
-        assert_eq!(decide_first_broker_login(false, false, true), ReviewProfile);
-        assert_eq!(decide_first_broker_login(false, false, false), ReviewProfile);
+        assert_eq!(decide_first_broker_login(false, true, true, false), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, true, false, false), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, false, true, false), ReviewProfile);
+        assert_eq!(decide_first_broker_login(false, false, false, false), ReviewProfile);
     }
 
     #[test]
@@ -1391,15 +1431,18 @@ mod tests {
     #[test]
     fn first_broker_login_decision_table() {
         use FirstBrokerLoginDecision::*;
-        // Email conflict: auto-link only for a trusted IdP with a verified email.
-        assert_eq!(decide_first_broker_login(true, true, true), AutoLink);
-        assert_eq!(decide_first_broker_login(true, true, false), LinkOrCreate);
-        assert_eq!(decide_first_broker_login(true, false, true), LinkOrCreate);
-        assert_eq!(decide_first_broker_login(true, false, false), LinkOrCreate);
+        // Email conflict: auto-link only for a trusted IdP with a verified
+        // email AND a local account that verified the same address.
+        assert_eq!(decide_first_broker_login(true, true, true, true), AutoLink);
+        assert_eq!(decide_first_broker_login(true, true, true, false), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, true, false, true), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, true, false, false), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, true, true), LinkOrCreate);
+        assert_eq!(decide_first_broker_login(true, false, false, true), LinkOrCreate);
         // No conflict: trusted providers skip the review page.
-        assert_eq!(decide_first_broker_login(false, true, true), AutoCreate);
-        assert_eq!(decide_first_broker_login(false, true, false), AutoCreate);
-        assert_eq!(decide_first_broker_login(false, false, true), ReviewProfile);
-        assert_eq!(decide_first_broker_login(false, false, false), ReviewProfile);
+        assert_eq!(decide_first_broker_login(false, true, true, false), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, true, false, false), AutoCreate);
+        assert_eq!(decide_first_broker_login(false, false, true, false), ReviewProfile);
+        assert_eq!(decide_first_broker_login(false, false, false, false), ReviewProfile);
     }
 }

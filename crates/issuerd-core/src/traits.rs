@@ -846,6 +846,17 @@ pub trait DistributedCache: Send + Sync {
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
     ) -> Result<bool, IssuerdError>;
+    /// Remove `key` only when its current value equals `expected`.
+    ///
+    /// Both shipped backends override this with an atomic operation. The
+    /// default is a compatibility fallback for test caches.
+    async fn compare_and_delete(&self, key: &str, expected: Vec<u8>) -> Result<bool, IssuerdError> {
+        if !self.compare_and_swap(key, Some(expected), Vec::new()).await? {
+            return Ok(false);
+        }
+        self.delete(key).await?;
+        Ok(true)
+    }
     /// Atomically increment the integer counter stored at `key` and return the
     /// new value. A missing key is created with value `1`; when `ttl` is
     /// provided it is applied only on creation (first increment), matching
@@ -878,7 +889,13 @@ pub trait DistributedCache: Send + Sync {
         handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
     ) -> Result<(), IssuerdError>;
     /// Return all keys matching `pattern` (`*` is the only wildcard,
-    /// matching any byte sequence, e.g. `login-lockout:realm-1:*`).
+    /// matching any byte sequence, e.g. `login-lockout:realm-1:*`; `\` makes
+    /// the next byte literal).
+    ///
+    /// Backends may honor further glob syntax (Redis also treats `?` and
+    /// `[...]` as wildcards), so every literal segment that is not a
+    /// compile-time constant (realm ids, usernames, ...) MUST be passed
+    /// through [`escape_scan_pattern`] first.
     ///
     /// Used by admin/attack-detection queries. The default implementation
     /// returns an empty list; backends override it (Redis `SCAN ... MATCH`,
@@ -887,6 +904,20 @@ pub trait DistributedCache: Send + Sync {
         let _ = pattern;
         Ok(Vec::new())
     }
+}
+
+/// Escape `literal` so it matches only itself inside a
+/// [`DistributedCache::scan_keys`] pattern: every glob metacharacter
+/// (`*`, `?`, `[`, `]`, `\`) is prefixed with `\`.
+pub fn escape_scan_pattern(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len());
+    for c in literal.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1084,19 @@ pub trait TokenService: Send + Sync {
     /// typically unknown at this point, so audience/nonce checks are skipped; the caller
     /// reads `aud`/`azp` from the returned claims for client binding.
     fn validate_id_token_hint(&self, token: &str) -> Result<IdTokenClaims, IssuerdError>;
+
+    /// Validate the browser SSO session cookie (`typ: Serialized-ID`).
+    ///
+    /// Access tokens share the cookie's claim shape but must never be
+    /// accepted here: every client and resource server holds them. The
+    /// default rejects everything (fail closed) for services that do not
+    /// mint session cookies.
+    fn validate_sso_session_token(
+        &self,
+        _token: &str,
+    ) -> Result<ValidatedAccessToken, IssuerdError> {
+        Err(IssuerdError::InvalidToken)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2356,5 +2400,14 @@ mod tests {
         };
         cache.set("login-lockout:r1:x", b"v".to_vec(), None).await.unwrap();
         assert!(cache.scan_keys("login-lockout:r1:*").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn escape_scan_pattern_escapes_glob_metacharacters() {
+        assert_eq!(escape_scan_pattern("alice"), "alice");
+        assert_eq!(escape_scan_pattern("a:b-c.d@e"), "a:b-c.d@e");
+        assert_eq!(escape_scan_pattern("*"), "\\*");
+        assert_eq!(escape_scan_pattern("al?c[e]\\x"), "al\\?c\\[e\\]\\\\x");
+        assert_eq!(escape_scan_pattern("ü*"), "ü\\*");
     }
 }

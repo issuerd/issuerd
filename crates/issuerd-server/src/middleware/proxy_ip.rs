@@ -56,12 +56,8 @@ fn resolve_client_ip(cfg: &ProxyConfig, peer: IpAddr, headers: &HeaderMap) -> Ip
     }
 
     if cfg.trust_x_forwarded_for {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
-            let entries: Vec<IpAddr> =
-                xff.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if let Some(client) = entries.iter().rev().find(|ip| !is_trusted(**ip)) {
-                return *client;
-            }
+        if let Some(client) = xff_client(headers, is_trusted) {
+            return client;
         }
     }
 
@@ -76,6 +72,42 @@ fn resolve_client_ip(cfg: &ProxyConfig, peer: IpAddr, headers: &HeaderMap) -> Ip
     }
 
     peer
+}
+
+/// Rightmost `X-Forwarded-For` entry that is not a trusted proxy.
+///
+/// A proxy may add its own header line instead of extending the client's, so
+/// all lines are combined in order (RFC 9110 §5.3). Walking right to left,
+/// trusted hops are skipped whether written as a bare IP or as `ip:port` /
+/// `[v6]:port`; the first untrusted bare IP is the client. Any other entry (an
+/// untrusted `ip:port`, an unparseable token, a non-ASCII line) ends the walk
+/// with no result: skipping it would promote a client-supplied entry from
+/// further left.
+fn xff_client(headers: &HeaderMap, is_trusted: impl Fn(IpAddr) -> bool) -> Option<IpAddr> {
+    // (host, is_bare_ip); `None` for anything that is neither IP nor ip:port.
+    let parse = |e: &str| -> Option<(IpAddr, bool)> {
+        e.parse()
+            .map(|ip| (ip, true))
+            .or_else(|_| e.parse::<SocketAddr>().map(|sa| (sa.ip(), false)))
+            .ok()
+    };
+    let mut entries: Vec<Option<(IpAddr, bool)>> = Vec::new();
+    for line in headers.get_all("x-forwarded-for") {
+        match line.to_str() {
+            Ok(s) => {
+                entries.extend(s.split(',').map(str::trim).filter(|e| !e.is_empty()).map(parse))
+            }
+            Err(_) => entries.push(None),
+        }
+    }
+    for entry in entries.into_iter().rev() {
+        match entry {
+            Some((ip, _)) if is_trusted(ip) => continue,
+            Some((ip, true)) => return Some(ip),
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -159,6 +191,90 @@ mod tests {
         );
     }
 
+    fn xff_lines(lines: &[&[u8]]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append("x-forwarded-for", axum::http::HeaderValue::from_bytes(line).unwrap());
+        }
+        headers
+    }
+
+    fn resolve(c: &ProxyConfig, h: &HeaderMap) -> IpAddr {
+        resolve_client_ip(c, "127.0.0.1".parse().unwrap(), h)
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn xff_lines_appended_by_proxy_are_combined() {
+        // Client sends its own line; the proxy (HAProxy style) adds a second one.
+        let c = cfg(&["127.0.0.1"], true, false);
+        assert_eq!(resolve(&c, &xff_lines(&[b"6.6.6.6", b"5.6.7.8"])), ip("5.6.7.8"));
+    }
+
+    #[test]
+    fn xff_lines_skip_trusted_hops_across_lines() {
+        let c = cfg(&["127.0.0.1", "10.0.0.0/8"], true, false);
+        let h = xff_lines(&[b"6.6.6.6, 7.7.7.7", b"5.6.7.8", b"10.0.0.1, 10.0.0.2"]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+    }
+
+    #[test]
+    fn xff_unparseable_entry_stops_walk() {
+        // A proxy appending "ip:port" must not promote the client-supplied entry.
+        let c = cfg(&["127.0.0.1"], true, false);
+        let h = headers_with(&[("x-forwarded-for", "6.6.6.6, 5.6.7.8:4711")]);
+        assert_eq!(resolve(&c, &h), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn xff_unparseable_entry_falls_through_to_real_ip() {
+        let c = cfg(&["127.0.0.1"], true, true);
+        let h = headers_with(&[
+            ("x-forwarded-for", "6.6.6.6, unknown"),
+            ("x-real-ip", "5.6.7.8"),
+        ]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+    }
+
+    #[test]
+    fn xff_trusted_hop_with_port_is_skipped() {
+        // e.g. Azure App Gateway writes hops as ip:port.
+        let c = cfg(&["127.0.0.1", "10.0.0.0/8"], true, false);
+        let h = headers_with(&[("x-forwarded-for", "5.6.7.8, 10.0.0.1:4711")]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+
+        let c = cfg(&["127.0.0.1", "10.0.0.0/8"], true, true);
+        let h = headers_with(&[
+            ("x-forwarded-for", "5.6.7.8, 10.0.0.1:4711"),
+            ("x-real-ip", "9.9.9.9"),
+        ]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+    }
+
+    #[test]
+    fn xff_trusted_v6_hop_with_port_is_skipped() {
+        let c = cfg(&["127.0.0.1", "2001:db8::/32"], true, false);
+        let h = headers_with(&[("x-forwarded-for", "5.6.7.8, [2001:db8::5]:443")]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+    }
+
+    #[test]
+    fn xff_non_ascii_line_stops_walk_only_when_reached() {
+        let c = cfg(&["127.0.0.1"], true, false);
+        assert_eq!(resolve(&c, &xff_lines(&[b"\xff", b"5.6.7.8"])), ip("5.6.7.8"));
+        assert_eq!(resolve(&c, &xff_lines(&[b"6.6.6.6", b"\xff"])), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn xff_garbage_left_of_client_and_empty_elements_are_ignored() {
+        let c = cfg(&["127.0.0.1"], true, false);
+        let h = headers_with(&[("x-forwarded-for", "garbage, 1.2.3.4,, 5.6.7.8, ")]);
+        assert_eq!(resolve(&c, &h), ip("5.6.7.8"));
+    }
+
     async fn handler(Extension(client_ip): Extension<ClientIp>) -> String {
         client_ip.0.to_string()
     }
@@ -178,6 +294,33 @@ mod tests {
         let mut req = Request::builder()
             .uri("/")
             .header("x-forwarded-for", "1.2.3.4, 5.6.7.8")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))));
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "5.6.7.8");
+    }
+
+    #[tokio::test]
+    async fn middleware_combines_multiple_xff_lines() {
+        let server_cfg = ServerConfig {
+            proxy: cfg(&["127.0.0.1"], true, false),
+            ..Default::default()
+        };
+        let state = Arc::new(ServerState::from_config(&server_cfg).await.unwrap());
+
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(axum::middleware::from_fn_with_state(state, proxy_ip_middleware));
+
+        let mut req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .header("x-forwarded-for", "5.6.7.8")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()

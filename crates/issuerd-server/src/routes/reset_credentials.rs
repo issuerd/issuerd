@@ -13,8 +13,9 @@
 //! the new password is written, making every link single-use and safe to serve
 //! from any cluster node.
 //!
-//! The request endpoint always answers 204 — whether the account exists, is
-//! enabled, or has an email address — so the flow cannot be used for account
+//! The request endpoint always answers 204 at once — whether the account
+//! exists, is enabled, or has an email address; the lookup and delivery run
+//! in a background task — so the flow cannot be used for account
 //! enumeration. The pages only ever mutate state via POST.
 
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, Instrument};
 
 use crate::email::{
     html_escape, render_reset_credentials_email_localized, RESET_CREDENTIALS_LINK_TTL_SECS,
@@ -313,8 +314,9 @@ pub async fn reset_credentials_page(
 }
 
 /// POST `/realms/{realm}/login/reset-credentials` — accept the request and,
-/// when the account exists and has an email address, send the reset link.
-/// Always 204: the response must not reveal whether an account exists.
+/// when the account exists and has an email address, send the reset link in
+/// a background task. Always an immediate 204: neither the status nor the
+/// response time may reveal whether an account exists.
 #[instrument(skip(state, headers, body), fields(realm = %realm_name))]
 pub async fn reset_credentials_submit(
     State(state): State<Arc<ServerState>>,
@@ -343,10 +345,17 @@ pub async fn reset_credentials_submit(
     }
 
     if let Some(username) = parse_username(&headers, &body) {
-        // A delivery failure must not leak through the response either.
-        if let Err(e) = send_reset_email(&state, &realm, &realm_name, &username).await {
-            error!(realm = %realm.id, error = %e, "failed to send reset-credentials email");
-        }
+        // Lookup, token minting and delivery run off the request path:
+        // awaiting them would make the 204 slower exactly when the account
+        // exists. A delivery failure must not leak through the response either.
+        tokio::spawn(
+            async move {
+                if let Err(e) = send_reset_email(&state, &realm, &realm_name, &username).await {
+                    error!(realm = %realm.id, error = %e, "failed to send reset-credentials email");
+                }
+            }
+            .in_current_span(),
+        );
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -645,7 +654,9 @@ mod tests {
         (sent, Arc::new(mock))
     }
 
-    async fn state_with_sender(sender: MockSender) -> (Arc<ServerState>, TestStorage, TestCache) {
+    async fn state_with_sender(
+        sender: Arc<dyn issuerd_core::EmailSender>,
+    ) -> (Arc<ServerState>, TestStorage, TestCache) {
         let cfg = ServerConfig::default();
         let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
         let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
@@ -915,6 +926,70 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(body_string(resp).await.contains("not enabled"));
+    }
+
+    /// An [`issuerd_core::EmailSender`] whose delivery stays pending until
+    /// `release` is notified, then records the recipient.
+    struct GatedSender {
+        release: Arc<tokio::sync::Notify>,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::EmailSender for GatedSender {
+        async fn send(
+            &self,
+            _realm: &Realm,
+            to: &str,
+            _subject: &str,
+            _text_body: &str,
+            _html_body: Option<String>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            self.release.notified().await;
+            self.sent.lock().unwrap().push(to.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_answers_before_the_reset_email_is_delivered() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = Arc::new(GatedSender {
+            release: release.clone(),
+            sent: sent.clone(),
+        });
+        let (state, storage, _cache) = state_with_sender(sender).await;
+        enable_reset_password(&state).await;
+        seed_user(&storage, &master_realm_id(), "alice", Some("alice@example.com"), true, &[])
+            .await;
+
+        // The 204 must not wait on delivery: response time would otherwise
+        // reveal that the account exists.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            reset_credentials_submit(
+                State(state.clone()),
+                Path("master".to_string()),
+                HeaderMap::new(),
+                Bytes::from("username=alice"),
+            ),
+        )
+        .await
+        .expect("204 returned while delivery is still pending");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(sent.lock().unwrap().is_empty(), "delivery still gated");
+
+        // The background task still delivers the link once unblocked.
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sent.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reset email delivered in the background");
+        assert_eq!(*sent.lock().unwrap(), vec!["alice@example.com".to_string()]);
     }
 
     // -- send_reset_email --------------------------------------------------------

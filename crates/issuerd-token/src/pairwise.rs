@@ -52,7 +52,7 @@ pub fn effective_subject(
 ) -> Result<UserId, IssuerdError> {
     if !client.pairwise_subjects()
         || user.id.0.as_str() == client.client_id.as_str()
-        || user.username.as_str() == client.service_account_username()
+        || client.is_service_account_user(user)
     {
         return Ok(user.id.clone());
     }
@@ -211,8 +211,13 @@ mod tests {
     fn service_account_subject_is_exempt() {
         let mut c = client(&[], &[("subject_type", "pairwise")]);
         c.service_accounts_enabled = true;
-        let sa = user(&c.service_account_username());
-        assert_eq!(effective_subject(&sa, &c, &realm()).unwrap(), UserId::new("user-1").unwrap());
+        let mut sa = user(&c.service_account_username());
+        sa.id = c.service_account_user_id();
+        sa.attributes.insert(
+            Client::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE.to_string(),
+            vec![c.id.to_string()],
+        );
+        assert_eq!(effective_subject(&sa, &c, &realm()).unwrap(), c.service_account_user_id());
     }
 
     #[test]

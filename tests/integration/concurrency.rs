@@ -35,7 +35,7 @@ async fn approved_ciba_request(harness: &TestHarness, client: &issuerd_core::Cli
         .post_form_with_cookie(
             "/realms/test/protocol/openid-connect/ext/ciba/approve",
             &[("auth_req_id", auth_req_id.as_str()), ("action", "approve")],
-            &format!("issuerd_session={}", tokens.access_token),
+            &format!("issuerd_session={}", tokens.sso_token),
         )
         .await;
     assert_eq!(approve_resp.status(), 200);

@@ -44,6 +44,56 @@ fn dummy_password_hash() -> &'static str {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Dummy verifies run on this thread, so tests can assert that a
+    /// rejection took the timing-equalizing path.
+    static DUMMY_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn dummy_verify_count() -> usize {
+    DUMMY_VERIFIES.with(std::cell::Cell::get)
+}
+
+/// Run one Argon2 verify against [`dummy_password_hash`]. Every password
+/// rejection that did no real hashing (unknown, disabled or locked account,
+/// or no parseable local hash) calls this, so it costs the same as a wrong
+/// password — otherwise the response time leaks which usernames exist.
+pub(crate) fn dummy_password_verify(password: &str) {
+    #[cfg(test)]
+    DUMMY_VERIFIES.with(|n| n.set(n.get() + 1));
+    if let Ok(parsed) = argon2::PasswordHash::new(dummy_password_hash()) {
+        let _ = argon2::Argon2::default().verify_password(password.as_bytes(), &parsed);
+    }
+}
+
+/// Check `password` against the user's stored Argon2 password credentials.
+/// When no credential holds a parseable hash, a dummy verify runs instead so
+/// the rejection is not measurably faster than a wrong password.
+pub(crate) fn verify_password_credentials(
+    creds: &[issuerd_core::Credential],
+    password: &str,
+) -> bool {
+    let mut hashed = false;
+    for cred in creds {
+        let Ok(hash_str) = std::str::from_utf8(&cred.secret_data) else {
+            continue;
+        };
+        let Ok(parsed) = argon2::PasswordHash::new(hash_str) else {
+            continue;
+        };
+        hashed = true;
+        if argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
+            return true;
+        }
+    }
+    if !hashed {
+        dummy_password_verify(password);
+    }
+    false
+}
+
 /// Mask an email address for the email-code challenge page: the first
 /// character of the local part and of the domain survive, plus the final
 /// domain suffix — `alice@example.com` → `a***@e***.com`.
@@ -620,7 +670,7 @@ pub async fn logout_api_handler(
             // Validate and destroy the referenced session (resolving the
             // realm from the realm-NAME based issuer), then fan out the
             // back-channel logout to its clients.
-            if let Ok(validated) = state.token_service.validate_access_token(value) {
+            if let Ok(validated) = state.token_service.validate_sso_session_token(value) {
                 let realm =
                     state.resolve_issuer_realm(validated.claims.iss.as_str()).await.ok().flatten();
                 if let Some(realm) = realm {
@@ -975,13 +1025,12 @@ pub(crate) async fn complete_login_with_method(
 
     let sso_token = match state
         .token_manager
-        .issue_access_token_with_roles(
+        .issue_sso_session_token(
             &user,
             &client,
             &realm,
             &pending.scope,
             &session_id,
-            None,
             pending.claims.clone(),
             Some(overlay),
         )
@@ -1154,14 +1203,8 @@ pub async fn admin_token_handler(
     let user = match state.storage.get_user_by_username(&realm_id, &body.username).await {
         Ok(Some(u)) if u.enabled => u,
         _ => {
-            // Run a dummy argon2 verify so unknown/disabled usernames cost the
-            // same as a wrong password — otherwise the response time leaks
-            // which usernames exist (P3-6).
-            let parsed = argon2::PasswordHash::new(dummy_password_hash());
-            if let Ok(parsed) = parsed {
-                let _ =
-                    argon2::Argon2::default().verify_password(body.password.as_bytes(), &parsed);
-            }
+            // Unknown/disabled usernames cost the same as a wrong password (P3-6).
+            dummy_password_verify(&body.password);
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
                 .into_response();
         }
@@ -1175,13 +1218,17 @@ pub async fn admin_token_handler(
         .then(|| issuerd_auth_flow::login_failures::LoginFailureConfig::from_realm(&realm));
     let ip_key = ip.to_string();
     if brute_force.is_some() {
-        let locked = state
+        let locked = match state
             .login_failure_tracker
             .is_temporarily_locked(&realm_id, user.username.as_str(), &ip_key, state.cache.as_ref())
             .await
-            .unwrap_or(false);
+        {
+            Ok(locked) => locked,
+            Err(e) => return super::oidc::cache_failure_response(&e),
+        };
         if locked {
             warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request rejected: account temporarily locked");
+            dummy_password_verify(&body.password);
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
                 .into_response();
         }
@@ -1201,38 +1248,23 @@ pub async fn admin_token_handler(
         }
     };
 
-    let mut matched = false;
-    for cred in &creds {
-        let hash_str = match String::from_utf8(cred.secret_data.clone()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let parsed = match argon2::PasswordHash::new(&hash_str) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if argon2::Argon2::default()
-            .verify_password(body.password.as_bytes(), &parsed)
-            .is_ok()
-        {
-            matched = true;
-            break;
-        }
-    }
-
-    if !matched {
+    if !verify_password_credentials(&creds, &body.password) {
         warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request failed: invalid password");
         if let Some(ref config) = brute_force {
-            let _ = state
-                .login_failure_tracker
-                .record_failure(
-                    &realm_id,
-                    user.username.as_str(),
-                    &ip_key,
-                    state.cache.as_ref(),
-                    config,
-                )
-                .await;
+            if let Some(response) = super::oidc::cache_operation_result(
+                state
+                    .login_failure_tracker
+                    .record_failure(
+                        &realm_id,
+                        user.username.as_str(),
+                        &ip_key,
+                        state.cache.as_ref(),
+                        config,
+                    )
+                    .await,
+            ) {
+                return response;
+            }
         }
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
             .into_response();
@@ -1723,7 +1755,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn admin_token_success() {
-        let cfg = ServerConfig::default();
+        let cfg = ServerConfig::with_test_admin();
         let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
 
         let response = admin_token_handler(
@@ -1767,7 +1799,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn admin_token_disabled_user_rejected() {
-        let cfg = ServerConfig::default();
+        let cfg = ServerConfig::with_test_admin();
         let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
 
         let realm_id = issuerd_core::RealmId::new("master").unwrap();
@@ -1797,7 +1829,7 @@ pub(crate) mod tests {
     }
 
     async fn setup_state() -> Arc<ServerState> {
-        Arc::new(ServerState::from_config(&ServerConfig::default()).await.unwrap())
+        Arc::new(ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap())
     }
 
     /// Request headers carrying the flow correlation cookie that the authorize
@@ -1973,7 +2005,7 @@ pub(crate) mod tests {
     async fn login_success_session_cookie_secure_under_https_issuer() {
         let config = ServerConfig {
             issuer_url: "https://issuerd.test.internal".to_string(),
-            ..Default::default()
+            ..ServerConfig::with_test_admin()
         };
         let state = Arc::new(ServerState::from_config(&config).await.unwrap());
         let execution_id = FlowStageId::new("username-password").unwrap();
@@ -2497,6 +2529,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn admin_token_missing_user() {
         let state = setup_state().await;
+        let before = dummy_verify_count();
         let response = admin_token_handler(
             State(state),
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
@@ -2508,6 +2541,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dummy_verify_count() - before, 1);
     }
 
     #[tokio::test]
@@ -2530,6 +2564,7 @@ pub(crate) mod tests {
         };
         state.storage.create_user(&user.realm_id, &user).await.unwrap();
 
+        let before = dummy_verify_count();
         let response = admin_token_handler(
             State(state),
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
@@ -2541,6 +2576,68 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // No local hash (brokered/federated/passwordless account): a dummy
+        // verify keeps the rejection as slow as a wrong password.
+        assert_eq!(dummy_verify_count() - before, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_token_locked_account_runs_dummy_verify() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = 2;
+        state.storage.update_realm(&realm).await.unwrap();
+        let attempt = |password: &str| {
+            admin_token_handler(
+                State(state.clone()),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                Json(AdminTokenRequest {
+                    realm: "master".to_string(),
+                    username: "admin".to_string(),
+                    password: password.to_string(),
+                }),
+            )
+        };
+        for _ in 0..2 {
+            assert_eq!(attempt("wrong").await.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Locked: rejected without checking the password, but not faster.
+        let before = dummy_verify_count();
+        assert_eq!(attempt("admin").await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dummy_verify_count() - before, 1);
+    }
+
+    #[test]
+    fn verify_password_credentials_runs_dummy_only_without_a_parseable_hash() {
+        use argon2::PasswordHasher;
+        let cred = |secret: Vec<u8>| issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret,
+            credential_data: serde_json::json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
+        let hash = argon2::Argon2::default().hash_password(b"secret", &salt).unwrap().to_string();
+        let real = cred(hash.into_bytes());
+        let junk = cred(b"not-a-phc-string".to_vec());
+
+        let before = dummy_verify_count();
+        assert!(!verify_password_credentials(&[], "secret"));
+        assert!(!verify_password_credentials(std::slice::from_ref(&junk), "secret"));
+        assert_eq!(dummy_verify_count() - before, 2, "no parseable hash → dummy verify");
+
+        let before = dummy_verify_count();
+        assert!(!verify_password_credentials(&[junk.clone(), real.clone()], "wrong"));
+        assert!(verify_password_credentials(&[junk, real], "secret"));
+        assert_eq!(dummy_verify_count(), before, "a real verify ran → no dummy");
     }
 
     #[tokio::test]
@@ -2883,6 +2980,44 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn logout_api_ignores_access_token_planted_as_session_cookie() {
+        let state = setup_state().await;
+        let password_body =
+            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid"
+                .to_string();
+        let password_resp = crate::routes::oidc::token_handler(
+            State(state.clone()),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            axum::http::HeaderMap::new(),
+            password_body,
+        )
+        .await;
+        assert_eq!(password_resp.status(), StatusCode::OK);
+        let json = extract_json(password_resp).await;
+        let access_token = json["access_token"].as_str().unwrap();
+        let sid = state.token_service.validate_access_token(access_token).unwrap().claims.sid;
+        let sid = sid.expect("access token carries the session id");
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_some());
+
+        // A client access token is not an SSO session cookie: the session it
+        // references must survive the browser logout endpoint.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_session_master={access_token}").parse().unwrap(),
+        );
+        let response = logout_api_handler(State(state.clone()), headers).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn admin_token_invalid_utf8_cred() {
         let state = setup_state().await;
         let realm_id = issuerd_core::RealmId::new("master").unwrap();
@@ -3101,15 +3236,14 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
-        let access_token = state
+        let sso_token = state
             .token_manager
-            .issue_access_token_with_roles(
+            .issue_sso_session_token(
                 &user,
                 &client,
                 &realm,
                 &["openid".to_string()],
                 &session_id,
-                None,
                 None,
                 None,
             )
@@ -3119,7 +3253,7 @@ pub(crate) mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("issuerd_session={}", access_token.token).parse().unwrap(),
+            format!("issuerd_session={}", sso_token.token).parse().unwrap(),
         );
 
         let response = logout_api_handler(State(state), headers).await;
@@ -3167,15 +3301,14 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
-        let access_token = state
+        let sso_token = state
             .token_manager
-            .issue_access_token_with_roles(
+            .issue_sso_session_token(
                 &user,
                 &client,
                 &realm,
                 &["openid".to_string()],
                 &session_id,
-                None,
                 None,
                 None,
             )
@@ -3185,7 +3318,7 @@ pub(crate) mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("issuerd_session_master={}; issuerd_remember_master=xyz", access_token.token)
+            format!("issuerd_session_master={}; issuerd_remember_master=xyz", sso_token.token)
                 .parse()
                 .unwrap(),
         );
@@ -3560,7 +3693,7 @@ pub(crate) mod tests {
     }
 
     async fn state_with_empty_jwks() -> Arc<ServerState> {
-        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let mut state = ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap();
         let crypto = Arc::new(
             issuerd_token::RingCryptoProvider::new(issuerd_token::CryptoConfig::default()).unwrap(),
         );
@@ -3576,7 +3709,7 @@ pub(crate) mod tests {
     }
 
     pub async fn state_for_mock_token(access_ok: bool, id_ok: bool) -> Arc<ServerState> {
-        let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let mut state = ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap();
         state.token_manager = mock_token_manager(access_ok, id_ok);
         Arc::new(state)
     }
@@ -4590,6 +4723,9 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        tm.issue_sso_session_token(&user, &client, &realm, &[], &session_id, None, None)
+            .await
+            .unwrap();
         tm.issue_refresh_token(&user, &client, &realm, &session_id, &[], false, None, None)
             .await
             .unwrap();
@@ -4645,6 +4781,21 @@ pub(crate) mod tests {
             _scope: &[String],
             _session_id: &issuerd_core::SessionId,
             _realm_access: Option<issuerd_core::RealmAccess>,
+            _claims: Option<serde_json::Value>,
+            _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        ) -> Result<issuerd_token::AccessToken, issuerd_core::IssuerdError> {
+            self.access_token_result
+                .clone()
+                .unwrap_or_else(|| Err(issuerd_core::IssuerdError::ServerError("mock".into())))
+        }
+
+        async fn issue_sso_session_token(
+            &self,
+            _user: &issuerd_core::User,
+            _client: &issuerd_core::Client,
+            _realm: &issuerd_core::Realm,
+            _scope: &[String],
+            _session_id: &issuerd_core::SessionId,
             _claims: Option<serde_json::Value>,
             _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
         ) -> Result<issuerd_token::AccessToken, issuerd_core::IssuerdError> {

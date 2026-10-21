@@ -67,6 +67,12 @@ pub struct ServerConfig {
     /// Optional path to a provision config file (YAML/TOML/JSON).
     /// Applied exactly once at first startup; ignored on restarts.
     pub provision: Option<PathBuf>,
+    /// Password for the `admin` user that the in-memory/JSON-file first-boot
+    /// bootstrap seeds into the `master` realm
+    /// (`ISSUERD_BOOTSTRAP_ADMIN_PASSWORD`). Unset or empty ⇒ a random
+    /// password is generated and printed once to stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_admin_password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -91,6 +97,7 @@ impl Default for ServerConfig {
             outbound_http: OutboundHttpConfig::default(),
             themes: ThemesConfig::default(),
             provision: None,
+            bootstrap_admin_password: None,
         }
     }
 }
@@ -188,6 +195,19 @@ impl ServerConfig {
             crypto: CryptoSettings::default(),
             outbound_http: OutboundHttpConfig::default(),
             provision: Some(PathBuf::from("provision.yaml")),
+            bootstrap_admin_password: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ServerConfig {
+    /// Defaults plus the well-known `admin`/`admin` bootstrap admin that unit
+    /// tests log in with.
+    pub(crate) fn with_test_admin() -> Self {
+        Self {
+            bootstrap_admin_password: Some("admin".to_string()),
+            ..Self::default()
         }
     }
 }
@@ -623,6 +643,15 @@ pub struct OutboundHttpConfig {
     /// internal network. Default false.
     #[serde(default)]
     pub allow_private_addresses: bool,
+    /// Allow the identity-broker calls (discovery, JWKS, token, userinfo, the
+    /// admin test-connection probe) to dial private, loopback, link-local,
+    /// and otherwise non-publicly-routable addresses, directly or through a
+    /// redirect — for an IdP on the internal network. The response-size cap
+    /// stays. Enabling it lets every admin who can configure an identity
+    /// provider (`manage-realm` in any realm) point server-side requests at
+    /// the internal network. Default false.
+    #[serde(default)]
+    pub allow_private_identity_providers: bool,
 }
 
 impl OutboundHttpConfig {
@@ -723,20 +752,34 @@ impl Default for SmtpConfig {
 impl SmtpConfig {
     /// Resolve the effective SMTP settings for a realm by merging
     /// `smtpServer.*` realm attributes over this global configuration.
+    ///
+    /// The global `username`/`password` belong to the global relay: they are
+    /// inherited only while the realm's effective host, port, `ssl` and
+    /// `starttls` all equal the global ones. A realm that changes any of them
+    /// must supply its own `smtpServer.user`/`smtpServer.password`, so a realm
+    /// admin cannot make the server authenticate to a host they choose with
+    /// the operator's credentials.
     pub fn for_realm(&self, realm: &issuerd_core::Realm) -> Self {
         let attr = |key: &str| realm.attributes.get(&format!("smtpServer.{key}"));
         let flag = |key: &str, default: bool| attr(key).map(|v| v == "true").unwrap_or(default);
+        let host = attr("host").cloned().unwrap_or_else(|| self.host.clone());
+        let port = attr("port").and_then(|v| v.parse().ok()).unwrap_or(self.port);
+        let starttls = flag("starttls", self.starttls);
+        let ssl = flag("ssl", self.ssl);
+        let global_transport =
+            host == self.host && port == self.port && starttls == self.starttls && ssl == self.ssl;
+        let global_secret = |v: &Option<String>| v.clone().filter(|_| global_transport);
         Self {
             enabled: self.enabled,
-            host: attr("host").cloned().unwrap_or_else(|| self.host.clone()),
-            port: attr("port").and_then(|v| v.parse().ok()).unwrap_or(self.port),
+            host,
+            port,
             from: attr("from").cloned().unwrap_or_else(|| self.from.clone()),
             from_display: attr("fromDisplayName").cloned().or_else(|| self.from_display.clone()),
             reply_to: attr("replyTo").cloned().or_else(|| self.reply_to.clone()),
-            starttls: flag("starttls", self.starttls),
-            ssl: flag("ssl", self.ssl),
-            username: attr("user").cloned().or_else(|| self.username.clone()),
-            password: attr("password").cloned().or_else(|| self.password.clone()),
+            starttls,
+            ssl,
+            username: attr("user").cloned().or_else(|| global_secret(&self.username)),
+            password: attr("password").cloned().or_else(|| global_secret(&self.password)),
         }
     }
 }
@@ -834,15 +877,78 @@ mod tests {
         assert_eq!(merged.port, 2525);
         assert_eq!(merged.from, "realm@example.com");
         assert!(merged.starttls);
-        // Untouched keys fall back to the global config.
-        assert_eq!(merged.username.as_deref(), Some("global-user"));
         assert!(merged.enabled);
+        // Global credentials never follow a realm-chosen transport.
+        assert_eq!(merged.username, None);
 
         // No attributes -> identical to global.
         let plain = issuerd_core::Realm::default();
         let merged = base.for_realm(&plain);
         assert_eq!(merged.host, base.host);
         assert_eq!(merged.port, base.port);
+        assert_eq!(merged.username.as_deref(), Some("global-user"));
+    }
+
+    #[test]
+    fn smtp_for_realm_withholds_global_credentials_from_realm_transport() {
+        let base = SmtpConfig {
+            enabled: true,
+            host: "relay.operator.example".to_string(),
+            port: 587,
+            starttls: true,
+            username: Some("global-user".to_string()),
+            password: Some("global-secret".to_string()),
+            ..SmtpConfig::default()
+        };
+        let realm_with = |pairs: &[(&str, &str)]| {
+            let mut realm = issuerd_core::Realm::default();
+            for (k, v) in pairs {
+                realm.attributes.insert(format!("smtpServer.{k}"), v.to_string());
+            }
+            realm
+        };
+
+        for overrides in [
+            vec![("host", "mx.attacker.example")],
+            vec![("port", "2525")],
+            vec![("ssl", "true")],
+            vec![("starttls", "false")],
+            vec![("host", "10.0.0.5"), ("port", "25"), ("starttls", "false")],
+        ] {
+            let merged = base.for_realm(&realm_with(&overrides));
+            assert_eq!(merged.username, None, "{overrides:?}");
+            assert_eq!(merged.password, None, "{overrides:?}");
+        }
+
+        // A realm user without its own password gets no global password.
+        let merged =
+            base.for_realm(&realm_with(&[("host", "mx.attacker.example"), ("user", "realm-user")]));
+        assert_eq!(merged.username.as_deref(), Some("realm-user"));
+        assert_eq!(merged.password, None);
+
+        // Realm-supplied credentials are used for a realm transport.
+        let merged = base.for_realm(&realm_with(&[
+            ("host", "mail.realm.example"),
+            ("user", "realm-user"),
+            ("password", "realm-secret"),
+        ]));
+        assert_eq!(merged.username.as_deref(), Some("realm-user"));
+        assert_eq!(merged.password.as_deref(), Some("realm-secret"));
+
+        // Overrides that leave the global transport unchanged keep the
+        // global credentials, as do non-transport overrides.
+        for overrides in [
+            vec![
+                ("host", "relay.operator.example"),
+                ("port", "587"),
+                ("starttls", "true"),
+            ],
+            vec![("from", "realm@example.com"), ("fromDisplayName", "Realm")],
+        ] {
+            let merged = base.for_realm(&realm_with(&overrides));
+            assert_eq!(merged.username.as_deref(), Some("global-user"), "{overrides:?}");
+            assert_eq!(merged.password.as_deref(), Some("global-secret"), "{overrides:?}");
+        }
     }
 
     #[test]
@@ -1012,6 +1118,18 @@ issuer_url = "http://example.com"
         std::env::remove_var("ISSUERD_ISSUER_URL");
     }
 
+    #[test]
+    fn bootstrap_admin_password_unset_by_default_and_env_overridable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ISSUERD_BOOTSTRAP_ADMIN_PASSWORD");
+        assert!(ServerConfig::default().bootstrap_admin_password.is_none());
+        assert!(ServerConfig::load(None).unwrap().bootstrap_admin_password.is_none());
+        std::env::set_var("ISSUERD_BOOTSTRAP_ADMIN_PASSWORD", "from-env");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_BOOTSTRAP_ADMIN_PASSWORD");
+        assert_eq!(cfg.bootstrap_admin_password.as_deref(), Some("from-env"));
+    }
+
     // ------------------------------------------------------------------
     // [crypto.key_encryption]
     // ------------------------------------------------------------------
@@ -1162,6 +1280,26 @@ key_base64 = "{}"
         // The SSRF guard's public-IP check is on unless explicitly lifted.
         assert!(!cfg.outbound_http.allow_private_addresses);
         assert!(!ServerConfig::generate_example().outbound_http.allow_private_addresses);
+        // The IdP calls' SSRF gate is on unless explicitly lifted.
+        assert!(!cfg.outbound_http.allow_private_identity_providers);
+        assert!(!ServerConfig::generate_example().outbound_http.allow_private_identity_providers);
+    }
+
+    #[test]
+    fn outbound_http_allow_private_identity_providers_loads() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("outbound_http_private_idp_toml", "toml");
+        fs::write(&path, "[outbound_http]\nallow_private_identity_providers = true\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(cfg.outbound_http.allow_private_identity_providers);
+        // Independent of the test-rig flag for attacker-influenced URLs.
+        assert!(!cfg.outbound_http.allow_private_addresses);
+        let _ = fs::remove_dir_all(&dir);
+
+        std::env::set_var("ISSUERD_OUTBOUND_HTTP__ALLOW_PRIVATE_IDENTITY_PROVIDERS", "true");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_OUTBOUND_HTTP__ALLOW_PRIVATE_IDENTITY_PROVIDERS");
+        assert!(cfg.outbound_http.allow_private_identity_providers);
     }
 
     #[test]
@@ -1216,6 +1354,7 @@ key_base64 = "{}"
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(PathBuf::from("/nonexistent/roots.pem")),
             allow_private_addresses: false,
+            allow_private_identity_providers: false,
         };
         let err = cfg.load_extra_roots().unwrap_err();
         assert!(err.to_string().contains("extra_ca_bundle"), "{err}");
@@ -1232,6 +1371,7 @@ key_base64 = "{}"
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(path.clone()),
             allow_private_addresses: false,
+            allow_private_identity_providers: false,
         };
         let err = cfg.load_extra_roots().unwrap_err();
         assert!(err.to_string().contains("not a valid PEM"), "{err}");
@@ -1243,6 +1383,7 @@ key_base64 = "{}"
             let cfg = OutboundHttpConfig {
                 extra_ca_bundle: Some(path.clone()),
                 allow_private_addresses: false,
+                allow_private_identity_providers: false,
             };
             let err = cfg.load_extra_roots().unwrap_err();
             assert!(err.to_string().contains("no certificates"), "{err}");
@@ -1259,6 +1400,7 @@ key_base64 = "{}"
         let cfg = OutboundHttpConfig {
             extra_ca_bundle: Some(path.clone()),
             allow_private_addresses: false,
+            allow_private_identity_providers: false,
         };
         let certs = cfg.load_extra_roots().unwrap();
         assert_eq!(certs.len(), 2, "both bundle certificates load");

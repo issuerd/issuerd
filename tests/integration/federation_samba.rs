@@ -532,6 +532,8 @@ async fn samba_dc_federated_password_write_through() {
         .post_form("/realms/samba-wt/login/reset-credentials", &[("username", "testuser2")])
         .await;
     assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+    // The mail is sent in the background, after the 204.
+    crate::harness::wait_until(|| !recorder.sent.lock().unwrap().is_empty()).await;
     let text = {
         let sent = recorder.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "expected exactly one reset email");

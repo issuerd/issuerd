@@ -59,8 +59,8 @@ use issuerd_auth_flow::built_in::verify_password_hash;
 use issuerd_core::{
     apply_mappers, decide_first_broker_login, AuthMethod, BrokerIdpSettings, BrokeredIdentity,
     CredentialType, DisplayName, Email, FirstBrokerLoginDecision, IdentityProviderConfig,
-    IdentityProviderLink, IssuerdError, Realm, RealmId, SessionId, TypedFlowResult, User, UserId,
-    Username,
+    IdentityProviderLink, IssuerdError, MapperEffects, Realm, RealmId, SessionId, TypedFlowResult,
+    User, UserId, Username,
 };
 use tracing::{info, instrument, warn};
 
@@ -574,7 +574,7 @@ async fn session_cookie_user(
     headers: &HeaderMap,
 ) -> Option<UserId> {
     let token = super::oidc::find_realm_cookie(headers, &realm.id, "issuerd_session")?;
-    let validated = state.token_service.validate_access_token(&token).ok()?;
+    let validated = state.token_service.validate_sso_session_token(&token).ok()?;
     let token_realm =
         issuerd_core::typestate::extract_realm_from_issuer(validated.claims.iss.as_str());
     if token_realm != Some(realm.name.as_str()) {
@@ -731,8 +731,12 @@ async fn finish_login(
             // Mappers re-apply per the sync mode; the stored token (if any)
             // is written at link-creation time only.
             let settings = BrokerIdpSettings::new(idp);
-            let apply = settings.sync_mode() == issuerd_core::BrokerSyncMode::Force;
-            return finalize_brokered_login(state, realm, idp, pending, user, &identity, apply)
+            let pass = if settings.sync_mode() == issuerd_core::BrokerSyncMode::Force {
+                MapperPass::ForceSync
+            } else {
+                MapperPass::Skip
+            };
+            return finalize_brokered_login(state, realm, idp, pending, user, &identity, pass)
                 .await;
         }
         Ok(None) => {}
@@ -766,6 +770,7 @@ async fn finish_login(
         conflicting_user.is_some(),
         settings.trust_email(),
         identity.email_verified,
+        conflicting_user.as_ref().is_some_and(|u| u.email_verified),
     );
     let store_tokens = settings.store_tokens();
 
@@ -795,7 +800,16 @@ async fn finish_login(
                     &copy.msg("broker.linkFailed", "account link failed"),
                 );
             }
-            finalize_brokered_login(state, realm, idp, pending, existing, &identity, true).await
+            finalize_brokered_login(
+                state,
+                realm,
+                idp,
+                pending,
+                existing,
+                &identity,
+                MapperPass::Link,
+            )
+            .await
         }
         FirstBrokerLoginDecision::AutoCreate => {
             let username = find_available_username(
@@ -834,8 +848,8 @@ async fn finish_login(
             .await
             {
                 Ok(()) => {
-                    finalize_brokered_login(state, realm, idp, pending, user, &identity, false)
-                        .await
+                    let pass = MapperPass::Skip;
+                    finalize_brokered_login(state, realm, idp, pending, user, &identity, pass).await
                 }
                 Err(resp) => resp,
             }
@@ -885,6 +899,19 @@ async fn finish_login(
     }
 }
 
+/// Which mapper pass [`finalize_brokered_login`] runs before completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapperPass {
+    /// No pass: mappers already ran at user creation, or `syncMode=import`.
+    Skip,
+    /// A new link on an existing account: apply mappers, grant roles only.
+    Link,
+    /// A returning login under `syncMode=force`: apply mappers and also
+    /// revoke the roles this provider's mappers granted whose claim no
+    /// longer matches.
+    ForceSync,
+}
+
 /// The user is authenticated; apply mappers when due, run pending required
 /// actions through the required-action continuation, or complete the login outright.
 async fn finalize_brokered_login(
@@ -894,16 +921,17 @@ async fn finalize_brokered_login(
     pending: PendingAuthData,
     mut user: User,
     identity: &BrokeredIdentity,
-    apply_mappers_now: bool,
+    pass: MapperPass,
 ) -> Response {
-    if apply_mappers_now {
+    if pass != MapperPass::Skip {
         let settings = BrokerIdpSettings::new(idp);
-        let effects =
-            apply_mappers(&settings.mappers(), idp.alias.as_ref(), &identity.claims, &mut user);
+        let alias: &str = idp.alias.as_ref();
+        let effects = apply_mappers(&settings.mappers(), alias, &identity.claims, &mut user);
+        let revoke = pass == MapperPass::ForceSync;
+        sync_mapped_roles(state, &realm.id, alias, &mut user, &effects, revoke).await;
         if let Err(e) = state.storage.update_user(&realm.id, &user).await {
             warn!(error = %e, "mapper attribute sync failed");
         }
-        assign_mapped_roles(state, &realm.id, &user.id, &effects.roles).await;
         issuerd_cluster::invalidate::invalidate_user_claims(
             state.cache.as_ref(),
             &realm.id,
@@ -972,25 +1000,98 @@ async fn finalize_brokered_login(
     .await
 }
 
-/// Assign realm roles named by mapper effects; unknown roles are skipped
-/// (mappers reference roles by name and must not conjure them into being).
-async fn assign_mapped_roles(
+/// User attribute recording which realm roles (by name) this provider's role
+/// mappers granted. It is the provenance Force-sync revocation relies on:
+/// only roles listed here are ever revoked, so a role the user already held
+/// when a mapper matched (assigned locally, or granted by another provider)
+/// is never touched. Self-service APIs cannot write user attributes.
+fn mapped_roles_attribute(alias: &str) -> String {
+    format!("idp_mapped_roles.{alias}")
+}
+
+/// Realize mapper role effects on `user`: grant the named realm roles and
+/// record in [`mapped_roles_attribute`] those the user did not hold before;
+/// with `revoke`, first remove the recorded roles whose mapper claim no
+/// longer matches. Unknown roles are skipped (mappers reference roles by
+/// name and must not conjure them into being). The caller persists `user`.
+async fn sync_mapped_roles(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    alias: &str,
+    user: &mut User,
+    effects: &MapperEffects,
+    revoke: bool,
+) {
+    let key = mapped_roles_attribute(alias);
+    let mut granted = user.attributes.get(&key).cloned().unwrap_or_default();
+    if revoke {
+        revoke_mapped_roles(state, realm_id, &user.id, &effects.revoked_roles, &mut granted).await;
+    }
+    // Without a snapshot of the held roles a grant cannot be told apart from
+    // a local assignment, so it is then not recorded (never revoked).
+    let held = state.storage.list_user_realm_roles(realm_id, &user.id).await;
+    if let Err(e) = &held {
+        warn!(error = %e, "role mapping lookup failed");
+    }
+    for name in &effects.roles {
+        let role = match state.storage.get_role_by_name(realm_id, name).await {
+            Ok(Some(role)) => role,
+            Ok(None) => {
+                warn!(role = %name, "IdP mapper references an unknown role");
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, role = %name, "role lookup failed");
+                continue;
+            }
+        };
+        if held.as_ref().is_ok_and(|ids| ids.contains(&role.id)) {
+            continue;
+        }
+        if let Err(e) = state.storage.add_user_realm_role(realm_id, &user.id, &role.id).await {
+            warn!(error = %e, role = %name, "mapped role assignment failed");
+            continue;
+        }
+        if held.is_ok() && !granted.contains(name) {
+            granted.push(name.clone());
+        }
+    }
+    if granted.is_empty() {
+        user.attributes.remove(&key);
+    } else {
+        user.attributes.insert(key, granted);
+    }
+}
+
+/// Remove the realm roles in `names` that `granted` (this provider's
+/// provenance record) lists, dropping them from the record on success.
+async fn revoke_mapped_roles(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     user_id: &UserId,
-    role_names: &[String],
+    names: &[String],
+    granted: &mut Vec<String>,
 ) {
-    for name in role_names {
+    for name in names {
+        if !granted.contains(name) {
+            continue;
+        }
         match state.storage.get_role_by_name(realm_id, name).await {
             Ok(Some(role)) => {
-                if let Err(e) = state.storage.add_user_realm_role(realm_id, user_id, &role.id).await
-                {
-                    warn!(error = %e, role = %name, "mapped role assignment failed");
+                let removed = state.storage.remove_user_realm_role(realm_id, user_id, &role.id);
+                if let Err(e) = removed.await {
+                    warn!(error = %e, role = %name, "mapped role revocation failed");
+                    continue;
                 }
             }
-            Ok(None) => warn!(role = %name, "IdP mapper references an unknown role"),
-            Err(e) => warn!(error = %e, role = %name, "role lookup failed"),
+            // The role no longer exists: nothing left to revoke.
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, role = %name, "role lookup failed");
+                continue;
+            }
         }
+        granted.retain(|g| g != name);
     }
 }
 
@@ -1003,14 +1104,21 @@ async fn find_available_username(
     alias: &str,
     subject: &str,
 ) -> String {
-    if Username::new(suggested).is_ok() && !username_taken(state, realm_id, suggested).await {
+    if assignable_username(suggested) && !username_taken(state, realm_id, suggested).await {
         return suggested.to_string();
     }
     let fallback = format!("{alias}.{subject}");
-    if Username::new(&fallback).is_ok() && !username_taken(state, realm_id, &fallback).await {
+    if assignable_username(&fallback) && !username_taken(state, realm_id, &fallback).await {
         return fallback;
     }
     format!("{alias}.{}", issuerd_core::utils::generate_id())
+}
+
+/// A username a brokered user may receive: valid, and outside the namespace
+/// reserved for client service accounts (an IdP-supplied
+/// `preferred_username` must not claim a client's service-account user).
+fn assignable_username(name: &str) -> bool {
+    Username::new(name).is_ok_and(|u| !u.is_service_account_reserved())
 }
 
 async fn username_taken(state: &Arc<ServerState>, realm_id: &RealmId, name: &str) -> bool {
@@ -1082,7 +1190,12 @@ async fn create_brokered_user(
             }
         }
     }
-    assign_mapped_roles(state, &realm.id, &user.id, &effects.roles).await;
+    sync_mapped_roles(state, &realm.id, &alias, &mut user, &effects, false).await;
+    if user.attributes.contains_key(&mapped_roles_attribute(&alias)) {
+        if let Err(e) = state.storage.update_user(&realm.id, &user).await {
+            warn!(realm = %realm.id, error = %e, "mapped role provenance update failed");
+        }
+    }
     // Realm default groups apply to interactive user creation
     // (registration, broker first login) — not to admin-created users.
     crate::groups::assign_default_groups(state, realm, &user.id).await;
@@ -1395,7 +1508,11 @@ pub async fn first_broker_login_submit(
             if Username::new(&username).is_err() {
                 retry!(entry, copy.msg("broker.usernameRequired", "a valid username is required"));
             }
-            if matches!(state.storage.get_user_by_username(&realm.id, &username).await, Ok(Some(_)))
+            if !assignable_username(&username)
+                || matches!(
+                    state.storage.get_user_by_username(&realm.id, &username).await,
+                    Ok(Some(_))
+                )
             {
                 retry!(entry, copy.msg("broker.usernameTaken", "that username is already taken"));
             }
@@ -1461,7 +1578,7 @@ pub async fn first_broker_login_submit(
                         entry.pending,
                         user,
                         &entry.identity,
-                        false,
+                        MapperPass::Skip,
                     )
                     .await
                 }
@@ -1572,11 +1689,14 @@ async fn link_via_password_submit(
         .then(|| issuerd_auth_flow::login_failures::LoginFailureConfig::from_realm(realm));
     let ip_key = ip.to_string();
     if brute_force.is_some() {
-        let locked = state
+        let locked = match state
             .login_failure_tracker
             .is_temporarily_locked(&realm.id, user.username.as_str(), &ip_key, state.cache.as_ref())
             .await
-            .unwrap_or(false);
+        {
+            Ok(locked) => locked,
+            Err(e) => return super::oidc::cache_failure_response(&e),
+        };
         if locked {
             warn!(realm = %realm.id, username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), ip = %ip, "broker link-via-password rejected: account temporarily locked");
             emit_link_login_error(state, realm, &entry, &user, ip, "temporarily_locked").await;
@@ -1599,16 +1719,20 @@ async fn link_via_password_submit(
     if !verified {
         warn!(realm = %realm.id, username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), ip = %ip, "broker link-via-password failed: invalid password");
         if let Some(ref config) = brute_force {
-            let _ = state
-                .login_failure_tracker
-                .record_failure(
-                    &realm.id,
-                    user.username.as_str(),
-                    &ip_key,
-                    state.cache.as_ref(),
-                    config,
-                )
-                .await;
+            if let Some(response) = super::oidc::cache_operation_result(
+                state
+                    .login_failure_tracker
+                    .record_failure(
+                        &realm.id,
+                        user.username.as_str(),
+                        &ip_key,
+                        state.cache.as_ref(),
+                        config,
+                    )
+                    .await,
+            ) {
+                return response;
+            }
         }
         emit_link_login_error(state, realm, &entry, &user, ip, "invalid_user_credentials").await;
         entry.failed_attempts += 1;
@@ -1653,7 +1777,8 @@ async fn link_via_password_submit(
             &copy.msg("broker.alreadyLinked", "this external account is already linked"),
         );
     }
-    finalize_brokered_login(state, realm, idp, entry.pending, user, &entry.identity, true).await
+    let pass = MapperPass::Link;
+    finalize_brokered_login(state, realm, idp, entry.pending, user, &entry.identity, pass).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2640,7 +2765,7 @@ mod tests {
             pending_auth_data(&realm_id, "flow-fin-1"),
             user,
             &identity,
-            false,
+            MapperPass::Skip,
         )
         .await;
 
@@ -2668,7 +2793,7 @@ mod tests {
             pending_auth_data(&realm_id, "flow-fin-2"),
             user,
             &identity,
-            false,
+            MapperPass::Skip,
         )
         .await;
 
@@ -2722,6 +2847,21 @@ mod tests {
         assert!(picked.starts_with("ext."), "{picked}");
         assert_ne!(picked, "ext.sub-9");
         assert!(Username::new(&picked).is_ok(), "{picked}");
+    }
+
+    #[tokio::test]
+    async fn find_available_username_skips_service_account_namespace() {
+        let (state, _storage, _cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let picked = find_available_username(
+            &state,
+            &realm_id,
+            "service-account-terraform",
+            IDP_ALIAS,
+            "sub-7",
+        )
+        .await;
+        assert_eq!(picked, "ext.sub-7");
     }
 
     // -- first_broker_login_submit --------------------------------------------
@@ -3254,7 +3394,7 @@ mod tests {
 
     // -- session_cookie_user / finish_linking ---------------------------------
 
-    /// Mint a realm-bound SSO access token for `user` (the cookie payload).
+    /// Mint a realm-bound SSO session token for `user` (the cookie payload).
     async fn mint_sso_token(state: &Arc<ServerState>, realm: &Realm, user: &User) -> String {
         // The token's `iss` is realm-derived; the client only feeds claims, so
         // the master realm's built-in admin-cli serves for any realm.
@@ -3270,13 +3410,12 @@ mod tests {
         let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
         state
             .token_manager
-            .issue_access_token_with_roles(
+            .issue_sso_session_token(
                 user,
                 &client,
                 realm,
                 &["openid".to_string()],
                 &session_id,
-                None,
                 None,
                 None,
             )
@@ -3632,6 +3771,7 @@ mod tests {
         idp.config.insert("trustEmail".to_string(), "true".to_string());
         let mut existing = broker_user(&realm_id, "existing-user", false);
         existing.email = Some(Email::new("ext@example.com").unwrap());
+        existing.email_verified = true;
         storage.create_user(&realm_id, &existing).await.unwrap();
         seed_pending_auth(&cache, &realm_id, "flow-autolink-disabled").await;
 
@@ -3665,6 +3805,7 @@ mod tests {
         idp.config.insert("trustEmail".to_string(), "true".to_string());
         let mut existing = broker_user(&realm_id, "existing-user", true);
         existing.email = Some(Email::new("ext@example.com").unwrap());
+        existing.email_verified = true;
         storage.create_user(&realm_id, &existing).await.unwrap();
         seed_pending_auth(&cache, &realm_id, "flow-autolink-ok").await;
 
@@ -3688,6 +3829,143 @@ mod tests {
             .unwrap()
             .expect("auto-link created");
         assert_eq!(link.user_id, existing.id);
+    }
+
+    /// A local account whose email was never verified (anyone can type an
+    /// address in) is not auto-linked: the user must prove ownership first.
+    #[tokio::test]
+    async fn finish_login_does_not_autolink_unverified_local_email() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.insert("trustEmail".to_string(), "true".to_string());
+        let mut existing = broker_user(&realm_id, "squatter", true);
+        existing.email = Some(Email::new("ext@example.com").unwrap());
+        storage.create_user(&realm_id, &existing).await.unwrap();
+        seed_pending_auth(&cache, &realm_id, "flow-autolink-unverified").await;
+
+        let resp = finish_login(
+            &state,
+            &realm,
+            &idp,
+            &PageCopy::builtin("en"),
+            MASTER,
+            login_broker_state(Some("flow-autolink-unverified")),
+            broker_identity(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("/realms/master/broker/first-login/"));
+        assert!(storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Force-sync IdP with two role mappers on the `groups` claim.
+    fn force_sync_role_idp() -> IdentityProviderConfig {
+        let mut idp = broker_idp_config(IDP_ALIAS);
+        idp.config.insert("trustEmail".to_string(), "true".to_string());
+        idp.config.insert("syncMode".to_string(), "force".to_string());
+        idp.config.insert(
+            "mappers".to_string(),
+            r#"[{"name":"admins","mapper_type":"role","config":{"claim":"groups","claim_value":"admins","role":"broker-mapped-role"}},
+                {"name":"ops","mapper_type":"role","config":{"claim":"groups","claim_value":"ops","role":"local-role"}}]"#
+                .to_string(),
+        );
+        idp
+    }
+
+    async fn login_with_groups(
+        state: &Arc<ServerState>,
+        cache: &TestCache,
+        realm: &Realm,
+        idp: &IdentityProviderConfig,
+        flow: &str,
+        groups: serde_json::Value,
+    ) {
+        seed_pending_auth(cache, &realm.id, flow).await;
+        let mut identity = broker_identity();
+        identity.claims = serde_json::json!({"sub": "ext-sub-1", "groups": groups});
+        let copy = PageCopy::builtin("en");
+        let broker_state = login_broker_state(Some(flow));
+        let resp =
+            finish_login(state, realm, idp, &copy, MASTER, broker_state, identity, None).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// Force sync revokes a role once its claim stops matching — but only a
+    /// role this provider's mapper granted, never one the user held locally.
+    #[tokio::test]
+    async fn finish_login_force_sync_revokes_only_mapper_granted_roles() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = force_sync_role_idp();
+        let mapped = realm_role(&realm_id, "broker-mapped-role");
+        let local = realm_role(&realm_id, "local-role");
+        storage.create_role(&realm_id, &mapped).await.unwrap();
+        storage.create_role(&realm_id, &local).await.unwrap();
+        let user = broker_user(&realm_id, "linked-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage.add_user_realm_role(&realm_id, &user.id, &local.id).await.unwrap();
+        storage
+            .create_identity_provider_link(&realm_id, &existing_link(&user.id))
+            .await
+            .unwrap();
+
+        let both = serde_json::json!(["admins", "ops"]);
+        login_with_groups(&state, &cache, &realm, &idp, "flow-grant", both).await;
+        let roles = storage.list_user_realm_roles(&realm_id, &user.id).await.unwrap();
+        assert!(roles.contains(&mapped.id) && roles.contains(&local.id));
+        let stored = storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.attributes.get(&mapped_roles_attribute(IDP_ALIAS)),
+            Some(&vec!["broker-mapped-role".to_string()]),
+            "only the role the mapper actually added is recorded"
+        );
+
+        login_with_groups(&state, &cache, &realm, &idp, "flow-revoke", serde_json::json!([])).await;
+        let roles = storage.list_user_realm_roles(&realm_id, &user.id).await.unwrap();
+        assert!(!roles.contains(&mapped.id), "mapper-granted role revoked");
+        assert!(roles.contains(&local.id), "locally assigned role untouched");
+        let stored = storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert!(!stored.attributes.contains_key(&mapped_roles_attribute(IDP_ALIAS)));
+    }
+
+    /// Establishing a new link (auto-link) never revokes, even when a
+    /// provenance record from an earlier link of this provider exists.
+    #[tokio::test]
+    async fn finish_login_autolink_never_revokes_roles() {
+        let (state, storage, cache) = test_state().await;
+        let realm_id = master_realm_id();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let idp = force_sync_role_idp();
+        let mapped = realm_role(&realm_id, "broker-mapped-role");
+        storage.create_role(&realm_id, &mapped).await.unwrap();
+        let mut existing = broker_user(&realm_id, "existing-user", true);
+        existing.email = Some(Email::new("ext@example.com").unwrap());
+        existing.email_verified = true;
+        existing
+            .attributes
+            .insert(mapped_roles_attribute(IDP_ALIAS), vec!["broker-mapped-role".to_string()]);
+        storage.create_user(&realm_id, &existing).await.unwrap();
+        storage.add_user_realm_role(&realm_id, &existing.id, &mapped.id).await.unwrap();
+
+        login_with_groups(&state, &cache, &realm, &idp, "flow-link", serde_json::json!([])).await;
+
+        let link = storage
+            .get_identity_provider_link(&realm_id, IDP_ALIAS, "ext-sub-1")
+            .await
+            .unwrap()
+            .expect("auto-link created");
+        assert_eq!(link.user_id, existing.id);
+        let roles = storage.list_user_realm_roles(&realm_id, &existing.id).await.unwrap();
+        assert!(roles.contains(&mapped.id), "first link must not revoke");
     }
 
     // -- create_brokered_user -----------------------------------------------------

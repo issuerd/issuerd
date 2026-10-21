@@ -41,7 +41,9 @@ use crate::middleware::proxy_ip::ClientIp;
 use crate::state::ServerState;
 
 use super::login_api::LoginResponse;
-use super::oidc::{emit_oidc_event, flow_cookie_header, has_flow_cookie, PendingAuthData};
+use super::oidc::{
+    emit_oidc_event, flow_cookie_header, has_flow_cookie, is_valid_flow_id, PendingAuthData,
+};
 
 /// Cache TTL for a paused required-action continuation (matches the pending
 /// auth entry TTL).
@@ -55,6 +57,16 @@ pub(crate) fn pending_actions_cache_key(realm_id: &RealmId, execution: &str) -> 
 /// Cache key for a single-use verify-email token.
 fn verify_email_cache_key(realm_id: &RealmId, token: &str) -> String {
     format!("verify-email:{}:{}", realm_id.0, token)
+}
+
+/// Cached value of a verify-email token: the user AND the address the link
+/// was mailed to. Redemption verifies only that address — a link issued
+/// before an email change must not mark the new, never-mailed address
+/// verified.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VerifyEmailTokenData {
+    user_id: String,
+    email: String,
 }
 
 fn action_required_tag() -> String {
@@ -816,7 +828,7 @@ fn render_action_page(
 // ---------------------------------------------------------------------------
 
 /// Send the verification email and store its single-use token
-/// (`verify-email:{realm}:{token}` → user id, 24 h TTL).
+/// (`verify-email:{realm}:{token}` → user id + mailed address, 24 h TTL).
 ///
 /// `execution` is the paused required-action continuation the link should
 /// resume; pass `None` when there is no login in flight (self-registration)
@@ -837,11 +849,17 @@ pub(crate) async fn send_verification_email(
         IssuerdError::InvalidRequest("no email address on file for this account".to_string())
     })?;
     let token = issuerd_core::utils::generate_id();
+    let data = VerifyEmailTokenData {
+        user_id: user.id.0.clone(),
+        email: email.as_str().to_string(),
+    };
+    let data = serde_json::to_vec(&data)
+        .map_err(|e| IssuerdError::ServerError(format!("verify-email token encoding: {e}")))?;
     state
         .cache
         .set(
             &verify_email_cache_key(&realm.id, &token),
-            user.id.0.clone().into_bytes(),
+            data,
             Some(Duration::from_secs(VERIFY_EMAIL_LINK_TTL_SECS as u64)),
         )
         .await?;
@@ -966,18 +984,28 @@ fn form_params(action: &str, form: &HashMap<String, String>) -> HashMap<String, 
 /// unguessable execution id (the URL itself), and the cookie merely binds
 /// that execution to a single browser — re-minting it for a browser that
 /// already learned the execution id grants nothing new.
+///
+/// The cookie is only minted for a well-formed execution id that names a live
+/// continuation in this realm: the id is attacker-chosen URL data and is
+/// spliced into the `Set-Cookie` header.
 pub async fn required_action_page(
     State(state): State<Arc<ServerState>>,
     Path((realm_name, execution)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let mint_cookie = !has_flow_cookie(&headers, &execution);
+    let mint_cookie = is_valid_flow_id(&execution) && !has_flow_cookie(&headers, &execution);
     // Resolved before `state` moves into the page renderer.
     let secure_cookies = state.config.secure_cookies();
-    let mut resp =
-        required_action_page_inner(state, realm_name, execution.clone(), accept_language(&headers))
-            .await;
-    if mint_cookie {
+    let mut entry_found = false;
+    let mut resp = required_action_page_inner(
+        state,
+        realm_name,
+        execution.clone(),
+        accept_language(&headers),
+        &mut entry_found,
+    )
+    .await;
+    if mint_cookie && entry_found {
         if let Ok(v) = HeaderValue::from_str(&flow_cookie_header(&execution, secure_cookies)) {
             resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
         }
@@ -990,6 +1018,7 @@ async fn required_action_page_inner(
     realm_name: String,
     execution: String,
     accept_language: Option<&str>,
+    entry_found: &mut bool,
 ) -> Response {
     let realm = match state.resolve_realm(&realm_name).await {
         Ok(Some(r)) => r,
@@ -1022,6 +1051,7 @@ async fn required_action_page_inner(
             );
         }
     };
+    *entry_found = true;
     // Page copy follows the locale pinned at the authorize endpoint, then the
     // request's Accept-Language header.
     let copy =
@@ -1408,35 +1438,43 @@ pub async fn verify_email_handler(
     let execution = query.get("execution");
 
     let token_key = verify_email_cache_key(&realm_id, token);
-    let user_id_bytes = match state.cache.get_and_delete(&token_key).await {
-        Ok(Some(b)) => b,
-        _ => {
-            return error_response(
-                &copy,
-                StatusCode::BAD_REQUEST,
-                &copy.msg(
-                    "verifyEmail.linkExpired",
-                    "This verification link is invalid or has expired. \
-                     Sign in again to request a new one.",
-                ),
-            );
-        }
+    let link_expired = || {
+        error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg(
+                "verifyEmail.linkExpired",
+                "This verification link is invalid or has expired. \
+                 Sign in again to request a new one.",
+            ),
+        )
     };
-    let user_id = match String::from_utf8(user_id_bytes)
-        .ok()
-        .and_then(|s| issuerd_core::UserId::new(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return error_response(
-                &copy,
-                StatusCode::BAD_REQUEST,
-                &copy.msg("verifyEmail.invalidToken", "Invalid verification token."),
-            )
-        }
+    let token_bytes = match state.cache.get_and_delete(&token_key).await {
+        Ok(Some(b)) => b,
+        _ => return link_expired(),
+    };
+    // A token is bound to the address it was mailed to; tokens without that
+    // binding (issued before it existed) are refused rather than trusted.
+    let Some((user_id, mailed_email)) =
+        serde_json::from_slice::<VerifyEmailTokenData>(&token_bytes)
+            .ok()
+            .and_then(|d| issuerd_core::UserId::new(d.user_id).ok().map(|id| (id, d.email)))
+    else {
+        return error_response(
+            &copy,
+            StatusCode::BAD_REQUEST,
+            &copy.msg("verifyEmail.invalidToken", "Invalid verification token."),
+        );
     };
 
     let user = match state.storage.get_user(&realm_id, &user_id).await {
+        Ok(Some(u)) if u.email.as_ref().map(|e| e.as_str()) != Some(mailed_email.as_str()) => {
+            // The address changed since the link was sent: the link proves
+            // ownership of the old address only, never of the current one.
+            warn!(realm = %realm_id, user_id = %user_id,
+                "verify-email: link was issued for a different address; not verifying");
+            return link_expired();
+        }
         Ok(Some(mut u)) => {
             u.email_verified = true;
             u.required_actions.retain(|a| a != "VERIFY_EMAIL");
@@ -2525,6 +2563,73 @@ mod tests {
         assert!(location.contains("code="), "unexpected redirect: {location}");
     }
 
+    /// A link mailed to the old address must not verify an address the user
+    /// switched to afterwards (it was never mailed there).
+    #[tokio::test]
+    async fn verify_email_link_does_not_verify_a_changed_address() {
+        let mut state =
+            ServerState::from_config(&crate::config::ServerConfig::default()).await.unwrap();
+        state.email_sender = Arc::new(RecordingSender::default());
+        let state = Arc::new(state);
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let mut user = test_user(&realm_id, "mallory", &[]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        send_verification_email(&state, &realm, "master", &user, None, None)
+            .await
+            .unwrap();
+        let keys = state.cache.scan_keys("verify-email:master:*").await.unwrap();
+        let token = keys[0].rsplit(':').next().unwrap().to_string();
+
+        user.email = Some(Email::new("victim@example.com").unwrap());
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let query = HashMap::from([("token".to_string(), token)]);
+        let resp = verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let stored = state.storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert!(!stored.email_verified, "changed address must stay unverified");
+    }
+
+    /// A token value carrying only a user id (no address binding) is refused.
+    #[tokio::test]
+    async fn verify_email_rejects_token_without_address_binding() {
+        let state = Arc::new(
+            ServerState::from_config(&crate::config::ServerConfig::default()).await.unwrap(),
+        );
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "legacy", &[]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        state
+            .cache
+            .set(
+                &verify_email_cache_key(&realm_id, "legacy-tok"),
+                user.id.0.clone().into_bytes(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        let query = HashMap::from([("token".to_string(), "legacy-tok".to_string())]);
+        let resp = verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let stored = state.storage.get_user(&realm_id, &user.id).await.unwrap().unwrap();
+        assert!(!stored.email_verified);
+    }
+
     #[tokio::test]
     async fn post_without_flow_cookie_is_rejected() {
         let state = test_state().await;
@@ -3048,6 +3153,40 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(body_string(resp).await.contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn get_page_never_mints_cookie_for_unknown_or_malformed_execution() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        // `%3B%20Domain%3D...` arrives percent-decoded from the Path extractor.
+        let injected = "x; Domain=example.com; y";
+        // A live entry under the malformed id still must not reach Set-Cookie.
+        state
+            .cache
+            .set(
+                &pending_actions_cache_key(&realm_id, injected),
+                serde_json::to_vec(&bare_entry(&realm_id, &["UPDATE_PASSWORD"])).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        let oversized = "a".repeat(4096);
+        for execution in [
+            injected,
+            "x; Domain=example.com",
+            "exec-missing",
+            &oversized,
+        ] {
+            let resp = required_action_page(
+                State(state.clone()),
+                Path(("master".to_string(), execution.to_string())),
+                HeaderMap::new(),
+            )
+            .await;
+            assert!(resp.headers().get(SET_COOKIE).is_none(), "cookie minted for {execution:?}");
+        }
     }
 
     #[tokio::test]

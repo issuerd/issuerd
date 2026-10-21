@@ -144,6 +144,52 @@ fn address_object(user: &User) -> Map<String, Value> {
     address
 }
 
+/// Claim names a configurable-name mapper (user attribute, user property,
+/// group membership) may never emit. Those mappers copy user- or
+/// group-editable data, so letting them write a claim that token consumers
+/// trust for authorization (`realm_access`/`resource_access` read by the
+/// admin API, `aud`, `cnf`, `authorization_details`, `allowed_origins`) or
+/// a registered/protocol claim (`sub`, `iss`, ... — also guarded for signed
+/// tokens by the token manager, but not for the userinfo body) would let
+/// that data forge them. The fixed-name mappers that legitimately produce
+/// `realm_access`/`resource_access`/`aud`/`allowed_origins` are unaffected.
+const PROTECTED_MAPPER_CLAIMS: &[&str] = &[
+    "realm_access",
+    "resource_access",
+    "aud",
+    "cnf",
+    "authorization_details",
+    "allowed_origins",
+    "iss",
+    "sub",
+    "exp",
+    "iat",
+    "nbf",
+    "jti",
+    "typ",
+    "scope",
+    "azp",
+    "sid",
+    "at_hash",
+    "c_hash",
+    "auth_time",
+    "nonce",
+    "acr",
+    "amr",
+    "claims",
+];
+
+/// The claim a configurable-name mapper writes (`claim.name`, else
+/// `default`), or `None` when that name is protected.
+fn configured_claim_name(mapper: &ProtocolMapper, default: &str) -> Option<String> {
+    let claim = mapper.config_value(mapper_config::CLAIM_NAME).unwrap_or(default);
+    if PROTECTED_MAPPER_CLAIMS.contains(&claim) {
+        tracing::debug!(mapper_id = %mapper.id, "mapper targets a protected claim name; skipped");
+        return None;
+    }
+    Some(claim.to_string())
+}
+
 /// Evaluate one mapper for one target, inserting produced claims into `out`.
 fn evaluate_mapper(
     mapper: &ProtocolMapper,
@@ -158,7 +204,9 @@ fn evaluate_mapper(
             let Some(attr) = mapper.config_value(mapper_config::USER_ATTRIBUTE) else {
                 return;
             };
-            let claim = mapper.config_value(mapper_config::CLAIM_NAME).unwrap_or(attr).to_string();
+            let Some(claim) = configured_claim_name(mapper, attr) else {
+                return;
+            };
             if let Some(values) = input.user.attributes.get(attr) {
                 insert_value(out, &claim, values, json_type, multivalued);
             }
@@ -167,8 +215,9 @@ fn evaluate_mapper(
             let Some(property) = mapper.config_value(mapper_config::USER_PROPERTY) else {
                 return;
             };
-            let claim =
-                mapper.config_value(mapper_config::CLAIM_NAME).unwrap_or(property).to_string();
+            let Some(claim) = configured_claim_name(mapper, property) else {
+                return;
+            };
             if let Some(raw) = user_property_value(input.user, property) {
                 if let Some(v) = typed_value(&raw, json_type) {
                     out.insert(claim, v);
@@ -189,8 +238,9 @@ fn evaluate_mapper(
             }
         }
         MapperType::GroupMembership => {
-            let claim =
-                mapper.config_value(mapper_config::CLAIM_NAME).unwrap_or("groups").to_string();
+            let Some(claim) = configured_claim_name(mapper, "groups") else {
+                return;
+            };
             let full_path = mapper.config_flag(mapper_config::FULL_PATH, false);
             let vals: Vec<Value> = input
                 .groups
@@ -554,12 +604,6 @@ pub async fn build_claims_overlay_for_targets(
     Ok(out)
 }
 
-/// Username of the dedicated service-account user backing a client's
-/// client-credentials grant (Keycloak naming).
-pub fn service_account_username(client: &Client) -> String {
-    format!("service-account-{}", client.client_id)
-}
-
 /// Merge RAR `authorization_details` (RFC 9396 §9.1) into a claims
 /// overlay. Same mechanics as DPoP's `bind_cnf_overlay`: the claim is injected
 /// post-mapper-evaluation and read back through the typed
@@ -612,6 +656,41 @@ pub fn is_known_requested_claim(claim: &str) -> bool {
     REQUESTABLE_CLAIMS.contains(&claim)
 }
 
+/// The standard scope whose claim set contains `claim` (OIDC Core §5.4).
+fn requested_claim_scope(claim: &str) -> Option<&'static str> {
+    match claim {
+        "email" | "email_verified" => Some("email"),
+        "phone_number" | "phone_number_verified" => Some("phone"),
+        "address" => Some("address"),
+        c if is_known_requested_claim(c) => Some("profile"),
+        _ => None,
+    }
+}
+
+/// Whether the `claims` request parameter may release `claim`: only when the
+/// client could have obtained it through the `scope` parameter itself. The
+/// covering scope must be among `granted_scopes`, or — for a client that
+/// does not require consent, where the scope parameter would accept it with
+/// no user interaction — among the client's assigned default/optional
+/// scopes. A consent-requiring (or unknown) client is limited to the granted
+/// (consented) scopes.
+pub fn requested_claim_permitted(
+    claim: &str,
+    client: Option<&Client>,
+    granted_scopes: &[String],
+) -> bool {
+    let Some(scope) = requested_claim_scope(claim) else {
+        return false;
+    };
+    if granted_scopes.iter().any(|s| s == scope) {
+        return true;
+    }
+    client.is_some_and(|c| {
+        !c.consent_required
+            && (c.default_scopes.contains(scope) || c.optional_scopes.contains(scope))
+    })
+}
+
 /// Resolve a requestable claim (OIDC Core §5.5) to its value for `user`.
 /// `None` means the underlying data is missing; callers choose the shape of
 /// that absence (the userinfo endpoint preserves its null-entry shape, token
@@ -654,7 +733,8 @@ pub fn requested_claim_value(user: &User, claim: &str) -> Option<Value> {
 /// profile; mapper-produced entries win (never overwritten); unresolvable
 /// entries are omitted. Essential/voluntary marks and `value`/`values` pins
 /// do not change the content (presence-based, matching the userinfo
-/// endpoint).
+/// endpoint). Entries whose covering scope the client may not obtain are
+/// never released ([`requested_claim_permitted`]).
 ///
 /// Used by the pure-implicit authorization flow (`response_type=id_token`),
 /// where no access token is minted and the userinfo endpoint is unreachable,
@@ -663,13 +743,17 @@ pub fn apply_requested_userinfo_claims(
     overlay: &mut Map<String, Value>,
     user: &User,
     claims: Option<&Value>,
+    client: Option<&Client>,
+    granted_scopes: &[String],
 ) {
     let Some(claims) = claims else { return };
     let Some(userinfo_claims) = claims.get("userinfo").and_then(|v| v.as_object()) else {
         return;
     };
     for claim_name in userinfo_claims.keys() {
-        if overlay.contains_key(claim_name) {
+        if overlay.contains_key(claim_name)
+            || !requested_claim_permitted(claim_name, client, granted_scopes)
+        {
             continue;
         }
         if let Some(value) = requested_claim_value(user, claim_name) {
@@ -683,7 +767,8 @@ pub fn apply_requested_userinfo_claims(
 /// the userinfo section ([`apply_requested_userinfo_claims`]): mapper-produced
 /// entries win, unresolvable entries are omitted (token overlays never carry
 /// null entries), essential/voluntary marks and `value`/`values` pins do not
-/// change the content.
+/// change the content, and the same scope gate
+/// ([`requested_claim_permitted`]) applies.
 ///
 /// Applies wherever an ID token is issued for a request that carried the
 /// `claims` parameter: the authorization endpoint (implicit and hybrid
@@ -696,13 +781,17 @@ pub fn apply_requested_id_token_claims(
     overlay: &mut Map<String, Value>,
     user: &User,
     claims: Option<&Value>,
+    client: Option<&Client>,
+    granted_scopes: &[String],
 ) {
     let Some(claims) = claims else { return };
     let Some(id_token_claims) = claims.get("id_token").and_then(|v| v.as_object()) else {
         return;
     };
     for claim_name in id_token_claims.keys() {
-        if overlay.contains_key(claim_name) {
+        if overlay.contains_key(claim_name)
+            || !requested_claim_permitted(claim_name, client, granted_scopes)
+        {
             continue;
         }
         if let Some(value) = requested_claim_value(user, claim_name) {
@@ -1237,9 +1326,14 @@ mod tests {
         assert!(ui.contains_key("updated_at"));
     }
 
+    fn openid_only() -> Vec<String> {
+        vec!["openid".to_string()]
+    }
+
     #[test]
     fn id_token_section_resolves_present_claims() {
         let user = test_user();
+        let client = test_client();
         let mut overlay = Map::new();
         let claims = serde_json::json!({
             "id_token": {
@@ -1250,7 +1344,13 @@ mod tests {
                 "birthdate": {"value": "1970-01-01"}
             }
         });
-        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        apply_requested_id_token_claims(
+            &mut overlay,
+            &user,
+            Some(&claims),
+            Some(&client),
+            &openid_only(),
+        );
         assert_eq!(overlay.get("name"), Some(&Value::String("Alice Smith".into())));
         assert_eq!(overlay.get("email"), Some(&Value::String("alice@example.com".into())));
         assert!(!overlay.contains_key("unknown_custom_claim"), "unknown names are ignored");
@@ -1260,22 +1360,172 @@ mod tests {
     #[test]
     fn id_token_section_never_overwrites_mapper_output() {
         let user = test_user();
+        let client = test_client();
         let mut overlay = Map::new();
         overlay.insert("name".to_string(), Value::String("From Mapper".into()));
         let claims = serde_json::json!({"id_token": {"name": {"essential": true}}});
-        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        apply_requested_id_token_claims(
+            &mut overlay,
+            &user,
+            Some(&claims),
+            Some(&client),
+            &openid_only(),
+        );
         assert_eq!(overlay.get("name"), Some(&Value::String("From Mapper".into())));
     }
 
     #[test]
     fn id_token_section_ignores_the_userinfo_section_and_absent_claims() {
         let user = test_user();
+        let client = test_client();
         let mut overlay = Map::new();
         // Only a userinfo section: the id_token evaluation is a no-op.
         let claims = serde_json::json!({"userinfo": {"name": null}});
-        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims));
+        apply_requested_id_token_claims(
+            &mut overlay,
+            &user,
+            Some(&claims),
+            Some(&client),
+            &openid_only(),
+        );
         assert!(overlay.is_empty());
-        apply_requested_id_token_claims(&mut overlay, &user, None);
+        apply_requested_id_token_claims(&mut overlay, &user, None, Some(&client), &openid_only());
         assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn configurable_name_mappers_never_emit_protected_claims() {
+        let mut user = test_user();
+        user.first_name = Some(
+            DisplayName::new(r#"{"roles":["manage-realm","manage-users","impersonation"]}"#)
+                .unwrap(),
+        );
+        user.attributes
+            .insert("resource_access".to_string(), vec![r#"{"x":{}}"#.to_string()]);
+        let client = test_client();
+        let roles = empty_roles();
+        let groups = vec![Group {
+            id: GroupId::new("g1").unwrap(),
+            name: GroupName::new("devs").unwrap(),
+            path: GroupPath::new("/devs").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            parent_id: None,
+            sub_groups: vec![],
+            attributes: HashMap::new(),
+            realm_roles: vec![],
+            client_roles: HashMap::new(),
+        }];
+        let forged_roles = mapper(
+            "forged roles",
+            MapperType::UserProperty,
+            &[
+                ("user.property", "firstName"),
+                ("claim.name", "realm_access"),
+                ("jsonType.label", "JSON"),
+            ],
+        );
+        let forged_sub = mapper(
+            "forged sub",
+            MapperType::UserAttribute,
+            &[("user.attribute", "department"), ("claim.name", "sub")],
+        );
+        // No claim.name: the attribute name itself is the claim name.
+        let forged_resource = mapper(
+            "forged resource",
+            MapperType::UserAttribute,
+            &[("user.attribute", "resource_access")],
+        );
+        let forged_aud =
+            mapper("forged aud", MapperType::GroupMembership, &[("claim.name", "aud")]);
+        let mappers = [&forged_roles, &forged_sub, &forged_resource, &forged_aud];
+        for target in [
+            ClaimTarget::AccessToken,
+            ClaimTarget::IdToken,
+            ClaimTarget::UserInfo,
+        ] {
+            let out =
+                evaluate_mappers(&mappers, &input(&user, Some(&client), &groups, &roles), target);
+            assert!(out.is_empty(), "protected claims leaked for {target:?}: {out:?}");
+        }
+
+        // The same mappers still work under a non-protected claim name.
+        let given = mapper(
+            "given",
+            MapperType::UserProperty,
+            &[("user.property", "firstName"), ("claim.name", "given_name")],
+        );
+        let out = evaluate_mappers(
+            &[&given],
+            &input(&user, Some(&client), &groups, &roles),
+            ClaimTarget::AccessToken,
+        );
+        assert!(out.contains_key("given_name"));
+    }
+
+    #[test]
+    fn requested_claims_need_a_scope_the_client_may_obtain() {
+        let user = test_user();
+        let claims = serde_json::json!({
+            "id_token": {"name": null, "email": null, "phone_number": null, "address": null},
+            "userinfo": {"name": null, "email": null, "phone_number": null, "address": null}
+        });
+
+        // A client assigned no profile/email/phone/address scope gets nothing.
+        let mut bare = test_client();
+        bare.default_scopes = Scope::parse("openid");
+        let mut id_overlay = Map::new();
+        apply_requested_id_token_claims(
+            &mut id_overlay,
+            &user,
+            Some(&claims),
+            Some(&bare),
+            &openid_only(),
+        );
+        assert!(id_overlay.is_empty(), "{id_overlay:?}");
+        let mut ui_overlay = Map::new();
+        apply_requested_userinfo_claims(
+            &mut ui_overlay,
+            &user,
+            Some(&claims),
+            Some(&bare),
+            &openid_only(),
+        );
+        assert!(ui_overlay.is_empty(), "{ui_overlay:?}");
+
+        // A granted scope releases exactly its own claims.
+        let granted = vec!["openid".to_string(), "phone".to_string()];
+        let mut overlay = Map::new();
+        apply_requested_id_token_claims(&mut overlay, &user, Some(&claims), Some(&bare), &granted);
+        assert_eq!(overlay.keys().collect::<Vec<_>>(), vec!["phone_number"]);
+
+        // Non-consent client: its assigned (default/optional) scopes count,
+        // as the scope parameter would accept them without user interaction.
+        let mut assigned = test_client();
+        assigned.default_scopes = Scope::parse("openid profile");
+        assigned.optional_scopes = Scope::parse("email");
+        let mut overlay = Map::new();
+        apply_requested_id_token_claims(
+            &mut overlay,
+            &user,
+            Some(&claims),
+            Some(&assigned),
+            &openid_only(),
+        );
+        assert!(overlay.contains_key("name") && overlay.contains_key("email"), "{overlay:?}");
+        assert!(!overlay.contains_key("phone_number") && !overlay.contains_key("address"));
+
+        // Consent-requiring or unknown client: only granted scopes count.
+        assigned.consent_required = true;
+        for client in [Some(&assigned), None] {
+            let mut overlay = Map::new();
+            apply_requested_id_token_claims(
+                &mut overlay,
+                &user,
+                Some(&claims),
+                client,
+                &openid_only(),
+            );
+            assert!(overlay.is_empty(), "{overlay:?}");
+        }
     }
 }

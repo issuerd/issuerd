@@ -236,7 +236,7 @@ pub fn message_bundle(
         // A malformed stored theme name must never become a path component
         // (same guard as the theme asset handler).
         let theme_name = match theme {
-            Some(t) if !t.contains('/') && !t.contains('\\') && t != ".." => t,
+            Some(t) if crate::routes::theme::is_safe_theme_name(t) => t,
             Some(_) => crate::routes::theme::DEFAULT_THEME,
             None => crate::routes::theme::DEFAULT_THEME,
         };
@@ -601,6 +601,29 @@ mod tests {
 
         let bundle = message_bundle(Some(&dir), None, "x/../../evil");
         // The unsafe layer is skipped; only the built-in English text remains.
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Sign In"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn message_bundle_ignores_drive_prefixed_theme_name() {
+        // A drive prefix such as `C:` must not become a path component (on
+        // Windows it discards the themes directory); such a stored theme
+        // falls back to the default theme.
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd-i18n-theme-test-{}", issuerd_core::utils::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // On Unix `C:` is an ordinary directory name, so this decoy is what a
+        // naive join would read (on Windows the join leaves `dir` entirely).
+        #[cfg(unix)]
+        {
+            let decoy = dir.join("C:");
+            std::fs::create_dir_all(&decoy).unwrap();
+            std::fs::write(decoy.join("messages_en.json"), r#"{"login.title":"PWNED"}"#).unwrap();
+        }
+
+        let bundle = message_bundle(Some(&dir), Some("C:"), "en");
         assert_eq!(bundle.get("login.title").map(String::as_str), Some("Sign In"));
 
         std::fs::remove_dir_all(&dir).ok();

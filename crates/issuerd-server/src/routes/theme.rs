@@ -43,12 +43,30 @@ fn builtin_theme_asset(asset_path: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether `seg` joins onto a directory as exactly one plain file/directory
+/// name on every platform. `:` is rejected because on Windows `C:` is a drive
+/// prefix that makes `Path::join` discard the base directory (and `name:stream`
+/// addresses an NTFS alternate data stream); the `Component` check catches
+/// any other platform-specific prefix or root.
+fn is_safe_path_segment(seg: &str) -> bool {
+    use std::path::Component;
+    if seg.is_empty() || seg == "." || seg == ".." || seg.contains(['/', '\\', ':']) {
+        return false;
+    }
+    let mut components = std::path::Path::new(seg).components();
+    matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
+}
+
+/// Whether a stored theme name may become a path component under the themes
+/// directory. `:` is rejected for the same reason as in asset segments: on
+/// Windows a `C:` theme name is a drive prefix that discards the themes root.
+pub(crate) fn is_safe_theme_name(name: &str) -> bool {
+    !name.contains(['/', '\\', ':']) && name != ".."
+}
+
 /// Reject path segments that could escape the theme directory.
 fn is_safe_asset_path(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'))
+    !path.is_empty() && path.split('/').all(is_safe_path_segment)
 }
 
 /// `GET /realms/{realm}/theme/{*path}` — serve a login-theme asset.
@@ -65,7 +83,7 @@ pub async fn theme_asset_handler(
     };
     let theme = realm.login_theme.as_ref().map(|t| t.as_str().to_string());
     let theme = match theme {
-        Some(t) if !t.contains('/') && !t.contains('\\') && t != ".." => t,
+        Some(t) if is_safe_theme_name(&t) => t,
         // A malformed stored theme name must never become a path component.
         _ => DEFAULT_THEME.to_string(),
     };
@@ -171,6 +189,54 @@ mod tests {
         // Trailing separator yields an empty final segment.
         assert!(!is_safe_asset_path("img/"));
         assert!(!is_safe_asset_path("/img/logo.svg"));
+    }
+
+    #[test]
+    fn asset_path_rejects_drive_prefixes_and_colons() {
+        // Windows drive prefixes make `Path::join` discard the theme root.
+        assert!(!is_safe_asset_path("C:/Windows/win.ini"));
+        assert!(!is_safe_asset_path("c:/ProgramData/issuerd/issuerd.toml"));
+        assert!(!is_safe_asset_path("C:issuerd.toml"));
+        assert!(!is_safe_asset_path("C:"));
+        assert!(!is_safe_asset_path("img/C:/x.css"));
+        // NTFS alternate data streams.
+        assert!(!is_safe_asset_path("login.css::$DATA"));
+        assert!(is_safe_asset_path("fonts/inter-v12.woff2"));
+        assert!(is_safe_asset_path("a.b.c"));
+    }
+
+    #[test]
+    fn path_segment_accepts_only_plain_names() {
+        for bad in ["", ".", "..", "a/b", "a\\b", "C:", "C:x", "\\\\srv"] {
+            assert!(!is_safe_path_segment(bad), "{bad:?} must be rejected");
+        }
+        for good in ["issuerd", "acme-login", "dark_v2", "login.css", "..."] {
+            assert!(is_safe_path_segment(good), "{good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn theme_name_rejects_drive_prefixes() {
+        for bad in ["..", "a/b", "a\\b", "C:", "C:x"] {
+            assert!(!is_safe_theme_name(bad), "{bad:?} must be rejected");
+        }
+        for good in ["issuerd", "acme-login", "."] {
+            assert!(is_safe_theme_name(good), "{good:?} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_prefixed_asset_path_is_400() {
+        let cfg = ServerConfig::default();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        for path in ["C:/ProgramData/issuerd/issuerd.toml", "C:issuerd.toml"] {
+            let resp = theme_asset_handler(
+                State(state.clone()),
+                Path(("master".to_string(), path.to_string())),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
     }
 
     #[test]

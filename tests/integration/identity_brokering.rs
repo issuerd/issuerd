@@ -132,7 +132,17 @@ async fn create_ext_idp(rig_internal: &TestHarness, ext: &LoopbackIdp, extra: &[
 /// Full rig: internal realm + public app client + broker IdP config;
 /// loopback realm + broker client + one external user.
 async fn broker_rig(idp_extra: &[(&str, &str)]) -> BrokerRig {
-    let internal = TestHarness::new().await;
+    // The loopback IdP lives on 127.0.0.1: the internal server must opt out
+    // of the IdP calls' SSRF gate, as an operator with an internal IdP would.
+    let config = ServerConfig {
+        outbound_http: issuerd_server::config::OutboundHttpConfig {
+            allow_private_identity_providers: true,
+            ..Default::default()
+        },
+        ..crate::harness::test_config()
+    };
+    let internal =
+        TestHarness::with_state(Arc::new(ServerState::from_config(&config).await.unwrap()));
     let ext = start_loopback_idp().await;
 
     ext.harness.create_realm(EXT_REALM).await;
@@ -844,4 +854,48 @@ async fn unlink_last_sign_in_method_guarded() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+async fn idp_test_connection(harness: &TestHarness) -> (StatusCode, serde_json::Value) {
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let resp = harness
+        .post_json_auth(
+            &format!(
+                "/admin/realms/{INTERNAL}/identity-provider/instances/{EXT_ALIAS}/test-connection"
+            ),
+            &admin,
+            serde_json::json!({}),
+        )
+        .await;
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// Default posture: test-connection refuses an IdP issuer on an internal
+/// address — even a live one — with the same "unreachable" a dead host gets,
+/// so a realm admin cannot use it to probe the internal network.
+#[tokio::test]
+async fn test_connection_refuses_internal_issuer_by_default() {
+    let internal = TestHarness::new().await;
+    let ext = start_loopback_idp().await;
+    ext.harness.create_realm(EXT_REALM).await;
+    internal.create_realm(INTERNAL).await;
+    create_ext_idp(&internal, &ext, &[]).await;
+
+    let (status, json) = idp_test_connection(&internal).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["status"], "error");
+    let problem = json["problems"][0].as_str().unwrap();
+    assert!(problem.contains("identity provider unreachable"), "{problem}");
+}
+
+/// With `[outbound_http] allow_private_identity_providers` the same internal
+/// IdP is reachable and test-connection passes.
+#[tokio::test]
+async fn test_connection_reaches_internal_issuer_when_operator_allows_it() {
+    let rig = broker_rig(&[]).await;
+    let (status, json) = idp_test_connection(&rig.internal).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "ok");
 }

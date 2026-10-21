@@ -836,6 +836,8 @@ pub struct IdentityProviderRepresentation {
     /// Whether the provider is active. Defaults to `true`.
     pub enabled: Option<bool>,
     /// Provider-specific configuration (client ID, authorization URL, etc.).
+    /// `clientSecret` and `bindCredential` read back as `**********` for
+    /// callers without `manage-realm`.
     pub config: Option<HashMap<String, String>>,
 }
 
@@ -1914,6 +1916,34 @@ impl From<IdentityProviderConfig> for IdentityProviderRepresentation {
     }
 }
 
+/// Placeholder shown instead of an identity-provider secret (Keycloak's
+/// `SECRET_VALUE` spelling).
+pub(crate) const IDP_SECRET_MASK: &str = "**********";
+
+/// IdP config keys holding credentials for external systems: the broker's
+/// upstream OAuth client secret and the LDAP federation bind password.
+const IDP_SECRET_CONFIG_KEYS: [&str; 2] = ["clientSecret", "bindCredential"];
+
+impl IdentityProviderRepresentation {
+    /// Replace every present IdP secret config value with [`IDP_SECRET_MASK`].
+    pub fn with_secrets_masked(mut self) -> Self {
+        if let Some(config) = self.config.as_mut() {
+            for key in IDP_SECRET_CONFIG_KEYS {
+                if let Some(value) = config.get_mut(key) {
+                    *value = IDP_SECRET_MASK.to_string();
+                }
+            }
+        }
+        self
+    }
+
+    /// Clone with IdP secrets masked, suitable for persisting in the
+    /// immutable admin-event audit log (readable via `view-realm`).
+    pub fn redacted_for_audit(&self) -> Self {
+        self.clone().with_secrets_masked()
+    }
+}
+
 impl TryFrom<IdentityProviderRepresentation> for IdentityProviderConfig {
     type Error = issuerd_core::IssuerdError;
 
@@ -2210,7 +2240,8 @@ pub struct ExportRolesRepresentation {
 ///
 /// The document carries no secret material: users never include credentials,
 /// client secrets are omitted, and identity-provider `clientSecret` config
-/// values are masked. Groups are a flat list — hierarchy is carried by
+/// values are masked (`bindCredential` too for callers without
+/// `manage-realm`). Groups are a flat list — hierarchy is carried by
 /// `parent_id` (`sub_groups` is always empty).
 #[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
 pub struct RealmExportRepresentation {
@@ -2225,7 +2256,8 @@ pub struct RealmExportRepresentation {
     pub groups: Vec<GroupRepresentation>,
     /// Realm and client role definitions.
     pub roles: ExportRolesRepresentation,
-    /// Identity provider configurations (`clientSecret` values masked).
+    /// Identity provider configurations (`clientSecret` values masked;
+    /// `bindCredential` too for callers without `manage-realm`).
     #[serde(rename = "identityProviders")]
     pub identity_providers: Vec<IdentityProviderRepresentation>,
     /// Client scopes including their protocol mappers.
@@ -2944,6 +2976,42 @@ mod tests {
         let back: IdentityProviderRepresentation = idp.into();
         assert_eq!(back.alias, Alias::new("google").unwrap());
         assert_eq!(back.display_name, Some("Google".to_string()));
+    }
+
+    fn idp_rep_with_config(entries: &[(&str, &str)]) -> IdentityProviderRepresentation {
+        IdentityProviderRepresentation {
+            alias: Alias::new("corp").unwrap(),
+            display_name: None,
+            provider_id: ProviderId::new("ldap"),
+            enabled: None,
+            config: Some(entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+        }
+    }
+
+    #[test]
+    fn identity_provider_secrets_masked_when_present() {
+        let rep = idp_rep_with_config(&[
+            ("clientSecret", "broker-secret"),
+            ("bindCredential", ""),
+            ("bindDn", "cn=svc"),
+        ]);
+        let config = rep.with_secrets_masked().config.unwrap();
+        assert_eq!(config["clientSecret"], IDP_SECRET_MASK);
+        assert_eq!(config["bindCredential"], IDP_SECRET_MASK);
+        assert_eq!(config["bindDn"], "cn=svc");
+
+        let config =
+            idp_rep_with_config(&[("clientId", "c")]).with_secrets_masked().config.unwrap();
+        assert!(!config.contains_key("clientSecret"));
+        assert!(!config.contains_key("bindCredential"));
+    }
+
+    #[test]
+    fn identity_provider_redacted_for_audit_leaves_original_untouched() {
+        let rep = idp_rep_with_config(&[("bindCredential", "bind-password")]);
+        let redacted = rep.redacted_for_audit().config.unwrap();
+        assert_eq!(redacted["bindCredential"], IDP_SECRET_MASK);
+        assert_eq!(rep.config.unwrap()["bindCredential"], "bind-password");
     }
 
     #[test]

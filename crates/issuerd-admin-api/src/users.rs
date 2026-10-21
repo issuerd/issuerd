@@ -13,8 +13,8 @@ use axum::{
     Json,
 };
 use issuerd_core::{
-    Credential, CredentialType, GroupId, OperationType, Pagination, RealmId, ResourceType, RoleId,
-    Storage, UserId,
+    Credential, CredentialType, GroupId, IssuerdError, OperationType, Pagination, RealmId,
+    ResourceType, Role, RoleId, Storage, UserId,
 };
 #[cfg(test)]
 use issuerd_core::{GroupName, RoleName};
@@ -29,7 +29,98 @@ use crate::{
     error::AdminApiError,
     state::AdminApiState,
 };
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
+
+/// Realm roles the admin API authorizes on (the `require_roles` vocabulary).
+const ADMIN_ROLES: [&str; 7] = [
+    "manage-realm",
+    "view-realm",
+    "manage-users",
+    "view-users",
+    "manage-clients",
+    "view-clients",
+    "impersonation",
+];
+
+/// Whether a caller holding the `held` realm roles may grant the admin role
+/// `role`: they hold it, or hold the `manage-*` role covering a `view-*` one.
+fn may_grant_admin_role(held: &[&str], role: &str) -> bool {
+    held.contains(&role)
+        || role
+            .strip_prefix("view-")
+            .is_some_and(|area| held.contains(&format!("manage-{area}").as_str()))
+}
+
+/// Refuse a grant (role mapping or group membership) whose composite closure
+/// carries an admin role the caller may not grant — Keycloak's rule that an
+/// administrator cannot map admin roles they do not hold. Without it a
+/// `manage-users`-only admin could map `manage-realm` onto itself.
+/// `manage-realm` holders are exempt: they can already reshape any composite
+/// (and therefore reach every role), so the grant adds nothing.
+async fn require_grantable(
+    state: &Arc<AdminApiState>,
+    auth: &AdminAuth,
+    realm_id: &RealmId,
+    granted: Vec<Role>,
+) -> Result<(), AdminApiError> {
+    let held: Vec<&str> = auth
+        .claims
+        .realm_access
+        .as_ref()
+        .map(|ra| ra.roles.iter().map(|r| r.as_str()).collect())
+        .unwrap_or_default();
+    if granted.is_empty() || held.contains(&"manage-realm") {
+        return Ok(());
+    }
+    let all = issuerd_core::list_all_roles(state.storage.as_ref(), realm_id).await?;
+    let denied = issuerd_core::expand_composites(granted, &all).into_iter().find(|r| {
+        !r.client_role
+            && ADMIN_ROLES.contains(&r.name.as_str())
+            && !may_grant_admin_role(&held, r.name.as_str())
+    });
+    if let Some(role) = denied {
+        warn!(role = %role.name, admin = %auth.claims.sub,
+            "admin API authorization denied: caller may not grant this admin role");
+        return Err(AdminApiError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Roles a group membership confers (its mappings plus composites); a group
+/// that does not exist confers none.
+async fn group_grant(
+    state: &Arc<AdminApiState>,
+    realm_id: &RealmId,
+    group_id: &GroupId,
+) -> Result<Vec<Role>, AdminApiError> {
+    match issuerd_core::effective_group_roles(state.storage.as_ref(), realm_id, group_id).await {
+        Ok(roles) => Ok(roles),
+        Err(IssuerdError::NotFound) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The service-account namespace is provisioned only by the clients API.
+fn reject_reserved_username(username: &issuerd_core::Username) -> Result<(), AdminApiError> {
+    if username.is_service_account_reserved() {
+        return Err(AdminApiError::BadRequest(format!(
+            "usernames starting with '{}' are reserved for client service accounts",
+            issuerd_core::Username::SERVICE_ACCOUNT_PREFIX
+        )));
+    }
+    Ok(())
+}
+
+fn reject_service_account_link(
+    attributes: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(), AdminApiError> {
+    if attributes.contains_key(issuerd_core::Client::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE) {
+        return Err(AdminApiError::BadRequest(
+            "the service-account client link is reserved for internal provisioning".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[utoipa::path(
     get,
@@ -153,13 +244,15 @@ pub async fn create_user(
         ));
     }
     let mut realm_role_ids: Vec<RoleId> = Vec::new();
+    let mut granted: Vec<Role> = Vec::new();
     for name in body.realm_roles.as_deref().unwrap_or_default() {
         let role = state
             .storage
             .get_role_by_name(&realm_id, name)
             .await?
             .ok_or_else(|| AdminApiError::BadRequest(format!("unknown realm role: {name}")))?;
-        realm_role_ids.push(role.id);
+        realm_role_ids.push(role.id.clone());
+        granted.push(role);
     }
     let mut group_ids: Vec<GroupId> = Vec::new();
     for gid in body.groups.as_deref().unwrap_or_default() {
@@ -169,9 +262,13 @@ pub async fn create_user(
             .get_group(&realm_id, &group_id)
             .await?
             .ok_or_else(|| AdminApiError::BadRequest(format!("unknown group: {gid}")))?;
+        granted.extend(group_grant(&state, &realm_id, &group_id).await?);
         group_ids.push(group_id);
     }
+    require_grantable(&state, &auth, &realm_id, granted).await?;
     let mut user: issuerd_core::User = body.clone().try_into()?;
+    reject_reserved_username(&user.username)?;
+    reject_service_account_link(&user.attributes)?;
     user.realm_id = realm_id.clone();
     // Hash password credentials exactly like the reset-password endpoint so
     // onboarding with an initial password actually works. The realm password
@@ -317,9 +414,32 @@ pub async fn update_user(
     // The admin representation has no federation_link field; preserve the
     // stored value so a routine edit does not detach federated users.
     updated.federation_link = existing.federation_link;
+    let link_key = issuerd_core::Client::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE;
+    match updated.attributes.get(link_key) {
+        Some(value) if existing.attributes.get(link_key) != Some(value) => {
+            return Err(AdminApiError::BadRequest(
+                "the service-account client link is reserved for internal provisioning".to_string(),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            if let Some(value) = existing.attributes.get(link_key) {
+                updated.attributes.insert(link_key.to_string(), value.clone());
+            }
+        }
+    }
+    if updated.enabled
+        && updated.username.is_service_account_reserved()
+        && !updated.attributes.contains_key(link_key)
+    {
+        return Err(AdminApiError::BadRequest(
+            "an unlinked reserved service-account user cannot be enabled".to_string(),
+        ));
+    }
     // Renaming onto an existing username must be a conflict, not a silent
     // duplicate (InMemory) or a 500 (Postgres unique violation).
     if updated.username != existing.username {
+        reject_reserved_username(&updated.username)?;
         if let Some(other) =
             state.storage.get_user_by_username(&realm_id, updated.username.as_ref()).await?
         {
@@ -812,6 +932,7 @@ pub async fn add_user_realm_roles(
     require_roles(&auth, &["manage-users"])?;
     let (realm_id, user) = load_user(&state, &realm, &id).await?;
     let roles = crate::roles::resolve_role_representations(&state, &realm_id, body.clone()).await?;
+    require_grantable(&state, &auth, &realm_id, roles.clone()).await?;
     for role in &roles {
         // A client role id posted to the realm endpoint is "not found" here —
         // client roles live under `role-mappings/clients/{clientId}`.
@@ -1021,6 +1142,8 @@ pub async fn add_user_client_roles(
     let (realm_id, user) = load_user(&state, &realm, &id).await?;
     let client = load_mapping_client(&state, &realm_id, &client_id).await?;
     let roles = crate::roles::resolve_role_representations(&state, &realm_id, body.clone()).await?;
+    // A client role can be a composite of realm admin roles.
+    require_grantable(&state, &auth, &realm_id, roles.clone()).await?;
     for role in &roles {
         if !role.client_role || role.client_id.as_ref() != Some(&client.id) {
             return Err(AdminApiError::NotFound);
@@ -1252,6 +1375,8 @@ pub async fn add_user_group(
         .id;
     let user_id = UserId::new(&id).map_err(|e| AdminApiError::BadRequest(e.to_string()))?;
     let group_id = GroupId::new(&group_id).map_err(|e| AdminApiError::BadRequest(e.to_string()))?;
+    let granted = group_grant(&state, &realm_id, &group_id).await?;
+    require_grantable(&state, &auth, &realm_id, granted).await?;
     state.storage.add_user_group(&realm_id, &user_id, &group_id).await?;
     issuerd_cluster::invalidate::invalidate_user_claims(state.cache.as_ref(), &realm_id, &user_id)
         .await;
@@ -1352,13 +1477,13 @@ mod tests {
                     jti: issuerd_core::JwtId::new("jti").unwrap(),
                     iss: issuerd_core::Issuer::new("http://localhost:8080/realms/master").unwrap(),
                     sub: issuerd_core::UserId::new("admin").unwrap(),
-                    aud: issuerd_core::Audience::new("aud").unwrap(),
+                    aud: issuerd_core::Audience::new("admin-cli").unwrap(),
                     exp: 9999999999,
                     iat: 0,
                     nbf: 0,
                     scope: issuerd_core::Scope::parse("openid"),
                     typ: JwtType::Bearer,
-                    azp: None,
+                    azp: Some("admin-cli".to_string()),
                     session_state: None,
                     realm_access: Some(RealmAccess {
                         roles: self.roles.clone(),
@@ -3527,5 +3652,259 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- admin role grants (privilege boundary) -------------------------------
+
+    fn roles(names: &[&str]) -> Vec<RoleName> {
+        names.iter().map(|n| RoleName::new(*n).unwrap()).collect()
+    }
+
+    async fn send(app: &Router, method: &str, uri: String, body: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn create_composite_role(
+        state: &Arc<AdminApiState>,
+        id: &str,
+        name: &str,
+        client: Option<&Client>,
+        composites: &[&str],
+    ) {
+        let mut role =
+            create_test_role(state, &RealmId::new("realm-1").unwrap(), id, name, client).await;
+        role.composite = true;
+        role.composites = roles(composites);
+        state.storage.update_role(&role.realm_id, &role).await.unwrap();
+    }
+
+    async fn user_realm_role_count(state: &Arc<AdminApiState>, user_id: &str) -> usize {
+        state
+            .storage
+            .list_user_realm_roles(
+                &RealmId::new("realm-1").unwrap(),
+                &UserId::new(user_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn manage_users_cannot_grant_admin_role_it_lacks() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-mr", "manage-realm", None).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/role-mappings/realm");
+        let status = send(&app, "POST", uri, r#"[{"id":"r-mr","name":"manage-realm"}]"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(user_realm_role_count(&state, &user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn manage_users_cannot_grant_composite_carrying_admin_role() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-imp", "impersonation", None).await;
+        create_composite_role(&state, "r-plus", "helpdesk-plus", None, &["impersonation"]).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/role-mappings/realm");
+        let status = send(&app, "POST", uri, r#"[{"id":"r-plus","name":"helpdesk-plus"}]"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(user_realm_role_count(&state, &user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_role_grantable_when_caller_holds_or_covers_it() {
+        let state = test_state(roles(&["manage-users", "impersonation"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-imp", "impersonation", None).await;
+        create_test_role(&state, &realm_id, "r-vu", "view-users", None).await;
+        create_test_role(&state, &realm_id, "r-plain", "reader", None).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/role-mappings/realm");
+        let body = r#"[{"id":"r-imp","name":"impersonation"},{"id":"r-vu","name":"view-users"},{"id":"r-plain","name":"reader"}]"#;
+        assert_eq!(send(&app, "POST", uri, body).await, StatusCode::NO_CONTENT);
+        assert_eq!(user_realm_role_count(&state, &user_id).await, 3);
+    }
+
+    #[tokio::test]
+    async fn manage_realm_caller_may_grant_admin_roles() {
+        let state = test_state(roles(&["manage-users", "manage-realm"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-imp", "impersonation", None).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/role-mappings/realm");
+        let status = send(&app, "POST", uri, r#"[{"id":"r-imp","name":"impersonation"}]"#).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn manage_users_cannot_grant_client_role_composite_of_admin_role() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let client = create_test_client(&state, &realm_id, "c-1", "app").await;
+        create_test_role(&state, &realm_id, "r-mr", "manage-realm", None).await;
+        create_composite_role(&state, "cr-1", "app-admin", Some(&client), &["manage-realm"]).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/role-mappings/clients/c-1");
+        let status = send(&app, "POST", uri, r#"[{"id":"cr-1","name":"app-admin"}]"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn manage_users_cannot_join_group_carrying_admin_role() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-mr", "manage-realm", None).await;
+        let group = issuerd_core::Group {
+            id: GroupId::new("group-adm").unwrap(),
+            name: GroupName::new("realm-admins").unwrap(),
+            path: issuerd_core::GroupPath::new("/realm-admins").unwrap(),
+            realm_id: realm_id.clone(),
+            parent_id: None,
+            sub_groups: vec![],
+            attributes: HashMap::new(),
+            realm_roles: roles(&["manage-realm"]),
+            client_roles: HashMap::new(),
+        };
+        state.storage.create_group(&realm_id, &group).await.unwrap();
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}/groups/group-adm");
+        assert_eq!(send(&app, "PUT", uri, "").await, StatusCode::FORBIDDEN);
+        let groups = state
+            .storage
+            .list_user_groups(&realm_id, &UserId::new(&user_id).unwrap())
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+
+        let body = r#"{"username":"eve","groups":["group-adm"]}"#;
+        let status = send(&app, "POST", format!("/admin/realms/{realm_name}/users"), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_user_cannot_carry_admin_role_caller_lacks() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        create_test_role(&state, &realm_id, "r-mr", "manage-realm", None).await;
+
+        let body = r#"{"username":"eve","realm_roles":["manage-realm"]}"#;
+        let status = send(&app, "POST", format!("/admin/realms/{realm_name}/users"), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(state.storage.get_user_by_username(&realm_id, "eve").await.unwrap().is_none());
+    }
+
+    // -- service-account username namespace -----------------------------------
+
+    #[tokio::test]
+    async fn create_user_rejects_service_account_username() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+
+        let body = r#"{"username":"service-account-terraform"}"#;
+        let status = send(&app, "POST", format!("/admin/realms/{realm_name}/users"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_service_account_link_attribute() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+
+        let body = r#"{"username":"eve","attributes":{"service_account_client_id":["client-1"]}}"#;
+        let status = send(&app, "POST", format!("/admin/realms/{realm_name}/users"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_rename_into_service_account_namespace() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}");
+        let status = send(&app, "PUT", uri, r#"{"username":"service-account-terraform"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let stored = state
+            .storage
+            .get_user(&RealmId::new("realm-1").unwrap(), &UserId::new(&user_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.username.as_str(), "alice");
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_reenabling_unlinked_service_account() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let uid = UserId::new(&user_id).unwrap();
+        let mut legacy = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        legacy.username = issuerd_core::Username::new("service-account-terraform").unwrap();
+        legacy.enabled = false;
+        state.storage.update_user(&realm_id, &legacy).await.unwrap();
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}");
+        let body = r#"{"username":"service-account-terraform","enabled":true}"#;
+        assert_eq!(send(&app, "PUT", uri, body).await, StatusCode::BAD_REQUEST);
+        let stored = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        assert!(!stored.enabled);
+    }
+
+    #[tokio::test]
+    async fn update_user_allows_linked_service_account() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let uid = UserId::new(&user_id).unwrap();
+        let mut linked = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        linked.username = issuerd_core::Username::new("service-account-terraform").unwrap();
+        linked.enabled = false;
+        linked.attributes.insert(
+            Client::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE.to_string(),
+            vec!["client-1".to_string()],
+        );
+        state.storage.update_user(&realm_id, &linked).await.unwrap();
+
+        let uri = format!("/admin/realms/{realm_name}/users/{user_id}");
+        let body = r#"{"username":"service-account-terraform","enabled":true}"#;
+        assert_eq!(send(&app, "PUT", uri, body).await, StatusCode::NO_CONTENT);
+        let stored = state.storage.get_user(&realm_id, &uid).await.unwrap().unwrap();
+        assert!(stored.enabled);
+        assert_eq!(stored.attributes, linked.attributes);
     }
 }

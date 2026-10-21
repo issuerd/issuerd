@@ -24,7 +24,14 @@
 //!   conditional stage the executor swallows failures, which would bypass
 //!   the factor).
 //! - `resend=1`/`resend=true` → mint and send a fresh code for the already
-//!   bound user, subject to the per-entry send limit.
+//!   bound user, subject to per-user and per-source send limits.
+//!
+//! Rate limits use atomic cache counters with fixed (never sliding) TTLs:
+//! submissions are counted per issued code and source before comparison, and
+//! mailed codes per (realm, user) and source within a code-TTL window. Burning
+//! or replacing a code does not reset the send budget; a successful login does.
+//! Consumption and burning use atomic compare-and-delete, so a stale flow
+//! cannot consume or burn a newer code.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,10 +60,16 @@ pub const REALM_ATTR_TTL_SECS: &str = "email_code_ttl_secs";
 pub const DEFAULT_CODE_LENGTH: usize = 6;
 /// Default cache-entry TTL (seconds): the code expires with the entry.
 pub const DEFAULT_TTL_SECS: u64 = 300;
-/// Wrong-code submissions after which the entry is burned.
+/// Submissions allowed per issued code; reaching it without a match burns
+/// the code.
 pub const MAX_VERIFY_ATTEMPTS: u32 = 5;
-/// Number of codes that may be emailed per entry lifetime.
+/// Number of codes that may be emailed per user within one window of one
+/// code TTL, counted from the first mail. Burning a code does not reset it.
 pub const MAX_SENDS: u32 = 5;
+/// Per-source caps leave one code and its attempts available from another
+/// source, so a single attacker cannot exhaust a victim's whole login window.
+const MAX_SENDS_PER_IP: u32 = MAX_SENDS - 1;
+const MAX_VERIFY_ATTEMPTS_PER_IP: u32 = MAX_SENDS_PER_IP * MAX_VERIFY_ATTEMPTS;
 
 /// Largest code length accepted from the realm attribute — guards against
 /// pathological values (and against length 0, which would compare equal to
@@ -79,21 +92,53 @@ pub trait EmailCodeSender: Send + Sync {
     ) -> Result<(), IssuerdError>;
 }
 
-/// State tracked per (realm, user) while a code is in flight. The cache
-/// entry's TTL enforces code expiry; a missing entry means "expired or never
-/// issued".
+/// The code in flight for a (realm, user). The cache entry's TTL enforces
+/// code expiry; a missing entry means "expired, burned, used, or never
+/// issued". The rate-limit counters live under separate keys so deleting or
+/// replacing this entry never resets the send budget.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EmailCodeEntry {
     code: String,
-    /// Failed verification attempts since the current code was issued.
+    /// Names this code's attempt counter. Absent in entries written by
+    /// nodes predating the atomic counters.
+    #[serde(default)]
+    nonce: Option<String>,
+    /// Code TTL in seconds at issue time; sizes this code's attempt-counter
+    /// window. Absent in entries written by nodes predating the atomic
+    /// counters ([`DEFAULT_TTL_SECS`] applies).
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    /// Attempts recorded in the entry itself: written as 0 and never updated
+    /// here; nodes predating the atomic counters count in it.
     attempts: u32,
-    /// Codes emailed within this entry's lifetime (resends included).
+    /// Copy of the per-user send count, kept so nodes predating the atomic
+    /// counters still enforce the send limit during a rolling upgrade.
     sends: u32,
 }
 
 /// Cache key holding the in-flight code entry for a user.
 fn entry_key(realm_id: &RealmId, user_id: &UserId) -> String {
     format!("email-code:{realm_id}:{user_id}")
+}
+
+/// Atomic counter of submissions against one issued code (see
+/// [`MAX_VERIFY_ATTEMPTS`]). Entries without a nonce share a `legacy` slot.
+fn attempts_key(realm_id: &RealmId, user_id: &UserId, nonce: Option<&str>) -> String {
+    let nonce = nonce.unwrap_or("legacy");
+    format!("email-code-attempts:{realm_id}:{user_id}:{nonce}")
+}
+
+/// Atomic counter of codes mailed to a user (see [`MAX_SENDS`]).
+fn sends_key(realm_id: &RealmId, user_id: &UserId) -> String {
+    format!("email-code-sends:{realm_id}:{user_id}")
+}
+
+fn sends_ip_key(realm_id: &RealmId, user_id: &UserId, ip: std::net::IpAddr) -> String {
+    format!("email-code-sends-ip:{realm_id}:{user_id}:{ip}")
+}
+
+fn attempts_ip_key(realm_id: &RealmId, user_id: &UserId, ip: std::net::IpAddr) -> String {
+    format!("email-code-attempts-ip:{realm_id}:{user_id}:{ip}")
 }
 
 fn otp_challenge() -> AuthStepResult {
@@ -174,10 +219,13 @@ impl EmailCodeAuthenticator {
         }
     }
 
-    async fn load_entry(&self, key: &str) -> Result<Option<EmailCodeEntry>, IssuerdError> {
+    async fn load_entry(
+        &self,
+        key: &str,
+    ) -> Result<Option<(EmailCodeEntry, Vec<u8>)>, IssuerdError> {
         match self.cache.get(key).await? {
             Some(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
+                .map(|entry| Some((entry, bytes)))
                 .map_err(|e| IssuerdError::ServerError(format!("corrupt email-code entry: {e}"))),
             None => Ok(None),
         }
@@ -193,6 +241,45 @@ impl EmailCodeAuthenticator {
             IssuerdError::ServerError(format!("failed to encode email-code entry: {e}"))
         })?;
         self.cache.set(key, bytes, Some(Duration::from_secs(ttl))).await
+    }
+
+    /// Charge one mail against the user's send budget and return the new
+    /// count, or `None` once the limit is reached. The increment is atomic,
+    /// so concurrent requests each get a distinct count, and its TTL applies
+    /// only when the counter is created, so the window never slides.
+    async fn charge_send(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+        ip_address: Option<std::net::IpAddr>,
+        ttl: u64,
+    ) -> Result<Option<u32>, IssuerdError> {
+        let window = Some(Duration::from_secs(ttl));
+        if let Some(ip) = ip_address {
+            let key = sends_ip_key(realm_id, user_id, ip);
+            let source_sends = self.cache.increment(&key, window).await?;
+            if source_sends > u64::from(MAX_SENDS_PER_IP) {
+                debug!(user_id = %user_id, sends = source_sends,
+                    "email-code per-source send limit reached; not sending");
+                return Ok(None);
+            }
+        }
+        let sends = self.cache.increment(&sends_key(realm_id, user_id), window).await?;
+        match u32::try_from(sends) {
+            Ok(n) if n <= MAX_SENDS => Ok(Some(n)),
+            _ => {
+                debug!(user_id = %user_id, sends = sends, "email-code send limit reached; not sending");
+                Ok(None)
+            }
+        }
+    }
+
+    /// A successful login clears the send budget. Best effort: a failed
+    /// delete only leaves the counter to expire with its window.
+    async fn clear_send_budget(&self, realm_id: &RealmId, user_id: &UserId) {
+        if let Err(e) = self.cache.delete(&sends_key(realm_id, user_id)).await {
+            warn!(user_id = %user_id, error = %e, "failed to clear email-code send counter");
+        }
     }
 
     /// Resolve the login-page identifier to a user: email address first
@@ -219,27 +306,26 @@ impl EmailCodeAuthenticator {
         email: &str,
     ) -> AuthStepResult {
         context.user_id = Some(user.id.clone());
-        let key = entry_key(&context.realm_id, &user.id);
-        let prior_sends = match self.load_entry(&key).await {
-            Ok(Some(entry)) => entry.sends,
-            Ok(None) => 0,
-            Err(e) => return AuthStepResult::Failure(e),
-        };
-        if prior_sends >= MAX_SENDS {
-            // TODO: signal "too many codes sent" to the page instead of a
-            // bare re-challenge (the last mailed code stays valid).
-            debug!(user_id = %user.id, sends = prior_sends, "email-code send limit reached; not sending");
-            return otp_challenge();
-        }
         let ttl = ttl_secs(realm);
+        let sends =
+            match self.charge_send(&context.realm_id, &user.id, context.ip_address, ttl).await {
+                Ok(Some(sends)) => sends,
+                // TODO: signal "too many codes sent" to the page instead of a
+                // bare re-challenge (the last mailed code stays valid).
+                Ok(None) => return otp_challenge(),
+                Err(e) => return AuthStepResult::Failure(e),
+            };
         let code = match generate_code(code_length(realm)) {
             Ok(code) => code,
             Err(e) => return AuthStepResult::Failure(e),
         };
+        let key = entry_key(&context.realm_id, &user.id);
         let entry = EmailCodeEntry {
             code: code.clone(),
+            nonce: Some(uuid::Uuid::new_v4().simple().to_string()),
+            ttl_secs: Some(ttl),
             attempts: 0,
-            sends: prior_sends + 1,
+            sends,
         };
         if let Err(e) = self.store_entry(&key, &entry, ttl).await {
             warn!(user_id = %user.id, error = %e, "failed to store email login code entry");
@@ -305,8 +391,9 @@ impl EmailCodeAuthenticator {
     }
 
     /// Code submission: verify against the cache entry. Single-use on
-    /// success; burned after [`MAX_VERIFY_ATTEMPTS`] failures; any other
-    /// outcome re-challenges (never `Failure` — see the module docs).
+    /// success; burned once its submissions reach [`MAX_VERIFY_ATTEMPTS`];
+    /// any other outcome re-challenges (never `Failure` — see the module
+    /// docs).
     async fn verify(&self, context: &mut AuthContext, submitted: &str) -> AuthStepResult {
         let Some(user_id) = context.user_id.clone() else {
             // No bound user (the entered email resolved to nobody): any code
@@ -314,44 +401,82 @@ impl EmailCodeAuthenticator {
             return otp_challenge();
         };
         let key = entry_key(&context.realm_id, &user_id);
-        let entry = match self.load_entry(&key).await {
+        let (entry, raw_entry) = match self.load_entry(&key).await {
             Ok(Some(entry)) => entry,
-            // Expired (cache TTL) or never issued.
+            // Expired (cache TTL), burned, used, or never issued.
             Ok(None) => return otp_challenge(),
             Err(e) => return AuthStepResult::Failure(e),
         };
-        let matches: bool = submitted.as_bytes().ct_eq(entry.code.as_bytes()).into();
-        if matches {
-            // Single-use: consume the entry before reporting success.
-            if let Err(e) = self.cache.delete(&key).await {
-                return AuthStepResult::Failure(e);
+        if let Some(ip) = context.ip_address {
+            let ttl = entry.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+            let window = ttl.saturating_mul(u64::from(MAX_VERIFY_ATTEMPTS));
+            let source_attempts = match self
+                .cache
+                .increment(
+                    &attempts_ip_key(&context.realm_id, &user_id, ip),
+                    Some(Duration::from_secs(window)),
+                )
+                .await
+            {
+                Ok(count) => count,
+                Err(e) => return AuthStepResult::Failure(e),
+            };
+            if source_attempts > u64::from(MAX_VERIFY_ATTEMPTS_PER_IP) {
+                return otp_challenge();
             }
+        }
+        // Count the submission against this code atomically BEFORE comparing:
+        // concurrent submissions from any number of flows bound to this user
+        // each get a distinct count, so at most MAX_VERIFY_ATTEMPTS are ever
+        // compared per code.
+        let attempts = match self.count_attempt(&context.realm_id, &user_id, &entry).await {
+            Ok(n) => n,
+            Err(e) => return AuthStepResult::Failure(e),
+        };
+        let max = u64::from(MAX_VERIFY_ATTEMPTS);
+        let matches =
+            attempts <= max && bool::from(submitted.as_bytes().ct_eq(entry.code.as_bytes()));
+        if matches {
+            match self.cache.compare_and_delete(&key, raw_entry).await {
+                Ok(true) => {}
+                Ok(false) => return otp_challenge(),
+                Err(e) => return AuthStepResult::Failure(e),
+            }
+            self.clear_send_budget(&context.realm_id, &user_id).await;
             context.attributes.insert("auth_method".to_string(), "email_code".to_string());
             return AuthStepResult::Success;
         }
-
-        let attempts = entry.attempts + 1;
-        if attempts >= MAX_VERIFY_ATTEMPTS {
-            // Burn the code: further submissions hit the missing-entry path.
-            if let Err(e) = self.cache.delete(&key).await {
-                return AuthStepResult::Failure(e);
-            }
-            warn!(user_id = %user_id, attempts = attempts, "email login code burned after repeated failed attempts");
-        } else {
-            // The cache API has no keep-TTL set, so the entry TTL restarts on
-            // each failed attempt — bounded by MAX_VERIFY_ATTEMPTS.
-            let ttl = match self.storage.get_realm(&context.realm_id).await {
-                Ok(Some(realm)) => ttl_secs(&realm),
-                Ok(None) => DEFAULT_TTL_SECS,
+        if attempts >= max {
+            // A stale flow must never burn a newer code issued for the user.
+            match self.cache.compare_and_delete(&key, raw_entry).await {
+                Ok(true) => {
+                    warn!(user_id = %user_id, attempts = attempts, "email login code burned after repeated failed attempts");
+                }
+                Ok(false) => {}
                 Err(e) => return AuthStepResult::Failure(e),
-            };
-            let updated = EmailCodeEntry { attempts, ..entry };
-            if let Err(e) = self.store_entry(&key, &updated, ttl).await {
-                return AuthStepResult::Failure(e);
             }
+        } else {
             debug!(user_id = %user_id, attempts = attempts, "email login code rejected; re-challenging");
         }
         otp_challenge()
+    }
+
+    /// Count one submission against `entry`'s code and return the total,
+    /// including attempts an older node recorded in the entry itself. The
+    /// counter's TTL (MAX_VERIFY_ATTEMPTS × the issue-time code TTL) is set
+    /// once at creation and comfortably outlives the code itself, so it cannot
+    /// expire and restart at 1 while the code is alive.
+    async fn count_attempt(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+        entry: &EmailCodeEntry,
+    ) -> Result<u64, IssuerdError> {
+        let key = attempts_key(realm_id, user_id, entry.nonce.as_deref());
+        let ttl = entry.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+        let window = Duration::from_secs(ttl.saturating_mul(u64::from(MAX_VERIFY_ATTEMPTS)));
+        let counted = self.cache.increment(&key, Some(window)).await?;
+        Ok(counted.saturating_add(u64::from(entry.attempts)))
     }
 }
 
@@ -545,6 +670,25 @@ mod tests {
         (result, ctx)
     }
 
+    async fn mint_from(f: &Fixture, login: &str, ip: std::net::IpAddr) -> String {
+        let mut ctx = with_param(context(), "username", login);
+        ctx.ip_address = Some(ip);
+        assert_otp_challenge(f.authenticator.authenticate(&mut ctx).await);
+        f.mailer.sent().last().unwrap().1.clone()
+    }
+
+    async fn submit_otp_from(
+        f: &Fixture,
+        user_id: &str,
+        otp: &str,
+        ip: std::net::IpAddr,
+    ) -> AuthStepResult {
+        let mut ctx = with_param(context(), "otp", otp);
+        ctx.user_id = Some(UserId::new(user_id).unwrap());
+        ctx.ip_address = Some(ip);
+        f.authenticator.authenticate(&mut ctx).await
+    }
+
     #[test]
     fn trait_metadata() {
         let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
@@ -617,11 +761,8 @@ mod tests {
         let (result, _) = submit_otp(&f, Some("u-3"), wrong).await;
         assert_otp_challenge(result);
 
-        // The entry survived with one recorded attempt; the right code still works.
-        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-3").unwrap());
-        let entry: EmailCodeEntry =
-            serde_json::from_slice(&f.cache.get(&key).await.unwrap().unwrap()).unwrap();
-        assert_eq!(entry.attempts, 1);
+        // One attempt is recorded and the entry survived: the right code still works.
+        assert_eq!(code_attempts(&f, "u-3").await, 1);
         let (result, _) = submit_otp(&f, Some("u-3"), &code).await;
         assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
     }
@@ -654,6 +795,8 @@ mod tests {
         let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-5").unwrap());
         let entry = EmailCodeEntry {
             code: "123456".to_string(),
+            nonce: None,
+            ttl_secs: None,
             attempts: 0,
             sends: 1,
         };
@@ -900,5 +1043,466 @@ mod tests {
             matches!(result, AuthStepResult::Success),
             "alice's code must verify after bob's mint: {result:?}"
         );
+    }
+
+    async fn resend(f: &Fixture, user_id: &str) -> AuthStepResult {
+        let mut ctx = with_param(context(), "resend", "1");
+        ctx.user_id = Some(UserId::new(user_id).unwrap());
+        f.authenticator.authenticate(&mut ctx).await
+    }
+
+    fn wrong_for(code: &str) -> &'static str {
+        if code == "000000" {
+            "000001"
+        } else {
+            "000000"
+        }
+    }
+
+    async fn counter(cache: &dyn DistributedCache, key: &str) -> u64 {
+        let value = cache.get(key).await.unwrap();
+        value.map_or(0, |b| String::from_utf8(b).unwrap().parse().unwrap())
+    }
+
+    async fn stored_entry(cache: &dyn DistributedCache, user_id: &str) -> Option<EmailCodeEntry> {
+        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new(user_id).unwrap());
+        let value = cache.get(&key).await.unwrap();
+        value.map(|b| serde_json::from_slice(&b).unwrap())
+    }
+
+    fn code_attempts_key(entry: &EmailCodeEntry, user_id: &str) -> String {
+        let user = UserId::new(user_id).unwrap();
+        attempts_key(&RealmId::new(REALM).unwrap(), &user, entry.nonce.as_deref())
+    }
+
+    /// Submissions counted against the user's current code.
+    async fn code_attempts(f: &Fixture, user_id: &str) -> u64 {
+        let entry = stored_entry(f.cache.as_ref(), user_id).await.expect("a code in flight");
+        counter(f.cache.as_ref(), &code_attempts_key(&entry, user_id)).await
+    }
+
+    async fn sends(f: &Fixture, user_id: &str) -> u64 {
+        let key = sends_key(&RealmId::new(REALM).unwrap(), &UserId::new(user_id).unwrap());
+        counter(f.cache.as_ref(), &key).await
+    }
+
+    #[tokio::test]
+    async fn burning_a_code_does_not_reset_the_send_budget() {
+        let f = fixture().await;
+        let user = test_user("u-30", "mona", Some("mona@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+
+        // Restart from the login page after every burn: each burned code is
+        // replaced while the send budget lasts.
+        for expected_sends in 1..=MAX_SENDS {
+            let mut ctx = with_param(context(), "username", "mona@example.com");
+            assert_otp_challenge(f.authenticator.authenticate(&mut ctx).await);
+            let mails = f.mailer.sent();
+            assert_eq!(mails.len() as u32, expected_sends);
+            let wrong = wrong_for(&mails.last().unwrap().1);
+            for _ in 0..MAX_VERIFY_ATTEMPTS {
+                assert_otp_challenge(submit_otp(&f, Some("u-30"), wrong).await.0);
+            }
+        }
+
+        // The burn used to delete the send count with the code, so this
+        // restarted at zero and mailed again.
+        let mut ctx = with_param(context(), "username", "mona@example.com");
+        assert_otp_challenge(f.authenticator.authenticate(&mut ctx).await);
+        assert!(ctx.user_id.is_some(), "the user is still bound (no existence leak)");
+        assert_otp_challenge(resend(&f, "u-30").await);
+        assert_eq!(f.mailer.sent().len() as u32, MAX_SENDS, "send limit survives burns");
+    }
+
+    #[tokio::test]
+    async fn reissued_code_gets_fresh_attempts() {
+        let f = fixture().await;
+        let user = test_user("u-31", "nils", Some("nils@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let (_, first) = mint(&f, "nils@example.com").await;
+        for _ in 0..MAX_VERIFY_ATTEMPTS {
+            assert_otp_challenge(submit_otp(&f, Some("u-31"), wrong_for(&first)).await.0);
+        }
+
+        // After a burn the legitimate user gets a new code with its own
+        // MAX_VERIFY_ATTEMPTS tries.
+        assert_otp_challenge(resend(&f, "u-31").await);
+        let second = f.mailer.sent()[1].1.clone();
+        for _ in 1..MAX_VERIFY_ATTEMPTS {
+            assert_otp_challenge(submit_otp(&f, Some("u-31"), wrong_for(&second)).await.0);
+        }
+        assert_eq!(code_attempts(&f, "u-31").await, u64::from(MAX_VERIFY_ATTEMPTS) - 1);
+        let (result, _) = submit_otp(&f, Some("u-31"), &second).await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn spent_attempt_budget_refuses_even_the_correct_code() {
+        let f = fixture().await;
+        let user = test_user("u-35", "sven", Some("sven@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let (_, code) = mint(&f, "sven@example.com").await;
+
+        // The state concurrent submissions leave behind when they loaded the
+        // entry before the burn: budget spent, code still present. The next
+        // submission is counted before it is compared, so it is refused.
+        let entry = stored_entry(f.cache.as_ref(), "u-35").await.unwrap();
+        let key = code_attempts_key(&entry, "u-35");
+        for _ in 0..MAX_VERIFY_ATTEMPTS {
+            f.cache.increment(&key, None).await.unwrap();
+        }
+        assert_otp_challenge(submit_otp(&f, Some("u-35"), &code).await.0);
+        assert!(stored_entry(f.cache.as_ref(), "u-35").await.is_none(), "the code is burned");
+    }
+
+    #[tokio::test]
+    async fn successful_login_clears_the_send_budget() {
+        let f = fixture().await;
+        let user = test_user("u-32", "olga", Some("olga@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        mint(&f, "olga@example.com").await;
+        assert_otp_challenge(resend(&f, "u-32").await);
+        assert_eq!(sends(&f, "u-32").await, 2);
+
+        let code = f.mailer.sent()[1].1.clone();
+        let (result, _) = submit_otp(&f, Some("u-32"), &code).await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+        assert_eq!(sends(&f, "u-32").await, 0);
+    }
+
+    #[tokio::test]
+    async fn send_budget_recovers_when_the_window_expires() {
+        let f = fixture().await;
+        let mut realm = test_realm();
+        realm.attributes.insert(REALM_ATTR_TTL_SECS.to_string(), "1".to_string());
+        f.storage.update_realm(&realm).await.unwrap();
+        let user = test_user("u-33", "pavel", Some("pavel@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        mint(&f, "pavel@example.com").await;
+        for _ in 0..MAX_SENDS {
+            assert_otp_challenge(resend(&f, "u-33").await);
+        }
+        assert_eq!(f.mailer.sent().len() as u32, MAX_SENDS);
+
+        // The window is fixed from the first mail, so it ends even though
+        // resends kept arriving.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_otp_challenge(resend(&f, "u-33").await);
+        let sent = f.mailer.sent();
+        assert_eq!(sent.len() as u32, MAX_SENDS + 1, "a fresh code once the window has expired");
+        let (result, _) = submit_otp(&f, Some("u-33"), &sent.last().unwrap().1).await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+    }
+
+    /// The entry shape nodes predating the atomic counters deserialize.
+    #[derive(serde::Deserialize)]
+    struct LegacyEntry {
+        code: String,
+        attempts: u32,
+        sends: u32,
+    }
+
+    #[tokio::test]
+    async fn new_entries_still_parse_as_the_legacy_shape() {
+        let f = fixture().await;
+        let user = test_user("u-36", "tara", Some("tara@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let (_, code) = mint(&f, "tara@example.com").await;
+        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-36").unwrap());
+        let raw = f.cache.get(&key).await.unwrap().unwrap();
+        let legacy: LegacyEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!((legacy.code, legacy.attempts, legacy.sends), (code, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn legacy_entries_verify_and_keep_their_recorded_attempts() {
+        let f = fixture().await;
+        let user = test_user("u-37", "uwe", Some("uwe@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-37").unwrap());
+        let legacy = br#"{"code":"123456","attempts":3,"sends":1}"#.to_vec();
+        let ttl = Some(Duration::from_secs(DEFAULT_TTL_SECS));
+        f.cache.set(&key, legacy, ttl).await.unwrap();
+
+        // A wrong attempt leaves the legacy entry unchanged; 3 recorded + 2
+        // counted reaches the cap and burns it.
+        assert_otp_challenge(submit_otp(&f, Some("u-37"), "000000").await.0);
+        let stored = stored_entry(f.cache.as_ref(), "u-37").await.unwrap();
+        assert_eq!((stored.nonce, stored.ttl_secs, stored.attempts), (None, None, 3));
+        assert_otp_challenge(submit_otp(&f, Some("u-37"), "000000").await.0);
+        assert!(stored_entry(f.cache.as_ref(), "u-37").await.is_none(), "the code is burned");
+        assert_otp_challenge(submit_otp(&f, Some("u-37"), "123456").await.0);
+
+        // A fresh legacy entry still verifies with the right code.
+        let legacy = br#"{"code":"654321","attempts":0,"sends":1}"#.to_vec();
+        let user = test_user("u-38", "vera", Some("vera@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-38").unwrap());
+        f.cache.set(&key, legacy, ttl).await.unwrap();
+        let (result, _) = submit_otp(&f, Some("u-38"), "654321").await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+    }
+
+    /// Fixture whose realm issues codes with a 1-second TTL.
+    async fn short_ttl_fixture(user: &User) -> Fixture {
+        let f = fixture().await;
+        let mut realm = test_realm();
+        realm.attributes.insert(REALM_ATTR_TTL_SECS.to_string(), "1".to_string());
+        f.storage.update_realm(&realm).await.unwrap();
+        f.storage.create_user(&user.realm_id, user).await.unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn wrong_attempt_does_not_extend_code_ttl() {
+        let f = short_ttl_fixture(&test_user("u-50", "wanda", Some("wanda@example.com"))).await;
+        let (_, code) = mint(&f, "wanda@example.com").await;
+
+        // Issued at t=0 with TTL 1 s, wrong at t=0.7, correct at t=1.4.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_otp_challenge(submit_otp(&f, Some("u-50"), wrong_for(&code)).await.0);
+        let entry = stored_entry(f.cache.as_ref(), "u-50").await.unwrap();
+        let attempts_key = code_attempts_key(&entry, "u-50");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            counter(f.cache.as_ref(), &attempts_key).await,
+            1,
+            "the counter outlives the original TTL"
+        );
+        assert_otp_challenge(submit_otp(&f, Some("u-50"), &code).await.0);
+    }
+
+    #[tokio::test]
+    async fn stale_wrong_attempt_does_not_overwrite_reissued_code() {
+        let f = fixture().await;
+        let user = test_user("u-53", "olivia", Some("olivia@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let (_, old_code) = mint(&f, "olivia@example.com").await;
+        assert_otp_challenge(resend(&f, "u-53").await);
+        let new_code = f.mailer.sent()[1].1.clone();
+
+        assert_otp_challenge(submit_otp(&f, Some("u-53"), wrong_for(&old_code)).await.0);
+        let (result, _) = submit_otp(&f, Some("u-53"), &new_code).await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+    }
+
+    /// Cache that, while armed, holds every `get` result at a barrier until
+    /// all parties have read, so concurrent requests act on the same state
+    /// before any of them writes — the interleaving under which a
+    /// read-modify-write counter loses updates.
+    #[derive(Default)]
+    struct GatedCache {
+        inner: issuerd_cluster::InMemoryCache,
+        gate: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    }
+
+    impl GatedCache {
+        fn arm(&self, parties: usize) {
+            *self.gate.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(parties)));
+        }
+
+        fn disarm(&self) {
+            *self.gate.lock().unwrap() = None;
+        }
+    }
+
+    #[async_trait]
+    impl DistributedCache for GatedCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            let value = self.inner.get(key).await;
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(barrier) = gate {
+                barrier.wait().await;
+            }
+            value
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn increment(&self, key: &str, ttl: Option<Duration>) -> Result<u64, IssuerdError> {
+            self.inner.increment(key, ttl).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    struct GatedFixture {
+        cache: Arc<GatedCache>,
+        mailer: Arc<RecordingMailer>,
+        authenticator: Arc<EmailCodeAuthenticator>,
+    }
+
+    async fn gated_fixture(user: &User) -> GatedFixture {
+        let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        storage.create_realm(&test_realm()).await.unwrap();
+        storage.create_user(&user.realm_id, user).await.unwrap();
+        let cache = Arc::new(GatedCache::default());
+        let mailer = Arc::new(RecordingMailer::default());
+        let authenticator =
+            Arc::new(EmailCodeAuthenticator::new(storage, cache.clone(), mailer.clone()));
+        GatedFixture {
+            cache,
+            mailer,
+            authenticator,
+        }
+    }
+
+    /// Run `parallel` copies of a bound-user submission with every cache
+    /// read held at the barrier; returns once all have finished.
+    async fn run_gated(g: &GatedFixture, parallel: usize, user_id: &str, key: &str, value: &str) {
+        g.cache.arm(parallel);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..parallel {
+            let auth = g.authenticator.clone();
+            let mut ctx = with_param(context(), key, value);
+            ctx.user_id = Some(UserId::new(user_id).unwrap());
+            tasks.spawn(async move { auth.authenticate(&mut ctx).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_otp_challenge(result.unwrap());
+        }
+        g.cache.disarm();
+    }
+
+    #[tokio::test]
+    async fn concurrent_wrong_codes_cannot_exceed_the_attempt_cap() {
+        const PARALLEL: usize = 20;
+        let g = gated_fixture(&test_user("u-40", "quinn", Some("quinn@example.com"))).await;
+        let mut ctx = with_param(context(), "username", "quinn@example.com");
+        assert_otp_challenge(g.authenticator.authenticate(&mut ctx).await);
+        let code = g.mailer.sent()[0].1.clone();
+        let entry = stored_entry(&g.cache.inner, "u-40").await.unwrap();
+
+        run_gated(&g, PARALLEL, "u-40", "otp", wrong_for(&code)).await;
+
+        // Every submission was counted against the code, so it is burned; a
+        // lost-update counter would have left it alive at one attempt.
+        let key = code_attempts_key(&entry, "u-40");
+        assert_eq!(counter(&g.cache.inner, &key).await, PARALLEL as u64);
+        let mut ctx = with_param(context(), "otp", &code);
+        ctx.user_id = Some(UserId::new("u-40").unwrap());
+        assert_otp_challenge(g.authenticator.authenticate(&mut ctx).await);
+
+        // The burn does not lock the user out: a reissued code verifies.
+        let mut ctx = with_param(context(), "resend", "1");
+        ctx.user_id = Some(UserId::new("u-40").unwrap());
+        assert_otp_challenge(g.authenticator.authenticate(&mut ctx).await);
+        let mut ctx = with_param(context(), "otp", &g.mailer.sent()[1].1);
+        ctx.user_id = Some(UserId::new("u-40").unwrap());
+        let result = g.authenticator.authenticate(&mut ctx).await;
+        assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_cannot_exceed_the_send_cap() {
+        let g = gated_fixture(&test_user("u-41", "rosa", Some("rosa@example.com"))).await;
+        run_gated(&g, 12, "u-41", "resend", "1").await;
+        assert_eq!(g.mailer.sent().len(), MAX_SENDS as usize);
+    }
+
+    #[tokio::test]
+    async fn concurrent_correct_codes_have_exactly_one_success() {
+        let g = gated_fixture(&test_user("u-42", "sam", Some("sam@example.com"))).await;
+        let mut ctx = with_param(context(), "username", "sam@example.com");
+        assert_otp_challenge(g.authenticator.authenticate(&mut ctx).await);
+        let code = g.mailer.sent()[0].1.clone();
+        g.cache.arm(2);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let auth = g.authenticator.clone();
+            let mut ctx = with_param(context(), "otp", &code);
+            ctx.user_id = Some(UserId::new("u-42").unwrap());
+            tasks.spawn(async move { auth.authenticate(&mut ctx).await });
+        }
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.unwrap());
+        }
+        g.cache.disarm();
+        assert_eq!(results.iter().filter(|r| matches!(r, AuthStepResult::Success)).count(), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, AuthStepResult::Challenge(_))).count(), 1);
+        assert!(stored_entry(&g.cache.inner, "u-42").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_burn_cannot_delete_a_reissued_code() {
+        let f = fixture().await;
+        let key = entry_key(&RealmId::new(REALM).unwrap(), &UserId::new("u-43").unwrap());
+        let old = EmailCodeEntry {
+            code: "111111".to_string(),
+            nonce: Some("old".to_string()),
+            ttl_secs: Some(DEFAULT_TTL_SECS),
+            attempts: 0,
+            sends: 1,
+        };
+        f.cache
+            .set(&key, serde_json::to_vec(&old).unwrap(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let old_raw = f.cache.get(&key).await.unwrap().unwrap();
+        let new = EmailCodeEntry {
+            code: "222222".to_string(),
+            nonce: Some("new".to_string()),
+            ..old
+        };
+        f.cache
+            .set(&key, serde_json::to_vec(&new).unwrap(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+
+        assert!(!f.cache.compare_and_delete(&key, old_raw).await.unwrap());
+        let current = f.cache.get(&key).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<EmailCodeEntry>(&current).unwrap().code, "222222");
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_burn_the_code_reserved_for_another_source() {
+        let f = fixture().await;
+        let user = test_user("u-44", "victim", Some("victim@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let attacker = "192.0.2.10".parse().unwrap();
+        let victim = "198.51.100.20".parse().unwrap();
+
+        for _ in 0..MAX_SENDS_PER_IP {
+            let code = mint_from(&f, "victim@example.com", attacker).await;
+            for _ in 0..MAX_VERIFY_ATTEMPTS {
+                assert_otp_challenge(submit_otp_from(&f, "u-44", wrong_for(&code), attacker).await);
+            }
+        }
+
+        let victim_code = mint_from(&f, "victim@example.com", victim).await;
+        assert_eq!(f.mailer.sent().len(), MAX_SENDS as usize);
+        assert_otp_challenge(submit_otp_from(&f, "u-44", wrong_for(&victim_code), attacker).await);
+        assert!(matches!(
+            submit_otp_from(&f, "u-44", &victim_code, victim).await,
+            AuthStepResult::Success
+        ));
     }
 }

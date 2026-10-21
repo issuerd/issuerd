@@ -147,11 +147,10 @@ fn detect_cycles(
     }
 
     let mut marks: HashMap<&str, Mark> = HashMap::new();
-    let mut path: Vec<&str> = Vec::new();
     for flow in flows {
         let alias = flow.alias.as_str();
         if !marks.contains_key(alias) {
-            visit(alias, &adjacency, &mut marks, &mut path, errors);
+            visit(alias, &adjacency, &mut marks, errors);
         }
     }
 }
@@ -164,31 +163,44 @@ enum Mark {
     Done,
 }
 
+/// Depth-first walk from `root` using an explicit stack rather than recursion:
+/// the sub-flow graph is admin-supplied with no nesting limit, so recursing
+/// once per level could overflow the thread stack and abort the process.
+/// `path[i]` is the alias at depth `i` and `cursor[i]` the index of its next
+/// unexplored target, which reproduces the recursive visiting order exactly.
 fn visit<'a>(
-    alias: &'a str,
+    root: &'a str,
     adjacency: &HashMap<&'a str, Vec<&'a str>>,
     marks: &mut HashMap<&'a str, Mark>,
-    path: &mut Vec<&'a str>,
     errors: &mut Vec<String>,
 ) {
-    marks.insert(alias, Mark::InStack);
-    path.push(alias);
-    if let Some(targets) = adjacency.get(alias) {
-        for target in targets {
-            match marks.get(target) {
-                Some(Mark::InStack) => {
-                    let start = path.iter().position(|a| a == target).unwrap_or(0);
-                    let mut cycle: Vec<&str> = path[start..].to_vec();
-                    cycle.push(target);
-                    errors.push(format!("sub-flow cycle detected: {}", cycle.join(" -> ")));
-                }
-                Some(Mark::Done) => {}
-                None => visit(target, adjacency, marks, path, errors),
+    let mut path: Vec<&'a str> = vec![root];
+    let mut cursor: Vec<usize> = vec![0];
+    marks.insert(root, Mark::InStack);
+    while let (Some(&alias), Some(next)) = (path.last(), cursor.last_mut()) {
+        let targets = adjacency.get(alias).map_or(&[][..], Vec::as_slice);
+        let Some(&target) = targets.get(*next) else {
+            path.pop();
+            cursor.pop();
+            marks.insert(alias, Mark::Done);
+            continue;
+        };
+        *next += 1;
+        match marks.get(target) {
+            Some(Mark::InStack) => {
+                let start = path.iter().position(|a| *a == target).unwrap_or(0);
+                let mut cycle: Vec<&str> = path[start..].to_vec();
+                cycle.push(target);
+                errors.push(format!("sub-flow cycle detected: {}", cycle.join(" -> ")));
+            }
+            Some(Mark::Done) => {}
+            None => {
+                marks.insert(target, Mark::InStack);
+                path.push(target);
+                cursor.push(0);
             }
         }
     }
-    path.pop();
-    marks.insert(alias, Mark::Done);
 }
 
 /// Look up an authenticator synchronously. `PluginRegistry` lookups are
@@ -416,6 +428,34 @@ mod tests {
                 expected_errors: vec!["sub-flow cycle detected: loop -> loop".to_string()],
             },
             Case {
+                name: "shared sub-flow and two cycles are reported in DFS order",
+                flows: vec![
+                    flow(
+                        "a",
+                        false,
+                        vec![
+                            subflow_stage("s1", Requirement::Required, "b"),
+                            subflow_stage("s2", Requirement::Required, "c"),
+                        ],
+                    ),
+                    flow("b", false, vec![subflow_stage("s1", Requirement::Required, "d")]),
+                    flow(
+                        "c",
+                        false,
+                        vec![
+                            subflow_stage("s1", Requirement::Required, "d"),
+                            subflow_stage("s2", Requirement::Required, "a"),
+                        ],
+                    ),
+                    flow("d", false, vec![subflow_stage("s1", Requirement::Required, "b")]),
+                ],
+                known_authenticators: &[],
+                expected_errors: vec![
+                    "sub-flow cycle detected: b -> d -> b".to_string(),
+                    "sub-flow cycle detected: a -> c -> a".to_string(),
+                ],
+            },
+            Case {
                 name: "duplicate stage id within one flow",
                 flows: vec![flow(
                     "browser",
@@ -484,5 +524,59 @@ mod tests {
                 assert_eq!(errors, case.expected_errors, "case '{}'", case.name);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Deep sub-flow chains (stack exhaustion regression)
+    // -----------------------------------------------------------------------
+
+    const DEEP_CHAIN_LEN: usize = 100_000;
+
+    /// `f0 -> f1 -> ... -> f{len-1}`; the last flow runs `auth-cookie`.
+    fn deep_chain(len: usize) -> Vec<FlowConfig> {
+        (0..len)
+            .map(|i| {
+                let stages = if i + 1 < len {
+                    vec![subflow_stage(
+                        "s1",
+                        Requirement::Required,
+                        &format!("f{}", i + 1),
+                    )]
+                } else {
+                    vec![stage("s1", Requirement::Required, "auth-cookie")]
+                };
+                flow(&format!("f{i}"), i == 0, stages)
+            })
+            .collect()
+    }
+
+    /// Validate on a thread with a deliberately small stack so that any
+    /// per-level recursion overflows deterministically.
+    fn validate_on_small_stack(flows: Vec<FlowConfig>) -> Result<(), Vec<String>> {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || validate_flows(&flows, &registry_with(&["auth-cookie"])))
+            .expect("spawn validation thread")
+            .join()
+            .expect("validation thread panicked")
+    }
+
+    #[test]
+    fn very_deep_sub_flow_chain_does_not_overflow_stack() {
+        assert_eq!(validate_on_small_stack(deep_chain(DEEP_CHAIN_LEN)), Ok(()));
+    }
+
+    #[test]
+    fn cycle_at_bottom_of_very_deep_chain_is_reported() {
+        let mut flows = deep_chain(DEEP_CHAIN_LEN);
+        let last = DEEP_CHAIN_LEN - 1;
+        let prev = format!("f{}", last - 1);
+        flows[last].stages = vec![subflow_stage("s1", Requirement::Required, &prev)];
+        assert_eq!(
+            validate_on_small_stack(flows),
+            Err(vec![format!(
+                "sub-flow cycle detected: {prev} -> f{last} -> {prev}"
+            )])
+        );
     }
 }

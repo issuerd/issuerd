@@ -17,6 +17,13 @@
 //! explicit non-public CIDR blocklist, no redirects, capped body, and a
 //! single generic error for every failure mode. The public-IP check lifts
 //! only under `[outbound_http] allow_private_addresses` (test rigs only).
+//!
+//! The IdP-facing calls (discovery, JWKS, token, userinfo — URLs a realm
+//! admin configures or the discovery document names) are SSRF-gated too:
+//! every address they dial, on every redirect hop, must be publicly
+//! routable, unless the operator sets `[outbound_http]
+//! allow_private_identity_providers`. Their response bodies are capped in
+//! both modes.
 
 use issuerd_core::{
     BrokerClient, BrokerDiscoveryDocument, BrokerIdpSettings, BrokerTokenResponse,
@@ -40,6 +47,8 @@ const EXTERNAL_TOKEN_LEEWAY_SECS: u64 = 60;
 /// Production [`BrokerClient`] over `reqwest` (rustls). Timeouts are short:
 /// a hung IdP must not stall login requests.
 pub struct ReqwestBrokerClient {
+    /// IdP-facing client (discovery, JWKS, token, userinfo), built for
+    /// `idp_egress`.
     client: reqwest::Client,
     /// Separate client for attacker-influenced URLs (`get_json_ssrf_guarded`):
     /// redirect following is disabled so a public URL cannot bounce the
@@ -49,24 +58,76 @@ pub struct ReqwestBrokerClient {
     /// resolved addresses in the guarded fetch (test rigs only — see the
     /// config key's warning).
     allow_private_addresses: bool,
+    /// How the IdP-facing calls are SSRF-gated.
+    idp_egress: IdpEgress,
 }
+
+/// How the IdP-facing calls are SSRF-gated, fixed when the client is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdpEgress {
+    /// `[outbound_http] allow_private_identity_providers`: no gate (IdPs on
+    /// the internal network, trusted by the operator).
+    Unrestricted,
+    /// Direct connections: [`PublicOnlyResolver`] checks every address the
+    /// connector dials, on every hop.
+    Direct,
+    /// An outbound proxy is configured through the environment: the proxy,
+    /// not this process, resolves the target, so the target host is resolved
+    /// and checked up front and redirects stay on that host.
+    Proxied,
+}
+
+/// The `*_PROXY` variables reqwest reads for its automatic outbound proxy.
+const PROXY_ENV_VARS: [&str; 6] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+fn env_proxy_configured() -> bool {
+    PROXY_ENV_VARS
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|val| !val.is_empty()))
+}
+
+/// Timeout for the SSRF checks' own DNS lookups (the request timeout).
+const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// reqwest's default redirect hop limit, kept for the gated IdP client.
+const MAX_IDP_REDIRECTS: usize = 10;
 
 /// Body-size cap for documents fetched from untrusted URLs (64 KiB) — both
 /// current consumers are small JSON documents (a `sector_identifier_uri`
 /// array of redirect URIs, a client JWKS).
 const MAX_UNTRUSTED_BODY_BYTES: usize = 64 * 1024;
 
+/// Body-size cap for IdP responses (discovery, JWKS, token, userinfo) — far
+/// above any real document, small enough that an IdP URL cannot stream the
+/// server out of memory.
+const MAX_IDP_BODY_BYTES: usize = 1024 * 1024;
+
 impl ReqwestBrokerClient {
     /// Build the broker client. `extra_roots` are the additional root CAs from
     /// `[outbound_http] extra_ca_bundle` (empty = public webpki roots only).
     /// `allow_private_addresses` lifts the SSRF guard's public-IP check
-    /// (test rigs only).
+    /// (test rigs only); `allow_private_identity_providers` lifts the
+    /// public-address gate of the IdP-facing calls.
     pub fn new(
         extra_roots: &[reqwest::Certificate],
         allow_private_addresses: bool,
+        allow_private_identity_providers: bool,
     ) -> Result<Self, IssuerdError> {
-        let client = crate::outbound_http::client_builder(extra_roots)
-            .timeout(std::time::Duration::from_secs(10))
+        let idp_egress = if allow_private_identity_providers {
+            IdpEgress::Unrestricted
+        } else if env_proxy_configured() {
+            IdpEgress::Proxied
+        } else {
+            IdpEgress::Direct
+        };
+        let client = idp_client_builder(extra_roots, idp_egress)
             .build()
             .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
         let untrusted_client = crate::outbound_http::client_builder(extra_roots)
@@ -78,6 +139,91 @@ impl ReqwestBrokerClient {
             client,
             untrusted_client,
             allow_private_addresses,
+            idp_egress,
+        })
+    }
+}
+
+/// The IdP-facing client for `egress`. `Direct` drops reqwest's automatic
+/// proxy (only non-environment, OS-configured proxies remain at that point)
+/// so the connector always resolves the target through
+/// [`PublicOnlyResolver`].
+fn idp_client_builder(
+    extra_roots: &[reqwest::Certificate],
+    egress: IdpEgress,
+) -> reqwest::ClientBuilder {
+    let builder = crate::outbound_http::client_builder(extra_roots)
+        .timeout(std::time::Duration::from_secs(10));
+    match egress {
+        IdpEgress::Unrestricted => builder,
+        IdpEgress::Direct => builder
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
+            .redirect(idp_redirect_policy(false)),
+        IdpEgress::Proxied => builder.redirect(idp_redirect_policy(true)),
+    }
+}
+
+/// Redirect policy of the gated IdP client: reqwest's default hop limit plus
+/// [`idp_redirect_verdict`].
+fn idp_redirect_policy(same_host_only: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match idp_redirect_verdict(attempt.url(), attempt.previous(), same_host_only) {
+            Ok(()) => attempt.follow(),
+            Err(why) => attempt.error(why),
+        }
+    })
+}
+
+/// Whether the gated IdP client may follow a redirect to `next` (`previous`
+/// holds the original URL and every earlier hop). A hop to a non-public IP
+/// literal is refused here because the connector never asks the resolver
+/// about literals. With `same_host_only` (behind a proxy, which resolves
+/// hops itself) only hops back to the original, pre-checked host are
+/// followed.
+fn idp_redirect_verdict(
+    next: &url::Url,
+    previous: &[url::Url],
+    same_host_only: bool,
+) -> Result<(), &'static str> {
+    if previous.len() >= MAX_IDP_REDIRECTS {
+        return Err("too many redirects");
+    }
+    if is_non_public_ip_literal(next) {
+        return Err("redirect to a non-public address");
+    }
+    if same_host_only && previous.first().and_then(|u| u.host_str()) != next.host_str() {
+        return Err("cross-host redirect behind a proxy");
+    }
+    Ok(())
+}
+
+/// Whether `url`'s host is an IP literal outside the public address space.
+fn is_non_public_ip_literal(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => !is_publicly_routable(&std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => !is_publicly_routable(&std::net::IpAddr::V6(v6)),
+        _ => false,
+    }
+}
+
+/// DNS resolver of the gated IdP client. It refuses a host unless every
+/// address it resolves to is publicly routable, and hands the connector
+/// exactly those checked addresses — so the check and the connection use
+/// the same answer, on the first request and on every redirect hop.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port 0: the connector substitutes the URL's port.
+            let addrs = resolve_public(&host, 0).await.map_err(|why| {
+                warn!(why, host, "IdP host refused by the SSRF resolver");
+                why
+            })?;
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
         })
     }
 }
@@ -168,9 +314,78 @@ fn transport_err(context: &str, e: reqwest::Error) -> IssuerdError {
     IssuerdError::ServerError(format!("identity provider unreachable: {context}"))
 }
 
+/// The error for an IdP call the SSRF gate refused or whose body broke the
+/// cap/parse — the same text as [`transport_err`], so the admin
+/// test-connection endpoint cannot tell a refused internal target from a
+/// dead host. The real cause is logged only.
+fn idp_unreachable(url: &str, why: &str) -> IssuerdError {
+    warn!(why, url, "identity provider call refused or failed");
+    IssuerdError::ServerError(format!("identity provider unreachable: {url}"))
+}
+
+/// Resolve `host` (within [`DNS_TIMEOUT`]) and return its addresses only if
+/// EVERY one is publicly routable; otherwise the reason, for the log.
+async fn resolve_public(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    let addrs: Vec<_> = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| "dns: timed out".to_string())?
+        .map_err(|e| format!("dns: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("dns: no addresses".to_string());
+    }
+    if let Some(bad) = addrs.iter().find(|a| !is_publicly_routable(&a.ip())) {
+        return Err(format!("non-public address {}", bad.ip()));
+    }
+    Ok(addrs)
+}
+
+/// Read an IdP response body, capped at [`MAX_IDP_BODY_BYTES`], as JSON.
+async fn read_idp_json(
+    mut resp: reqwest::Response,
+    url: &str,
+) -> Result<serde_json::Value, IssuerdError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| transport_err(url, e))? {
+        if body.len() + chunk.len() > MAX_IDP_BODY_BYTES {
+            return Err(idp_unreachable(url, "response body exceeds cap"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|e| idp_unreachable(url, &format!("json parse: {e}")))
+}
+
+impl ReqwestBrokerClient {
+    /// Up-front part of the IdP SSRF gate (their URLs come from realm-admin
+    /// IdP config or from the IdP's discovery document). The connector never
+    /// asks the resolver about IP literals, so a non-public literal is
+    /// refused here. Behind a proxy the proxy resolves the target, so the
+    /// host is resolved and checked here instead; the proxy's own lookup can
+    /// still differ (DNS-rebinding window, proxied mode only). In direct
+    /// mode the hostname check happens in [`PublicOnlyResolver`], on the
+    /// addresses actually dialed.
+    async fn check_idp_url(&self, url: &str) -> Result<(), IssuerdError> {
+        if self.idp_egress == IdpEgress::Unrestricted {
+            return Ok(());
+        }
+        let refuse = |why: &str| idp_unreachable(url, why);
+        let parsed = url::Url::parse(url).map_err(|e| refuse(&format!("url parse: {e}")))?;
+        if is_non_public_ip_literal(&parsed) {
+            return Err(refuse("non-public address literal"));
+        }
+        if self.idp_egress == IdpEgress::Proxied {
+            if let Some(url::Host::Domain(host)) = parsed.host() {
+                resolve_public(host, 0).await.map_err(|why| refuse(&why))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl BrokerClient for ReqwestBrokerClient {
     async fn get_json(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
+        self.check_idp_url(url).await?;
         let resp = self
             .client
             .get(url)
@@ -184,7 +399,7 @@ impl BrokerClient for ReqwestBrokerClient {
                 "identity provider returned an error".to_string(),
             ));
         }
-        resp.json::<serde_json::Value>().await.map_err(|e| transport_err(url, e))
+        read_idp_json(resp, url).await
     }
 
     async fn post_form(
@@ -193,6 +408,7 @@ impl BrokerClient for ReqwestBrokerClient {
         form: &[(String, String)],
         basic_auth: Option<(String, String)>,
     ) -> Result<serde_json::Value, IssuerdError> {
+        self.check_idp_url(url).await?;
         let mut req = self
             .client
             .post(url)
@@ -203,7 +419,7 @@ impl BrokerClient for ReqwestBrokerClient {
         }
         let resp = req.send().await.map_err(|e| transport_err(url, e))?;
         let status = resp.status();
-        let body = resp.json::<serde_json::Value>().await.map_err(|e| transport_err(url, e))?;
+        let body = read_idp_json(resp, url).await?;
         if !status.is_success() {
             // OAuth2 error body -> invalid_grant (bad/expired code); anything
             // without an `error` field is an upstream failure.
@@ -224,6 +440,7 @@ impl BrokerClient for ReqwestBrokerClient {
         url: &str,
         access_token: &str,
     ) -> Result<serde_json::Value, IssuerdError> {
+        self.check_idp_url(url).await?;
         let resp = self
             .client
             .get(url)
@@ -236,7 +453,7 @@ impl BrokerClient for ReqwestBrokerClient {
             warn!(status = %resp.status(), url, "IdP userinfo returned non-success");
             return Err(IssuerdError::ServerError("identity provider userinfo failed".to_string()));
         }
-        resp.json::<serde_json::Value>().await.map_err(|e| transport_err(url, e))
+        read_idp_json(resp, url).await
     }
 
     /// Hardened fetch for attacker-influenced URLs (the pairwise
@@ -299,19 +516,7 @@ impl ReqwestBrokerClient {
         // skips this check wholesale (test rigs only; the scheme, redirect,
         // size-cap and timeout rules still apply).
         if !self.allow_private_addresses {
-            let addrs = tokio::net::lookup_host((host, port))
-                .await
-                .map_err(|e| fail(&format!("dns: {e}")))?;
-            let mut resolved_any = false;
-            for addr in addrs {
-                resolved_any = true;
-                if !is_publicly_routable(&addr.ip()) {
-                    return Err(fail(&format!("non-public address {}", addr.ip())));
-                }
-            }
-            if !resolved_any {
-                return Err(fail("dns: no addresses"));
-            }
+            resolve_public(host, port).await.map_err(|why| fail(&why))?;
         }
 
         // Redirects are disabled on this client, so a 3xx surfaces as the
@@ -605,12 +810,12 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_client_builds() {
-        assert!(ReqwestBrokerClient::new(&[], false).is_ok());
+        assert!(ReqwestBrokerClient::new(&[], false, false).is_ok());
     }
 
     #[tokio::test]
     async fn guarded_fetch_rejects_non_https_before_any_network_io() {
-        let client = ReqwestBrokerClient::new(&[], false).unwrap();
+        let client = ReqwestBrokerClient::new(&[], false, false).unwrap();
         let err = client.get_json_ssrf_guarded("http://app.example.com/jwks").await.unwrap_err();
         assert!(
             matches!(err, IssuerdError::InvalidRequest(_)),
@@ -809,12 +1014,12 @@ mod tests {
         let url = format!("{base}/jwks");
 
         // Default posture: loopback is refused by the guard (never dialed).
-        let client = ReqwestBrokerClient::new(std::slice::from_ref(&root), false).unwrap();
+        let client = ReqwestBrokerClient::new(std::slice::from_ref(&root), false, false).unwrap();
         let err = client.get_json_ssrf_guarded(&url).await.unwrap_err();
         assert!(matches!(err, IssuerdError::InvalidRequest(_)), "{err}");
 
         // Test-rig mode: the same fetch succeeds end to end.
-        let client = ReqwestBrokerClient::new(&[root], true).unwrap();
+        let client = ReqwestBrokerClient::new(&[root], true, false).unwrap();
         let json = client.get_json_ssrf_guarded(&url).await.unwrap();
         assert_eq!(json["keys"], serde_json::json!([]));
     }
@@ -823,8 +1028,199 @@ mod tests {
     /// even with the flag on.
     #[tokio::test]
     async fn guarded_fetch_allow_private_keeps_the_https_rule() {
-        let client = ReqwestBrokerClient::new(&[], true).unwrap();
+        let client = ReqwestBrokerClient::new(&[], true, false).unwrap();
         let err = client.get_json_ssrf_guarded("http://127.0.0.1/jwks").await.unwrap_err();
         assert!(matches!(err, IssuerdError::InvalidRequest(_)), "{err}");
+    }
+
+    /// A refused IdP call fails exactly like a dead host, so the admin
+    /// test-connection endpoint is no internal-network oracle.
+    fn assert_idp_unreachable(err: &IssuerdError, url: &str) {
+        let expected = format!("identity provider unreachable: {url}");
+        assert!(
+            matches!(err, IssuerdError::ServerError(m) if *m == expected),
+            "{url} must be refused as unreachable: {err}"
+        );
+    }
+
+    fn gated_client(egress: IdpEgress, builder: reqwest::ClientBuilder) -> ReqwestBrokerClient {
+        ReqwestBrokerClient {
+            client: builder.build().unwrap(),
+            untrusted_client: reqwest::Client::new(),
+            allow_private_addresses: false,
+            idp_egress: egress,
+        }
+    }
+
+    /// Default posture: every IdP-facing call (discovery/JWKS GET, token
+    /// POST, userinfo GET) refuses internal and metadata IP literals, over
+    /// http and https, before any connection is made.
+    #[tokio::test]
+    async fn idp_calls_refuse_non_public_ip_literals_by_default() {
+        let client = ReqwestBrokerClient::new(&[], false, false).unwrap();
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.5:8500/v1/agent/.well-known/openid-configuration",
+            "https://127.0.0.1/realms/x/protocol/openid-connect/certs",
+            "https://192.168.1.1/token",
+            "http://[::1]/userinfo",
+            "http://[::ffff:10.0.0.5]/userinfo",
+        ] {
+            assert_idp_unreachable(&client.get_json(url).await.unwrap_err(), url);
+            assert_idp_unreachable(&client.post_form(url, &[], None).await.unwrap_err(), url);
+            assert_idp_unreachable(&client.get_json_bearer(url, "at").await.unwrap_err(), url);
+        }
+    }
+
+    /// Plain http and public hosts pass the up-front check; in direct mode
+    /// hostnames are left to the resolver (no lookup here).
+    #[tokio::test]
+    async fn idp_up_front_check_allows_http_and_public_targets() {
+        let client = gated_client(IdpEgress::Direct, idp_client_builder(&[], IdpEgress::Direct));
+        for url in [
+            "http://idp.example.com/.well-known/openid-configuration",
+            "http://8.8.8.8/x",
+        ] {
+            client.check_idp_url(url).await.unwrap();
+        }
+    }
+
+    /// The resolver hands the connector exactly the checked addresses and
+    /// refuses a host with any non-public address.
+    #[tokio::test]
+    async fn public_only_resolver_returns_only_checked_addresses() {
+        use reqwest::dns::Resolve;
+        let addrs: Vec<_> =
+            PublicOnlyResolver.resolve("8.8.8.8".parse().unwrap()).await.unwrap().collect();
+        assert_eq!(addrs, vec!["8.8.8.8:0".parse().unwrap()]);
+        for host in ["localhost", "127.0.0.1", "10.0.0.5", "169.254.169.254"] {
+            assert!(PublicOnlyResolver.resolve(host.parse().unwrap()).await.is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn idp_redirect_verdict_rules() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let origin = [u("https://idp.example.com/a")];
+        // Hops to public hosts (names or literals) are followed.
+        assert!(idp_redirect_verdict(&u("http://other.example.org/b"), &origin, false).is_ok());
+        assert!(idp_redirect_verdict(&u("https://8.8.8.8/b"), &origin, false).is_ok());
+        // Non-public literals are refused (the resolver never sees them).
+        for hop in [
+            "http://127.0.0.1/b",
+            "http://169.254.169.254/latest",
+            "http://[::1]/b",
+            "http://[::ffff:192.168.0.1]/b",
+            "http://2130706433/b",
+        ] {
+            assert!(idp_redirect_verdict(&u(hop), &origin, false).is_err(), "{hop}");
+        }
+        // reqwest's default hop limit.
+        let nine = vec![u("https://idp.example.com/a"); 9];
+        assert!(idp_redirect_verdict(&u("https://idp.example.com/b"), &nine, false).is_ok());
+        let ten = vec![u("https://idp.example.com/a"); 10];
+        assert!(idp_redirect_verdict(&u("https://idp.example.com/b"), &ten, false).is_err());
+        // Behind a proxy only same-host hops are followed.
+        assert!(idp_redirect_verdict(&u("http://idp.example.com/b"), &origin, true).is_ok());
+        assert!(idp_redirect_verdict(&u("https://other.example.org/b"), &origin, true).is_err());
+    }
+
+    /// Proxied mode resolves and checks the target up front.
+    #[tokio::test]
+    async fn idp_proxied_mode_checks_the_target_up_front() {
+        let client = gated_client(IdpEgress::Proxied, idp_client_builder(&[], IdpEgress::Proxied));
+        let url = "http://localhost:8500/v1/agent";
+        assert_idp_unreachable(&client.check_idp_url(url).await.unwrap_err(), url);
+        client.check_idp_url("http://8.8.8.8/x").await.unwrap();
+    }
+
+    /// The IdP gate lifts only under `allow_private_identity_providers` — the
+    /// test-rig flag for attacker-influenced URLs does not lift it.
+    #[tokio::test]
+    async fn idp_calls_private_targets_follow_their_own_config_flag() {
+        let (base, root) = start_loopback_tls_json().await;
+        let url = format!("{base}/jwks");
+
+        let client = ReqwestBrokerClient::new(std::slice::from_ref(&root), false, false).unwrap();
+        assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
+        let client = ReqwestBrokerClient::new(std::slice::from_ref(&root), true, false).unwrap();
+        assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
+
+        let client = ReqwestBrokerClient::new(&[root], false, true).unwrap();
+        let json = client.get_json(&url).await.unwrap();
+        assert_eq!(json["keys"], serde_json::json!([]));
+    }
+
+    /// A plain-http loopback IdP: `/doc` serves JSON, `/big` a document over
+    /// the body cap, `/to?url=..` redirects to `url`.
+    async fn start_loopback_http_idp() -> u16 {
+        let app = axum::Router::new()
+            .route(
+                "/doc",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+            )
+            .route(
+                "/big",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"pad": "x".repeat(MAX_IDP_BODY_BYTES)}))
+                }),
+            )
+            .route(
+                "/to",
+                axum::routing::get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move { axum::response::Redirect::temporary(&q["url"]) },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    /// Direct mode end to end, without DNS: `idp.test` stands in for a public
+    /// IdP host (a reqwest DNS override pins it to the loopback server).
+    /// Plain http works and public hops are followed; a hop to a non-public
+    /// literal, or to a name that resolves non-public, is refused; the body
+    /// is capped.
+    #[tokio::test]
+    async fn idp_direct_mode_follows_public_hops_only_and_caps_the_body() {
+        let port = start_loopback_http_idp().await;
+        let pinned = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let builder = idp_client_builder(&[], IdpEgress::Direct).resolve("idp.test", pinned);
+        let client = gated_client(IdpEgress::Direct, builder);
+        let base = format!("http://idp.test:{port}");
+
+        assert_eq!(client.get_json(&format!("{base}/doc")).await.unwrap()["ok"], true);
+        let hop = format!("{base}/to?url=http://idp.test:{port}/doc");
+        assert_eq!(client.get_json(&hop).await.unwrap()["ok"], true);
+
+        for target in [
+            format!("http://127.0.0.1:{port}/doc"),
+            format!("http://localhost:{port}/doc"),
+        ] {
+            let url = format!("{base}/to?url={target}");
+            assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
+        }
+        let url = format!("http://localhost:{port}/doc");
+        assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
+        let url = format!("{base}/big");
+        assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
+    }
+
+    /// `allow_private_identity_providers` restores the pre-gate behaviour
+    /// (internal targets, redirects followed); only the body cap remains.
+    #[tokio::test]
+    async fn idp_unrestricted_mode_follows_redirects_and_caps_the_body() {
+        let port = start_loopback_http_idp().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = ReqwestBrokerClient::new(&[], false, true).unwrap();
+        let hop = format!("{base}/to?url=http://localhost:{port}/doc");
+        assert_eq!(client.get_json(&hop).await.unwrap()["ok"], true);
+        let url = format!("{base}/big");
+        assert_idp_unreachable(&client.get_json(&url).await.unwrap_err(), &url);
     }
 }

@@ -41,49 +41,18 @@ pub(crate) async fn load_client(
     Ok((realm_id, client))
 }
 
-/// Username of a client's service-account user.
-///
-/// Mirrors `issuerd_server::claims::service_account_username`; issuerd-admin-api must
-/// not depend on issuerd-server, so the formula is duplicated here and the two
-/// must be kept in sync.
-pub(crate) fn service_account_username(client: &issuerd_core::Client) -> String {
-    format!("service-account-{}", client.client_id)
-}
-
-/// Return the service-account user for `client`, creating it on first use.
-///
-/// The user is a plain realm user with no credentials; it exists so the
-/// client-credentials grant and admin role-mapping screens have a subject to
-/// attach roles to.
+/// Return the client-linked service-account user, creating it on first use.
 pub(crate) async fn ensure_service_account_user(
     state: &Arc<AdminApiState>,
     realm_id: &issuerd_core::RealmId,
     client: &issuerd_core::Client,
 ) -> Result<issuerd_core::User, AdminApiError> {
-    let username = service_account_username(client);
-    if let Some(user) = state.storage.get_user_by_username(realm_id, &username).await? {
-        return Ok(user);
-    }
-    let now = chrono::Utc::now();
-    let user = issuerd_core::User {
-        id: issuerd_core::UserId::new(issuerd_core::utils::generate_id())
-            .map_err(|e| AdminApiError::BadRequest(e.to_string()))?,
-        realm_id: realm_id.clone(),
-        username: issuerd_core::Username::new(&username)
-            .map_err(|e| AdminApiError::BadRequest(e.to_string()))?,
-        email: None,
-        email_verified: false,
-        first_name: None,
-        last_name: None,
-        enabled: true,
-        federation_link: None,
-        attributes: std::collections::HashMap::new(),
-        required_actions: Vec::new(),
-        created_at: now,
-        updated_at: now,
-    };
-    state.storage.create_user(realm_id, &user).await?;
-    Ok(user)
+    Ok(issuerd_core::service_account::ensure_service_account_user(
+        state.storage.as_ref(),
+        realm_id,
+        client,
+    )
+    .await?)
 }
 
 #[utoipa::path(
@@ -244,6 +213,13 @@ pub async fn create_client(
     let mut rep = body;
     seed_client_scopes_from_realm_defaults(&state.storage, &realm_id, &mut rep).await?;
     let mut client: issuerd_core::Client = rep.clone().try_into()?;
+    if client
+        .attributes
+        .get(issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE)
+        .is_some_and(|value| value == "true")
+    {
+        require_roles(&auth, &["manage-realm"])?;
+    }
     ensure_client_id_available(&state.storage, &realm_id, &client.client_id, None).await?;
     client.realm_id = realm_id.clone();
     // OIDC Core §8.1: pairwise clients must resolve to an
@@ -349,6 +325,18 @@ pub async fn update_client(
     // "clear it" — the representation never round-trips secrets on read.
     if updated.secret.is_none() {
         updated.secret = existing.secret;
+    }
+    let admin_access_key = issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE;
+    match updated.attributes.get(admin_access_key) {
+        Some(value) if existing.attributes.get(admin_access_key) != Some(value) => {
+            require_roles(&auth, &["manage-realm"])?;
+        }
+        Some(_) => {}
+        None => {
+            if let Some(value) = existing.attributes.get(admin_access_key) {
+                updated.attributes.insert(admin_access_key.to_string(), value.clone());
+            }
+        }
     }
     // Scope mappings live behind the `/scope-mappings` sub-resources and are
     // not part of the representation — preserve them across client updates.
@@ -979,6 +967,119 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let user2: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(user.get("id"), user2.get("id"));
+    }
+
+    #[tokio::test]
+    async fn service_account_never_adopts_a_squatted_username() {
+        let state = crate::test_utils::tests::test_state(vec![]);
+        let (realm_name, client_id) = create_test_realm_and_client(&state).await;
+        let realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        let client_id = ClientId::new(client_id).unwrap();
+        let mut client = state.storage.get_client(&realm.id, &client_id).await.unwrap().unwrap();
+        client.service_accounts_enabled = true;
+        let now = chrono::Utc::now();
+        let squatter = issuerd_core::User {
+            id: issuerd_core::UserId::new("squatter").unwrap(),
+            realm_id: realm.id.clone(),
+            username: issuerd_core::Username::new(client.service_account_username()).unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: std::collections::HashMap::new(),
+            required_actions: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        state.storage.create_user(&realm.id, &squatter).await.unwrap();
+
+        let (first, second) = tokio::join!(
+            issuerd_core::service_account::ensure_service_account_user(
+                state.storage.as_ref(),
+                &realm.id,
+                &client,
+            ),
+            issuerd_core::service_account::ensure_service_account_user(
+                state.storage.as_ref(),
+                &realm.id,
+                &client,
+            )
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.id, client.service_account_user_id());
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.id, squatter.id);
+        assert!(client.is_service_account_user(&first));
+        assert_eq!(first.username.as_str(), format!("service-account-{}", client.id));
+        let contained = state.storage.get_user(&realm.id, &squatter.id).await.unwrap().unwrap();
+        assert!(!contained.enabled);
+    }
+
+    #[tokio::test]
+    async fn service_account_link_mismatch_fails_closed() {
+        let state = crate::test_utils::tests::test_state(vec![]);
+        let (realm_name, client_id) = create_test_realm_and_client(&state).await;
+        let realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        let client_id = ClientId::new(client_id).unwrap();
+        let client = state.storage.get_client(&realm.id, &client_id).await.unwrap().unwrap();
+        let now = chrono::Utc::now();
+        let forged = issuerd_core::User {
+            id: client.service_account_user_id(),
+            realm_id: realm.id.clone(),
+            username: issuerd_core::Username::new("forged-service-account").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: std::collections::HashMap::new(),
+            required_actions: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        state.storage.create_user(&realm.id, &forged).await.unwrap();
+        assert!(issuerd_core::service_account::find_service_account_user(
+            state.storage.as_ref(),
+            &realm.id,
+            &client,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_api_access_opt_in_requires_manage_realm() {
+        for (role_names, expected) in [
+            (vec!["manage-clients"], StatusCode::FORBIDDEN),
+            (vec!["manage-clients", "manage-realm"], StatusCode::CREATED),
+        ] {
+            let roles = role_names
+                .into_iter()
+                .map(|name| issuerd_core::RoleName::new(name).unwrap())
+                .collect();
+            let state = crate::test_utils::tests::test_state(roles);
+            let app = client_routes(state.clone());
+            let (realm_name, _) = create_test_realm_and_client(&state).await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/admin/realms/{realm_name}/clients"))
+                        .header("Authorization", "Bearer valid-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(
+                            r#"{"client_id":"automation","attributes":{"admin_api_access":"true"}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]

@@ -242,8 +242,8 @@ impl issuerd_core::EmailSender for RecordingSender {
 
 /// Harness with the recording sender wired in; returns the recorder too.
 async fn harness_with_recorder() -> (TestHarness, Arc<RecordingSender>) {
-    use issuerd_server::{config::ServerConfig, state::ServerState};
-    let config = ServerConfig::default();
+    use issuerd_server::state::ServerState;
+    let config = crate::harness::test_config();
     let mut state = ServerState::from_config(&config).await.unwrap();
     let recorder = Arc::new(RecordingSender::default());
     state.email_sender = recorder.clone();

@@ -31,6 +31,18 @@ pub fn ensure_ring_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Poll `done` until it holds, panicking after 5 s. For work that completes
+/// after the response, such as the background reset-credentials email.
+pub async fn wait_until(mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition not met within 5 s");
+}
+
 // Legacy TestHarness is kept for issuerd-only tests that require
 // direct storage access or the internal auth-code flow helpers.
 use std::collections::HashMap;
@@ -48,6 +60,9 @@ pub struct TokenBundleLegacy {
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
     pub expires_in: u64,
+    /// Value of the SSO session cookie the login response set (an access
+    /// token is not accepted in its place).
+    pub sso_token: String,
 }
 
 /// Connection details for a real Windows Server Active Directory lab, read
@@ -156,9 +171,19 @@ pub struct TestHarness {
     pub base_url: String,
 }
 
+/// Server defaults plus the well-known `admin`/`admin` master-realm bootstrap
+/// admin the suites log in with (unconfigured, the bootstrap generates a
+/// random password).
+pub fn test_config() -> ServerConfig {
+    ServerConfig {
+        bootstrap_admin_password: Some("admin".to_string()),
+        ..ServerConfig::default()
+    }
+}
+
 impl TestHarness {
     pub async fn new() -> Self {
-        let config = ServerConfig::default();
+        let config = test_config();
         let state = Arc::new(ServerState::from_config(&config).await.unwrap());
         let storage = Arc::clone(&state.storage);
         let cache = Arc::clone(&state.cache);
@@ -385,6 +410,7 @@ impl TestHarness {
             )
             .await;
         assert_eq!(login_resp.status(), axum::http::StatusCode::OK);
+        let sso_token = Self::sso_cookie_value(&login_resp);
 
         // Step 4: Extract code from JSON response
         let body = axum::body::to_bytes(login_resp.into_body(), usize::MAX).await.unwrap();
@@ -427,6 +453,7 @@ impl TestHarness {
             refresh_token: token_json["refresh_token"].as_str().map(|s| s.to_string()),
             id_token: token_json["id_token"].as_str().map(|s| s.to_string()),
             expires_in: token_json["expires_in"].as_u64().unwrap(),
+            sso_token,
         }
     }
 
@@ -463,6 +490,7 @@ impl TestHarness {
             )
             .await;
         assert_eq!(login_resp.status(), axum::http::StatusCode::OK);
+        let sso_token = Self::sso_cookie_value(&login_resp);
 
         let body = axum::body::to_bytes(login_resp.into_body(), usize::MAX).await.unwrap();
         let login_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -503,7 +531,22 @@ impl TestHarness {
             refresh_token: token_json["refresh_token"].as_str().map(|s| s.to_string()),
             id_token: token_json["id_token"].as_str().map(|s| s.to_string()),
             expires_in: token_json["expires_in"].as_u64().unwrap(),
+            sso_token,
         }
+    }
+
+    /// Value of the per-realm SSO session cookie a login response sets
+    /// (the `issuerd_session_state_*` companion cookie excluded).
+    fn sso_cookie_value(resp: &Response) -> String {
+        resp.headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|c| !c.starts_with("issuerd_session_state_"))
+            .find_map(|c| c.strip_prefix("issuerd_session_"))
+            .and_then(|rest| rest.split(';').next()?.split_once('='))
+            .map(|(_, value)| value.to_string())
+            .expect("login response sets the SSO session cookie")
     }
 
     pub async fn get_admin_token(&self, realm: &str, username: &str, password: &str) -> String {

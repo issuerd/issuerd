@@ -12,18 +12,32 @@ use issuerd_core::{IdpMapper, OperationType, ResourceType};
 use std::sync::Arc;
 
 use crate::{
-    auth::{require_roles, AdminAuth},
+    auth::{has_realm_role, require_roles, AdminAuth},
     dto::IdentityProviderRepresentation,
     error::AdminApiError,
     state::AdminApiState,
 };
+
+/// IdP read representation for `auth`: secrets for external systems stay
+/// readable with `manage-realm`, read-only callers get them masked.
+pub(crate) fn readable_idp(
+    auth: &AdminAuth,
+    idp: issuerd_core::IdentityProviderConfig,
+) -> IdentityProviderRepresentation {
+    let rep = IdentityProviderRepresentation::from(idp);
+    if has_realm_role(auth, "manage-realm") {
+        rep
+    } else {
+        rep.with_secrets_masked()
+    }
+}
 
 #[utoipa::path(
     get,
     path = "/admin/realms/{realm}/identity-provider/instances",
     tag = "Identity Providers",
     summary = "List identity providers",
-    description = "Returns all external identity provider configurations for the realm. Requires `view-realm` or `manage-realm` role.",
+    description = "Returns all external identity provider configurations for the realm. Requires `view-realm` or `manage-realm` role. `clientSecret` and `bindCredential` config values are masked as `**********` for callers without `manage-realm`.",
     params(("realm" = String, Path, description = "Realm name")),
     responses(
         (status = 200, description = "List of identity providers", body = Vec<IdentityProviderRepresentation>),
@@ -46,7 +60,7 @@ pub async fn list_idps(
         .ok_or(AdminApiError::NotFound)?
         .id;
     let idps = state.storage.list_identity_providers(&realm_id).await?;
-    Ok(Json(idps.into_iter().map(Into::into).collect()))
+    Ok(Json(idps.into_iter().map(|idp| readable_idp(&auth, idp)).collect()))
 }
 
 #[utoipa::path(
@@ -89,7 +103,7 @@ pub async fn create_idp(
         OperationType::Create,
         ResourceType::IdentityProvider,
         &format!("identity-provider/instances/{}", idp.alias),
-        serde_json::to_string(&body).ok(),
+        serde_json::to_string(&body.redacted_for_audit()).ok(),
     )
     .await;
     Ok((StatusCode::CREATED, Json(idp.into())))
@@ -100,7 +114,7 @@ pub async fn create_idp(
     path = "/admin/realms/{realm}/identity-provider/instances/{alias}",
     tag = "Identity Providers",
     summary = "Get an identity provider",
-    description = "Returns the identity provider configuration. Requires `view-realm` or `manage-realm` role.",
+    description = "Returns the identity provider configuration. Requires `view-realm` or `manage-realm` role. `clientSecret` and `bindCredential` config values are masked as `**********` for callers without `manage-realm`.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("alias" = String, Path, description = "IdP alias")
@@ -130,7 +144,7 @@ pub async fn get_idp(
         .get_identity_provider_by_alias(&realm_id, &alias)
         .await?
         .ok_or(AdminApiError::NotFound)?;
-    Ok(Json(idp.into()))
+    Ok(Json(readable_idp(&auth, idp)))
 }
 
 #[utoipa::path(
@@ -180,7 +194,7 @@ pub async fn update_idp(
         OperationType::Update,
         ResourceType::IdentityProvider,
         &format!("identity-provider/instances/{}", alias),
-        serde_json::to_string(&body).ok(),
+        serde_json::to_string(&body.redacted_for_audit()).ok(),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -736,6 +750,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    const IDPS_URI: &str = "/admin/realms/test/identity-provider/instances";
+    const IDP_URI: &str = "/admin/realms/test/identity-provider/instances/corpidp";
+
+    fn secret_idp_config() -> std::collections::HashMap<String, String> {
+        idp_config(&[
+            ("clientId", "corp-client"),
+            ("clientSecret", "broker-secret-value"),
+            ("bindCredential", "ldap-bind-password"),
+        ])
+    }
+
+    /// GET list + GET single, returning the two `config` objects.
+    async fn read_idp_configs(app: &Router) -> [serde_json::Value; 2] {
+        let list = app.clone().oneshot(req("GET", IDPS_URI, None)).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let single = app.clone().oneshot(req("GET", IDP_URI, None)).await.unwrap();
+        assert_eq!(single.status(), StatusCode::OK);
+        [
+            body_json(list).await[0]["config"].clone(),
+            body_json(single).await["config"].clone(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn view_realm_reads_mask_idp_secrets() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-realm").unwrap()
+            ]);
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+        seed_idp(&state, &realm_id, "oidc", secret_idp_config()).await;
+
+        for config in read_idp_configs(&app).await {
+            assert_eq!(config["clientSecret"], crate::dto::IDP_SECRET_MASK);
+            assert_eq!(config["bindCredential"], crate::dto::IDP_SECRET_MASK);
+            assert_eq!(config["clientId"], "corp-client");
+            let serialized = config.to_string();
+            assert!(!serialized.contains("broker-secret-value"));
+            assert!(!serialized.contains("ldap-bind-password"));
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_realm_reads_and_writes_keep_idp_secrets() {
+        let state = crate::test_utils::tests::test_state(vec![
+            issuerd_core::RoleName::new("view-realm").unwrap(),
+            issuerd_core::RoleName::new("manage-realm").unwrap(),
+        ]);
+        let app = idp_routes(state.clone());
+        let realm_id = seed_realm(&state).await;
+
+        let create = serde_json::json!({
+            "alias": "corpidp", "provider_id": "oidc", "config": secret_idp_config()
+        });
+        let response = app
+            .clone()
+            .oneshot(req("POST", IDPS_URI, Some(&create.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response).await;
+        assert_eq!(created["config"]["clientSecret"], "broker-secret-value");
+        assert_eq!(created["config"]["bindCredential"], "ldap-bind-password");
+
+        for config in read_idp_configs(&app).await {
+            assert_eq!(config["clientSecret"], "broker-secret-value");
+            assert_eq!(config["bindCredential"], "ldap-bind-password");
+        }
+
+        let mut update = create;
+        update["config"]["clientSecret"] = "rotated-secret".into();
+        let response = app.oneshot(req("PUT", IDP_URI, Some(&update.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let stored = state
+            .storage
+            .get_identity_provider_by_alias(&realm_id, "corpidp")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.config["clientSecret"], "rotated-secret");
+        assert_eq!(stored.config["bindCredential"], "ldap-bind-password");
+    }
+
+    #[tokio::test]
+    async fn admin_event_representations_never_carry_idp_secrets() {
+        let state = manage_realm_state();
+        let app = idp_routes(state.clone());
+        let realm = issuerd_core::Realm {
+            id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            admin_events_enabled: true,
+            include_representations: true,
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+
+        let mut body = serde_json::json!({
+            "alias": "corpidp", "provider_id": "oidc", "config": secret_idp_config()
+        });
+        let response = app
+            .clone()
+            .oneshot(req("POST", IDPS_URI, Some(&body.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        body["config"]["clientSecret"] = "rotated-secret-value".into();
+        let response = app.oneshot(req("PUT", IDP_URI, Some(&body.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let query = issuerd_core::AdminEventQuery {
+            operation_type: None,
+            resource_type: None,
+            auth_user_id: None,
+            date_from: None,
+            date_to: None,
+            pagination: issuerd_core::Pagination::default(),
+        };
+        let events = state.storage.query_admin_events(&realm.id, &query).await.unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let representation = event.representation.unwrap();
+            assert!(representation.contains(crate::dto::IDP_SECRET_MASK), "{representation}");
+            assert!(representation.contains("corp-client"), "{representation}");
+            for secret in [
+                "broker-secret-value",
+                "rotated-secret-value",
+                "ldap-bind-password",
+            ] {
+                assert!(!representation.contains(secret), "{representation}");
+            }
+        }
     }
 
     // ------------------------------------------------------------------

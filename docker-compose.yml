@@ -74,7 +74,7 @@ services:
     image: redis:7-alpine
     container_name: issuerd-demo-redis
     # Purely transient state — no persistence needed.
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

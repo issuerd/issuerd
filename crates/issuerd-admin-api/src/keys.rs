@@ -338,6 +338,22 @@ mod tests {
         storage: Arc<issuerd_storage::InMemoryStorage>,
         reload: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<AdminApiState> {
+        crate::test_utils::tests::block_on_ready(async {
+            if issuerd_core::Storage::get_realm_by_name(storage.as_ref(), "master")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                let realm = crate::test_utils::tests::master_realm();
+                issuerd_core::Storage::create_realm(storage.as_ref(), &realm).await.unwrap();
+                let admin_cli =
+                    crate::realms::build_admin_cli_client(&realm.id, "http://localhost:8080")
+                        .unwrap();
+                issuerd_core::Storage::create_client(storage.as_ref(), &realm.id, &admin_cli)
+                    .await
+                    .unwrap();
+            }
+        });
         test_state_with_token_service(
             storage,
             reload,

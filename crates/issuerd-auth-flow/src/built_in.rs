@@ -17,17 +17,21 @@ use serde_json::json;
 use tracing::{debug, info, instrument, warn};
 
 use crate::email_code::REALM_ATTR_EMAIL_CODE_LOGIN;
-use crate::login_failures::{LoginFailureConfig, LoginFailureTracker};
+use crate::login_failures::{
+    federated_failure_identifier, otp_failure_config, LoginFailureConfig, LoginFailureTracker,
+};
 
 // ---------------------------------------------------------------------------
 // Authenticators
 // ---------------------------------------------------------------------------
 
-/// Authenticates the user via an existing session cookie (JWT access token),
-/// or via a server-verified remember-me re-authentication.
+/// Authenticates the user via an existing SSO session cookie, or via a
+/// server-verified remember-me re-authentication.
 ///
 /// Two context attributes are recognized:
-/// - `session_cookie`: the raw `issuerd_session` cookie JWT, validated here.
+/// - `session_cookie`: the raw `issuerd_session` cookie JWT, validated here as
+///   an SSO session token (`typ: Serialized-ID`) — client access tokens are
+///   rejected.
 /// - `remember_me_user`: a user id injected by the HTTP layer **only** after
 ///   the `issuerd_remember` action token passed full cryptographic verification
 ///   (signature, purpose, realm binding, expiry) and the user was confirmed
@@ -71,7 +75,7 @@ impl issuerd_core::Authenticator for CookieAuthenticator {
     #[instrument(skip(self, context), fields(authenticator = %self.id(), realm = %context.realm_id))]
     async fn authenticate(&self, context: &mut AuthContext) -> AuthStepResult {
         if let Some(cookie) = context.attributes.get("session_cookie").cloned() {
-            match self.token_service.validate_access_token(&cookie) {
+            match self.token_service.validate_sso_session_token(&cookie) {
                 Ok(ValidatedAccessToken { claims, .. }) => {
                     // Reject session cookies issued for a different realm. The
                     // `issuerd_session` cookie is global, so a browser may send a cookie
@@ -122,6 +126,38 @@ impl issuerd_core::Authenticator for CookieAuthenticator {
 }
 
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static DUMMY_VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide argon2id hash (default params, like every stored password
+/// hash) used for timing-equalizing dummy verifies. Generated once on first
+/// use so it is always a valid PHC string.
+fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use argon2::{password_hash::SaltString, PasswordHasher};
+        use rand::rngs::OsRng;
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"dummy-password", &salt)
+            .map(|h| h.to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// Spend one Argon2 verify on a login path that would otherwise skip it
+/// (unknown, disabled or password-less account), so the response time does
+/// not reveal which usernames exist. The result is always discarded.
+fn dummy_password_verify(password: &str) {
+    #[cfg(test)]
+    DUMMY_VERIFY_CALLS.with(|c| c.set(c.get() + 1));
+    if let Ok(parsed) = PasswordHash::new(dummy_password_hash()) {
+        let _ = Argon2::default().verify_password(password.as_bytes(), &parsed);
+    }
+}
 
 /// Authenticates the user via username and password.
 pub struct UsernamePasswordAuthenticator {
@@ -175,19 +211,26 @@ impl UsernamePasswordAuthenticator {
         };
 
         let mut matched = false;
+        let mut verified_any = false;
         for cred in &creds {
             let hash_str = match String::from_utf8(cred.secret_data.clone()) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            // Non-argon2 PHC strings would fail Argon2 verification before
+            // any hashing; skip them so they count as "no hash" below.
             let parsed = match PasswordHash::new(&hash_str) {
-                Ok(p) => p,
-                Err(_) => continue,
+                Ok(p) if argon2::Algorithm::try_from(p.algorithm).is_ok() => p,
+                _ => continue,
             };
+            verified_any = true;
             if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
                 matched = true;
                 break;
             }
+        }
+        if !verified_any {
+            dummy_password_verify(password);
         }
 
         if matched {
@@ -202,10 +245,15 @@ impl UsernamePasswordAuthenticator {
 
     /// Load the realm's brute-force configuration when protection is enabled.
     ///
-    /// Returns `None` when the realm has `brute_force_protected = false` (or
-    /// the realm cannot be loaded) — callers must then skip failure tracking
-    /// and lockout checks entirely.
+    /// Returns `None` when no tracker is wired, the realm has
+    /// `brute_force_protected = false` (or the realm cannot be loaded) —
+    /// callers must then skip failure tracking and lockout checks entirely.
+    /// The realm lookup happens once per login attempt here, not inside the
+    /// tracker.
     async fn brute_force_config(&self, context: &AuthContext) -> Option<LoginFailureConfig> {
+        if self.tracker.is_none() || self.cache.is_none() {
+            return None;
+        }
         let realm = self.storage.get_realm(&context.realm_id).await.ok()??;
         if !realm.brute_force_protected {
             return None;
@@ -213,10 +261,39 @@ impl UsernamePasswordAuthenticator {
         Some(LoginFailureConfig::from_realm(&realm))
     }
 
+    /// Lockout gate run before any password check: `Some` is the result to
+    /// return without consulting the password at all.
+    async fn lockout_rejection(
+        &self,
+        context: &AuthContext,
+        username: &str,
+        brute_force: Option<&LoginFailureConfig>,
+    ) -> Option<AuthStepResult> {
+        let (Some(tracker), Some(cache), Some(_)) = (&self.tracker, &self.cache, brute_force)
+        else {
+            return None;
+        };
+        let ip = context
+            .ip_address
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        match tracker
+            .is_temporarily_locked(&context.realm_id, username, &ip, cache.as_ref())
+            .await
+        {
+            Ok(true) => {
+                warn!(username = %issuerd_core::utils::sanitize_log_str(username), "account temporarily locked due to failed login attempts");
+                Some(AuthStepResult::Failure(IssuerdError::AccessDenied))
+            }
+            Ok(false) => None,
+            Err(e) => Some(AuthStepResult::Failure(e)),
+        }
+    }
+
     async fn record_failure_and_return(
         &self,
         context: &AuthContext,
-        user: &issuerd_core::User,
+        username: &str,
         brute_force: Option<&LoginFailureConfig>,
     ) -> AuthStepResult {
         if let (Some(ref tracker), Some(ref cache), Some(config)) =
@@ -227,10 +304,11 @@ impl UsernamePasswordAuthenticator {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             if let Err(e) = tracker
-                .record_failure(&context.realm_id, &user.username, &ip, cache.as_ref(), config)
+                .record_failure(&context.realm_id, username, &ip, cache.as_ref(), config)
                 .await
             {
-                warn!(username = %issuerd_core::utils::sanitize_log_str(user.username.as_str()), error = %e, "failed to record login failure; brute-force lockout may not engage");
+                warn!(username = %issuerd_core::utils::sanitize_log_str(username), error = %e, "failed to record login failure; rejecting authentication");
+                return AuthStepResult::Failure(IssuerdError::TemporarilyUnavailable);
             }
         }
         AuthStepResult::Failure(IssuerdError::InvalidGrant)
@@ -347,40 +425,17 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                 // credentials so the endpoint does not leak account state.
                 if !user.enabled {
                     warn!(username = %user.username, "login rejected: user is disabled");
+                    dummy_password_verify(&password);
                     return AuthStepResult::Failure(IssuerdError::InvalidGrant);
                 }
 
-                // Brute-force check (local users only), gated on the realm's
-                // brute-force protection toggle. Realm lookup happens once
-                // per login attempt here — not inside the tracker — and only
-                // when a tracker is wired at all.
-                let brute_force = match (&self.tracker, &self.cache) {
-                    (Some(_), Some(_)) => self.brute_force_config(context).await,
-                    _ => None,
-                };
-                if let (Some(ref tracker), Some(ref cache), Some(_)) =
-                    (&self.tracker, &self.cache, &brute_force)
+                // Brute-force check, gated on the realm's brute-force
+                // protection toggle.
+                let brute_force = self.brute_force_config(context).await;
+                if let Some(rejection) =
+                    self.lockout_rejection(context, &user.username, brute_force.as_ref()).await
                 {
-                    let ip = context
-                        .ip_address
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "0.0.0.0".to_string());
-                    match tracker
-                        .is_temporarily_locked(
-                            &context.realm_id,
-                            &user.username,
-                            &ip,
-                            cache.as_ref(),
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            warn!(username = %user.username, "account temporarily locked due to failed login attempts");
-                            return AuthStepResult::Failure(IssuerdError::AccessDenied);
-                        }
-                        Ok(false) => {}
-                        Err(e) => return AuthStepResult::Failure(e),
-                    }
+                    return rejection;
                 }
 
                 if let Some(ref link) = user.federation_link {
@@ -422,7 +477,7 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                                         return self
                                             .record_failure_and_return(
                                                 context,
-                                                &user,
+                                                &user.username,
                                                 brute_force.as_ref(),
                                             )
                                             .await;
@@ -448,7 +503,7 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                 let result = self.validate_local_password(context, &user, &password).await;
                 if !matches!(result, AuthStepResult::Success) {
                     return self
-                        .record_failure_and_return(context, &user, brute_force.as_ref())
+                        .record_failure_and_return(context, &user.username, brute_force.as_ref())
                         .await;
                 }
                 self.reset_failures_on_success(context, &user.username, brute_force.as_ref())
@@ -461,6 +516,18 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                 if let Some(ref fm) = self.federation_manager {
                     match fm.find_user(&context.realm_id, &username).await {
                         Ok(Some((provider, federated_user))) => {
+                            // Same lockout gate and failure tracking as the
+                            // local branch, keyed so every spelling the
+                            // directory accepts (case, whitespace) shares one
+                            // budget.
+                            let failure_id = federated_failure_identifier(&username);
+                            let brute_force = self.brute_force_config(context).await;
+                            if let Some(rejection) = self
+                                .lockout_rejection(context, &failure_id, brute_force.as_ref())
+                                .await
+                            {
+                                return rejection;
+                            }
                             debug!(username = %issuerd_core::utils::sanitize_log_str(&username), provider_id = %provider.id(), "found federated user; validating password");
                             match provider.validate_password(&username, &password).await {
                                 Ok(true) => {
@@ -475,11 +542,23 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                                         Err(e) => return AuthStepResult::Failure(e),
                                     };
                                     context.user_id = Some(user.id);
+                                    self.reset_failures_on_success(
+                                        context,
+                                        &failure_id,
+                                        brute_force.as_ref(),
+                                    )
+                                    .await;
                                     return AuthStepResult::Success;
                                 }
                                 Ok(false) => {
                                     warn!(username = %issuerd_core::utils::sanitize_log_str(&username), provider_id = %provider.id(), "federated password rejected for user not present locally");
-                                    return AuthStepResult::Failure(IssuerdError::InvalidGrant);
+                                    return self
+                                        .record_failure_and_return(
+                                            context,
+                                            &failure_id,
+                                            brute_force.as_ref(),
+                                        )
+                                        .await;
                                 }
                                 Err(e) => {
                                     warn!(username = %issuerd_core::utils::sanitize_log_str(&username), provider_id = %provider.id(), error = %e, "federation provider error during password validation");
@@ -489,15 +568,18 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                         }
                         Ok(None) => {
                             warn!(username = %issuerd_core::utils::sanitize_log_str(&username), "user not found locally or in federation provider");
+                            dummy_password_verify(&password);
                             AuthStepResult::Failure(IssuerdError::InvalidGrant)
                         }
                         Err(e) => {
                             warn!(username = %issuerd_core::utils::sanitize_log_str(&username), error = %e, "federation lookup error");
+                            dummy_password_verify(&password);
                             AuthStepResult::Failure(IssuerdError::InvalidGrant)
                         }
                     }
                 } else {
                     warn!(username = %issuerd_core::utils::sanitize_log_str(&username), "local user not found and no federation manager configured");
+                    dummy_password_verify(&password);
                     AuthStepResult::Failure(IssuerdError::InvalidGrant)
                 }
             }
@@ -653,13 +735,93 @@ impl issuerd_core::Authenticator for SpnegoFlowAuthenticator {
 /// (pass-through — the stage is gated by the conditional-user-configured
 /// condition). A correct code persists the matched step as the credential's
 /// `last_used_step` replay watermark before succeeding.
+///
+/// Built via [`Self::with_tracker`], every code submission first reserves an
+/// attempt from the user's one-time-code budget
+/// ([`LoginFailureTracker::reserve_otp_attempt`], shared with the password
+/// grant and device verification); a refused reservation re-challenges
+/// without checking the code, and a correct code clears the budget.
 pub struct OtpFormAuthenticator {
     storage: Arc<dyn Storage>,
+    tracker: Option<Arc<LoginFailureTracker>>,
+    cache: Option<Arc<dyn DistributedCache>>,
+}
+
+/// Outcome of reserving one OTP verification attempt.
+enum OtpThrottle {
+    /// No tracker wired: codes are verified without throttling.
+    Off,
+    /// Attempt counted against this username: verify, and clear the count
+    /// if the code is correct.
+    Open(String),
+    /// Locked out, budget spent, or the throttle state could not be read or
+    /// written: the code must not be verified (fail closed).
+    Closed,
 }
 
 impl OtpFormAuthenticator {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            tracker: None,
+            cache: None,
+        }
+    }
+
+    pub fn with_tracker(
+        storage: Arc<dyn Storage>,
+        tracker: Arc<LoginFailureTracker>,
+        cache: Arc<dyn DistributedCache>,
+    ) -> Self {
+        Self {
+            storage,
+            tracker: Some(tracker),
+            cache: Some(cache),
+        }
+    }
+
+    /// Reserve one code check from the user's one-time-code budget.
+    async fn throttle(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+        config: &LoginFailureConfig,
+    ) -> OtpThrottle {
+        let (Some(tracker), Some(cache)) = (&self.tracker, &self.cache) else {
+            return OtpThrottle::Off;
+        };
+        let username = match self.storage.get_user(realm_id, user_id).await {
+            Ok(Some(user)) => user.username.to_string(),
+            Ok(None) => {
+                warn!(user_id = %user_id, "OTP stage: user not found; refusing to verify the code");
+                return OtpThrottle::Closed;
+            }
+            Err(e) => {
+                warn!(user_id = %user_id, error = %e, "OTP stage: user lookup failed; refusing to verify the code");
+                return OtpThrottle::Closed;
+            }
+        };
+        match tracker.reserve_otp_attempt(realm_id, &username, cache.as_ref(), config).await {
+            Ok(true) => OtpThrottle::Open(username),
+            Ok(false) => {
+                warn!(username = %issuerd_core::utils::sanitize_log_str(&username), "OTP stage temporarily locked due to repeated wrong codes");
+                OtpThrottle::Closed
+            }
+            Err(e) => {
+                warn!(username = %issuerd_core::utils::sanitize_log_str(&username), error = %e, "failed to count OTP attempt; refusing to verify the code");
+                OtpThrottle::Closed
+            }
+        }
+    }
+
+    /// A correct code clears the user's OTP failure counter (best-effort).
+    async fn reset_otp_failures(&self, realm_id: &RealmId, username: &str) {
+        let (Some(tracker), Some(cache)) = (&self.tracker, &self.cache) else {
+            return;
+        };
+        if let Err(e) = tracker.clear_otp_attempts(realm_id, username, cache.as_ref()).await {
+            warn!(username = %issuerd_core::utils::sanitize_log_str(username), error = %e, "failed to reset OTP failure counter; stale lockout may persist");
+        }
     }
 }
 
@@ -722,11 +884,23 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
         // the Keycloak defaults instead of failing: at a Conditional flow
         // stage the executor swallows failures (skip_conditional_scope), so a
         // Failure here would let the login succeed WITHOUT a second factor.
-        let policy = match self.storage.get_realm(&context.realm_id).await {
-            Ok(Some(realm)) => realm.otp_policy,
-            Ok(None) => issuerd_core::OtpPolicy::default(),
+        let (policy, failure_config) = match self.storage.get_realm(&context.realm_id).await {
+            Ok(Some(realm)) => {
+                let failure_config = otp_failure_config(&realm);
+                (realm.otp_policy, failure_config)
+            }
+            Ok(None) => (issuerd_core::OtpPolicy::default(), LoginFailureConfig::default()),
             Err(e) => return AuthStepResult::Failure(e),
         };
+
+        // A locked-out user is re-challenged without the code being checked
+        // (never a Failure — see the wrong-code branch below).
+        let throttle = self.throttle(&context.realm_id, &user_id, &failure_config).await;
+        if matches!(throttle, OtpThrottle::Closed) {
+            return AuthStepResult::Challenge(Challenge::OtpForm {
+                action_url: "".to_string(),
+            });
+        }
 
         let now = issuerd_core::utils::now_secs();
         for cred in &creds {
@@ -753,6 +927,9 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
                     warn!(user_id = %user_id, error = %e, "failed to persist TOTP replay watermark");
                     return AuthStepResult::Failure(e);
                 }
+                if let OtpThrottle::Open(ref username) = throttle {
+                    self.reset_otp_failures(&context.realm_id, username).await;
+                }
                 // Marker for the WebAuthn conditional stage: a
                 // satisfied OTP challenge counts as the second factor for
                 // this login, so a user with BOTH credential types is not
@@ -765,7 +942,8 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
 
         // A wrong code is NEVER a Failure: conditional-stage failures are
         // swallowed by the executor (see above), which would bypass the second
-        // factor. Re-challenge so the user can retry.
+        // factor. It already counted toward the per-user lockout (see
+        // `throttle`); re-challenge so the user can retry.
         debug!(user_id = %user_id, "TOTP code rejected; re-challenging");
         AuthStepResult::Challenge(Challenge::OtpForm {
             action_url: "".to_string(),
@@ -1010,10 +1188,16 @@ impl RegistrationAuthenticator {
         } else {
             (optional_name("first_name")?, optional_name("last_name")?)
         };
+        let username = Username::new(&username)?;
+        if username.is_service_account_reserved() {
+            return Err(IssuerdError::InvalidRequest(
+                "this username is reserved for client service accounts".into(),
+            ));
+        }
         let user = User {
             id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
             realm_id: context.realm_id.clone(),
-            username: Username::new(&username)?,
+            username,
             email: Some(Email::new(&email)?),
             email_verified: false,
             first_name,
@@ -1897,6 +2081,7 @@ mod tests {
     use issuerd_storage::memory::InMemoryStorage;
 
     use super::*;
+    use crate::login_failures::OTP_FAILURE_SOURCE;
 
     fn test_context() -> AuthContext {
         AuthContext {
@@ -2070,9 +2255,12 @@ mod tests {
     // CookieAuthenticator
     // -----------------------------------------------------------------------
 
+    /// Mirrors the real validators: a token validates only through the
+    /// validator matching its `typ`.
     struct MockTokenService {
         valid: bool,
         issuer: String,
+        typ: JwtType,
     }
 
     impl MockTokenService {
@@ -2080,16 +2268,12 @@ mod tests {
             Self {
                 valid,
                 issuer: format!("https://id.example.com/realms/{realm}"),
+                typ: JwtType::SerializedId,
             }
         }
-    }
 
-    impl issuerd_core::TokenService for MockTokenService {
-        fn validate_access_token(
-            &self,
-            _token: &str,
-        ) -> Result<ValidatedAccessToken, IssuerdError> {
-            if self.valid {
+        fn validate_typed(&self, typ: JwtType) -> Result<ValidatedAccessToken, IssuerdError> {
+            if self.valid && self.typ == typ {
                 Ok(ValidatedAccessToken {
                     claims: AccessTokenClaims {
                         jti: issuerd_core::JwtId::new("jti").unwrap(),
@@ -2100,7 +2284,7 @@ mod tests {
                         iat: 0,
                         nbf: 0,
                         scope: issuerd_core::Scope::parse("openid"),
-                        typ: JwtType::Bearer,
+                        typ,
                         azp: None,
                         session_state: None,
                         realm_access: None,
@@ -2119,6 +2303,22 @@ mod tests {
             } else {
                 Err(IssuerdError::InvalidToken)
             }
+        }
+    }
+
+    impl issuerd_core::TokenService for MockTokenService {
+        fn validate_access_token(
+            &self,
+            _token: &str,
+        ) -> Result<ValidatedAccessToken, IssuerdError> {
+            self.validate_typed(JwtType::Bearer)
+        }
+
+        fn validate_sso_session_token(
+            &self,
+            _token: &str,
+        ) -> Result<ValidatedAccessToken, IssuerdError> {
+            self.validate_typed(JwtType::SerializedId)
         }
 
         fn validate_id_token(
@@ -2150,6 +2350,10 @@ mod tests {
     /// segments are compared as names). `issuer_realm_name` is the name
     /// embedded in the mock cookie's `iss`.
     async fn cookie_authenticator(valid: bool, issuer_realm_name: &str) -> CookieAuthenticator {
+        cookie_authenticator_with(MockTokenService::for_realm(valid, issuer_realm_name)).await
+    }
+
+    async fn cookie_authenticator_with(tokens: MockTokenService) -> CookieAuthenticator {
         let storage = Arc::new(InMemoryStorage::new());
         storage
             .create_realm(&issuerd_core::Realm {
@@ -2159,10 +2363,7 @@ mod tests {
             })
             .await
             .unwrap();
-        CookieAuthenticator::new(
-            Arc::new(MockTokenService::for_realm(valid, issuer_realm_name)),
-            storage,
-        )
+        CookieAuthenticator::new(Arc::new(tokens), storage)
     }
 
     #[tokio::test]
@@ -2174,6 +2375,21 @@ mod tests {
         assert_auth_success(result);
         assert_eq!(ctx.user_id, Some(UserId::new("alice").unwrap()));
         assert_eq!(ctx.session_id, Some(SessionId::new("sess-1").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cookie_authenticator_rejects_access_token_as_cookie() {
+        // A client access token for the same user/realm/live session must not
+        // pass as the SSO session cookie.
+        let mut tokens = MockTokenService::for_realm(true, "test-realm");
+        tokens.typ = JwtType::Bearer;
+        let auth = cookie_authenticator_with(tokens).await;
+        let mut ctx = test_context();
+        ctx.attributes.insert("session_cookie".to_string(), "access-token".to_string());
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_attempted(result);
+        assert!(ctx.user_id.is_none());
+        assert!(ctx.session_id.is_none());
     }
 
     #[tokio::test]
@@ -3488,6 +3704,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_rejects_service_account_username() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.create_realm(&test_realm()).await.unwrap();
+
+        let auth = RegistrationAuthenticator::new(storage.clone());
+        let mut ctx = registration_context();
+        ctx.parameters
+            .insert("username".to_string(), vec!["service-account-terraform".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_failure(
+            result,
+            IssuerdError::InvalidRequest(
+                "this username is reserved for client service accounts".into(),
+            ),
+        );
+        assert!(storage
+            .get_user_by_username(&RealmId::new("realm-1").unwrap(), "service-account-terraform")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn registration_missing_default_role_does_not_fail() {
         let storage = Arc::new(InMemoryStorage::new());
         // Realm names a default role that was never created.
@@ -3837,6 +4076,222 @@ mod tests {
         ctx.parameters.insert("otp".to_string(), vec!["000000".to_string()]);
         let result = auth.authenticate(&mut ctx).await;
         assert_auth_challenge_otp(result);
+    }
+
+    /// Storage holding `realm` plus alice with the shared TOTP credential.
+    async fn otp_fixture(realm: issuerd_core::Realm) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.create_realm(&realm).await.unwrap();
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let secret = crate::totp::base32_encode(OTP_TEST_KEY);
+        storage
+            .create_credential(&user.realm_id, &user.id, &totp_credential(&secret, None))
+            .await
+            .unwrap();
+        storage
+    }
+
+    /// A code outside the whole acceptance window right now.
+    fn wrong_otp() -> String {
+        let secret = crate::totp::base32_encode(OTP_TEST_KEY);
+        let now = issuerd_core::utils::now_secs();
+        let policy = issuerd_core::OtpPolicy::default();
+        (0..1000u32)
+            .map(|n| format!("{n:06}"))
+            .find(|c| crate::totp::verify(&secret, c, now, &policy, None).is_none())
+            .unwrap()
+    }
+
+    async fn submit_otp(auth: &OtpFormAuthenticator, otp: &str) -> AuthStepResult {
+        let mut ctx = test_context();
+        ctx.user_id = Some(UserId::new("alice").unwrap());
+        ctx.parameters.insert("otp".to_string(), vec![otp.to_string()]);
+        auth.authenticate(&mut ctx).await
+    }
+
+    fn tracked_otp_authenticator(
+        storage: Arc<InMemoryStorage>,
+        cache: Arc<dyn DistributedCache>,
+    ) -> OtpFormAuthenticator {
+        OtpFormAuthenticator::with_tracker(storage, Arc::new(LoginFailureTracker::new()), cache)
+    }
+
+    #[tokio::test]
+    async fn otp_wrong_codes_lock_the_stage_until_cleared() {
+        // Realm WITHOUT brute-force protection: the tracker defaults still
+        // throttle the second factor.
+        let storage = otp_fixture(test_realm()).await;
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = tracked_otp_authenticator(storage.clone(), cache.clone());
+        let wrong = wrong_otp();
+        for _ in 0..LoginFailureConfig::default().max_failures {
+            assert_auth_challenge_otp(submit_otp(&auth, &wrong).await);
+        }
+
+        // Locked: even the correct code is re-challenged without being
+        // checked (no replay watermark is written).
+        assert_auth_challenge_otp(submit_otp(&auth, &current_otp()).await);
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let user_id = UserId::new("alice").unwrap();
+        let stored = storage
+            .get_credentials(&realm_id, &user_id, CredentialType::Totp)
+            .await
+            .unwrap();
+        assert!(stored[0].credential_data.get("last_used_step").is_none());
+
+        // The attack-detection "clear user" sweep (every login-failure /
+        // login-lockout key under the username) unlocks the stage.
+        for prefix in ["login-failure", "login-lockout"] {
+            for key in cache.scan_keys(&format!("{prefix}:realm-1:alice:*")).await.unwrap() {
+                cache.delete(&key).await.unwrap();
+            }
+        }
+        assert_auth_success(submit_otp(&auth, &current_otp()).await);
+    }
+
+    #[tokio::test]
+    async fn otp_lockout_uses_realm_settings_and_survives_password_success() {
+        let mut realm = test_realm();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = 2;
+        realm.wait_increment_secs = 0;
+        realm.lockout_duration_secs = 900;
+        let storage = otp_fixture(realm).await;
+        let user = test_user();
+        let password = Credential {
+            id: CredentialId::new("cred-pw").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data: hash_password("password").into_bytes(),
+            credential_data: json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        storage.create_credential(&user.realm_id, &user.id, &password).await.unwrap();
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let tracker = Arc::new(LoginFailureTracker::new());
+        let otp_auth =
+            OtpFormAuthenticator::with_tracker(storage.clone(), tracker.clone(), cache.clone());
+        let password_auth =
+            UsernamePasswordAuthenticator::with_tracker(storage, tracker, cache.clone());
+
+        // The realm threshold (2, below the default 5) applies.
+        let wrong = wrong_otp();
+        assert_auth_challenge_otp(submit_otp(&otp_auth, &wrong).await);
+        assert_auth_challenge_otp(submit_otp(&otp_auth, &wrong).await);
+
+        // Restarting the login: the password check succeeds (and resets the
+        // user+IP password counter), but the OTP lockout stays in force.
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+        assert_auth_success(password_auth.authenticate(&mut ctx).await);
+        assert_auth_challenge_otp(submit_otp(&otp_auth, &current_otp()).await);
+
+        // Once the lockout expires (simulated), the next code is checked.
+        let lockout = crate::login_failures::lockout_key(
+            &RealmId::new("realm-1").unwrap(),
+            "alice",
+            OTP_FAILURE_SOURCE,
+        );
+        cache.delete(&lockout).await.unwrap();
+        assert_auth_success(submit_otp(&otp_auth, &current_otp()).await);
+    }
+
+    #[tokio::test]
+    async fn otp_correct_code_clears_failure_counter() {
+        let storage = otp_fixture(test_realm()).await;
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = tracked_otp_authenticator(storage, cache.clone());
+        let wrong = wrong_otp();
+        for _ in 1..LoginFailureConfig::default().max_failures {
+            assert_auth_challenge_otp(submit_otp(&auth, &wrong).await);
+        }
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let count =
+            crate::login_failures::failure_count_key(&realm_id, "alice", OTP_FAILURE_SOURCE);
+        let lockout = crate::login_failures::lockout_key(&realm_id, "alice", OTP_FAILURE_SOURCE);
+        assert!(cache.get(&count).await.unwrap().is_some());
+
+        // The last attempt of the budget verifies; success clears the count
+        // and the lockout marker that attempt's own increment wrote.
+        assert_auth_success(submit_otp(&auth, &current_otp()).await);
+        assert!(cache.get(&count).await.unwrap().is_none());
+        assert!(cache.get(&lockout).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn otp_zero_lockout_duration_still_bounds_attempts() {
+        // A zero lockout duration never writes the lockout marker: the
+        // attempt count within the counting window is then the only bound,
+        // and it still refuses checks past the threshold.
+        let mut realm = test_realm();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = 2;
+        realm.wait_increment_secs = 0;
+        realm.lockout_duration_secs = 0;
+        let storage = otp_fixture(realm).await;
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = tracked_otp_authenticator(storage, cache.clone());
+        let wrong = wrong_otp();
+        assert_auth_challenge_otp(submit_otp(&auth, &wrong).await);
+        assert_auth_challenge_otp(submit_otp(&auth, &wrong).await);
+        let lockout = crate::login_failures::lockout_key(
+            &RealmId::new("realm-1").unwrap(),
+            "alice",
+            OTP_FAILURE_SOURCE,
+        );
+        assert!(cache.get(&lockout).await.unwrap().is_none());
+        assert_auth_challenge_otp(submit_otp(&auth, &current_otp()).await);
+    }
+
+    /// Cache whose reads always fail.
+    struct UnreadableCache;
+
+    #[async_trait]
+    impl DistributedCache for UnreadableCache {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            Err(IssuerdError::ServerError("cache down".into()))
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected: Option<Vec<u8>>,
+            _new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            Ok(true)
+        }
+        async fn publish(&self, _channel: &str, _message: Vec<u8>) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn subscribe(
+            &self,
+            _channel: &str,
+            _handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn otp_unreadable_lockout_state_fails_closed() {
+        // The lockout cannot be checked: the code is not verified, and the
+        // stage re-challenges (never a Failure, never a Success).
+        let storage = otp_fixture(test_realm()).await;
+        let auth = tracked_otp_authenticator(storage, Arc::new(UnreadableCache));
+        assert_auth_challenge_otp(submit_otp(&auth, &current_otp()).await);
     }
 
     #[tokio::test]
@@ -4738,6 +5193,260 @@ mod tests {
         assert_auth_success(result);
     }
 
+    /// Directory provider ("ldap-test") that counts password checks.
+    struct CountingFedProvider {
+        validate_result: std::sync::Mutex<Result<bool, issuerd_core::FederationError>>,
+        validate_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFedProvider {
+        fn calls(&self) -> usize {
+            self.validate_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::FederationProvider for CountingFedProvider {
+        fn id(&self) -> &str {
+            "ldap-test"
+        }
+        fn provider_type(&self) -> issuerd_core::FederationProviderType {
+            issuerd_core::FederationProviderType::Ldap
+        }
+        async fn find_user(
+            &self,
+            _username: &str,
+        ) -> Result<Option<issuerd_core::FederatedUser>, issuerd_core::FederationError> {
+            Ok(None)
+        }
+        async fn find_user_by_email(
+            &self,
+            _email: &str,
+        ) -> Result<Option<issuerd_core::FederatedUser>, issuerd_core::FederationError> {
+            Ok(None)
+        }
+        async fn validate_password(
+            &self,
+            _username: &str,
+            _password: &str,
+        ) -> Result<bool, issuerd_core::FederationError> {
+            self.validate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.validate_result.lock().unwrap().clone()
+        }
+    }
+
+    /// Tracked authenticator backed by a directory that knows "alice" (any
+    /// spelling); `linked_row` seeds a local row linked to it. The provider
+    /// rejects passwords until a test flips it.
+    async fn federated_password_auth(
+        brute_force_protected: bool,
+        max_login_failures: u32,
+        linked_row: Option<&str>,
+    ) -> (
+        Arc<InMemoryStorage>,
+        Arc<CountingFedProvider>,
+        Arc<dyn DistributedCache>,
+        UsernamePasswordAuthenticator,
+    ) {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut realm = test_realm();
+        realm.brute_force_protected = brute_force_protected;
+        realm.max_login_failures = max_login_failures;
+        realm.wait_increment_secs = 0;
+        realm.lockout_duration_secs = 900;
+        storage.create_realm(&realm).await.unwrap();
+        if let Some(name) = linked_row {
+            let mut user = test_user();
+            user.username = Username::new(name).unwrap();
+            user.federation_link = Some("ldap-test".to_string());
+            storage.create_user(&user.realm_id, &user).await.unwrap();
+        }
+
+        let provider = Arc::new(CountingFedProvider {
+            validate_result: std::sync::Mutex::new(Ok(false)),
+            validate_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fed_user = issuerd_core::FederatedUser {
+            username: "alice".to_string(),
+            federation_link: "ldap-test".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        let fm = Arc::new(MockFedManager {
+            providers: vec![provider.clone()],
+            find_user_result: std::sync::Mutex::new(Ok(Some((provider.clone(), fed_user)))),
+        });
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = UsernamePasswordAuthenticator::with_tracker(
+            storage.clone(),
+            Arc::new(LoginFailureTracker::new()),
+            cache.clone(),
+        )
+        .with_federation_manager(fm);
+        (storage, provider, cache, auth)
+    }
+
+    fn alice_failure_count_key() -> String {
+        crate::login_failures::failure_count_key(
+            &RealmId::new("realm-1").unwrap(),
+            "alice",
+            "0.0.0.0",
+        )
+    }
+
+    #[tokio::test]
+    async fn password_unimported_federated_user_failures_lock_out() {
+        let (storage, provider, _cache, auth) = federated_password_auth(true, 1, None).await;
+
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong2").await;
+        assert_auth_failure(result, IssuerdError::AccessDenied);
+
+        // The correct directory password while locked is still denied and
+        // nothing is imported.
+        *provider.validate_result.lock().unwrap() = Ok(true);
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "secret").await;
+        assert_auth_failure(result, IssuerdError::AccessDenied);
+        let realm = RealmId::new("realm-1").unwrap();
+        assert!(storage.get_user_by_username(&realm, "alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn password_unimported_federated_user_success_resets_failure_counter() {
+        let (storage, provider, cache, auth) = federated_password_auth(true, 3, None).await;
+
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert!(
+            cache.get(&alice_failure_count_key()).await.unwrap().is_some(),
+            "directory password rejection must be counted"
+        );
+
+        *provider.validate_result.lock().unwrap() = Ok(true);
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "secret").await;
+        assert_auth_success(result);
+        assert!(cache.get(&alice_failure_count_key()).await.unwrap().is_none());
+        let realm = RealmId::new("realm-1").unwrap();
+        assert!(storage.get_user_by_username(&realm, "alice").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn password_unimported_federated_user_no_tracking_when_realm_unprotected() {
+        let (_storage, _provider, cache, auth) = federated_password_auth(false, 1, None).await;
+
+        for _ in 0..5 {
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+        }
+        assert!(cache.get(&alice_failure_count_key()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn password_unimported_federated_provider_error_is_not_counted() {
+        // A provider error can never succeed on this path (no local
+        // fallback), so it is not a password guess and must not lock out.
+        let (_storage, provider, cache, auth) = federated_password_auth(true, 1, None).await;
+        *provider.validate_result.lock().unwrap() =
+            Err(issuerd_core::FederationError::ProviderUnavailable("down".into()));
+
+        for _ in 0..3 {
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "secret").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+        }
+        assert!(cache.get(&alice_failure_count_key()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn password_unimported_federated_spelling_variants_share_lockout() {
+        let (storage, provider, _cache, auth) = federated_password_auth(true, 1, None).await;
+        let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+
+        // Every spelling the directory accepts is locked as well, even with
+        // the correct password, and the directory is never consulted.
+        *provider.validate_result.lock().unwrap() = Ok(true);
+        let calls = provider.calls();
+        let realm = RealmId::new("realm-1").unwrap();
+        for variant in ["Alice", "alice ", " ALICE", "AlIcE"] {
+            let (result, _) = login_counting_dummy_verifies(&auth, variant, "secret").await;
+            assert_auth_failure(result, IssuerdError::AccessDenied);
+            assert!(storage.get_user_by_username(&realm, variant).await.unwrap().is_none());
+        }
+        assert_eq!(provider.calls(), calls, "locked logins must not reach the directory");
+    }
+
+    #[tokio::test]
+    async fn password_variant_lockout_does_not_block_linked_stored_spelling() {
+        // Mixed-case stored row, as directory sync imports it. A variant
+        // misses the exact-match local lookup and is locked on the
+        // directory-lookup branch; the linked row keeps its own stored-name
+        // budget (base behaviour, consistent with the admin unlock).
+        let (_storage, provider, _cache, auth) =
+            federated_password_auth(true, 1, Some("Alice")).await;
+        let (result, _) = login_counting_dummy_verifies(&auth, "ALICE ", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        let (result, _) = login_counting_dummy_verifies(&auth, "ALICE ", "wrong").await;
+        assert_auth_failure(result, IssuerdError::AccessDenied);
+
+        *provider.validate_result.lock().unwrap() = Ok(true);
+        let (result, _) = login_counting_dummy_verifies(&auth, "Alice", "secret").await;
+        assert_auth_success(result);
+    }
+
+    #[tokio::test]
+    async fn password_linked_federated_row_failures_keyed_by_stored_name() {
+        // A mixed-case linked row keeps counting under its stored name (the
+        // key the admin unlock and the other password endpoints use) and
+        // never writes the normalized key.
+        let (_storage, provider, cache, auth) =
+            federated_password_auth(true, 1, Some("Alice")).await;
+        let (result, _) = login_counting_dummy_verifies(&auth, "Alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let key = |id: &str| crate::login_failures::failure_count_key(&realm_id, id, "0.0.0.0");
+        assert!(cache.get(&key("Alice")).await.unwrap().is_some());
+        assert!(cache.get(&alice_failure_count_key()).await.unwrap().is_none());
+
+        *provider.validate_result.lock().unwrap() = Ok(true);
+        let (result, _) = login_counting_dummy_verifies(&auth, "Alice", "secret").await;
+        assert_auth_failure(result, IssuerdError::AccessDenied);
+
+        // Clearing the stored-name keys (as the admin unlock does) unlocks.
+        LoginFailureTracker::new()
+            .reset_failures(&realm_id, "Alice", "0.0.0.0", cache.as_ref())
+            .await
+            .unwrap();
+        let (result, _) = login_counting_dummy_verifies(&auth, "Alice", "secret").await;
+        assert_auth_success(result);
+    }
+
+    #[tokio::test]
+    async fn password_local_user_failure_key_keeps_stored_spelling() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut realm = test_realm();
+        realm.brute_force_protected = true;
+        realm.max_login_failures = 3;
+        storage.create_realm(&realm).await.unwrap();
+        let mut user = test_user();
+        user.username = Username::new("Alice").unwrap();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = UsernamePasswordAuthenticator::with_tracker(
+            storage,
+            Arc::new(LoginFailureTracker::new()),
+            cache.clone(),
+        );
+
+        let (result, _) = login_counting_dummy_verifies(&auth, "Alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let key = |id: &str| crate::login_failures::failure_count_key(&realm_id, id, "0.0.0.0");
+        assert!(cache.get(&key("Alice")).await.unwrap().is_some());
+        assert!(cache.get(&alice_failure_count_key()).await.unwrap().is_none());
+    }
+
     // -----------------------------------------------------------------------
     // SpnegoFlowAuthenticator
     // -----------------------------------------------------------------------
@@ -5072,6 +5781,156 @@ mod tests {
         ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
         let result = auth.authenticate(&mut ctx).await;
         assert_auth_server_error(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // UsernamePasswordAuthenticator timing equalization (dummy Argon2 verify)
+    // -----------------------------------------------------------------------
+
+    /// Run one password login and report how many dummy verifies it spent.
+    async fn login_counting_dummy_verifies(
+        auth: &UsernamePasswordAuthenticator,
+        username: &str,
+        password: &str,
+    ) -> (AuthStepResult, usize) {
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec![username.to_string()]);
+        ctx.parameters.insert("password".to_string(), vec![password.to_string()]);
+        let before = DUMMY_VERIFY_CALLS.with(|c| c.get());
+        let result = auth.authenticate(&mut ctx).await;
+        (result, DUMMY_VERIFY_CALLS.with(|c| c.get()) - before)
+    }
+
+    fn password_cred(secret_data: Vec<u8>) -> Credential {
+        Credential {
+            id: CredentialId::new("cred-1").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data,
+            credential_data: json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        }
+    }
+
+    fn fed_manager_with_lookup(
+        find_user_result: Result<
+            Option<(Arc<dyn issuerd_core::FederationProvider>, issuerd_core::FederatedUser)>,
+            IssuerdError,
+        >,
+    ) -> Arc<MockFedManager> {
+        Arc::new(MockFedManager {
+            providers: vec![],
+            find_user_result: std::sync::Mutex::new(find_user_result),
+        })
+    }
+
+    #[test]
+    fn dummy_password_hash_matches_stored_hash_params() {
+        let dummy = PasswordHash::new(dummy_password_hash()).unwrap();
+        let real = hash_password("password");
+        let real = PasswordHash::new(&real).unwrap();
+        assert_eq!(dummy.algorithm, real.algorithm);
+        assert_eq!(dummy.version, real.version);
+        assert_eq!(
+            argon2::Params::try_from(&dummy).unwrap(),
+            argon2::Params::try_from(&real).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn password_unknown_user_runs_dummy_verify() {
+        let auth = UsernamePasswordAuthenticator::new(Arc::new(InMemoryStorage::new()));
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "bob", "password").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 1);
+    }
+
+    #[tokio::test]
+    async fn password_unknown_user_federation_miss_runs_dummy_verify() {
+        let auth = UsernamePasswordAuthenticator::new(Arc::new(InMemoryStorage::new()))
+            .with_federation_manager(fed_manager_with_lookup(Ok(None)));
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "bob", "password").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 1);
+    }
+
+    #[tokio::test]
+    async fn password_unknown_user_federation_error_runs_dummy_verify() {
+        let fm = fed_manager_with_lookup(Err(IssuerdError::ServerError("ldap down".into())));
+        let auth = UsernamePasswordAuthenticator::new(Arc::new(InMemoryStorage::new()))
+            .with_federation_manager(fm);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "bob", "password").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 1);
+    }
+
+    #[tokio::test]
+    async fn password_disabled_user_runs_dummy_verify() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut user = test_user();
+        user.enabled = false;
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let cred = password_cred(hash_password("password").into_bytes());
+        storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "password").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 1);
+    }
+
+    #[tokio::test]
+    async fn password_user_without_credential_runs_dummy_verify() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "password").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 1);
+    }
+
+    #[tokio::test]
+    async fn password_user_without_argon2_hash_runs_dummy_verify() {
+        let pbkdf2 = "$pbkdf2-sha256$i=27500$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo";
+        assert!(PasswordHash::new(pbkdf2).is_ok(), "fixture must be a parseable PHC string");
+        for secret in [
+            vec![0x80, 0x81, 0x82],
+            b"not-a-valid-hash".to_vec(),
+            pbkdf2.as_bytes().to_vec(),
+        ] {
+            let storage = Arc::new(InMemoryStorage::new());
+            let user = test_user();
+            storage.create_user(&user.realm_id, &user).await.unwrap();
+            storage
+                .create_credential(&user.realm_id, &user.id, &password_cred(secret))
+                .await
+                .unwrap();
+
+            let auth = UsernamePasswordAuthenticator::new(storage);
+            let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "password").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            assert_eq!(dummy, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn password_user_with_argon2_hash_skips_dummy_verify() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let cred = password_cred(hash_password("password").into_bytes());
+        storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 0);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "password").await;
+        assert_auth_success(result);
+        assert_eq!(dummy, 0);
     }
 
     #[tokio::test]

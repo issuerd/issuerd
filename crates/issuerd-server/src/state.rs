@@ -407,6 +407,7 @@ impl ServerState {
             Arc::new(crate::broker::ReqwestBrokerClient::new(
                 &extra_roots,
                 config.outbound_http.allow_private_addresses,
+                config.outbound_http.allow_private_identity_providers,
             )?);
 
         let plugin_registry: Arc<dyn PluginRegistry> = {
@@ -431,7 +432,11 @@ impl ServerState {
                 ),
             ));
             reg.register_authenticator(Arc::new(
-                issuerd_auth_flow::built_in::OtpFormAuthenticator::new(storage.clone()),
+                issuerd_auth_flow::built_in::OtpFormAuthenticator::with_tracker(
+                    storage.clone(),
+                    login_failure_tracker.clone(),
+                    cache.clone(),
+                ),
             ));
             // Passwordless email one-time-code login (only factor when a
             // realm's browser flow binds it): mails a numeric code via the
@@ -731,10 +736,11 @@ async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError>
     // Hash password with argon2
     use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
     use rand::rngs::OsRng;
+    let (password, generated) = resolve_bootstrap_admin_password(&state.config);
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let hash = argon2
-        .hash_password("admin".as_bytes(), &salt)
+        .hash_password(password.as_bytes(), &salt)
         .map_err(|e| IssuerdError::ServerError(format!("hash failed: {e}")))?
         .to_string();
 
@@ -748,6 +754,9 @@ async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError>
         priority: 1,
     };
     state.storage.create_credential(&realm.id, &admin_user.id, &cred).await?;
+    if generated {
+        announce_generated_admin_password(&password);
+    }
 
     // Create the built-in clients every realm gets (Keycloak parity):
     // admin-cli for admin-style logins and account-console for the Account SPA.
@@ -801,6 +810,35 @@ async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError>
 
     info!("bootstrapped master realm with default admin user — change the password immediately");
     Ok(())
+}
+
+/// Password for the bootstrap `admin` user: the configured
+/// `bootstrap_admin_password`, or — when unset or empty — a fresh random one
+/// (flagged `true` so the caller hands it to the operator).
+fn resolve_bootstrap_admin_password(config: &ServerConfig) -> (String, bool) {
+    if let Some(password) = config.bootstrap_admin_password.as_deref().filter(|p| !p.is_empty()) {
+        return (password.to_string(), false);
+    }
+    use base64::Engine;
+    use rand::RngCore;
+    let mut bytes = [0u8; 18];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    (base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes), true)
+}
+
+/// One-time operator hand-off of a generated bootstrap admin password: printed
+/// directly to stderr, never recorded through `tracing` (passwords are never
+/// logged).
+fn announce_generated_admin_password(password: &str) {
+    eprintln!(
+        "\n*** Issuerd master realm bootstrap: generated password for user 'admin': {password}\n\
+         *** It is shown only once. Set `bootstrap_admin_password` \
+         (env ISSUERD_BOOTSTRAP_ADMIN_PASSWORD) to choose it instead.\n"
+    );
+    tracing::warn!(
+        "master realm bootstrap: no bootstrap_admin_password configured — generated a random \
+         admin password and printed it once to stderr"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -912,6 +950,7 @@ mod tests {
             outbound_http: crate::config::OutboundHttpConfig {
                 extra_ca_bundle: Some(std::path::PathBuf::from("/nonexistent/roots.pem")),
                 allow_private_addresses: false,
+                allow_private_identity_providers: false,
             },
             ..Default::default()
         };
@@ -936,6 +975,7 @@ mod tests {
             outbound_http: crate::config::OutboundHttpConfig {
                 extra_ca_bundle: Some(bundle),
                 allow_private_addresses: false,
+                allow_private_identity_providers: false,
             },
             ..Default::default()
         };
@@ -1088,6 +1128,65 @@ mod tests {
 
         let result = bootstrap_master_realm(&state).await;
         assert!(result.is_err());
+    }
+
+    async fn bootstrap_admin_verifies(state: &ServerState, password: &str) -> bool {
+        use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+        let realm_id = RealmId::new("master").unwrap();
+        let creds = state
+            .storage
+            .get_credentials(&realm_id, &UserId::new("admin").unwrap(), CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 1, "bootstrap seeds exactly one admin password");
+        let hash = std::str::from_utf8(&creds[0].secret_data).unwrap();
+        let parsed = PasswordHash::new(hash).unwrap();
+        Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_uses_configured_password() {
+        let cfg = ServerConfig {
+            bootstrap_admin_password: Some("Op3rator-Chosen!".to_string()),
+            ..Default::default()
+        };
+        let state = ServerState::from_config(&cfg).await.unwrap();
+        assert!(bootstrap_admin_verifies(&state, "Op3rator-Chosen!").await);
+        assert!(!bootstrap_admin_verifies(&state, "admin").await);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_never_gets_hardcoded_password_by_default() {
+        let state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        assert!(!bootstrap_admin_verifies(&state, "admin").await);
+        let empty = ServerConfig {
+            bootstrap_admin_password: Some(String::new()),
+            ..Default::default()
+        };
+        let state = ServerState::from_config(&empty).await.unwrap();
+        assert!(!bootstrap_admin_verifies(&state, "admin").await);
+        assert!(!bootstrap_admin_verifies(&state, "").await);
+    }
+
+    #[test]
+    fn resolve_bootstrap_admin_password_generates_random_when_unset() {
+        let (configured, generated) = resolve_bootstrap_admin_password(&ServerConfig {
+            bootstrap_admin_password: Some("pinned".to_string()),
+            ..Default::default()
+        });
+        assert_eq!((configured.as_str(), generated), ("pinned", false));
+
+        let (first, generated) = resolve_bootstrap_admin_password(&ServerConfig::default());
+        assert!(generated);
+        assert_eq!(first.len(), 24, "18 random bytes, base64url without padding");
+        let (second, _) = resolve_bootstrap_admin_password(&ServerConfig::default());
+        assert_ne!(first, second);
+
+        let (_, generated) = resolve_bootstrap_admin_password(&ServerConfig {
+            bootstrap_admin_password: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(generated, "an empty configured password counts as unset");
     }
 
     #[tokio::test]
