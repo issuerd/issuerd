@@ -83,7 +83,9 @@ jobs:
           set -euo pipefail
           start=$(grep -nF "## [$VERSION] - " CHANGELOG.md | head -1 | cut -d: -f1)
           # Section body up to the next '## [' heading, leading blank lines dropped.
-          tail -n +"$((start + 1))" CHANGELOG.md | awk '/^## \[/{exit} {print}' | awk 'NF{p=1} p' > release-notes.md
+          # awk reads the file itself (not tail | awk): an early-exit awk
+          # downstream of tail is a SIGPIPE race under `set -o pipefail`.
+          awk -v start="$start" 'NR > start && /^## \[/{exit} NR > start' CHANGELOG.md | awk 'NF{p=1} p' > release-notes.md
           test -s release-notes.md
           cat >> release-notes.md <<EOF
 
