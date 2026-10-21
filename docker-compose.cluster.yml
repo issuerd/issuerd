@@ -59,10 +59,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    # Purely ephemeral shared state — no persistence needed. If Redis is wiped,
-    # in-flight logins retry; issued tokens and sessions are unaffected (JWTs
-    # are self-contained, sessions live in PostgreSQL).
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    # Revocation, rotation, replay, and lockout markers must never be evicted.
+    # Writes fail closed when the memory cap is reached.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     networks:
       - cluster-net
     healthcheck:

@@ -19,7 +19,7 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use tower::ServiceExt;
 
-use crate::harness::TestHarness;
+use crate::harness::{wait_until, TestHarness};
 
 /// Create a realm with internationalization enabled (`en` + `de`).
 async fn create_i18n_realm(harness: &TestHarness, name: &str) -> issuerd_core::Realm {
@@ -291,6 +291,8 @@ async fn reset_password_email_uses_user_locale() {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
+    // The mails are sent in the background, after the 204s.
+    wait_until(|| recorder.sent.lock().unwrap().len() >= 2).await;
     let sent = recorder.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 2, "both users get mail: {sent:?}");
     let german = sent.iter().find(|(to, _)| to == "nils@example.com").expect("nils mail");
@@ -407,6 +409,7 @@ async fn reset_password_email_uses_theme_supplied_locale() {
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
+    wait_until(|| !recorder.sent.lock().unwrap().is_empty()).await;
     let sent = recorder.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 1, "one reset email sent: {sent:?}");
     assert_eq!(sent[0].0, "pierre@example.com");

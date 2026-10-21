@@ -35,7 +35,7 @@ async fn cross_realm_cookie_is_ignored_at_auth_endpoint() {
     let req = Request::builder()
         .method("GET")
         .uri(&auth_path)
-        .header("Cookie", format!("issuerd_session={}", tokens_a.access_token))
+        .header("Cookie", format!("issuerd_session={}", tokens_a.sso_token))
         .body(Body::empty())
         .unwrap();
     let req = harness.add_connect_info(req);

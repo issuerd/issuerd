@@ -237,7 +237,7 @@ async fn ciba_grant() {
         .post_form_with_cookie(
             "/realms/test/protocol/openid-connect/ext/ciba/approve",
             &[("auth_req_id", auth_req_id), ("action", "approve")],
-            &format!("issuerd_session={}", tokens.access_token),
+            &format!("issuerd_session={}", tokens.sso_token),
         )
         .await;
     assert_eq!(approve_resp.status(), 200);
@@ -443,7 +443,7 @@ async fn ciba_audit_events_record_lifecycle() {
         .post_form_with_cookie(
             "/realms/test/protocol/openid-connect/ext/ciba/approve",
             &[("auth_req_id", auth_req_id.as_str()), ("action", "approve")],
-            &format!("issuerd_session={}", tokens.access_token),
+            &format!("issuerd_session={}", tokens.sso_token),
         )
         .await;
     assert_eq!(approve.status(), 200);
@@ -509,7 +509,7 @@ async fn ciba_audit_events_record_rejections() {
     let tokens = harness
         .authenticate_user("test", &client.client_id, "alice", "password123")
         .await;
-    let cookie = format!("issuerd_session={}", tokens.access_token);
+    let cookie = format!("issuerd_session={}", tokens.sso_token);
     let approve = harness
         .post_form_with_cookie(
             "/realms/test/protocol/openid-connect/ext/ciba/approve",

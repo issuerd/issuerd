@@ -802,7 +802,8 @@ enum RegistrationPolicy {
 /// `request_uris` names URLs the authorization endpoint fetches (all
 /// SSRF-guarded fetches, but the open endpoint takes no caller-controlled
 /// fetch targets).
-const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 7] = [
+const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 8] = [
+    issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE,
     crate::client_assertion::ATTR_JWKS_URL,
     crate::client_assertion::ATTR_USE_JWKS_URL,
     crate::client_assertion::ATTR_JWKS_STRING,
@@ -2073,6 +2074,7 @@ mod tests {
                 "use.jwks.string": "true",
                 "backchannel_logout_uri": "https://attacker.example.com/hook",
                 "frontchannel_logout_uri": "https://attacker.example.com/logout",
+                "admin_api_access": "true",
                 "custom": "kept"
             }
         }))

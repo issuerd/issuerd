@@ -405,7 +405,7 @@ fn mask_idp_secrets(
     path = "/admin/realms/{realm}/export",
     tag = "Realms",
     summary = "Export the full realm",
-    description = "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********`. Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
+    description = "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********` (`bindCredential` too for callers without `manage-realm`). Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
     params(("realm" = String, Path, description = "Realm name")),
     responses(
         (status = 200, description = "Realm export document", body = RealmExportRepresentation),
@@ -470,7 +470,7 @@ pub async fn export_realm(
         .await?
         .into_iter()
         .map(mask_idp_secrets)
-        .map(IdentityProviderRepresentation::from)
+        .map(|idp| crate::idp::readable_idp(&auth, idp))
         .collect();
     let client_scopes = state
         .storage
@@ -1164,6 +1164,28 @@ mod tests {
         assert!(parsed.users[0].credentials.is_none());
         assert_eq!(parsed.roles.realm.iter().filter(|r| r.name == "r1").count(), 1);
         assert_eq!(parsed.roles.client["c1"][0].name, "cr1");
+    }
+
+    #[tokio::test]
+    async fn export_masks_bind_credential_for_callers_without_manage_realm() {
+        for (role, bind_credential) in [
+            ("view-realm", "**********"),
+            ("manage-realm", "bind-secret-value"),
+        ] {
+            let state = crate::test_utils::tests::test_state(vec![RoleName::new(role).unwrap()]);
+            let app = test_app(state.clone());
+            let realm_id = master_realm_id();
+            let mut idp = seed_idp(&state, &realm_id, "idp1", Some("idp-secret-value")).await;
+            idp.config.insert("bindCredential".to_string(), "bind-secret-value".to_string());
+            state.storage.update_identity_provider(&realm_id, &idp).await.unwrap();
+
+            let (status, body) = post_json(&app, "/admin/realms/master/export", None).await;
+            assert_eq!(status, StatusCode::OK, "body: {body}");
+            let config = &body["identityProviders"][0]["config"];
+            assert_eq!(config["clientSecret"], "**********", "role {role}");
+            assert_eq!(config["bindCredential"], bind_credential, "role {role}");
+            assert_eq!(config["clientId"], "idp-client", "role {role}");
+        }
     }
 
     #[tokio::test]

@@ -18,6 +18,11 @@
 //! `max_failure_wait_secs` (0 = uncapped). With `wait_increment_secs == 0` a
 //! fixed `lockout_duration_secs` applies. A computed duration of 0 means
 //! "no lockout marker" (degenerate config).
+//!
+//! One-time codes (TOTP) are tracked under the [`OTP_FAILURE_SOURCE`] slot in
+//! place of the IP — one budget per user, shared by every path that checks a
+//! code — and are throttled whatever the realm's brute-force toggle (see
+//! [`otp_failure_config`] and [`LoginFailureTracker::reserve_otp_attempt`]).
 
 use std::time::Duration;
 
@@ -82,9 +87,29 @@ impl LoginFailureConfig {
     }
 }
 
+/// Throttle settings for one-time-code attempts: the realm's brute-force
+/// settings when the realm enables protection, the defaults otherwise. The
+/// second factor is never left unthrottled — once the password is known it
+/// is the only barrier left (RFC 4226 §7.3).
+pub fn otp_failure_config(realm: &Realm) -> LoginFailureConfig {
+    if realm.brute_force_protected {
+        LoginFailureConfig::from_realm(realm)
+    } else {
+        LoginFailureConfig::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cache keys
 // ---------------------------------------------------------------------------
+
+/// Slot used in place of the client IP for one-time-code attempts: one
+/// counter per user across all addresses, shared by the browser OTP stage,
+/// the password grant and device verification. The password paths reset
+/// only their own user+IP pairs, so neither IP rotation nor a successful
+/// password check buys fresh guesses. The attack-detection admin API lists
+/// and clears these entries with the user's other lockouts.
+pub const OTP_FAILURE_SOURCE: &str = "otp";
 
 /// Cache key for the per-identifier failure counter.
 pub fn failure_count_key(realm: &RealmId, identifier: &str, ip: &str) -> String {
@@ -94,6 +119,18 @@ pub fn failure_count_key(realm: &RealmId, identifier: &str, ip: &str) -> String 
 /// Cache key for the per-identifier lockout marker.
 pub fn lockout_key(realm: &RealmId, identifier: &str, ip: &str) -> String {
     format!("login-lockout:{}:{}:{}", realm.0, identifier, ip)
+}
+
+/// Failure/lockout identifier for password checks against a directory
+/// account that has no local row yet.
+///
+/// Directories match login names case-insensitively and ignore surrounding
+/// and repeated whitespace, so every spelling they accept for one account
+/// must share one budget: whitespace is trimmed, inner runs collapse to one
+/// space, and letters are lowercased. Accounts with a local row keep their
+/// stored username as the identifier.
+pub fn federated_failure_identifier(username: &str) -> String {
+    username.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +196,55 @@ impl LoginFailureTracker {
         cache.delete(&failure_count_key(realm, identifier, ip)).await?;
         cache.delete(&lockout_key(realm, identifier, ip)).await?;
         Ok(())
+    }
+
+    /// Reserve one one-time-code check for `identifier` (the canonical
+    /// username); `false` means the code must not be checked.
+    ///
+    /// The attempt is counted BEFORE the code is checked, so concurrent
+    /// submissions cannot outrun the threshold; a correct code must then be
+    /// followed by [`Self::clear_otp_attempts`]. Below the threshold every
+    /// attempt is checked. At or past it, the attempt arms the lockout first
+    /// and only the request that creates the marker is checked: one check per
+    /// expired lockout, as on the password path, however many requests race.
+    pub async fn reserve_otp_attempt(
+        &self,
+        realm: &RealmId,
+        identifier: &str,
+        cache: &dyn DistributedCache,
+        config: &LoginFailureConfig,
+    ) -> Result<bool, IssuerdError> {
+        if self.is_temporarily_locked(realm, identifier, OTP_FAILURE_SOURCE, cache).await? {
+            return Ok(false);
+        }
+        let counter = failure_count_key(realm, identifier, OTP_FAILURE_SOURCE);
+        let attempts = cache
+            .increment(&counter, Some(Duration::from_secs(config.failure_ttl_secs)))
+            .await?;
+        if attempts < u64::from(config.max_failures) {
+            return Ok(true);
+        }
+        let wait = config.lockout_for(attempts);
+        if wait == 0 {
+            // No lockout duration configured: the counting window alone
+            // bounds the attempts (a zero threshold still allows one).
+            return Ok(attempts <= u64::from(config.max_failures.max(1)));
+        }
+        // `increment` creates the marker together with its TTL atomically,
+        // so a result of 1 identifies the single request that armed it.
+        let marker = lockout_key(realm, identifier, OTP_FAILURE_SOURCE);
+        let claimed = cache.increment(&marker, Some(Duration::from_secs(wait))).await?;
+        Ok(claimed == 1)
+    }
+
+    /// A correct one-time code clears the user's attempt count and lockout.
+    pub async fn clear_otp_attempts(
+        &self,
+        realm: &RealmId,
+        identifier: &str,
+        cache: &dyn DistributedCache,
+    ) -> Result<(), IssuerdError> {
+        self.reset_failures(realm, identifier, OTP_FAILURE_SOURCE, cache).await
     }
 }
 
@@ -410,6 +496,14 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    fn federated_identifier_folds_case_and_whitespace() {
+        for spelling in ["alice", "Alice", " ALICE", "alice\t", "AlIcE "] {
+            assert_eq!(federated_failure_identifier(spelling), "alice");
+        }
+        assert_eq!(federated_failure_identifier("  John \t Smith "), "john smith");
+    }
+
+    #[test]
     fn fixed_lockout_when_no_wait_increment() {
         let config = fixed_config(5, 300);
         assert_eq!(config.lockout_for(5), 300);
@@ -599,5 +693,121 @@ mod tests {
             "no lockout marker may be written for a zero wait: {:?}",
             cache.recorded_sets()
         );
+    }
+
+    #[tokio::test]
+    async fn otp_attempts_allow_one_check_per_expired_lockout() {
+        let tracker = LoginFailureTracker::new();
+        let config = fixed_config(3, 900);
+        let cache = InMemoryCache::new();
+        let realm = RealmId::new("realm-1").unwrap();
+        let reserve = || tracker.reserve_otp_attempt(&realm, "alice", &cache, &config);
+
+        // Up to the threshold every attempt is checked; the last one arms
+        // the lockout before its check.
+        for _ in 0..3 {
+            assert!(reserve().await.unwrap());
+        }
+        assert!(tracker
+            .is_temporarily_locked(&realm, "alice", OTP_FAILURE_SOURCE, &cache)
+            .await
+            .unwrap());
+        assert!(!reserve().await.unwrap());
+
+        // The user+IP password reset leaves the OTP budget alone.
+        tracker.reset_failures(&realm, "alice", "127.0.0.1", &cache).await.unwrap();
+        assert!(!reserve().await.unwrap());
+
+        // Lockout expiry (simulated): exactly one more check, which re-arms it.
+        cache.delete(&lockout_key(&realm, "alice", OTP_FAILURE_SOURCE)).await.unwrap();
+        assert!(reserve().await.unwrap());
+        assert!(!reserve().await.unwrap());
+
+        // A correct code clears the count and the lockout.
+        tracker.clear_otp_attempts(&realm, "alice", &cache).await.unwrap();
+        let counter = failure_count_key(&realm, "alice", OTP_FAILURE_SOURCE);
+        assert!(cache.get(&counter).await.unwrap().is_none());
+        assert!(reserve().await.unwrap());
+    }
+
+    /// Lets a competing request arm the lockout marker right after this
+    /// request's lockout check — the race the marker claim must settle.
+    struct RacingCache {
+        inner: InMemoryCache,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for RacingCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            let seen = self.inner.get(key).await?;
+            if key.starts_with("login-lockout:") && seen.is_none() {
+                self.inner.increment(key, Some(Duration::from_secs(900))).await?;
+            }
+            Ok(seen)
+        }
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.set(key, value, ttl).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+        async fn increment(&self, key: &str, ttl: Option<Duration>) -> Result<u64, IssuerdError> {
+            self.inner.increment(key, ttl).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    #[tokio::test]
+    async fn otp_attempt_losing_the_lockout_claim_is_not_checked() {
+        let tracker = LoginFailureTracker::new();
+        let config = fixed_config(1, 900);
+        let realm = RealmId::new("realm-1").unwrap();
+
+        // Uncontended, the threshold attempt arms the lockout and is checked.
+        let cache = InMemoryCache::new();
+        assert!(tracker.reserve_otp_attempt(&realm, "alice", &cache, &config).await.unwrap());
+
+        // A competitor armed the marker after this request's lockout check:
+        // this request lost the claim and must not check its code.
+        let racing = RacingCache {
+            inner: InMemoryCache::new(),
+        };
+        assert!(!tracker.reserve_otp_attempt(&realm, "alice", &racing, &config).await.unwrap());
+    }
+
+    #[test]
+    fn otp_failure_config_follows_the_realm_toggle() {
+        let mut realm = Realm {
+            max_login_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            otp_failure_config(&realm).max_failures,
+            LoginFailureConfig::default().max_failures
+        );
+        realm.brute_force_protected = true;
+        assert_eq!(otp_failure_config(&realm).max_failures, 2);
     }
 }

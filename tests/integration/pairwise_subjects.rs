@@ -655,6 +655,7 @@ async fn pairwise_service_account_client_credentials_not_affected() {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let sub = jwt_claims(json["access_token"].as_str().unwrap())["sub"].clone();
-    // Synthetic fallback (no service-account user provisioned): sub = client_id.
-    assert_eq!(sub, serde_json::json!(client.client_id.as_ref()));
+    // Client-linked service-account subject: deterministic and exempt from
+    // pairwise derivation just like the synthetic client-credentials shape.
+    assert_eq!(sub, serde_json::json!(client.service_account_user_id().to_string()));
 }

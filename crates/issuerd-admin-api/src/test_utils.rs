@@ -27,13 +27,13 @@ pub mod tests {
                     jti: JwtId::new("jti").unwrap(),
                     iss: Issuer::new("http://localhost:8080/realms/master").unwrap(),
                     sub: issuerd_core::UserId::new("admin").unwrap(),
-                    aud: Audience::new("aud").unwrap(),
+                    aud: Audience::new("admin-cli").unwrap(),
                     exp: 9999999999,
                     iat: 0,
                     nbf: 0,
                     scope: issuerd_core::Scope::parse("openid"),
                     typ: JwtType::Bearer,
-                    azp: None,
+                    azp: Some("admin-cli".to_string()),
                     session_state: None,
                     realm_access: Some(RealmAccess {
                         roles: self.roles.clone(),
@@ -102,6 +102,15 @@ pub mod tests {
         let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
         block_on_ready(issuerd_core::Storage::create_realm(storage.as_ref(), &master_realm()))
             .unwrap();
+        let admin_cli =
+            crate::realms::build_admin_cli_client(&master_realm().id, "http://localhost:8080")
+                .unwrap();
+        block_on_ready(issuerd_core::Storage::create_client(
+            storage.as_ref(),
+            &master_realm().id,
+            &admin_cli,
+        ))
+        .unwrap();
         storage
     }
 

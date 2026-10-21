@@ -1,6 +1,8 @@
 # Local development rig: in-memory storage, plain HTTP on :8080.
 # Works out of the box on a fresh clone: `cargo run --bin issuerd -- daemon`.
-# The master realm is auto-bootstrapped with admin/admin; the provision file
+# The master realm is auto-bootstrapped with admin/admin (pinned below for this
+# loopback-only rig; without bootstrap_admin_password the daemon generates a
+# random admin password and prints it once to stderr); the provision file
 # below adds the "myrealm" demo content (user alice/changeme, clients my-app
 # and public-app). The Vite dev server (webclientsrc) proxies /admin, /realms,
 # /api and /login.html to this daemon.
@@ -8,6 +10,7 @@ bind = "127.0.0.1"
 port = 8080
 issuer_url = "http://localhost:8080"
 provision = "examples/provision.example.yaml"
+bootstrap_admin_password = "admin"
 
 # To run over HTTPS (see the manual-testing section in AGENTS.md), generate a
 # certificate and switch the issuer scheme to https, e.g.:

@@ -27,14 +27,32 @@ impl KerberosFederationProvider {
         Ok(Self { id, config })
     }
 
-    #[allow(dead_code)]
-    fn principal_to_username(&self, principal: &str) -> String {
-        if let Some((user, realm)) = principal.split_once('@') {
-            if realm.eq_ignore_ascii_case(&self.config.kerberos_realm) {
-                return user.to_string();
-            }
+    /// Refuses a SPNEGO result whose principal (`name@REALM`) is not in the
+    /// configured realm.
+    ///
+    /// Callers map the part before the first `@` onto a local username, so a
+    /// principal from any other realm the KDC trusts must be refused here.
+    /// No configured realm means no principal is accepted.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn require_configured_realm(
+        &self,
+        result: SpnegoAuthResult,
+    ) -> Result<SpnegoAuthResult, FederationError> {
+        let Some(principal) = result.principal.as_deref() else {
+            return Ok(result);
+        };
+        let realm = &self.config.kerberos_realm;
+        if !realm.is_empty()
+            && principal.split_once('@').is_some_and(|(_, r)| r.eq_ignore_ascii_case(realm))
+        {
+            return Ok(result);
         }
-        principal.to_string()
+        tracing::warn!(
+            provider_id = %self.id,
+            principal = %issuerd_core::utils::sanitize_log_str(principal),
+            "SPNEGO principal is outside the configured Kerberos realm"
+        );
+        Err(FederationError::InvalidCredentials)
     }
 }
 
@@ -101,7 +119,7 @@ impl FederationProvider for KerberosFederationProvider {
             }
             let config = self.config.clone();
             let token = token.to_string();
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || -> Result<_, FederationError> {
                 let mut auth = crate::kerberos::spnego::SpnegoAuthenticator::new(config)?;
                 let result = auth.authenticate(&token)?;
                 Ok(SpnegoAuthResult {
@@ -121,7 +139,8 @@ impl FederationProvider for KerberosFederationProvider {
                 })
             })
             .await
-            .map_err(|e| FederationError::NetworkError(e.to_string()))?
+            .map_err(|e| FederationError::NetworkError(e.to_string()))??;
+            self.require_configured_realm(result)
         }
         #[cfg(not(unix))]
         {
@@ -141,6 +160,8 @@ impl FederationProvider for KerberosFederationProvider {
 
 #[cfg(test)]
 mod tests {
+    use issuerd_core::SpnegoStatus;
+
     use super::*;
 
     fn test_config() -> KerberosConfig {
@@ -192,13 +213,80 @@ mod tests {
         assert!(matches!(err, FederationError::NotSupported));
     }
 
-    #[test]
-    fn kerberos_provider_principal_to_username() {
+    fn spnego_result(principal: Option<&str>, status: SpnegoStatus) -> SpnegoAuthResult {
+        SpnegoAuthResult {
+            principal: principal.map(str::to_string),
+            response_token: Some("cmVzcA==".to_string()),
+            status,
+        }
+    }
+
+    fn provider_for_realm(realm: &str) -> KerberosFederationProvider {
         let mut config = test_config();
-        config.kerberos_realm = "EXAMPLE.COM".to_string();
-        let provider = KerberosFederationProvider::new("krb-test".to_string(), config).unwrap();
-        assert_eq!(provider.principal_to_username("user@EXAMPLE.COM"), "user");
-        assert_eq!(provider.principal_to_username("user@OTHER.COM"), "user@OTHER.COM");
+        config.kerberos_realm = realm.to_string();
+        KerberosFederationProvider::new("krb-test".to_string(), config).unwrap()
+    }
+
+    #[test]
+    fn kerberos_provider_accepts_principal_in_configured_realm() {
+        let provider = provider_for_realm("EXAMPLE.COM");
+        for principal in ["user@EXAMPLE.COM", "user@example.com"] {
+            let result = provider
+                .require_configured_realm(spnego_result(
+                    Some(principal),
+                    SpnegoStatus::Authenticated,
+                ))
+                .unwrap();
+            assert_eq!(result.principal.as_deref(), Some(principal));
+            assert_eq!(result.status, SpnegoStatus::Authenticated);
+            assert_eq!(result.response_token.as_deref(), Some("cmVzcA=="));
+        }
+    }
+
+    #[test]
+    fn kerberos_provider_rejects_principal_outside_configured_realm() {
+        let provider = provider_for_realm("EXAMPLE.COM");
+        for principal in [
+            "user@OTHER.COM",
+            "user@PARTNER.EXAMPLE.COM",
+            "user@EXAMPLE.COM.EVIL",
+            "user@EXAMPLE.COM@PARTNER.CORP",
+            "user\\@EXAMPLE.COM@PARTNER.CORP",
+            "user",
+            "user@",
+        ] {
+            let err = provider
+                .require_configured_realm(spnego_result(
+                    Some(principal),
+                    SpnegoStatus::Authenticated,
+                ))
+                .unwrap_err();
+            assert_eq!(err, FederationError::InvalidCredentials, "{principal}");
+        }
+    }
+
+    #[test]
+    fn kerberos_provider_without_realm_rejects_every_principal() {
+        let provider = provider_for_realm("");
+        for principal in ["user@EXAMPLE.COM", "user@", "user"] {
+            let err = provider
+                .require_configured_realm(spnego_result(
+                    Some(principal),
+                    SpnegoStatus::Authenticated,
+                ))
+                .unwrap_err();
+            assert_eq!(err, FederationError::InvalidCredentials, "{principal}");
+        }
+    }
+
+    #[test]
+    fn kerberos_provider_passes_through_results_without_principal() {
+        let provider = provider_for_realm("EXAMPLE.COM");
+        let result = provider
+            .require_configured_realm(spnego_result(None, SpnegoStatus::Continue))
+            .unwrap();
+        assert_eq!(result.status, SpnegoStatus::Continue);
+        assert_eq!(result.response_token.as_deref(), Some("cmVzcA=="));
     }
 
     #[test]

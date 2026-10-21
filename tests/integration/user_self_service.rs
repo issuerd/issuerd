@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode};
 use base64::Engine;
 use tower::ServiceExt;
 
-use crate::harness::TestHarness;
+use crate::harness::{wait_until, TestHarness};
 
 /// Create a realm with the remember-me toggle in the requested state.
 async fn create_realm_with_remember_me(
@@ -1341,6 +1341,8 @@ async fn request_reset_token(
         .post_form(&format!("/realms/{realm}/login/reset-credentials"), &[("username", login)])
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // The mail is sent in the background, after the 204.
+    wait_until(|| !recorder.sent.lock().unwrap().is_empty()).await;
     // Copy the recorded mail out of the lock before any further .await
     // (clippy::await_holding_lock).
     let text = {
@@ -1429,6 +1431,19 @@ async fn reset_credentials_unknown_user_sends_no_email() {
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(recorder.sent.lock().unwrap().is_empty(), "no mail for disabled users");
+
+    // Delivery runs in background tasks, in request order on this
+    // current-thread runtime: once a known user's mail (requested last) has
+    // arrived, the earlier requests have finished — and must have sent nothing.
+    harness.create_user("rs-unknown", "judy", "Password123!").await;
+    let resp = harness
+        .post_form("/realms/rs-unknown/login/reset-credentials", &[("username", "judy")])
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    wait_until(|| !recorder.sent.lock().unwrap().is_empty()).await;
+    let sent = recorder.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "only the known user gets mail");
+    assert_eq!(sent[0].0, "judy@example.com");
 }
 
 #[tokio::test]
@@ -1442,6 +1457,7 @@ async fn reset_credentials_known_user_receives_link() {
         .post_form("/realms/rs-known/login/reset-credentials", &[("username", "kyle")])
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    wait_until(|| !recorder.sent.lock().unwrap().is_empty()).await;
     {
         let sent = recorder.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -1456,6 +1472,7 @@ async fn reset_credentials_known_user_receives_link() {
         .post_form("/realms/rs-known/login/reset-credentials", &[("username", "kyle@example.com")])
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    wait_until(|| recorder.sent.lock().unwrap().len() >= 2).await;
     assert_eq!(recorder.sent.lock().unwrap().len(), 2);
 }
 

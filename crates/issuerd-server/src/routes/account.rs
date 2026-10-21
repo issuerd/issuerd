@@ -366,6 +366,9 @@ pub async fn account_update_me_handler(
                 return bad_request("username changes are not allowed in this realm");
             }
             match Username::new(new_username) {
+                Ok(username) if username.is_service_account_reserved() => {
+                    return bad_request("this username is reserved for client service accounts")
+                }
                 Ok(username) => user.username = username,
                 Err(e) => return bad_request(&e.to_string()),
             }
@@ -1898,7 +1901,7 @@ mod tests {
     use crate::{config::ServerConfig, state::ServerState};
 
     async fn test_state() -> Arc<ServerState> {
-        let cfg = ServerConfig::default();
+        let cfg = ServerConfig::with_test_admin();
         Arc::new(ServerState::from_config(&cfg).await.unwrap())
     }
 
@@ -2587,6 +2590,31 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["error"], "username changes are not allowed in this realm");
         // The username is untouched in storage.
+        assert!(state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn account_update_me_rejects_service_account_username() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let access_token = password_grant_token(&state).await;
+        set_edit_username_allowed(&state, true).await;
+
+        let resp = account_update_me_handler(
+            State(state.clone()),
+            master_realm(),
+            bearer_headers(&access_token),
+            Json(UpdateMeRequest {
+                first_name: None,
+                last_name: None,
+                email: None,
+                username: Some("service-account-terraform".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], "this username is reserved for client service accounts");
         assert!(state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().is_some());
     }
 

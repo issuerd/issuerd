@@ -27,7 +27,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use issuerd_core::{DistributedCache, IssuerdError, OperationType, RealmId, ResourceType};
+use issuerd_core::{
+    escape_scan_pattern, DistributedCache, IssuerdError, OperationType, RealmId, ResourceType,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
@@ -229,7 +231,7 @@ pub async fn list_initial_access_tokens(
         .id;
     let prefix = format!("initial-access:{}:", realm_id);
     let mut tokens = Vec::new();
-    for key in state.cache.scan_keys(&format!("{prefix}*")).await? {
+    for key in state.cache.scan_keys(&format!("{}*", escape_scan_pattern(&prefix))).await? {
         let Some(id) = key.strip_prefix(&prefix) else {
             continue;
         };

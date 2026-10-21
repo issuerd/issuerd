@@ -9880,7 +9880,7 @@
           "Realms"
         ],
         "summary": "Export the full realm",
-        "description": "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********`. Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
+        "description": "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********` (`bindCredential` too for callers without `manage-realm`). Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
         "operationId": "export_realm",
         "parameters": [
           {
@@ -11706,7 +11706,7 @@
           "Identity Providers"
         ],
         "summary": "List identity providers",
-        "description": "Returns all external identity provider configurations for the realm. Requires `view-realm` or `manage-realm` role.",
+        "description": "Returns all external identity provider configurations for the realm. Requires `view-realm` or `manage-realm` role. `clientSecret` and `bindCredential` config values are masked as `**********` for callers without `manage-realm`.",
         "operationId": "list_idps",
         "parameters": [
           {
@@ -11874,7 +11874,7 @@
           "Identity Providers"
         ],
         "summary": "Get an identity provider",
-        "description": "Returns the identity provider configuration. Requires `view-realm` or `manage-realm` role.",
+        "description": "Returns the identity provider configuration. Requires `view-realm` or `manage-realm` role. `clientSecret` and `bindCredential` config values are masked as `**********` for callers without `manage-realm`.",
         "operationId": "get_idp",
         "parameters": [
           {
@@ -19720,7 +19720,7 @@
               "object",
               "null"
             ],
-            "description": "Provider-specific configuration (client ID, authorization URL, etc.).",
+            "description": "Provider-specific configuration (client ID, authorization URL, etc.).\n`clientSecret` and `bindCredential` read back as `**********` for\ncallers without `manage-realm`.",
             "additionalProperties": {
               "type": "string"
             },
@@ -20733,7 +20733,7 @@
                 "items": {
                   "$ref": "#/components/schemas/IdentityProviderRepresentation"
                 },
-                "description": "Identity provider configurations (`clientSecret` values masked)."
+                "description": "Identity provider configurations (`clientSecret` values masked;\n`bindCredential` too for callers without `manage-realm`)."
               },
               "roles": {
                 "$ref": "#/components/schemas/ExportRolesRepresentation",
@@ -20749,7 +20749,7 @@
             }
           }
         ],
-        "description": "Full realm export returned by `POST /admin/realms/{realm}/export`: realm\nfields at the top level (Keycloak-compatible where fields overlap) plus\nusers, clients, groups, roles, identity providers, and client scopes.\n\nThe document carries no secret material: users never include credentials,\nclient secrets are omitted, and identity-provider `clientSecret` config\nvalues are masked. Groups are a flat list — hierarchy is carried by\n`parent_id` (`sub_groups` is always empty)."
+        "description": "Full realm export returned by `POST /admin/realms/{realm}/export`: realm\nfields at the top level (Keycloak-compatible where fields overlap) plus\nusers, clients, groups, roles, identity providers, and client scopes.\n\nThe document carries no secret material: users never include credentials,\nclient secrets are omitted, and identity-provider `clientSecret` config\nvalues are masked (`bindCredential` too for callers without\n`manage-realm`). Groups are a flat list — hierarchy is carried by\n`parent_id` (`sub_groups` is always empty)."
       },
       "RealmRepresentation": {
         "type": "object",

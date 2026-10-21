@@ -322,6 +322,121 @@ async fn otp_replay_is_rejected() {
     assert!(page.contains("Invalid one-time code."), "expected replay rejection: {page}");
 }
 
+#[tokio::test]
+async fn otp_wrong_codes_lock_the_second_factor() {
+    let harness = TestHarness::new().await;
+    let _realm = harness.create_realm("mfa-lock").await;
+    let client = harness.create_client("mfa-lock", false).await;
+    let user = harness.create_user("mfa-lock", "lars", "Password123!").await;
+    add_totp_credential(&harness, "mfa-lock", &user).await;
+    let credentials = [("username", "lars"), ("password", "Password123!")];
+
+    let exec = start_auth_flow(&harness, "mfa-lock", client.client_id.as_ref()).await;
+    let resp = submit_login_form(&harness, "mfa-lock", &exec, &credentials).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Five wrong codes: the default threshold (the realm leaves brute-force
+    // protection off, the second factor is throttled regardless).
+    let wrong = wrong_code(TEST_SECRET_B32);
+    for _ in 0..5 {
+        let resp = submit_login_form(&harness, "mfa-lock", &exec, &[("otp", &wrong)]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Locked: the correct code no longer completes the login.
+    let resp =
+        submit_login_form(&harness, "mfa-lock", &exec, &[("otp", &current_code(TEST_SECRET_B32))])
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_string(resp).await;
+    assert!(page.contains("Invalid one-time code."), "expected OTP lockout: {page}");
+
+    // Restarting the login (the password check succeeds again) does not
+    // reset the OTP lockout.
+    let exec = start_auth_flow(&harness, "mfa-lock", client.client_id.as_ref()).await;
+    let resp = submit_login_form(&harness, "mfa-lock", &exec, &credentials).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp =
+        submit_login_form(&harness, "mfa-lock", &exec, &[("otp", &current_code(TEST_SECRET_B32))])
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_string(resp).await;
+    assert!(page.contains("Invalid one-time code."), "expected OTP lockout: {page}");
+
+    // The password grant shares the budget: the correct code is refused there too.
+    let resp = password_grant_with_totp(
+        &harness,
+        "mfa-lock",
+        &client,
+        "lars",
+        &current_code(TEST_SECRET_B32),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Resource-owner password grant carrying a `totp` code (raw response).
+async fn password_grant_with_totp(
+    harness: &TestHarness,
+    realm: &str,
+    client: &issuerd_core::Client,
+    username: &str,
+    totp: &str,
+) -> axum::response::Response {
+    let client_id = client.client_id.to_string();
+    harness
+        .post_form(
+            &format!("/realms/{realm}/protocol/openid-connect/token"),
+            &[
+                ("grant_type", "password"),
+                ("client_id", &client_id),
+                ("client_secret", client.secret.as_deref().unwrap_or("")),
+                ("username", username),
+                ("password", "Password123!"),
+                ("totp", totp),
+                ("scope", "openid"),
+            ],
+        )
+        .await
+}
+
+#[tokio::test]
+async fn password_grant_wrong_codes_spend_the_browser_otp_budget() {
+    let harness = TestHarness::new().await;
+    let _realm = harness.create_realm("mfa-shared").await;
+    let client = harness.create_client("mfa-shared", false).await;
+    let user = harness.create_user("mfa-shared", "sven", "Password123!").await;
+    add_totp_credential(&harness, "mfa-shared", &user).await;
+
+    // Five wrong codes through the token endpoint...
+    let wrong = wrong_code(TEST_SECRET_B32);
+    for _ in 0..5 {
+        let resp = password_grant_with_totp(&harness, "mfa-shared", &client, "sven", &wrong).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ...lock the browser OTP stage as well.
+    let exec = start_auth_flow(&harness, "mfa-shared", client.client_id.as_ref()).await;
+    let resp = submit_login_form(
+        &harness,
+        "mfa-shared",
+        &exec,
+        &[("username", "sven"), ("password", "Password123!")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = submit_login_form(
+        &harness,
+        "mfa-shared",
+        &exec,
+        &[("otp", &current_code(TEST_SECRET_B32))],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_string(resp).await;
+    assert!(page.contains("Invalid one-time code."), "expected OTP lockout: {page}");
+}
+
 // ---------------------------------------------------------------------------
 // CONFIGURE_TOTP required action
 // ---------------------------------------------------------------------------

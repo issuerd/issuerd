@@ -203,6 +203,11 @@ pub async fn par_handler(
                 .into_response();
         }
     };
+    if bytes.len() > oidc::MAX_CACHED_AUTH_PAYLOAD_BYTES {
+        return par_endpoint_error(&IssuerdError::InvalidRequest(
+            "pushed authorization request exceeds the 64 KiB cache limit".into(),
+        ));
+    }
     if let Err(e) = state
         .cache
         .set(
@@ -213,11 +218,7 @@ pub async fn par_handler(
         .await
     {
         error!(realm = %realm_id, error = %e, "failed to store pushed authorization request");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(oidc::error_response(&IssuerdError::ServerError(e.to_string()))),
-        )
-            .into_response();
+        return oidc::cache_failure_response(&e);
     }
 
     debug!(realm = %realm_id, client_id = %client.client_id, "pushed authorization request stored");
@@ -470,6 +471,28 @@ mod tests {
         let back: ParData = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.client_id, "client1");
         assert_eq!(back.params["response_type"], "code");
+    }
+
+    #[tokio::test]
+    async fn oversized_pushed_request_is_rejected_before_cache_write() {
+        let cfg = ServerConfig::default();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let challenge = "a".repeat(43);
+        let state_value = "x".repeat(70 * 1024);
+        let body = format!(
+            "client_id=admin-cli&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2F&response_type=code&scope=openid&code_challenge={challenge}&code_challenge_method=S256&state={state_value}"
+        );
+        let response = par_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "invalid_request");
     }
 
     #[tokio::test]

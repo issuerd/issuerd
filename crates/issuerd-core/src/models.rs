@@ -148,6 +148,17 @@ impl Username {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Prefix of the usernames reserved for client service-account users
+    /// (`service-account-{client_id}`, see `Client::service_account_username`).
+    pub const SERVICE_ACCOUNT_PREFIX: &'static str = "service-account-";
+
+    /// Whether the name lies in the reserved service-account namespace.
+    /// User-controlled create/rename paths reject it; linked service accounts
+    /// are provisioned separately by the clients API.
+    pub fn is_service_account_reserved(&self) -> bool {
+        self.0.starts_with(Self::SERVICE_ACCOUNT_PREFIX)
+    }
 }
 
 impl TryFrom<String> for Username {
@@ -1903,8 +1914,10 @@ pub struct Realm {
     pub sso_session_max_lifespan: SecondsNonZero,
     pub offline_session_idle_timeout: SecondsNonZero,
     // --- Brute-force detection ---
-    /// Master toggle: when `false`, no login-failure tracking or lockout is
-    /// applied for this realm.
+    /// Master toggle: when `false`, no password login-failure tracking or
+    /// lockout is applied for this realm. One-time-code (TOTP) attempts are
+    /// throttled regardless (tracker source `otp`): with the toggle on they
+    /// follow the settings below, with it off the tracker defaults.
     #[serde(default)]
     pub brute_force_protected: bool,
     /// Number of consecutive failures before the account+IP is locked.
@@ -2499,6 +2512,39 @@ pub struct Client {
 }
 
 impl Client {
+    /// User attribute holding the internal UUID of the client that owns a
+    /// service-account user. It is set only by the service-account provisioner.
+    pub const SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE: &'static str = "service_account_client_id";
+
+    /// Stable, client-bound ID of this client's service-account user.
+    pub fn service_account_user_id(&self) -> UserId {
+        UserId::new(format!("{}{}", Username::SERVICE_ACCOUNT_PREFIX, self.id))
+            .expect("a client UUID produces a non-empty service-account user id")
+    }
+
+    /// Whether `user` is the linked service-account identity of this client.
+    pub fn is_service_account_user(&self, user: &User) -> bool {
+        user.id == self.service_account_user_id()
+            && user
+                .attributes
+                .get(Self::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE)
+                .is_some_and(|values| values.len() == 1 && values[0].as_str() == self.id.0.as_str())
+    }
+
+    /// Reserved attribute allowing a custom client's tokens to call the Admin API.
+    /// Only a `manage-realm` administrator may change it through the Admin API.
+    pub const ADMIN_API_ACCESS_ATTRIBUTE: &'static str = "admin_api_access";
+
+    /// Whether tokens issued to this client may be used as Admin API credentials.
+    pub fn admin_api_access_allowed(&self) -> bool {
+        self.enabled
+            && (self.client_id.as_str() == "admin-cli"
+                || self
+                    .attributes
+                    .get(Self::ADMIN_API_ACCESS_ATTRIBUTE)
+                    .is_some_and(|v| v == "true"))
+    }
+
     /// Client attribute carrying the per-client response-type allowlist
     /// consulted by the authorization endpoint. Two encodings are honored:
     /// a JSON array of response-type strings (what dynamic client
@@ -2826,8 +2872,9 @@ impl std::fmt::Display for TokenType {
 /// JWT token type claim used in access and refresh token payloads.
 ///
 /// Keycloak uses `"Bearer"` for access tokens, `"Refresh"` for online refresh
-/// tokens, and `"Offline"` for offline refresh tokens (tokens
-/// bound to an offline session rather than the SSO session). The enum
+/// tokens, `"Offline"` for offline refresh tokens (tokens
+/// bound to an offline session rather than the SSO session), and
+/// `"Serialized-ID"` for the browser SSO identity cookie. The enum
 /// prevents arbitrary strings from appearing in token claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum JwtType {
@@ -2837,6 +2884,11 @@ pub enum JwtType {
     Refresh,
     #[serde(rename = "Offline")]
     Offline,
+    /// The browser SSO session cookie (Keycloak `TokenUtil.TOKEN_TYPE_KEYCLOAK_ID`).
+    /// Only the login endpoint mints it and it never leaves the `HttpOnly`
+    /// cookie, so a client access token can never stand in for it.
+    #[serde(rename = "Serialized-ID")]
+    SerializedId,
 }
 
 impl std::fmt::Display for JwtType {
@@ -2845,6 +2897,7 @@ impl std::fmt::Display for JwtType {
             JwtType::Bearer => f.write_str("Bearer"),
             JwtType::Refresh => f.write_str("Refresh"),
             JwtType::Offline => f.write_str("Offline"),
+            JwtType::SerializedId => f.write_str("Serialized-ID"),
         }
     }
 }
@@ -4541,6 +4594,14 @@ mod tests {
         assert_eq!(Username::try_from("alice").unwrap(), u);
     }
 
+    #[test]
+    fn username_service_account_namespace_is_reserved() {
+        assert!(Username::new("service-account-my-app").unwrap().is_service_account_reserved());
+        assert!(Username::new("  service-account-x").unwrap().is_service_account_reserved());
+        assert!(!Username::new("alice").unwrap().is_service_account_reserved());
+        assert!(!Username::new("my-service-account-x").unwrap().is_service_account_reserved());
+    }
+
     // ------------------------------------------------------------------
     // Email validation & traits
     // ------------------------------------------------------------------
@@ -5373,8 +5434,11 @@ mod tests {
     fn jwt_type_display_and_roundtrip() {
         assert_eq!(JwtType::Bearer.to_string(), "Bearer");
         assert_eq!(JwtType::Refresh.to_string(), "Refresh");
+        assert_eq!(JwtType::SerializedId.to_string(), "Serialized-ID");
+        assert_eq!(serde_json::to_string(&JwtType::SerializedId).unwrap(), "\"Serialized-ID\"");
         roundtrip(&JwtType::Bearer);
         roundtrip(&JwtType::Refresh);
+        roundtrip(&JwtType::SerializedId);
     }
 
     #[test]

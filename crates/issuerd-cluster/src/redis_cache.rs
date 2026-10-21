@@ -170,6 +170,31 @@ impl DistributedCache for RedisCache {
         Ok(result)
     }
 
+    async fn compare_and_delete(&self, key: &str, expected: Vec<u8>) -> Result<bool, IssuerdError> {
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+            "#,
+        );
+        let mut guard = self.conn.lock().await;
+        let result: i64 = match &mut *guard {
+            RedisConn::Single(conn) => {
+                script.key(key).arg(&expected).invoke_async(conn).await.map_err(|e| {
+                    IssuerdError::ServerError(format!("redis compare-delete failed: {e}"))
+                })?
+            }
+            RedisConn::Cluster(conn) => {
+                script.key(key).arg(&expected).invoke_async(conn).await.map_err(|e| {
+                    IssuerdError::ServerError(format!("redis cluster compare-delete failed: {e}"))
+                })?
+            }
+        };
+        Ok(result == 1)
+    }
+
     async fn compare_and_swap(
         &self,
         key: &str,
@@ -595,6 +620,19 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Docker"]
+    async fn redis_compare_and_delete_requires_exact_value() {
+        let (cache, _container) = setup_redis().await;
+        cache.set("cd", b"old".to_vec(), None).await.unwrap();
+
+        assert!(!cache.compare_and_delete("cd", b"wrong".to_vec()).await.unwrap());
+        assert_eq!(cache.get("cd").await.unwrap(), Some(b"old".to_vec()));
+        assert!(cache.compare_and_delete("cd", b"old".to_vec()).await.unwrap());
+        assert_eq!(cache.get("cd").await.unwrap(), None);
+        assert!(!cache.compare_and_delete("cd", b"old".to_vec()).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
     async fn redis_scan_keys() {
         let (cache, _container) = setup_redis().await;
 
@@ -629,5 +667,17 @@ mod tests {
             ]
         );
         assert!(cache.scan_keys("login-failure:realm-3:*").await.unwrap().is_empty());
+
+        // Escaped literals (`*`, `?`, `[`, `]`, `\`) match only themselves.
+        cache.set("login-failure:realm-1:*:otp", b"1".to_vec(), None).await.unwrap();
+        cache
+            .set("login-failure:realm-1:[a]l?ce\\:otp", b"1".to_vec(), None)
+            .await
+            .unwrap();
+        for username in ["*", "[a]l?ce\\"] {
+            let prefix = format!("login-failure:realm-1:{username}:");
+            let pattern = format!("{}*", issuerd_core::escape_scan_pattern(&prefix));
+            assert_eq!(cache.scan_keys(&pattern).await.unwrap(), vec![format!("{prefix}otp")]);
+        }
     }
 }

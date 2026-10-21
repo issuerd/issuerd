@@ -19,6 +19,7 @@ pub mod password;
 pub mod provision;
 pub mod roles;
 pub mod scope;
+pub mod service_account;
 pub mod traits;
 pub mod typestate;
 pub mod utils;

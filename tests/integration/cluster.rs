@@ -52,7 +52,7 @@ struct TwoNodeCluster {
 
 /// Boot node A first (shared signing keys + master realm bootstrap), then node B.
 async fn two_node_cluster() -> TwoNodeCluster {
-    let config = ServerConfig::default();
+    let config = crate::harness::test_config();
     let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
     let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
     let node_a = boot_node(&config, Arc::clone(&storage), Arc::clone(&cache)).await;

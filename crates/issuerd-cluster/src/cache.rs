@@ -3,8 +3,9 @@
 //
 // In-memory distributed cache for development and single-node deployments.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -12,20 +13,59 @@ use issuerd_core::{DistributedCache, IssuerdError};
 
 type Handler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
+/// Minimum time between two sweeps of expired entries.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// In-memory distributed cache for development and single-node deployments.
 ///
 /// Uses `DashMap` for concurrent access and supports TTL via lazy eviction.
+/// Writes also sweep out all expired entries at most once per
+/// [`SWEEP_INTERVAL`], so keys that are written once and never read again
+/// (abandoned login flows, replay markers) do not stay in memory forever.
 pub struct InMemoryCache {
     store: DashMap<String, (Vec<u8>, Option<Instant>)>,
     subscribers: DashMap<String, Vec<Handler>>,
+    created: Instant,
+    /// Milliseconds after `created` at which the last sweep started.
+    last_sweep_ms: AtomicU64,
+    sweep_interval: Duration,
 }
 
 impl InMemoryCache {
     pub fn new() -> Self {
+        Self::with_sweep_interval(SWEEP_INTERVAL)
+    }
+
+    fn with_sweep_interval(sweep_interval: Duration) -> Self {
         Self {
             store: DashMap::new(),
             subscribers: DashMap::new(),
+            created: Instant::now(),
+            last_sweep_ms: AtomicU64::new(0),
+            sweep_interval,
         }
+    }
+
+    /// Removes every expired entry once `sweep_interval` has passed since the
+    /// last sweep; only the caller that claims the slot pays for the pass.
+    /// Expired entries are already invisible to every operation, so this
+    /// only reclaims memory. Must not be called while holding a guard into
+    /// `store` (the sweep write-locks every shard).
+    fn maybe_sweep_expired(&self) {
+        let now = u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        let interval = u64::try_from(self.sweep_interval.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(last) < interval {
+            return;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.store.retain(|_, entry| !Self::is_expired(entry));
     }
 
     fn is_expired(entry: &(Vec<u8>, Option<Instant>)) -> bool {
@@ -37,9 +77,10 @@ impl InMemoryCache {
 }
 
 /// Match `key` against a glob `pattern` where `*` is the only wildcard and
-/// matches zero or more arbitrary bytes. All other bytes match literally
-/// (no `?`, no character classes, no escaping). An empty pattern matches
-/// only an empty key.
+/// matches zero or more arbitrary bytes. `\` makes the next pattern byte
+/// literal (Redis-compatible, see `issuerd_core::escape_scan_pattern`); a
+/// trailing lone `\` matches itself. All other bytes match literally (no
+/// `?`, no character classes). An empty pattern matches only an empty key.
 fn glob_match(pattern: &str, key: &str) -> bool {
     let (p, k) = (pattern.as_bytes(), key.as_bytes());
     let (mut pi, mut ki) = (0usize, 0usize);
@@ -47,11 +88,17 @@ fn glob_match(pattern: &str, key: &str) -> bool {
     // the key index from which that star's expansion is retried.
     let mut star: Option<(usize, usize)> = None;
     while ki < k.len() {
+        // Pattern width of the literal at `pi` when it matches `k[ki]`.
+        let literal_width = match p.get(pi) {
+            Some(b'\\') if pi + 1 < p.len() => (p[pi + 1] == k[ki]).then_some(2),
+            Some(b'*') | None => None,
+            Some(&b) => (b == k[ki]).then_some(1),
+        };
         if pi < p.len() && p[pi] == b'*' {
             star = Some((pi, ki));
             pi += 1;
-        } else if pi < p.len() && p[pi] == k[ki] {
-            pi += 1;
+        } else if let Some(width) = literal_width {
+            pi += width;
             ki += 1;
         } else if let Some((star_pi, star_ki)) = star {
             // Mismatch: let the last `*` absorb one more byte and retry.
@@ -95,6 +142,7 @@ impl DistributedCache for InMemoryCache {
         value: Vec<u8>,
         ttl: Option<std::time::Duration>,
     ) -> Result<(), IssuerdError> {
+        self.maybe_sweep_expired();
         let expiry = ttl.map(|d| Instant::now() + d);
         self.store.insert(key.to_string(), (value, expiry));
         Ok(())
@@ -115,12 +163,31 @@ impl DistributedCache for InMemoryCache {
         Ok(removed.map(|(_, entry)| entry.0))
     }
 
+    async fn compare_and_delete(&self, key: &str, expected: Vec<u8>) -> Result<bool, IssuerdError> {
+        self.maybe_sweep_expired();
+        match self.store.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                if Self::is_expired(occupied.get()) {
+                    occupied.remove();
+                    return Ok(false);
+                }
+                if occupied.get().0.as_slice() == expected.as_slice() {
+                    occupied.remove();
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => Ok(false),
+        }
+    }
+
     async fn compare_and_swap(
         &self,
         key: &str,
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
     ) -> Result<bool, IssuerdError> {
+        self.maybe_sweep_expired();
         match self.store.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if Self::is_expired(occupied.get()) {
@@ -157,6 +224,7 @@ impl DistributedCache for InMemoryCache {
         key: &str,
         ttl: Option<std::time::Duration>,
     ) -> Result<u64, IssuerdError> {
+        self.maybe_sweep_expired();
         match self.store.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if Self::is_expired(occupied.get()) {
@@ -507,6 +575,40 @@ mod tests {
         assert!(glob_match("[ab]", "[ab]"));
     }
 
+    #[test]
+    fn glob_backslash_escapes_next_byte() {
+        assert!(glob_match("a\\*", "a*"));
+        assert!(!glob_match("a\\*", "ab"));
+        assert!(glob_match("a\\\\b", "a\\b"));
+        assert!(!glob_match("a\\\\b", "a\\\\b"));
+        assert!(glob_match("\\a", "a"));
+        // A trailing lone backslash is literal (Redis parity).
+        assert!(glob_match("a\\", "a\\"));
+        // Escaped star inside a wildcard pattern still needs a literal `*`.
+        assert!(glob_match("x:\\*:*", "x:*:1.2.3.4"));
+        assert!(!glob_match("x:\\*:*", "x:alice:1.2.3.4"));
+        assert!(!glob_match("x:\\*", "x:"));
+    }
+
+    #[tokio::test]
+    async fn scan_keys_escaped_literal_does_not_wildcard() {
+        let cache = InMemoryCache::new();
+        cache.set("login-failure:r1:*:1.1.1.1", b"1".to_vec(), None).await.unwrap();
+        cache.set("login-failure:r1:alice:1.1.1.1", b"1".to_vec(), None).await.unwrap();
+        cache.set("login-failure:r1:a\\b:otp", b"1".to_vec(), None).await.unwrap();
+
+        let star = issuerd_core::escape_scan_pattern("login-failure:r1:*:");
+        assert_eq!(
+            cache.scan_keys(&format!("{star}*")).await.unwrap(),
+            vec!["login-failure:r1:*:1.1.1.1"]
+        );
+        let backslash = issuerd_core::escape_scan_pattern("login-failure:r1:a\\b:");
+        assert_eq!(
+            cache.scan_keys(&format!("{backslash}*")).await.unwrap(),
+            vec!["login-failure:r1:a\\b:otp"]
+        );
+    }
+
     fn sorted(mut keys: Vec<String>) -> Vec<String> {
         keys.sort();
         keys
@@ -643,5 +745,72 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(cache.get_and_delete("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn write_sweeps_expired_keys_that_are_never_read_again() {
+        let cache = InMemoryCache::with_sweep_interval(Duration::ZERO);
+        for i in 0..100 {
+            let key = format!("pending_auth:realm-1:{i}");
+            cache
+                .set(&key, b"flow".to_vec(), Some(Duration::from_millis(50)))
+                .await
+                .unwrap();
+        }
+        cache.set("persistent", b"p".to_vec(), None).await.unwrap();
+        cache.set("live", b"l".to_vec(), Some(Duration::from_secs(60))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cache.set("trigger", b"t".to_vec(), None).await.unwrap();
+
+        assert_eq!(cache.store.len(), 3, "expired entries must be freed without being read");
+        assert_eq!(cache.get("persistent").await.unwrap(), Some(b"p".to_vec()));
+        assert_eq!(cache.get("live").await.unwrap(), Some(b"l".to_vec()));
+        assert_eq!(cache.get("trigger").await.unwrap(), Some(b"t".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn increment_and_cas_also_sweep_expired_keys() {
+        let cache = InMemoryCache::with_sweep_interval(Duration::ZERO);
+        cache
+            .set("old-a", b"a".to_vec(), Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        cache
+            .set("old-b", b"b".to_vec(), Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.increment("counter", None).await.unwrap(), 1);
+        assert_eq!(cache.store.len(), 1);
+
+        cache.store.insert("old-c".to_string(), (b"c".to_vec(), Some(Instant::now())));
+        assert!(cache.compare_and_swap("cas", None, b"v".to_vec()).await.unwrap());
+        assert_eq!(
+            sorted(cache.store.iter().map(|e| e.key().clone()).collect()),
+            ["cas", "counter"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_waits_for_the_interval() {
+        let mut cache = InMemoryCache::with_sweep_interval(Duration::from_secs(3600));
+        cache.set("old", b"v".to_vec(), Some(Duration::from_millis(50))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Interval not yet elapsed: the write does not pay for a sweep.
+        cache.set("a", b"v".to_vec(), None).await.unwrap();
+        assert_eq!(cache.store.len(), 2);
+
+        cache.sweep_interval = Duration::ZERO;
+        cache.set("b", b"v".to_vec(), None).await.unwrap();
+        assert_eq!(sorted(cache.store.iter().map(|e| e.key().clone()).collect()), ["a", "b"]);
+    }
+
+    #[test]
+    fn default_cache_constructs_outside_a_runtime() {
+        let cache = InMemoryCache::default();
+        assert_eq!(cache.sweep_interval, SWEEP_INTERVAL);
+        assert!(cache.store.is_empty());
     }
 }

@@ -69,13 +69,11 @@ impl Client {
             .filter(|s| !s.is_empty())
     }
 
-    /// Username of the dedicated service-account user backing this client's
-    /// client-credentials grant (`service-account-{client_id}`).
-    /// Centralized here so token issuance (issuerd-token) can recognize subjects
-    /// that are already client-scoped and exempt them from pairwise
-    /// derivation.
+    /// Conventional display username for this client's service-account user.
+    /// Resolution and pairwise-subject recognition use the client-linked
+    /// identity instead of trusting this name.
     pub fn service_account_username(&self) -> String {
-        format!("service-account-{}", self.client_id)
+        format!("{}{}", crate::models::Username::SERVICE_ACCOUNT_PREFIX, self.client_id)
     }
 
     /// Resolve this client's sector identifier (OIDC Core §8.1): the host of

@@ -468,10 +468,13 @@ async fn service_account_backs_client_credentials_grant() {
     client.service_accounts_enabled = true;
     harness.storage.update_client(&realm.id, &client).await.unwrap();
 
-    // The dedicated service-account user (created lazily by the admin API in
-    // production; seeded directly here).
-    let sa_username = format!("service-account-{}", client.client_id);
-    let sa_user = harness.create_user("cs-service-acct", &sa_username, "unused-password").await;
+    let sa_user = issuerd_core::service_account::ensure_service_account_user(
+        harness.storage.as_ref(),
+        &realm.id,
+        &client,
+    )
+    .await
+    .unwrap();
     let role = realm_role(&realm.id, "svc-role");
     harness.storage.create_role(&realm.id, &role).await.unwrap();
     harness

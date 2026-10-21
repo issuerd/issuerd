@@ -235,6 +235,64 @@ impl<C: CryptoProvider> TokenManager<C> {
         claims: Option<serde_json::Value>,
         claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<AccessToken, IssuerdError> {
+        self.issue_access_shaped_token(
+            JwtType::Bearer,
+            user,
+            client,
+            realm,
+            scope,
+            session_id,
+            realm_access,
+            claims,
+            claims_overlay,
+        )
+        .await
+    }
+
+    /// Issue the browser SSO session cookie token (`typ: Serialized-ID`).
+    ///
+    /// Same claim shape and lifetime as an access token, but a distinct
+    /// `typ`: [`Self::validate_sso_session_token`] accepts only this type and
+    /// [`Self::validate_access_token`] rejects it, so a client access token
+    /// can never be planted as the SSO cookie (and vice versa).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue_sso_session_token(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<AccessToken, IssuerdError> {
+        self.issue_access_shaped_token(
+            JwtType::SerializedId,
+            user,
+            client,
+            realm,
+            scope,
+            session_id,
+            None,
+            claims,
+            claims_overlay,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_access_shaped_token(
+        &self,
+        typ: JwtType,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        realm_access: Option<issuerd_core::RealmAccess>,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<AccessToken, IssuerdError> {
         let now = Utc::now().timestamp();
         let claims = AccessTokenClaims {
             jti: issuerd_core::JwtId::new(issuerd_core::utils::generate_id()).unwrap(),
@@ -246,7 +304,7 @@ impl<C: CryptoProvider> TokenManager<C> {
             iat: now,
             nbf: now,
             scope: issuerd_core::Scope::from(scope.to_vec()),
-            typ: JwtType::Bearer,
+            typ,
             azp: Some(client.client_id.to_string()),
             session_state: None,
             realm_access,
@@ -488,10 +546,31 @@ impl<C: CryptoProvider> TokenManager<C> {
         Ok(token)
     }
 
-    /// Stateless validation of an access token.
+    /// Stateless validation of an access token (`typ: Bearer` only).
     pub fn validate_access_token(&self, token: &str) -> Result<ValidatedAccessToken, IssuerdError> {
+        self.validate_access_shaped_token(token, JwtType::Bearer)
+    }
+
+    /// Stateless validation of the browser SSO session cookie token
+    /// (`typ: Serialized-ID` only — client access tokens are rejected).
+    pub fn validate_sso_session_token(
+        &self,
+        token: &str,
+    ) -> Result<ValidatedAccessToken, IssuerdError> {
+        self.validate_access_shaped_token(token, JwtType::SerializedId)
+    }
+
+    fn validate_access_shaped_token(
+        &self,
+        token: &str,
+        expected_typ: JwtType,
+    ) -> Result<ValidatedAccessToken, IssuerdError> {
         let (claims, issuerd_alg, kid) =
             self.decode_token::<AccessTokenClaims>(token, true, None)?;
+
+        if claims.typ != expected_typ {
+            return Err(IssuerdError::InvalidToken);
+        }
 
         // jsonwebtoken 9 does not validate iat; check manually.
         let now = Utc::now().timestamp();
@@ -946,6 +1025,13 @@ impl<C: CryptoProvider + 'static> issuerd_core::TokenService for TokenManager<C>
         self.validate_access_token(token)
     }
 
+    fn validate_sso_session_token(
+        &self,
+        token: &str,
+    ) -> Result<ValidatedAccessToken, IssuerdError> {
+        self.validate_sso_session_token(token)
+    }
+
     fn validate_id_token(
         &self,
         token: &str,
@@ -991,6 +1077,21 @@ pub trait TokenIssuer: Send + Sync {
         claims: Option<serde_json::Value>,
         claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<AccessToken, IssuerdError>;
+
+    /// Issue the browser SSO session cookie token (`typ: Serialized-ID`).
+    /// The default fails closed for issuers that do not mint session cookies.
+    async fn issue_sso_session_token(
+        &self,
+        _user: &User,
+        _client: &Client,
+        _realm: &Realm,
+        _scope: &[String],
+        _session_id: &SessionId,
+        _claims: Option<serde_json::Value>,
+        _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<AccessToken, IssuerdError> {
+        Err(IssuerdError::ServerError("SSO session tokens are not supported".into()))
+    }
 
     async fn issue_refresh_token(
         &self,
@@ -1086,6 +1187,20 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
             claims_overlay,
         )
         .await
+    }
+
+    async fn issue_sso_session_token(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<AccessToken, IssuerdError> {
+        self.issue_sso_session_token(user, client, realm, scope, session_id, claims, claims_overlay)
+            .await
     }
 
     async fn issue_refresh_token(
@@ -3271,6 +3386,56 @@ mod tests {
             .await
             .unwrap();
         assert!(tm.validate_refresh_token(&token.token).is_err());
+    }
+
+    #[tokio::test]
+    async fn sso_session_token_and_access_token_are_not_interchangeable() {
+        let crypto = Arc::new(
+            RingCryptoProvider::new(CryptoConfig {
+                default_alg: Algorithm::Rs256,
+                rsa_key_size: 2048,
+            })
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let tm = TokenManager::new(
+            crypto.clone(),
+            "https://issuer".to_string(),
+            Duration::from_secs(60),
+            jwks,
+        );
+        let sid = SessionId::new("s1").unwrap();
+        let scope = ["openid".to_string()];
+
+        let sso = tm
+            .issue_sso_session_token(
+                &test_user(),
+                &test_client(),
+                &test_realm(),
+                &scope,
+                &sid,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sso.claims.typ, JwtType::SerializedId);
+        let validated = tm.validate_sso_session_token(&sso.token).unwrap();
+        assert_eq!(validated.claims.sid, Some(sid.clone()));
+        assert!(tm.validate_access_token(&sso.token).is_err());
+        assert!(!tm.introspect(&sso.token, None).unwrap().active);
+
+        // Every client and resource server holds access tokens: one must
+        // never pass as the browser SSO session cookie.
+        let at = tm
+            .issue_access_token(&test_user(), &test_client(), &test_realm(), &scope, &sid)
+            .await
+            .unwrap();
+        assert!(tm.validate_access_token(&at.token).is_ok());
+        assert!(tm.validate_sso_session_token(&at.token).is_err());
+        let ts: &dyn issuerd_core::TokenService = &tm;
+        assert!(ts.validate_sso_session_token(&at.token).is_err());
+        assert!(ts.validate_sso_session_token(&sso.token).is_ok());
     }
 
     #[tokio::test]

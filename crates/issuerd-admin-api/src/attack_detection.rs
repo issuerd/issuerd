@@ -21,7 +21,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use issuerd_core::{OperationType, RealmId, ResourceType, UserId};
+use issuerd_core::{escape_scan_pattern, OperationType, RealmId, ResourceType, UserId};
 use std::sync::Arc;
 
 use crate::{
@@ -54,6 +54,24 @@ async fn failure_count(
     Ok(count)
 }
 
+/// Every key starting with the literal `{family}:{realm_id}:{username}:`
+/// (this user's keys for any IP slot). The prefix is glob-escaped so
+/// metacharacters in the username or realm id (e.g. a username of `*`)
+/// cannot widen the scan to other users' keys, and the result is re-checked
+/// against the literal prefix whatever glob dialect the backend speaks.
+async fn user_keys(
+    state: &AdminApiState,
+    family: &str,
+    realm_id: &RealmId,
+    username: &str,
+) -> Result<Vec<String>, AdminApiError> {
+    let prefix = format!("{family}:{realm_id}:{username}:");
+    let pattern = format!("{}*", escape_scan_pattern(&prefix));
+    let mut keys = state.cache.scan_keys(&pattern).await?;
+    keys.retain(|key| key.starts_with(&prefix));
+    Ok(keys)
+}
+
 #[utoipa::path(
     get,
     path = "/admin/realms/{realm}/attack-detection/brute-force/users",
@@ -78,7 +96,7 @@ pub async fn list_locked_users(
     let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let prefix = format!("{LOCKOUT_PREFIX}:{}:", realm.id);
     let mut locked = Vec::new();
-    for key in state.cache.scan_keys(&format!("{prefix}*")).await? {
+    for key in state.cache.scan_keys(&format!("{}*", escape_scan_pattern(&prefix))).await? {
         let Some((username, ip)) = key.strip_prefix(&prefix).and_then(|s| s.rsplit_once(':'))
         else {
             continue;
@@ -136,16 +154,14 @@ pub async fn get_user_brute_force_status(
     let username = user.username.to_string();
 
     let mut num_failures = 0u32;
-    let failure_pattern = format!("{FAILURE_PREFIX}:{}:{username}:*", realm.id);
-    for key in state.cache.scan_keys(&failure_pattern).await? {
+    for key in user_keys(&state, FAILURE_PREFIX, &realm.id, &username).await? {
         if let Some(raw) = state.cache.get(&key).await? {
             let count =
                 std::str::from_utf8(&raw).ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
             num_failures = num_failures.saturating_add(count);
         }
     }
-    let lockout_pattern = format!("{LOCKOUT_PREFIX}:{}:{username}:*", realm.id);
-    let locked = !state.cache.scan_keys(&lockout_pattern).await?.is_empty();
+    let locked = !user_keys(&state, LOCKOUT_PREFIX, &realm.id, &username).await?.is_empty();
 
     Ok(Json(BruteForceUserStatusRepresentation {
         user_id: user.id.to_string(),
@@ -189,8 +205,7 @@ pub async fn clear_user_brute_force_state(
     let username = user.username.to_string();
 
     for prefix in [FAILURE_PREFIX, LOCKOUT_PREFIX] {
-        let pattern = format!("{prefix}:{}:{username}:*", realm.id);
-        for key in state.cache.scan_keys(&pattern).await? {
+        for key in user_keys(&state, prefix, &realm.id, &username).await? {
             state.cache.delete(&key).await?;
         }
     }
@@ -426,6 +441,99 @@ mod tests {
         let status: BruteForceUserStatusRepresentation = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.num_failures, 0);
         assert!(!status.locked);
+    }
+
+    /// Add a user whose username carries glob metacharacters.
+    async fn create_user_named(state: &Arc<AdminApiState>, id: &str, username: &str) {
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let user = issuerd_core::User {
+            id: issuerd_core::UserId::new(id).unwrap(),
+            realm_id: realm_id.clone(),
+            username: issuerd_core::Username::new(username).unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: None,
+            attributes: HashMap::new(),
+            required_actions: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn glob_metachar_username_only_touches_its_own_keys() {
+        let cache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let state = test_state_with_cache(
+            vec![issuerd_core::RoleName::new("manage-users").unwrap()],
+            cache.clone(),
+        );
+        create_test_realm_and_user(&state).await;
+        seed_lockout_keys(&cache).await;
+        for (id, username) in [
+            ("user-star", "*"),
+            ("user-q", "alic?"),
+            ("user-cls", "[a]lice"),
+        ] {
+            create_user_named(&state, id, username).await;
+        }
+        cache
+            .set("login-failure:realm-1:*:10.0.0.9", b"7".to_vec(), None)
+            .await
+            .unwrap();
+        cache.set("login-failure:realm-1:*:otp", b"1".to_vec(), None).await.unwrap();
+        cache
+            .set("login-lockout:realm-1:*:10.0.0.9", b"1".to_vec(), None)
+            .await
+            .unwrap();
+        let app = attack_detection_routes(state);
+
+        let request = |method: &str, id: &str| {
+            Request::builder()
+                .method(method)
+                .uri(format!("/admin/realms/test/attack-detection/brute-force/users/{id}"))
+                .header("Authorization", "Bearer valid-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Status of `*` reports only its own counters, not alice's.
+        let response = app.clone().oneshot(request("GET", "user-star")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: BruteForceUserStatusRepresentation = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.num_failures, 8);
+        assert!(status.locked);
+
+        // `alic?` / `[a]lice` have no keys and must not see alice's.
+        for id in ["user-q", "user-cls"] {
+            let response = app.clone().oneshot(request("GET", id)).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let status: BruteForceUserStatusRepresentation = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status.num_failures, 0, "{id}");
+            assert!(!status.locked, "{id}");
+        }
+
+        // Clearing `*`, `alic?` and `[a]lice` leaves alice's lockout intact.
+        for id in ["user-star", "user-q", "user-cls"] {
+            let response = app.clone().oneshot(request("DELETE", id)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        assert!(cache.scan_keys("login-failure:realm-1:\\**").await.unwrap().is_empty());
+        assert!(cache.scan_keys("login-lockout:realm-1:\\**").await.unwrap().is_empty());
+        let mut alice_keys = cache.scan_keys("login-*:realm-1:alice:*").await.unwrap();
+        alice_keys.sort();
+        assert_eq!(
+            alice_keys,
+            vec![
+                "login-failure:realm-1:alice:10.0.0.1",
+                "login-failure:realm-1:alice:10.0.0.2",
+                "login-lockout:realm-1:alice:10.0.0.1",
+            ]
+        );
     }
 
     #[tokio::test]
