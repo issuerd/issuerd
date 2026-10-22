@@ -5998,6 +5998,7 @@ async fn logout_inner(
     let mut session_id: Option<issuerd_core::SessionId> = None;
     let mut user_id: Option<issuerd_core::UserId> = None;
     let mut client: Option<issuerd_core::Client> = None;
+    let mut invalid_id_token_hint = false;
     // Tracks whether `session_id` came from an explicitly presented refresh
     // token (vs. an `id_token_hint`): only the former may destroy an offline
     // session.
@@ -6070,6 +6071,8 @@ async fn logout_inner(
                     .ok()
                     .flatten();
             }
+        } else {
+            invalid_id_token_hint = true;
         }
     }
 
@@ -6176,6 +6179,20 @@ async fn logout_inner(
     // Without a recognized client we cannot validate the target,
     // so we refuse the redirect rather than acting as an open redirector.
     if let Some(target) = params.get("post_logout_redirect_uri") {
+        if invalid_id_token_hint {
+            return with_session_state_cleared(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "invalid id_token_hint"
+                    })),
+                )
+                    .into_response(),
+                &realm,
+                state.config.secure_cookies(),
+            );
+        }
         let registered = client
             .as_ref()
             .map(|c| {
@@ -6198,6 +6215,15 @@ async fn logout_inner(
             })
             .unwrap_or(false);
         if !registered {
+            let error_description = if client.is_some() {
+                "invalid post_logout_redirect_uri"
+            } else if params.contains_key("client_id") {
+                "invalid client_id"
+            } else if params.contains_key("id_token_hint") {
+                "invalid id_token_hint"
+            } else {
+                "missing id_token_hint"
+            };
             // The session was still destroyed above — the companion cookie
             // must not outlive it.
             return with_session_state_cleared(
@@ -6205,7 +6231,7 @@ async fn logout_inner(
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
                         "error": "invalid_request",
-                        "error_description": "invalid post_logout_redirect_uri"
+                        "error_description": error_description
                     })),
                 )
                     .into_response(),
@@ -13851,6 +13877,14 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = extract_json(response).await;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "invalid_request",
+                "error_description": "invalid post_logout_redirect_uri"
+            })
+        );
     }
 
     #[tokio::test]

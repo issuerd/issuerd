@@ -402,6 +402,128 @@ async fn logout_without_frontchannel_clients_keeps_plain_redirect_behavior() {
     assert_eq!(location, "http://localhost:8080/cb?state=s1");
 }
 
+async fn assert_logout_error(response: axum::response::Response, expected_description: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "invalid_request",
+            "error_description": expected_description
+        })
+    );
+}
+
+#[tokio::test]
+async fn logout_post_logout_without_hint_or_client_reports_missing_hint() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-missing-hint").await;
+    harness.create_client("plru-missing-hint", false).await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-missing-hint",
+        &[("post_logout_redirect_uri", "http://localhost:8080/cb")],
+    )
+    .await;
+    assert_logout_error(resp, "missing id_token_hint").await;
+}
+
+#[tokio::test]
+async fn logout_post_logout_with_invalid_hint_reports_invalid_hint() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-invalid-hint").await;
+    harness.create_client("plru-invalid-hint", false).await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-invalid-hint",
+        &[
+            ("id_token_hint", "not-a-jwt"),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+        ],
+    )
+    .await;
+    assert_logout_error(resp, "invalid id_token_hint").await;
+}
+
+#[tokio::test]
+async fn logout_post_logout_with_invalid_hint_and_valid_client_does_not_redirect() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-invalid-hint-client").await;
+    let client = harness.create_client("plru-invalid-hint-client", false).await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-invalid-hint-client",
+        &[
+            ("id_token_hint", "not-a-jwt"),
+            ("client_id", client.client_id.as_ref()),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+        ],
+    )
+    .await;
+    assert!(resp.headers().get("location").is_none());
+    assert_logout_error(resp, "invalid id_token_hint").await;
+}
+
+#[tokio::test]
+async fn logout_post_logout_without_hint_uses_explicit_client() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-client-only").await;
+    let client = harness.create_client("plru-client-only", false).await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-client-only",
+        &[
+            ("client_id", client.client_id.as_ref()),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+            ("state", "client-only"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(location, "http://localhost:8080/cb?state=client-only");
+}
+
+#[tokio::test]
+async fn logout_post_logout_with_unregistered_target_reports_redirect_error() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-unregistered").await;
+    let client = harness.create_client("plru-unregistered", false).await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-unregistered",
+        &[
+            ("client_id", client.client_id.as_ref()),
+            ("post_logout_redirect_uri", "https://evil.example/steal"),
+        ],
+    )
+    .await;
+    assert_logout_error(resp, "invalid post_logout_redirect_uri").await;
+}
+
+#[tokio::test]
+async fn logout_post_logout_with_unknown_client_reports_invalid_client_id() {
+    let harness = TestHarness::new().await;
+    harness.create_realm("plru-unknown-client").await;
+
+    let resp = logout_get(
+        &harness,
+        "plru-unknown-client",
+        &[
+            ("client_id", "missing-client"),
+            ("post_logout_redirect_uri", "http://localhost:8080/cb"),
+        ],
+    )
+    .await;
+    assert_logout_error(resp, "invalid client_id").await;
+}
+
 // ---------------------------------------------------------------------------
 // Client metadata: post_logout_redirect_uris + logout *_session_required
 // ---------------------------------------------------------------------------
