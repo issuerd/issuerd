@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-22
+
 ### Fixed
 
 - **RP-Initiated Logout errors now identify the actual failure.** Missing or invalid `id_token_hint` values and unknown `client_id` values no longer produce the misleading `invalid post_logout_redirect_uri` description. An invalid hint is rejected even when a valid `client_id` and registered post-logout target are also supplied; valid client-only logout redirects remain supported.
