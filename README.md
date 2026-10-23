@@ -13,7 +13,7 @@
   <a href="https://github.com/issuerd/issuerd/actions/workflows/ci.yml"><img src="https://github.com/issuerd/issuerd/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV: 1.95"></a>
-  <a href="https://openid.net/certification/certified-openid-connect-implementations/"><img src="https://img.shields.io/badge/OpenID%20Certified-11%20OP%20profiles-brightgreen" alt="OpenID Certified: 11 OP profiles across v0.1.17 and v0.1.19"></a>
+  <a href="https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23"><img src="https://img.shields.io/badge/OpenID%20Certified-11%20OP%20profiles-brightgreen" alt="OpenID Certified: 11 OP profiles across v0.1.17 and v0.1.19"></a>
   <a href="https://github.com/rust-secure-code/safety-dance/"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
@@ -32,7 +32,7 @@ Issuerd is a modular Identity and Access Management (IAM) server implementing Op
 
 ## Why Issuerd?
 
-- **OpenID Certified, not "spec-inspired".** The [OpenID Foundation registry](https://openid.net/certification/certified-openid-connect-implementations/) lists Issuerd v0.1.17 for 10 OP profiles; the [logout registry](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) adds RP-Initiated Logout OP on v0.1.19. The accepted evidence comes from the OIDF-hosted conformance suite (release v5.3.3). Separately, a broader self-hosted run of release v5.3.2 passes the full OP certification matrix with **zero failures and zero unexpected warnings**, 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
+- **OpenID Certified, not "spec-inspired".** The [OpenID Foundation registry](https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23) lists Issuerd v0.1.17 for 10 OP profiles; the [logout registry](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) adds RP-Initiated Logout OP on v0.1.19. The accepted evidence comes from the OIDF-hosted conformance suite (release v5.3.3). Separately, a broader self-hosted run of release v5.3.2 passes the full OP certification matrix with **zero failures and zero unexpected warnings**, 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
 - **Keycloak-compatible where it counts.** Realms, clients, roles, client scopes, protocol mappers, authentication flows, and the Admin REST API follow the Keycloak model, so existing OIDC clients and Keycloak-hardened operational knowledge transfer directly. A dual-target test suite runs the same protocol assertions against Issuerd and a live Keycloak 24.0 container, and [every deliberate difference is documented](tests/KEYCLOAK_DIFFS.md).
 - **Rust, end to end.** Memory safety without a garbage collector, async I/O on Tokio, constant-time secret handling, ~155k lines of Rust across 9 tightly-scoped crates with a strictly acyclic dependency graph. The entire server — including the embedded admin and account consoles — deploys as one binary.
 - **Horizontally scalable from day one.** Access-token validation is stateless (no database lookup on the hot path), signing keys are shared cluster-wide through PostgreSQL, and transient coordination state lives in Redis. No sticky sessions — put any number of nodes behind any load balancer.
@@ -141,7 +141,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 ## OIDC Conformance
 
 <p align="center">
-  <a href="https://openid.net/certification/certified-openid-connect-implementations/">
+  <a href="https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23">
     <img src=".github/assets/openid-certified.jpg" alt="OpenID Certified" width="180">
   </a>
 </p>
@@ -150,7 +150,7 @@ Issuerd is listed in the official OpenID Foundation certification registries:
 
 | Certified version | Certified OP profiles | Official registry |
 |---|---|---|
-| **v0.1.17** | Config, Basic, Implicit, Hybrid, Dynamic, 3rd Party-Init, Form Post, Front-Channel Logout, Back-Channel Logout, Session Management | [OIDC implementations](https://openid.net/certification/certified-openid-connect-implementations/) · [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
+| **v0.1.17** | Config, Basic, Implicit, Hybrid, Dynamic, 3rd Party-Init, Form Post, Front-Channel Logout, Back-Channel Logout, Session Management | [OIDC implementations](https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23) · [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
 | **v0.1.19** | RP-Initiated Logout | [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
 
 These registry entries are version-specific: they do not mean that v0.1.19 alone is certified for all 11 profiles.
