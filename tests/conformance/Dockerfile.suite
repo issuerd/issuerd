@@ -8,7 +8,7 @@
 # network.
 
 # --- Stage 1: build the suite JAR from the pristine upstream sources ---
-FROM maven:3-eclipse-temurin-21 AS jar
+FROM maven:3-eclipse-temurin-27 AS jar
 WORKDIR /build
 COPY conformance-suite/ ./
 # BuildKit cache keeps the maven repository across builds on this host
