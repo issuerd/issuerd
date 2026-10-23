@@ -200,7 +200,7 @@ zeroize = "1.8"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1", "tokio1-rustls-tls"] }
 
 # Base64
-base64 = "0.22"
+base64 = "0.23"
 
 # Test certificate generation
 rcgen = "0.13"

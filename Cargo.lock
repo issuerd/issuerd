@@ -2203,7 +2203,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
@@ -2278,7 +2278,7 @@ version = "0.1.19"
 dependencies = [
  "argon2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "issuerd-cluster",
  "issuerd-core",
@@ -2343,7 +2343,7 @@ name = "issuerd-federation"
 version = "0.1.19"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "issuerd-cluster",
  "issuerd-core",
@@ -2360,7 +2360,7 @@ dependencies = [
 name = "issuerd-protocol"
 version = "0.1.19"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "issuerd-core",
  "mirai-annotations",
  "proptest",
@@ -2383,7 +2383,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "figment",
  "include_dir",
@@ -2458,7 +2458,7 @@ version = "0.1.19"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "issuerd-core",
  "jsonwebtoken",
