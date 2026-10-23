@@ -16,6 +16,7 @@ ENV ADMIN_PASSWORD=AdminPass123!
 
 RUN apt-get update && apt-get install -y \
     samba \
+    samba-ad-dc \
     krb5-user \
     winbind \
     ldap-utils \
