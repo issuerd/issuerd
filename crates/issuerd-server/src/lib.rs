@@ -7,6 +7,7 @@
 
 pub mod bootstrap;
 pub mod broker;
+pub mod challenges;
 pub mod claims;
 pub mod claims_cache;
 pub mod client_assertion;
