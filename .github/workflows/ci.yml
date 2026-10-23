@@ -138,7 +138,7 @@ jobs:
       - name: Rust tests + coverage
         run: cargo llvm-cov --locked --workspace --lcov --output-path rust-lcov.info --fail-under-lines 90
       - name: Rust Cobertura report
-        run: cargo llvm-cov report --cobertura --output-path rust-cobertura.xml
+        run: cargo llvm-cov report --workspace --cobertura --output-path rust-cobertura.xml
       # llvm-cov cannot instrument doctests on stable, so they are not part
       # of the coverage run — execute them uninstrumented instead.
       - name: Rust doc tests
