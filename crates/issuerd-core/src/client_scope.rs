@@ -15,7 +15,11 @@
 //! Built-in scopes ([`builtin_client_scopes`]) are seeded per realm and
 //! reproduce the claim behavior that was hardcoded before client scopes were
 //! introduced: `profile`, `email`, `address`, `phone`, `roles`,
-//! `offline_access`, `web-origins`, and `acr`.
+//! `offline_access`, `web-origins`, and `acr`. Two more built-ins,
+//! `mcp:read` and `mcp:write`, are coarse agent-facing authorization gates
+//! for the MCP (Model Context Protocol) endpoint: they carry no protocol
+//! mappers, are never part of the realm default sets, and are assigned to
+//! specific agent clients by an administrator.
 
 use std::collections::HashMap;
 
@@ -227,6 +231,8 @@ pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "offline_access",
     "web-origins",
     "acr",
+    "mcp:read",
+    "mcp:write",
 ];
 
 /// Built-in scopes assigned as *default* scopes to every realm (and mirrored
@@ -316,7 +322,7 @@ fn scope(realm_id: &RealmId, name: &str, mappers: Vec<ProtocolMapper>) -> Client
     }
 }
 
-/// Build the eight built-in client scopes for a realm, with fresh random ids.
+/// Build the ten built-in client scopes for a realm, with fresh random ids.
 ///
 /// The mapper set reproduces the claim behavior that was hardcoded before
 /// client scopes were introduced: `profile`/`email`/`address`/`phone`
@@ -325,6 +331,12 @@ fn scope(realm_id: &RealmId, name: &str, mappers: Vec<ProtocolMapper>) -> Client
 /// tokens only. One Keycloak-parity exception: the `username` mapper also
 /// targets access tokens, so `preferred_username` is available to access-
 /// token consumers (e.g. the admin console's user menu).
+///
+/// `mcp:read` and `mcp:write` are agent-facing authorization gates for the
+/// MCP (Model Context Protocol) endpoint: they carry no protocol mappers and
+/// are deliberately absent from [`DEFAULT_DEFAULT_SCOPES`] and
+/// [`DEFAULT_OPTIONAL_SCOPES`] — an administrator assigns them to specific
+/// agent clients explicitly.
 pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
     let profile = scope(
         realm_id,
@@ -454,6 +466,24 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
 
     let acr = scope(realm_id, "acr", vec![]);
 
+    // Coarse agent-facing authorization gates for the MCP endpoint: pure
+    // gates with no protocol mappers (they emit no claims), seeded per realm
+    // but never default-assigned — see the function-level docs.
+    let mcp_read = ClientScope {
+        description: Some("Read access for MCP (Model Context Protocol) agents".to_string()),
+        ..scope(realm_id, "mcp:read", vec![])
+    };
+    let mcp_write = ClientScope {
+        description: Some(
+            concat!(
+                "Write access for MCP (Model Context Protocol) agents; ",
+                "destructive operations additionally require step-up approval"
+            )
+            .to_string(),
+        ),
+        ..scope(realm_id, "mcp:write", vec![])
+    };
+
     vec![
         profile,
         email,
@@ -463,6 +493,8 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
         offline_access,
         web_origins,
         acr,
+        mcp_read,
+        mcp_write,
     ]
 }
 
@@ -557,12 +589,34 @@ mod tests {
                 "roles",
                 "offline_access",
                 "web-origins",
-                "acr"
+                "acr",
+                "mcp:read",
+                "mcp:write"
             ]
         );
         for s in &scopes {
             assert_eq!(s.realm_id, realm);
             assert_eq!(s.protocol, ClientProtocol::OpenIdConnect);
+        }
+    }
+
+    #[test]
+    fn mcp_scopes_are_mapperless_and_never_default_assigned() {
+        let realm = RealmId::new("r1").unwrap();
+        let scopes = builtin_client_scopes(&realm);
+        for name in ["mcp:read", "mcp:write"] {
+            let scope = scopes.iter().find(|s| s.name == name).unwrap();
+            // Pure authorization gates: they emit no claims and carry no role
+            // subsetting.
+            assert!(scope.protocol_mappers.is_empty());
+            assert!(scope.scope_mappings.realm_roles.is_empty());
+            assert!(scope.scope_mappings.client_roles.is_empty());
+            assert!(scope.description.is_some());
+            assert!(is_builtin_scope_name(name));
+            // Optional-assignment only: an administrator assigns them to
+            // specific agent clients; they never join the realm default sets.
+            assert!(!DEFAULT_DEFAULT_SCOPES.contains(&name));
+            assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&name));
         }
     }
 

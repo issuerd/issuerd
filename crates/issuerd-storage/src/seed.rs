@@ -22,7 +22,7 @@ const ALL: Pagination = Pagination {
     max: i32::MAX,
 };
 
-/// Seed the eight built-in client scopes into `realm_id` and wire the realm
+/// Seed the ten built-in client scopes into `realm_id` and wire the realm
 /// default scope sets ([`DEFAULT_DEFAULT_SCOPES`] / [`DEFAULT_OPTIONAL_SCOPES`]).
 ///
 /// Scopes that already exist (matched by name) are left untouched; realm
@@ -190,13 +190,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_builtin_client_scopes_creates_all_eight_with_realm_defaults() {
+    async fn seed_builtin_client_scopes_creates_all_ten_with_realm_defaults() {
         let storage = InMemoryStorage::new();
         let realm = realm_id();
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 8);
+        assert_eq!(scopes.len(), 10);
         for expected in builtin_client_scopes(&realm) {
             assert!(
                 scopes.iter().any(|s| s.name == expected.name),
@@ -219,6 +219,13 @@ mod tests {
                 );
             }
         }
+        // The MCP authorization gates are seeded but never join the realm
+        // default sets — administrators assign them to agent clients
+        // explicitly.
+        for name in ["mcp:read", "mcp:write"] {
+            let scope = scopes.iter().find(|s| s.name == name).unwrap();
+            assert!(!defaults.iter().any(|(id, _)| id == &scope.id));
+        }
     }
 
     #[tokio::test]
@@ -240,7 +247,7 @@ mod tests {
     async fn seed_builtin_client_scopes_preserves_preexisting_scope() {
         // A realm that already carries one of the built-in scopes (created
         // before seeding existed): the pre-existing row must be preserved
-        // (not recreated) and the remaining seven scopes filled in.
+        // (not recreated) and the remaining nine scopes filled in.
         let storage = InMemoryStorage::new();
         let realm = realm_id();
         let preexisting = ClientScope {
@@ -258,7 +265,7 @@ mod tests {
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 8);
+        assert_eq!(scopes.len(), 10);
         let profile = scopes.iter().find(|s| s.name == "profile").unwrap();
         assert_eq!(profile.id, preexisting.id);
         assert_eq!(profile.description, preexisting.description);

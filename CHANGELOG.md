@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Built-in `mcp:read` / `mcp:write` client scopes (groundwork for the MCP endpoint).** Every realm now seeds two coarse, agent-facing authorization gates for the upcoming MCP (Model Context Protocol) admin endpoint. The scopes carry no protocol mappers (they emit no claims), are never part of the realm default/optional scope sets, and are never auto-assigned to newly created clients — an administrator assigns them to specific agent clients explicitly. They are also absent from the discovery document's `scopes_supported`; they will be advertised via the RFC 9728 protected-resource metadata instead. Existing realms gain the two scopes through the storage seeding backfill on next start. ([#39](https://github.com/issuerd/issuerd/issues/39))
+
 ## [0.1.19] - 2026-10-22
 
 ### Fixed

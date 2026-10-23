@@ -1511,7 +1511,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            8
+            10
         );
         assert_eq!(storage.list_realm_default_client_scopes(&realm_id).await.unwrap().len(), 8);
         let client = storage
@@ -1534,8 +1534,40 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            8
+            10
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn json_storage_backfills_mcp_scopes_when_loading_pre_mcp_snapshot() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("issuerd-json-pre-mcp-{}.json", uuid::Uuid::new_v4()));
+
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&test_realm()).await.unwrap();
+            // Simulate a snapshot written before the MCP scopes existed:
+            // every built-in except `mcp:read`/`mcp:write` is present.
+            let realm_id = RealmId::new("realm-1").unwrap();
+            for name in ["mcp:read", "mcp:write"] {
+                let scope =
+                    storage.get_client_scope_by_name(&realm_id, name).await.unwrap().unwrap();
+                storage.delete_client_scope(&realm_id, &scope.id).await.unwrap();
+            }
+        }
+
+        // Loading backfills the two missing built-ins; the realm default sets
+        // are untouched (the MCP scopes never join them).
+        let storage = JsonFileStorage::new(&path).unwrap();
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let scopes = storage.list_client_scopes(&realm_id, &Pagination::default()).await.unwrap();
+        assert_eq!(scopes.len(), 10);
+        for name in ["mcp:read", "mcp:write"] {
+            assert!(scopes.iter().any(|s| s.name == name));
+        }
+        assert_eq!(storage.list_realm_default_client_scopes(&realm_id).await.unwrap().len(), 8);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2199,9 +2231,9 @@ mod tests {
             // Signing keys
             assert_eq!(storage.list_signing_keys().await.unwrap(), vec![signing_key.clone()]);
 
-            // Client scopes: 8 built-ins + the custom one
+            // Client scopes: 10 built-ins + the custom one
             let scopes = storage.list_client_scopes(&realm_id, &page).await.unwrap();
-            assert_eq!(scopes.len(), 9);
+            assert_eq!(scopes.len(), 11);
             assert_eq!(
                 storage.get_client_scope(&realm_id, &custom_scope.id).await.unwrap().unwrap(),
                 custom_scope

@@ -169,6 +169,8 @@ async fn realm_creation_seeds_builtin_client_scopes() {
             "acr",
             "address",
             "email",
+            "mcp:read",
+            "mcp:write",
             "offline_access",
             "phone",
             "profile",
@@ -222,6 +224,42 @@ async fn client_creation_seeds_scope_assignments() {
     // list, and `roles` always as a default (keeps `realm_access` flowing).
     assert_eq!(defaults, vec!["profile", "roles"]);
     assert_eq!(optionals, vec!["email"]);
+}
+
+#[tokio::test]
+async fn mcp_scopes_are_seeded_but_never_default_assigned() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("cs-mcp-scopes").await;
+    let client = harness.create_client("cs-mcp-scopes", false).await;
+
+    // Seeded per realm as pure authorization gates (no protocol mappers).
+    for name in ["mcp:read", "mcp:write"] {
+        let scope = harness
+            .storage
+            .get_client_scope_by_name(&realm.id, name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(scope.protocol_mappers.is_empty());
+    }
+
+    // Never part of the realm default/optional sets ...
+    let defaults = harness.storage.list_realm_default_client_scopes(&realm.id).await.unwrap();
+    for (scope_id, _) in defaults {
+        let scope = harness.storage.get_client_scope(&realm.id, &scope_id).await.unwrap().unwrap();
+        assert!(!scope.name.starts_with("mcp:"));
+    }
+
+    // ... and never auto-assigned to newly created clients.
+    let assignments = harness
+        .storage
+        .list_client_scope_assignments(&realm.id, &client.id)
+        .await
+        .unwrap();
+    for (scope_id, _) in assignments {
+        let scope = harness.storage.get_client_scope(&realm.id, &scope_id).await.unwrap().unwrap();
+        assert!(!scope.name.starts_with("mcp:"));
+    }
 }
 
 #[tokio::test]
