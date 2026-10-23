@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
+#
+# cargo-fuzz harness for the issuerd-protocol parsers (pure functions, no I/O).
+# Detached workspace (own empty [workspace] table, like lints/): the root
+# workspace uses an explicit members list, so `cargo build/check/test
+# --workspace` at the repository root never builds this crate. Run with:
+#
+#   cargo fuzz run authorization_request_parse
+#   cargo fuzz run token_request_parse
+#   cargo fuzz run pkce_verify
+#
+# (needs `cargo install cargo-fuzz` and a nightly toolchain).
+
+[package]
+name = "issuerd-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.issuerd-protocol]
+path = "../crates/issuerd-protocol"
+
+[dependencies.issuerd-core]
+path = "../crates/issuerd-core"
+
+[[bin]]
+name = "authorization_request_parse"
+path = "fuzz_targets/authorization_request_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "token_request_parse"
+path = "fuzz_targets/token_request_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pkce_verify"
+path = "fuzz_targets/pkce_verify.rs"
+test = false
+doc = false
+
+[workspace]
