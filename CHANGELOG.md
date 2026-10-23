@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency security updates.** `ctutils` 0.4.3 → 0.4.5 (RUSTSEC-2026-0385, non-constant-time comparisons), `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety soundness), and the web client's transitive `js-yaml` pinned to 4.3.2 via an npm `overrides` entry (GHSA-2883-xcg3-v3hh, GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj — CPU-exhaustion YAML parsing issues in a build-time-only codegen dependency). No operator action required.
+
 ## [0.1.19] - 2026-10-22
 
 ### Fixed
