@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <strong>Fast, Keycloak-compatible IAM with DPoP and CIBA — conformance-tested OIDC/OAuth2 in Rust, shipped as a single binary, horizontally scalable.</strong>
+  <strong>Fast, Keycloak-compatible IAM with DPoP and CIBA — OpenID Certified OIDC/OAuth2 in Rust, shipped as a single binary, horizontally scalable.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/issuerd/issuerd/actions/workflows/ci.yml"><img src="https://github.com/issuerd/issuerd/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV: 1.95"></a>
-  <a href="tests/conformance/README.md"><img src="https://img.shields.io/badge/OIDF%20conformance-11%20OP%20profiles-brightgreen" alt="OIDF Conformance: 11 OP profiles"></a>
+  <a href="https://openid.net/certification/certified-openid-connect-implementations/"><img src="https://img.shields.io/badge/OpenID%20Certified-11%20OP%20profiles-brightgreen" alt="OpenID Certified: 11 OP profiles across v0.1.17 and v0.1.19"></a>
   <a href="https://github.com/rust-secure-code/safety-dance/"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
@@ -22,7 +22,7 @@
   <a href="https://hub.docker.com/r/issuerd/issuerd"><img src="https://img.shields.io/docker/pulls/issuerd/issuerd" alt="Docker pulls"></a>
 </p>
 
-> **Proof, not promises:** 31,000+ conformance conditions with 0 failures and 0 unexpected warnings across the full OIDF OP certification matrix · 100,000-user LDAP sync in ~30 s · 3,460+ automated tests · one self-contained binary.
+> **Proof, not promises:** OpenID Certified across the 11-profile OP matrix (10 profiles on v0.1.17 + RP-Initiated Logout on v0.1.19) · 31,000+ self-hosted conformance conditions with 0 failures and 0 unexpected warnings · 100,000-user LDAP sync in ~30 s · 3,460+ automated tests · one self-contained binary.
 
 Issuerd is a modular Identity and Access Management (IAM) server implementing OpenID Connect and OAuth 2.x. It delivers the feature surface you expect from a mature identity provider — single sign-on, MFA and passkeys, user federation, social login, a full admin console and management API — with the operational profile of a Rust service: one self-contained binary, predictable latency, and no JVM to babysit. Keycloak is used throughout as the baseline reference implementation: protocol behavior, JSON shapes, and Admin API responses are continuously validated against a real Keycloak 24.0.
 
@@ -32,7 +32,7 @@ Issuerd is a modular Identity and Access Management (IAM) server implementing Op
 
 ## Why Issuerd?
 
-- **Conformance-proven, not "spec-inspired".** Issuerd has completed the OIDF-hosted [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.3) certification matrix with **zero FAILED or INTERRUPTED results**. A broader self-hosted run of release v5.3.2 also passes the full OP certification matrix — Basic, Implicit, Hybrid, Config, Dynamic, Form Post, and 3rd-Party-Init OP, plus all four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel) — with **zero failures and zero unexpected warnings**, 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
+- **OpenID Certified, not "spec-inspired".** The [OpenID Foundation registry](https://openid.net/certification/certified-openid-connect-implementations/) lists Issuerd v0.1.17 for 10 OP profiles; the [logout registry](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) adds RP-Initiated Logout OP on v0.1.19. The accepted evidence comes from the OIDF-hosted conformance suite (release v5.3.3). Separately, a broader self-hosted run of release v5.3.2 passes the full OP certification matrix with **zero failures and zero unexpected warnings**, 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
 - **Keycloak-compatible where it counts.** Realms, clients, roles, client scopes, protocol mappers, authentication flows, and the Admin REST API follow the Keycloak model, so existing OIDC clients and Keycloak-hardened operational knowledge transfer directly. A dual-target test suite runs the same protocol assertions against Issuerd and a live Keycloak 24.0 container, and [every deliberate difference is documented](tests/KEYCLOAK_DIFFS.md).
 - **Rust, end to end.** Memory safety without a garbage collector, async I/O on Tokio, constant-time secret handling, ~155k lines of Rust across 9 tightly-scoped crates with a strictly acyclic dependency graph. The entire server — including the embedded admin and account consoles — deploys as one binary.
 - **Horizontally scalable from day one.** Access-token validation is stateless (no database lookup on the hot path), signing keys are shared cluster-wide through PostgreSQL, and transient coordination state lives in Redis. No sticky sessions — put any number of nodes behind any load balancer.
@@ -70,7 +70,7 @@ Issuerd deliberately mirrors Keycloak's domain model and API surface — it is n
 | Runtime | Single Rust binary | JVM (Quarkus) distribution |
 | Cluster state | PostgreSQL + Redis | Embedded Infinispan grid |
 | Protocol parity | Continuously diff-tested against Keycloak 24.0 | Reference |
-| Conformance evidence | Suite results checked into the repo; full report bundle attached to every release | Vendor certification program |
+| Conformance evidence | OpenID Certified (11 OP profiles across v0.1.17/v0.1.19); public OIDF listings and per-release report bundles | Vendor certification program |
 | SAML, UMA, FGAP, Organizations | Not implemented (see [scope](#project-scope)) | Implemented |
 
 If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model, Issuerd is a drop-in alternative with a Rust operational footprint.
@@ -117,9 +117,10 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 
 | Specification | Status |
 |---|---|
-| OpenID Connect Core 1.0 | Conformance-suite verified (Basic, Implicit, Hybrid, Config, Dynamic, Form Post, 3rd-Party-Init OP) |
+| OpenID Connect Core 1.0 | **OpenID Certified** on v0.1.17 (Basic, Implicit, Hybrid, Config, Dynamic, Form Post, 3rd-Party-Init OP) |
 | OpenID Connect Discovery | Full metadata, truthful capability advertisement |
-| OIDC RP-Initiated, Front-Channel & Back-Channel Logout | Implemented |
+| OIDC RP-Initiated, Front-Channel & Back-Channel Logout | **OpenID Certified**: RP-Initiated on v0.1.19; Front-Channel & Back-Channel on v0.1.17 |
+| OIDC Session Management 1.0 | **OpenID Certified** on v0.1.17 (Session Management OP) |
 | OAuth 2.0 (RFC 6749) + Bearer Tokens (RFC 6750) | Implemented |
 | PKCE (RFC 7636) | S256-only, enforced for public clients |
 | Token Introspection (RFC 7662) | Implemented |
@@ -139,7 +140,22 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 
 ## OIDC Conformance
 
-The OIDF-hosted certification matrix was completed against the [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.3): 33 plan invocations, **524 modules FINISHED — 393 PASSED, 41 declared SKIPPED, 90 REVIEW with screenshots — with no FAILED or INTERRUPTED results**.
+<p align="center">
+  <a href="https://openid.net/certification/certified-openid-connect-implementations/">
+    <img src=".github/assets/openid-certified.jpg" alt="OpenID Certified" width="180">
+  </a>
+</p>
+
+Issuerd is listed in the official OpenID Foundation certification registries:
+
+| Certified version | Certified OP profiles | Official registry |
+|---|---|---|
+| **v0.1.17** | Config, Basic, Implicit, Hybrid, Dynamic, 3rd Party-Init, Form Post, Front-Channel Logout, Back-Channel Logout, Session Management | [OIDC implementations](https://openid.net/certification/certified-openid-connect-implementations/) · [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
+| **v0.1.19** | RP-Initiated Logout | [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
+
+These registry entries are version-specific: they do not mean that v0.1.19 alone is certified for all 11 profiles.
+
+Across the two accepted certification submissions, the OIDF-hosted runs used the [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.3): 33 plan invocations, **524 modules FINISHED — 393 PASSED, 41 declared SKIPPED, 90 REVIEW with screenshots — with no FAILED or INTERRUPTED results**.
 
 The broader self-hosted engineering matrix below used release v5.3.2 in a hermetic TLS environment against a pristine, unpatched suite: 43 plan invocations, **612 test modules, 31,000+ conditions, 0 failures and 0 unexpected warnings**:
 
