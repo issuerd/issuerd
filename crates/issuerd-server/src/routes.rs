@@ -33,6 +33,7 @@ pub(crate) mod login_api;
 pub mod logout;
 pub(crate) mod oidc;
 mod par;
+mod protected_resource;
 mod registration;
 mod required_actions;
 mod reset_credentials;
@@ -184,6 +185,15 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .route("/metrics", get(system::metrics_handler))
         .route("/.well-known/openid-configuration", get(oidc::discovery_handler))
         .route("/realms/{realm}/.well-known/openid-configuration", get(oidc::discovery_handler))
+        // RFC 9728 protected-resource metadata (gated by `[mcp] enabled`).
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource::protected_resource_metadata_handler),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/realms/{realm}/mcp",
+            get(protected_resource::protected_resource_metadata_realm_handler),
+        )
         .route("/realms/{realm}/protocol/openid-connect/certs", get(oidc::certs_handler))
         .route(
             "/realms/{realm}/protocol/openid-connect/auth",

@@ -34,7 +34,7 @@ pub use broker::{
 pub use client_scope::{
     builtin_client_scopes, is_builtin_scope_name, mapper_config, ClaimTarget, ClientScope,
     MapperType, ProtocolMapper, ScopeMappings, BUILTIN_SCOPE_NAMES, DEFAULT_DEFAULT_SCOPES,
-    DEFAULT_OPTIONAL_SCOPES,
+    DEFAULT_OPTIONAL_SCOPES, MCP_SCOPE_READ, MCP_SCOPE_WRITE,
 };
 pub use error::{IssuerdError, OAuth2Error, OAuth2ErrorCode};
 pub use events::{AdminEvent, Event, EventType, OperationType, ResourceType};

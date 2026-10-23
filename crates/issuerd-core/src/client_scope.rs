@@ -221,6 +221,16 @@ pub struct ClientScope {
     pub scope_mappings: ScopeMappings,
 }
 
+/// Scope name gating read operations for MCP (Model Context Protocol) agent
+/// clients. A pure authorization gate: no protocol mappers, never
+/// default-assigned — see [`builtin_client_scopes`].
+pub const MCP_SCOPE_READ: &str = "mcp:read";
+
+/// Scope name gating write operations for MCP agent clients (destructive
+/// operations additionally require step-up approval). Same assignment rules
+/// as [`MCP_SCOPE_READ`].
+pub const MCP_SCOPE_WRITE: &str = "mcp:write";
+
 /// Names of the built-in client scopes seeded into every realm.
 pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "profile",
@@ -231,8 +241,8 @@ pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "offline_access",
     "web-origins",
     "acr",
-    "mcp:read",
-    "mcp:write",
+    MCP_SCOPE_READ,
+    MCP_SCOPE_WRITE,
 ];
 
 /// Built-in scopes assigned as *default* scopes to every realm (and mirrored
@@ -471,7 +481,7 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
     // but never default-assigned — see the function-level docs.
     let mcp_read = ClientScope {
         description: Some("Read access for MCP (Model Context Protocol) agents".to_string()),
-        ..scope(realm_id, "mcp:read", vec![])
+        ..scope(realm_id, MCP_SCOPE_READ, vec![])
     };
     let mcp_write = ClientScope {
         description: Some(
@@ -481,7 +491,7 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
             )
             .to_string(),
         ),
-        ..scope(realm_id, "mcp:write", vec![])
+        ..scope(realm_id, MCP_SCOPE_WRITE, vec![])
     };
 
     vec![

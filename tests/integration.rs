@@ -77,6 +77,8 @@ mod oidc_discovery;
 mod pairwise_subjects;
 #[path = "integration/par.rs"]
 mod par;
+#[path = "integration/protected_resource.rs"]
+mod protected_resource;
 #[path = "integration/rar.rs"]
 mod rar;
 #[path = "integration/request_uri.rs"]

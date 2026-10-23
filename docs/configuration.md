@@ -23,6 +23,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[cache]](#cache)
 - [[oauth]](#oauth)
 - [[dpop]](#dpop)
+- [[mcp]](#mcp)
 - [[crypto.key_encryption]](#cryptokey_encryption)
 - [[outbound_http]](#outbound_http)
 - [[themes]](#themes)
@@ -478,6 +479,35 @@ or expired. RFC 9449 defines no discovery metadata for nonce support, so none
 is advertised — clients discover the requirement from the
 `use_dpop_nonce`/`DPoP-Nonce` signals.
 
+## [mcp]
+
+MCP (Model Context Protocol) surface — groundwork for the MCP resource
+endpoint. The flag currently gates only the RFC 9728 protected-resource
+metadata document that MCP clients read to discover the authorization server
+before starting OAuth:
+
+- `GET /.well-known/oauth-protected-resource` serves the **master** realm's
+  MCP resource metadata (resource identifier `{issuer_url}/realms/master/mcp`);
+- `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` serves the
+  named realm's (the RFC 9728 §3.1 path-inserted form).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both routes answer `404`, indistinguishable from an unknown realm. |
+
+```toml
+[mcp]
+enabled = false
+```
+
+Environment equivalent: `ISSUERD_MCP__ENABLED`.
+
+The document advertises the realm issuer URL as the authorization server, the
+built-in `mcp:read` / `mcp:write` scopes (never default-assigned — an
+administrator grants them to specific agent clients), and the DPoP
+proof-signing algorithms, identical to `dpop_signing_alg_values_supported` in
+the OIDC discovery document.
+
 ## [crypto.key_encryption]
 
 Envelope encryption for the cluster-wide JWT **signing keys at rest**
@@ -833,6 +863,13 @@ auth_code_ttl_secs = 600        # authorization-code redemption window; 10-600, 
 [dpop.nonce]
 mode = "disabled"               # server-provided proof nonces: "disabled" | "supported" | "required"
 lifetime_secs = 30              # single-use nonce TTL; 5-300
+
+# ---- MCP ----------------------------------------------------------------------
+# Groundwork for the MCP endpoint: gates the RFC 9728 protected-resource
+# metadata routes (/.well-known/oauth-protected-resource — MCP clients read it
+# to discover the authorization server). Both routes 404 while disabled.
+[mcp]
+enabled = false
 
 # ---- Signing-key encryption at rest ------------------------------------------
 # Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).

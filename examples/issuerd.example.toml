@@ -50,6 +50,9 @@ auth_code_ttl_secs = 600
 mode = "disabled"
 lifetime_secs = 30
 
+[mcp]
+enabled = false
+
 [crypto]
 
 [outbound_http]

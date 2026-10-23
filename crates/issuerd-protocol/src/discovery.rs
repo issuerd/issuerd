@@ -322,16 +322,11 @@ impl DiscoveryResponse {
                 issuerd_core::Algorithm::Hs384,
                 issuerd_core::Algorithm::Hs512,
             ],
-            // DPoP proofs are asymmetric-only (the accept set of
-            // `issuerd_token::dpop::validate_dpop_proof`; keep in sync).
-            dpop_signing_alg_values_supported: vec![
-                issuerd_core::Algorithm::Rs256,
-                issuerd_core::Algorithm::Rs384,
-                issuerd_core::Algorithm::Rs512,
-                issuerd_core::Algorithm::Es256,
-                issuerd_core::Algorithm::Es384,
-                issuerd_core::Algorithm::EdDsa,
-            ],
+            // DPoP proofs are asymmetric-only: the accept set of the proof
+            // validator (`issuerd_token::dpop::validate_dpop_proof`), shared
+            // with the RFC 9728 protected-resource metadata via the constant.
+            dpop_signing_alg_values_supported:
+                issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED.to_vec(),
             // Populated per realm by the server handler from the
             // realm's `authorization_details_types` attribute; omitted when
             // the deployment defines no type list.
@@ -352,6 +347,56 @@ impl DiscoveryResponse {
             backchannel_logout_session_supported: true,
             frontchannel_logout_supported: true,
             frontchannel_logout_session_supported: true,
+        }
+    }
+}
+
+/// OAuth 2.0 Protected Resource Metadata (RFC 9728 §3.2) for a realm's MCP
+/// resource (`{issuer_url}/realms/{realm}/mcp`).
+///
+/// Served from `/.well-known/oauth-protected-resource` (bare form: the master
+/// realm's resource) and `/.well-known/oauth-protected-resource/realms/{realm}/mcp`
+/// (the RFC 9728 §3.1 path-inserted form) when `[mcp] enabled = true`; MCP
+/// clients read this document to locate the authorization server before
+/// starting OAuth. Groundwork for the MCP endpoint (GitHub issue #39) — the
+/// resource itself follows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtectedResourceMetadata {
+    /// The protected resource identifier (RFC 9728 §3.2 `resource`).
+    pub resource: Url,
+    /// Authorization servers issuing tokens for this resource: the realm
+    /// issuer URL — identical to the OIDC discovery document's `issuer`.
+    pub authorization_servers: Vec<Url>,
+    /// Scopes the resource understands: the built-in agent-facing
+    /// authorization gates (never default-assigned; an administrator grants
+    /// them to specific agent clients).
+    pub scopes_supported: Vec<String>,
+    /// DPoP proof signing algorithms accepted at the resource (RFC 9449
+    /// §5.1): the same validator accept set the OIDC discovery document
+    /// advertises (`Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED`).
+    pub dpop_signing_alg_values_supported: Vec<issuerd_core::Algorithm>,
+    /// RFC 6750 bearer-token presentation methods: the Authorization header
+    /// only — form-body and URI-query methods would leak tokens into logs and
+    /// caches.
+    pub bearer_methods_supported: Vec<String>,
+}
+
+impl ProtectedResourceMetadata {
+    /// Build the document for the realm named `realm` under `base_url` (the
+    /// configured issuer URL).
+    pub fn for_realm(base_url: &str, realm: &str) -> Self {
+        let issuer =
+            Url::parse(&format!("{}/realms/{}", base_url.trim_end_matches('/'), realm)).unwrap();
+        Self {
+            resource: Url::parse(&format!("{issuer}/mcp")).unwrap(),
+            authorization_servers: vec![issuer],
+            scopes_supported: vec![
+                issuerd_core::MCP_SCOPE_READ.to_string(),
+                issuerd_core::MCP_SCOPE_WRITE.to_string(),
+            ],
+            dpop_signing_alg_values_supported:
+                issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED.to_vec(),
+            bearer_methods_supported: vec!["header".to_string()],
         }
     }
 }
@@ -486,6 +531,71 @@ mod tests {
         assert!(json.contains("\"private_key_jwt\""));
         assert!(json.contains("\"client_secret_jwt\""));
         assert!(json.contains("\"HS256\""));
+    }
+
+    #[test]
+    fn dpop_alg_list_is_the_shared_validator_accept_set() {
+        let d = DiscoveryResponse::for_realm("https://auth.example.com", "test-realm");
+        // The advertised set IS the proof validator's accept set — one shared
+        // constant, not a hand-synced copy (RFC 9449 §5.1).
+        assert_eq!(
+            d.dpop_signing_alg_values_supported,
+            issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED
+        );
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            json["dpop_signing_alg_values_supported"],
+            serde_json::json!(["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"])
+        );
+    }
+
+    #[test]
+    fn protected_resource_metadata_shape() {
+        let doc = ProtectedResourceMetadata::for_realm("https://auth.example.com", "test-realm");
+        let json = serde_json::to_value(&doc).unwrap();
+        // Exactly the five fields, no extras, no nulls (RFC 9728 §3.2).
+        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "authorization_servers",
+                "bearer_methods_supported",
+                "dpop_signing_alg_values_supported",
+                "resource",
+                "scopes_supported"
+            ]
+        );
+        assert_eq!(json["resource"], "https://auth.example.com/realms/test-realm/mcp");
+        assert_eq!(
+            json["authorization_servers"],
+            serde_json::json!(["https://auth.example.com/realms/test-realm"])
+        );
+        assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read", "mcp:write"]));
+        assert_eq!(
+            json["dpop_signing_alg_values_supported"],
+            serde_json::json!(["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"])
+        );
+        assert_eq!(json["bearer_methods_supported"], serde_json::json!(["header"]));
+    }
+
+    #[test]
+    fn protected_resource_metadata_uses_realm_name_and_trims_base_slash() {
+        let doc = ProtectedResourceMetadata::for_realm("https://auth.example.com/", "demo");
+        assert_eq!(doc.resource.as_str(), "https://auth.example.com/realms/demo/mcp");
+        assert_eq!(doc.authorization_servers[0].as_str(), "https://auth.example.com/realms/demo");
+    }
+
+    #[test]
+    fn protected_resource_metadata_serialization_roundtrip() {
+        let doc = ProtectedResourceMetadata::for_realm("https://auth.example.com", "test-realm");
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: ProtectedResourceMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc.resource, back.resource);
+        assert_eq!(doc.authorization_servers, back.authorization_servers);
+        assert_eq!(doc.scopes_supported, back.scopes_supported);
+        assert_eq!(doc.dpop_signing_alg_values_supported, back.dpop_signing_alg_values_supported);
+        assert_eq!(doc.bearer_methods_supported, back.bearer_methods_supported);
     }
 
     #[test]

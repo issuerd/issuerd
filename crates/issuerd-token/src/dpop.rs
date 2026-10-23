@@ -18,7 +18,9 @@
 //! Checks performed (RFC 9449 §4.2/§4.3):
 //! - header: `typ: dpop+jwt`, asymmetric alg allowlist (the same accept set
 //!   as external ID tokens / `private_key_jwt` — HS* is meaningless here
-//!   because the verification key comes from the proof itself), `jwk`
+//!   because the verification key comes from the proof itself; advertised
+//!   verbatim as `dpop_signing_alg_values_supported` from
+//!   `issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED`), `jwk`
 //!   present, public only (no private members), family-matching `alg`;
 //! - signature against the embedded `jwk`;
 //! - claims: `jti` present (bounded length), `htm`/`htu` match the request,

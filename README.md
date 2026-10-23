@@ -131,6 +131,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 | JWT-Secured Authorization Response Mode — JARM | Implemented |
 | Rich Authorization Requests (RFC 9396) | Implemented |
 | DPoP (RFC 9449) | Implemented (mTLS sender-constraining deferred) |
+| OAuth 2.0 Protected Resource Metadata (RFC 9728) | Implemented; gated by `[mcp] enabled` (default off) |
 | Dynamic Client Registration (RFC 7591/7592) | Implemented, incl. read/update/delete |
 | CIBA (OpenID Connect Client-Initiated Backchannel Authentication) | Poll mode |
 | TOTP (RFC 6238), WebAuthn / FIDO2 | Implemented |
