@@ -7,7 +7,7 @@
 #   docker run -d --privileged -p 389:389 -p 636:636 -p 88:88 -p 88:88/udp \
 #     -p 464:464 -p 464:464/udp issuerd/samba-dc
 
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV REALM=TEST.ISSUERD.LOCAL

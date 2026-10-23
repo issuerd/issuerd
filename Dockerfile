@@ -20,8 +20,8 @@
 # The web client is embedded at compile time (include_dir! in issuerd-server), so the
 # runtime image contains only the binary plus its shared-library dependencies.
 
-ARG BUILDER_IMAGE=mcr.microsoft.com/playwright:v1.59.1-jammy
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+ARG BUILDER_IMAGE=mcr.microsoft.com/playwright:v1.59.1-jammy@sha256:8a0360d39d1973be506dd59002904a774f6d697d4946c94063b3fd006461c8ff
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
 
 # -----------------------------------------------------------------------------
 # Stage 1: build environment (Node + Rust).

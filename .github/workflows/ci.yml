@@ -21,8 +21,8 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -31,9 +31,9 @@ jobs:
     name: cargo check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo check --locked --all-targets --all-features
@@ -42,11 +42,11 @@ jobs:
     name: cargo clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -55,9 +55,9 @@ jobs:
     name: cargo doc
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo doc --locked --workspace --no-deps
@@ -66,20 +66,20 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # cargo audit is a cargo subcommand — needs cargo on PATH, which bare
       # (self-hosted / container) runners do not provide out of the box.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8b0909b8902031c9ed62abc2387ebd6120876869 # cargo-audit
       - run: cargo audit
 
   deny:
     name: cargo deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@7ff3827688bd742ffc0b597ab1bf503967134e46 # cargo-deny
       - run: cargo deny check
 
   webclient:
@@ -89,8 +89,8 @@ jobs:
       run:
         working-directory: webclientsrc
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -111,18 +111,18 @@ jobs:
       contents: write
       code-quality: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           # cargo-llvm-cov shells out to llvm-profdata/llvm-cov from this component.
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: actions/setup-node@v7
+      - uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856 # cargo-llvm-cov
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -177,7 +177,7 @@ jobs:
                   out.write(f"| {name.capitalize()} | {badge['message']} |\n")
           EOF
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           # rust-lcov.info is renderable locally (genhtml); webclientsrc's
           # coverage/ includes the browsable lcov-report/ HTML.
@@ -209,9 +209,9 @@ jobs:
     name: openapi.json in sync
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - name: Regenerate the spec from the backend

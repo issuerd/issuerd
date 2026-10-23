@@ -28,9 +28,9 @@ jobs:
     name: federation (Samba AD DC + OpenLDAP)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       # --wait blocks until the samba-dc/openldap healthchecks (real LDAP
@@ -53,9 +53,9 @@ jobs:
     name: cluster E2E (two nodes behind nginx)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - name: Build and start the two-node cluster
@@ -81,9 +81,9 @@ jobs:
     name: dual-target parity vs Keycloak
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - name: Start reference Keycloak
@@ -98,8 +98,8 @@ jobs:
     name: release binary (embedded web UI)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -109,8 +109,8 @@ jobs:
       - name: Build the web client
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
       - run: cargo build --locked --bin issuerd --release
@@ -124,7 +124,7 @@ jobs:
     # Issuerd release binary are both compiled inside Docker. Bound hangs.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The suite sources are gitignored (tests/conformance/conformance-suite)
       # — clone fresh at the pinned release tag.
       - name: Clone the OIDF conformance suite
@@ -160,7 +160,7 @@ jobs:
           ls -lh conformance-evidence.tar.gz
       - name: Upload evidence artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: conformance-evidence
           path: tests/conformance/conformance-evidence.tar.gz
