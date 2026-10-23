@@ -185,9 +185,10 @@ Actions layout:
   `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
   stable; Vitest `--coverage` for the web client; both reduced to shields.io
   endpoint-badge JSONs by `scripts/coverage_badges.py` and pushed to the
-  `badges` branch on main — self-hosted, no external coverage service; the
-  lcov export and the web client's HTML report are uploaded as workflow
-  artifacts), and an `openapi-sync` job that regenerates the spec and diffs
+  `badges` branch on main — self-hosted badges, no external coverage service;
+  Cobertura reports are uploaded to GitHub Code Quality for the native
+  pull-request coverage rule; the lcov export and the web client's HTML report
+  are uploaded as workflow artifacts), and an `openapi-sync` job that regenerates the spec and diffs
   it against the committed `webclientsrc/openapi.json`.
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches

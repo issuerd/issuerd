@@ -20,8 +20,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       // json-summary feeds scripts/coverage_badges.py (CI coverage job);
-      // lcov.info + lcov-report/ (HTML) go into the CI artifacts.
-      reporter: ['text', 'lcov', 'json-summary'],
+      // lcov.info + lcov-report/ (HTML) go into the CI artifacts; cobertura
+      // feeds GitHub Code Quality's native pull-request coverage check.
+      reporter: ['text', 'lcov', 'json-summary', 'cobertura'],
       exclude: [
         'generated/**',
         'src/**/*.module.css',

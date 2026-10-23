@@ -109,8 +109,11 @@ jobs:
     permissions:
       # The badge-publish step pushes the badge JSONs to the `badges` branch.
       contents: write
+      code-quality: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           # cargo-llvm-cov shells out to llvm-profdata/llvm-cov from this component.
@@ -134,6 +137,8 @@ jobs:
       # workspace total drops below 90% (baseline ~95%, see the badges branch).
       - name: Rust tests + coverage
         run: cargo llvm-cov --locked --workspace --lcov --output-path rust-lcov.info --fail-under-lines 90
+      - name: Rust Cobertura report
+        run: cargo llvm-cov report --cobertura --output-path rust-cobertura.xml
       # llvm-cov cannot instrument doctests on stable, so they are not part
       # of the coverage run — execute them uninstrumented instead.
       - name: Rust doc tests
@@ -144,6 +149,20 @@ jobs:
           npm ci
           npm run generate-api
           npm run test -- --coverage
+      - name: Upload Rust coverage to Code Quality
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
+        with:
+          file: rust-cobertura.xml
+          language: Rust
+          label: code-coverage/rust
+      - name: Upload web client coverage to Code Quality
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
+        with:
+          file: webclientsrc/coverage/cobertura-coverage.xml
+          language: JavaScript
+          label: code-coverage/webclient
       - name: Build badge JSONs
         run: python3 scripts/coverage_badges.py --rust rust-lcov.info --webclient webclientsrc/coverage/coverage-summary.json --outdir badges
       - name: Job summary
