@@ -45,11 +45,15 @@ describe('isMac', () => {
   })
 
   it('returns false when navigator is undefined', () => {
-    const originalNavigator = globalThis.navigator
-    // @ts-ignore
-    globalThis.navigator = undefined
-    expect(isMac()).toBe(false)
-    globalThis.navigator = originalNavigator
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+    Object.defineProperty(globalThis, 'navigator', { value: undefined, configurable: true })
+    try {
+      expect(isMac()).toBe(false)
+    } finally {
+      if (originalNavigator) {
+        Object.defineProperty(globalThis, 'navigator', originalNavigator)
+      }
+    }
   })
 })
 
