@@ -345,6 +345,10 @@ impl<C: CryptoProvider> TokenManager<C> {
     /// RAR authorization details on the refresh token — the durable artifact
     /// of the grant — so the refresh grant can re-issue (or narrow) them
     /// without a storage lookup.
+    ///
+    /// `resource` (RFC 8707 §2.2) carries the granted resource indicator on
+    /// the refresh token — like `authorization_details`, the refresh grant
+    /// re-issues it onto the rotated token and the access token's `aud`.
     #[allow(clippy::too_many_arguments)]
     pub async fn issue_refresh_token(
         &self,
@@ -356,6 +360,7 @@ impl<C: CryptoProvider> TokenManager<C> {
         offline: bool,
         dpop_jkt: Option<&str>,
         authorization_details: Option<&[serde_json::Value]>,
+        resource: Option<&str>,
     ) -> Result<RefreshToken, IssuerdError> {
         let now = Utc::now().timestamp();
         let lifespan = if offline {
@@ -385,6 +390,7 @@ impl<C: CryptoProvider> TokenManager<C> {
                 jkt: jkt.to_string(),
             }),
             authorization_details: authorization_details.map(<[serde_json::Value]>::to_vec),
+            resource: resource.map(str::to_string),
         };
 
         let (token, _) = self.sign_claims(&claims, self.signing_alg_for_realm(realm)).await?;
@@ -1103,6 +1109,7 @@ pub trait TokenIssuer: Send + Sync {
         offline: bool,
         dpop_jkt: Option<&str>,
         authorization_details: Option<&[serde_json::Value]>,
+        resource: Option<&str>,
     ) -> Result<RefreshToken, IssuerdError>;
 
     async fn issue_id_token(
@@ -1213,6 +1220,7 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
         offline: bool,
         dpop_jkt: Option<&str>,
         authorization_details: Option<&[serde_json::Value]>,
+        resource: Option<&str>,
     ) -> Result<RefreshToken, IssuerdError> {
         self.issue_refresh_token(
             user,
@@ -1223,6 +1231,7 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
             offline,
             dpop_jkt,
             authorization_details,
+            resource,
         )
         .await
     }
@@ -1646,6 +1655,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1683,6 +1693,7 @@ mod tests {
                 &SessionId::new("s1").unwrap(),
                 &["openid".to_string(), "offline_access".to_string()],
                 true,
+                None,
                 None,
                 None,
             )
@@ -3307,6 +3318,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3344,6 +3356,7 @@ mod tests {
                 &SessionId::new("s1").unwrap(),
                 &["openid".to_string(), "offline_access".to_string()],
                 true,
+                None,
                 None,
                 None,
             )
@@ -3466,6 +3479,7 @@ mod tests {
                 &SessionId::new("s1").unwrap(),
                 &["openid".to_string()],
                 false,
+                None,
                 None,
                 None,
             )
@@ -4006,6 +4020,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4447,6 +4462,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4620,6 +4636,7 @@ mod tests {
             sid: SessionId::new("s1").unwrap(),
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
 
         let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();
@@ -4655,6 +4672,7 @@ mod tests {
             sid: SessionId::new("s1").unwrap(),
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
 
         let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();
@@ -4690,6 +4708,7 @@ mod tests {
             sid: SessionId::new("s1").unwrap(),
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
 
         // Sanity: the legitimate realm issuer still validates end-to-end.
@@ -5187,6 +5206,7 @@ mod tests {
                 &SessionId::new("s1").unwrap(),
                 &["openid".to_string()],
                 false,
+                None,
                 None,
                 None,
             )

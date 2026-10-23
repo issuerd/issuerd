@@ -83,6 +83,8 @@ mod protected_resource;
 mod rar;
 #[path = "integration/request_uri.rs"]
 mod request_uri;
+#[path = "integration/resource_indicators.rs"]
+mod resource_indicators;
 #[path = "integration/session_management.rs"]
 mod session_management;
 #[path = "integration/spec_conformance.rs"]

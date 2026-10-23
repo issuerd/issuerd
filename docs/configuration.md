@@ -482,18 +482,29 @@ is advertised — clients discover the requirement from the
 ## [mcp]
 
 MCP (Model Context Protocol) surface — groundwork for the MCP resource
-endpoint. The flag currently gates only the RFC 9728 protected-resource
-metadata document that MCP clients read to discover the authorization server
-before starting OAuth:
+endpoint. The flag currently gates two pieces of the MCP surface:
 
-- `GET /.well-known/oauth-protected-resource` serves the **master** realm's
-  MCP resource metadata (resource identifier `{issuer_url}/realms/master/mcp`);
-- `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` serves the
-  named realm's (the RFC 9728 §3.1 path-inserted form).
+- the RFC 9728 protected-resource metadata document that MCP clients read to
+  discover the authorization server before starting OAuth:
+  `GET /.well-known/oauth-protected-resource` serves the **master** realm's
+  MCP resource metadata (resource identifier
+  `{issuer_url}/realms/master/mcp`), and
+  `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` serves the
+  named realm's (the RFC 9728 §3.1 path-inserted form);
+- RFC 8707 resource indicators: the `resource` parameter at the
+  authorization endpoint (plain, PAR-pushed, and JAR request-object
+  requests) and on the token endpoint's `authorization_code` /
+  `refresh_token` grants. The allowlist holds exactly one value per realm —
+  the MCP resource URI `{issuer_url}/realms/{realm}/mcp`, compared
+  byte-for-byte. A granted resource becomes the access token's `aud`
+  (`[client_id, resource]`, client id first) and rides the refresh token as
+  a `resource` claim; redemption may restate it, omit it (inherit), or
+  introduce it when the code carried none, while a refresh request may only
+  restate or omit. Every other grant refuses `resource` outright.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both routes answer `404`, indistinguishable from an unknown realm. |
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm) and any request carrying a `resource` parameter is refused with `invalid_target` — fail-closed, never silently ignored. |
 
 ```toml
 [mcp]
@@ -867,7 +878,9 @@ lifetime_secs = 30              # single-use nonce TTL; 5-300
 # ---- MCP ----------------------------------------------------------------------
 # Groundwork for the MCP endpoint: gates the RFC 9728 protected-resource
 # metadata routes (/.well-known/oauth-protected-resource — MCP clients read it
-# to discover the authorization server). Both routes 404 while disabled.
+# to discover the authorization server) and RFC 8707 resource indicators (the
+# `resource` parameter; the only allowlisted value is the realm's MCP resource
+# URI). The routes 404 and any `resource` is refused while disabled.
 [mcp]
 enabled = false
 

@@ -108,6 +108,7 @@ mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         }
     }
 

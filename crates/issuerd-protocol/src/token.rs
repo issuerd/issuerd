@@ -58,6 +58,10 @@ pub struct TokenRequest {
     /// `authorization_code` and `refresh_token` grants honor it — the server
     /// rejects it for the others.
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// Resource indicator (RFC 8707 §2.2): structurally validated (absolute
+    /// URI, no fragment); only the `authorization_code` and `refresh_token`
+    /// grants honor it — the server rejects it for the others.
+    pub resource: Option<String>,
 }
 
 impl TokenRequest {
@@ -121,6 +125,7 @@ impl TokenRequest {
             authorization_details: crate::authorization::parse_authorization_details(
                 body.get("authorization_details"),
             )?,
+            resource: crate::resource::parse_resource_indicator(body.get("resource"))?,
         })
     }
 
@@ -448,6 +453,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         let client = make_test_client(false);
         assert!(req.validate(&Realm::default(), &client).is_err());
@@ -478,6 +484,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         let client = make_test_client(true);
         assert!(req.validate(&Realm::default(), &client).is_err());
@@ -508,6 +515,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_err());
     }
@@ -537,6 +545,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_err());
     }
@@ -566,6 +575,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_ok());
     }
@@ -623,6 +633,31 @@ mod tests {
         assert!(matches!(err, IssuerdError::InvalidAuthorizationDetails(_)));
     }
 
+    #[test]
+    fn token_request_parses_resource() {
+        let mut body = HashMap::new();
+        body.insert("grant_type".to_string(), "authorization_code".to_string());
+        body.insert("code".to_string(), "code-1".to_string());
+        body.insert("redirect_uri".to_string(), "https://example.com/cb".to_string());
+        body.insert(
+            "resource".to_string(),
+            "https://issuer.example.com/realms/demo/mcp".to_string(),
+        );
+        let req = TokenRequest::parse(&body).unwrap();
+        assert_eq!(req.resource.as_deref(), Some("https://issuer.example.com/realms/demo/mcp"));
+
+        // Malformed values are rejected with the RFC 8707 error code.
+        for raw in ["/relative", "https://example.com/mcp#frag", ""] {
+            body.insert("resource".to_string(), raw.to_string());
+            let err = TokenRequest::parse(&body).unwrap_err();
+            assert!(
+                matches!(err, IssuerdError::InvalidTarget(_)),
+                "expected invalid_target for {raw:?}, got {err}"
+            );
+            assert_eq!(err.oauth_error_code().as_ref(), "invalid_target");
+        }
+    }
+
     fn make_token_exchange_request(
         subject_token: Option<&str>,
         subject_token_type: Option<&str>,
@@ -650,6 +685,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         }
     }
 
@@ -748,6 +784,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         }
     }
 

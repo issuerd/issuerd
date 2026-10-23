@@ -250,6 +250,25 @@ payment/open-banking type profiles exist — types are opaque to Issuerd.
 - **PAR and JAR needed no changes**: both pass `authorization_details` through generically, so pushed/signed RAR requests work — also the RFC's recommended transport for large payloads (§11.4).
 - The standalone **SPNEGO endpoint** does not pick up `authorization_details`; the main authorize endpoint is the RAR entry point.
 
+## Resource Indicators: `resource` (RFC 8707)
+
+Issuerd implements RFC 8707 fail-closed behind the `[mcp] enabled` config
+key (default `false`): the `resource` parameter is honored at the
+authorization endpoint (including PAR-pushed and JAR request-object
+requests) and on the token endpoint's `authorization_code` and
+`refresh_token` grants. A granted resource becomes the access token's `aud`
+(`[client_id, resource]`, client id first) and rides the refresh token as a
+`resource` claim.
+
+- **Keycloak has no RFC 8707 support**, so there is no behavioral baseline to match; the shape follows the RFC directly.
+- **The allowlist is exactly one value per realm**: the realm's MCP resource URI `{issuer_url}/realms/{realm}/mcp` — the same derivation the RFC 9728 protected-resource metadata publishes, so the two can never drift apart. Comparison is byte-for-byte (no normalization); anything else is `invalid_target`. With `[mcp] enabled = false`, any present `resource` is `invalid_target` — a disabled gate never silently ignores the parameter.
+- **Structural validation (§2) rejects relative URIs, any fragment component (even an empty `#`), and a present-but-empty value**; an absent parameter is always fine. The validated value passes through verbatim.
+- **Code redemption (§2.2)** may restate the granted resource verbatim, omit it (inherit), or — when the code carried none — introduce an allowlisted value; a contradicting value is `invalid_target`. **Refresh** may only restate verbatim or omit (inherit) — a resource-less grant can never gain one at refresh time.
+- **Every other grant refuses the parameter**: `password`, `client_credentials`, device, CIBA, and token exchange answer `invalid_target` rather than silently dropping `resource` (same discipline as `authorization_details`).
+- **The access-token `aud` overlay replaces any mapper-produced `aud`** when a resource is granted — the RFC 8707 binding always wins over scope-driven audience mapping for that token. ID tokens are untouched.
+- **PAR validates at push time** (RFC 9126 §2.1 rule 3) and again when the stored request is consumed at the authorize endpoint. JAR request objects carry `resource` through the standard claim merge.
+- Unlike `authorization_details`, the standalone **SPNEGO endpoint does validate and carry `resource`**: it mints authorization codes interaction-free, so it applies the same parse + allowlist rules instead of silently dropping the parameter.
+
 ## Dynamic Client Registration (RFC 7591/7592)
 
 Issuerd implements Keycloak's `clients-registrations` endpoints: open

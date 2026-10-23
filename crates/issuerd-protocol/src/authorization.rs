@@ -38,6 +38,10 @@ pub struct AuthorizationRequest {
     /// non-empty string `type`). Type values are extensible; no type-specific
     /// semantics are evaluated.
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// Resource indicator (RFC 8707 §2): structurally validated (absolute
+    /// URI, no fragment). Whether the resource is recognized is the server's
+    /// allowlist decision (§2.1), not the parser's.
+    pub resource: Option<String>,
     /// Issuerd-specific hint (`registration=true`): when the realm allows
     /// self-registration and the request would render the login page, the
     /// authorize endpoint redirects to the registration form instead, and the
@@ -104,6 +108,8 @@ impl AuthorizationRequest {
         let authorization_details =
             parse_authorization_details(params.get("authorization_details"))?;
 
+        let resource = crate::resource::parse_resource_indicator(params.get("resource"))?;
+
         // JAR (RFC 9101): a `request`/`request_uri` parameter
         // never reaches plain parsing — the server validates the signed
         // request object (or resolves the PAR reference) BEFORE this point
@@ -142,6 +148,7 @@ impl AuthorizationRequest {
             ui_locales: parse_space_separated(params.get("ui_locales")),
             claims,
             authorization_details,
+            resource,
             registration: params.get("registration").is_some_and(|v| v == "true"),
             request: params.get("request").cloned(),
             request_uri: params.get("request_uri").cloned(),
@@ -863,6 +870,41 @@ mod tests {
     }
 
     #[test]
+    fn authorization_request_parses_resource() {
+        let mut params = HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "client1".to_string());
+        params.insert("redirect_uri".to_string(), "https://example.com/cb".to_string());
+        params.insert(
+            "resource".to_string(),
+            "https://issuer.example.com/realms/demo/mcp".to_string(),
+        );
+        let req = AuthorizationRequest::parse(&params).unwrap();
+        assert_eq!(req.resource.as_deref(), Some("https://issuer.example.com/realms/demo/mcp"));
+    }
+
+    #[rstest::rstest]
+    // Relative reference — not an absolute URI (RFC 8707 §2).
+    #[case("/realms/demo/mcp")]
+    // Fragment components are forbidden (RFC 8707 §2).
+    #[case("https://issuer.example.com/realms/demo/mcp#frag")]
+    // An empty value is not an absolute URI.
+    #[case("")]
+    fn authorization_request_rejects_malformed_resource(#[case] raw: &str) {
+        let mut params = HashMap::new();
+        params.insert("response_type".to_string(), "code".to_string());
+        params.insert("client_id".to_string(), "client1".to_string());
+        params.insert("redirect_uri".to_string(), "https://example.com/cb".to_string());
+        params.insert("resource".to_string(), raw.to_string());
+        let err = AuthorizationRequest::parse(&params).unwrap_err();
+        assert!(
+            matches!(err, IssuerdError::InvalidTarget(_)),
+            "expected invalid_target, got {err}"
+        );
+        assert_eq!(err.oauth_error_code().as_ref(), "invalid_target");
+    }
+
+    #[test]
     fn authorization_details_subset_exact_containment() {
         let granted = vec![
             serde_json::json!({"type":"account_information","actions":["list_accounts","read_balances"]}),
@@ -913,6 +955,7 @@ mod tests {
             "scope": "openid profile",
             "max_age": 3600,
             "claims": {"userinfo": {"name": null}},
+            "resource": "https://issuer.example.com/realms/demo/mcp",
             "do_not_use": null,
         });
         let params = request_object_claims_to_params(claims.as_object().unwrap());
@@ -931,6 +974,8 @@ mod tests {
         let req = AuthorizationRequest::parse(&params).unwrap();
         assert_eq!(req.response_type, ResponseType::Code);
         assert_eq!(req.client_id, "client1");
+        // A `resource` claim (RFC 8707) rides the request object through.
+        assert_eq!(req.resource.as_deref(), Some("https://issuer.example.com/realms/demo/mcp"));
     }
 
     #[test]
@@ -973,6 +1018,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1010,6 +1056,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1060,6 +1107,7 @@ mod tests {
                 ui_locales: vec![],
                 claims: None,
                 authorization_details: None,
+                resource: None,
                 registration: false,
                 request: None,
                 request_uri: None,
@@ -1109,6 +1157,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1144,6 +1193,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1179,6 +1229,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1214,6 +1265,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1271,6 +1323,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1306,6 +1359,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1336,6 +1390,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1442,6 +1497,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1495,6 +1551,7 @@ mod tests {
             ui_locales: vec![],
             claims: None,
             authorization_details: Some(vec![serde_json::json!({"type": type_value})]),
+            resource: None,
             registration: false,
             request: None,
             request_uri: None,
@@ -1567,6 +1624,7 @@ mod tests {
             "ui_locales",
             "claims",
             "authorization_details",
+            "resource",
             "request",
             "request_uri",
         ];

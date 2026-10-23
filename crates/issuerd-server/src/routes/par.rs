@@ -165,7 +165,16 @@ pub async fn par_handler(
         Ok(r) => r,
         Err(e) => return par_endpoint_error(&e),
     };
-    if let Err(e) = auth_req.validate(&realm, &client) {
+    if let Err(e) = auth_req.validate(&realm, &client).and_then(|()| {
+        // RFC 8707 §2.1: a pushed `resource` faces the same fail-closed
+        // allowlist as at the authorization endpoint (gated on
+        // `[mcp] enabled`); it is re-checked when the request is consumed.
+        crate::routes::protected_resource::validate_resource_param(
+            &state.config,
+            &realm_name,
+            auth_req.resource.as_deref(),
+        )
+    }) {
         return par_endpoint_error(&e);
     }
     // Reject unimplemented response types at push time, mirroring the

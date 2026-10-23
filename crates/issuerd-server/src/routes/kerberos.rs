@@ -247,6 +247,35 @@ pub async fn handle_spnego(
                         .into_response();
                 }
 
+                // RFC 8707 §2.1: a present `resource` must parse (absolute
+                // URI, no fragment) and be on the server's allowlist
+                // (fail-closed, `[mcp] enabled`-gated) — the same rule the
+                // authorization endpoint applies, so this interaction-free
+                // entry point cannot bypass it.
+                let resource = match issuerd_protocol::resource::parse_resource_indicator(
+                    params.get("resource"),
+                )
+                .and_then(|r| {
+                    super::protected_resource::validate_resource_param(
+                        &state.config,
+                        realm_name,
+                        r.as_deref(),
+                    )
+                    .map(|()| r)
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": e.oauth_error_code().as_ref(),
+                                "error_description": e.to_string()
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+
                 // Find or create user
                 let user = match state
                     .storage
@@ -371,6 +400,7 @@ pub async fn handle_spnego(
                     acr_values: vec![],
                     claims: None,
                     authorization_details: None,
+                    resource,
                 };
                 if let Err(e) = super::oidc::store_auth_code(
                     &state.cache,

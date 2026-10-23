@@ -320,7 +320,7 @@ pub async fn impersonate_user(
         .await?;
     let refresh = state
         .token_issuer
-        .issue_refresh_token(&user, &client, &realm, &session_id, &scope, false, None, None)
+        .issue_refresh_token(&user, &client, &realm, &session_id, &scope, false, None, None, None)
         .await?;
     let id_token = state
         .token_issuer

@@ -532,13 +532,16 @@ impl Default for DpopNonceConfig {
 ///
 /// Groundwork for the MCP resource endpoint (GitHub issue #39): the flag
 /// currently gates the RFC 9728 protected-resource metadata routes
-/// (`/.well-known/oauth-protected-resource` and the path-suffixed form); the
+/// (`/.well-known/oauth-protected-resource` and the path-suffixed form) and
+/// RFC 8707 resource indicators (the `resource` parameter — while disabled,
+/// any request carrying one is refused with `invalid_target`); the
 /// MCP endpoint itself follows. The whole section is optional and defaults to
 /// disabled, so existing configuration files boot unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
     /// Master switch for the MCP surface. Default `false`: the
-    /// protected-resource metadata routes answer 404.
+    /// protected-resource metadata routes answer 404 and any `resource`
+    /// parameter is refused with `invalid_target`.
     #[serde(default)]
     pub enabled: bool,
 }

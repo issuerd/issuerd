@@ -51,6 +51,10 @@ pub enum OAuth2ErrorCode {
     /// malformed, carries an authorization-details type the realm does not
     /// support, or is not covered by the underlying grant.
     InvalidAuthorizationDetails,
+    /// RFC 8707 Sections 2.1/2.2 — the `resource` parameter is malformed
+    /// (not an absolute URI, or carries a fragment) or names a resource the
+    /// authorization server does not recognize (fail-closed allowlist).
+    InvalidTarget,
 }
 
 impl std::fmt::Display for OAuth2ErrorCode {
@@ -81,6 +85,7 @@ impl AsRef<str> for OAuth2ErrorCode {
             OAuth2ErrorCode::RequestNotSupported => "request_not_supported",
             OAuth2ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
             OAuth2ErrorCode::InvalidAuthorizationDetails => "invalid_authorization_details",
+            OAuth2ErrorCode::InvalidTarget => "invalid_target",
         }
     }
 }
@@ -186,6 +191,8 @@ pub enum IssuerdError {
     InvalidDpopProof,
     #[error("invalid authorization details: {0}")]
     InvalidAuthorizationDetails(String),
+    #[error("invalid target: {0}")]
+    InvalidTarget(String),
     #[error("signing-key encryption error: {0}")]
     KeyEncryption(String),
 }
@@ -214,6 +221,7 @@ impl IssuerdError {
             IssuerdError::InvalidAuthorizationDetails(_) => {
                 OAuth2ErrorCode::InvalidAuthorizationDetails
             }
+            IssuerdError::InvalidTarget(_) => OAuth2ErrorCode::InvalidTarget,
             IssuerdError::KeyEncryption(_) => OAuth2ErrorCode::ServerError,
         }
     }
@@ -239,6 +247,7 @@ impl IssuerdError {
             IssuerdError::RequestNotSupported => 400,
             IssuerdError::InvalidDpopProof => 400,
             IssuerdError::InvalidAuthorizationDetails(_) => 400,
+            IssuerdError::InvalidTarget(_) => 400,
             IssuerdError::KeyEncryption(_) => 500,
         }
     }
@@ -276,6 +285,7 @@ mod tests {
         403
     )]
     #[case(IssuerdError::ServerError("boom".into()), OAuth2ErrorCode::ServerError, 500)]
+    #[case(IssuerdError::InvalidTarget("bad resource".into()), OAuth2ErrorCode::InvalidTarget, 400)]
     #[case(
         IssuerdError::TemporarilyUnavailable,
         OAuth2ErrorCode::TemporarilyUnavailable,
@@ -330,6 +340,7 @@ mod tests {
             IssuerdError::RequestNotSupported,
             IssuerdError::InvalidDpopProof,
             IssuerdError::InvalidAuthorizationDetails("x".into()),
+            IssuerdError::InvalidTarget("x".into()),
             IssuerdError::KeyEncryption("x".into()),
         ];
         for err in variants {
@@ -371,6 +382,7 @@ mod tests {
             OAuth2ErrorCode::RequestNotSupported,
             OAuth2ErrorCode::InvalidDpopProof,
             OAuth2ErrorCode::InvalidAuthorizationDetails,
+            OAuth2ErrorCode::InvalidTarget,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let back: OAuth2ErrorCode = serde_json::from_str(&json).unwrap();

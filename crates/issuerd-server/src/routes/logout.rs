@@ -355,6 +355,7 @@ mod tests {
             _offline: bool,
             _dpop_jkt: Option<&str>,
             _authorization_details: Option<&[serde_json::Value]>,
+            _resource: Option<&str>,
         ) -> Result<RefreshToken, IssuerdError> {
             Err(IssuerdError::ServerError("mock".into()))
         }
@@ -572,6 +573,7 @@ mod tests {
             _offline: bool,
             _dpop_jkt: Option<&str>,
             _authorization_details: Option<&[serde_json::Value]>,
+            _resource: Option<&str>,
         ) -> Result<RefreshToken, IssuerdError> {
             Err(IssuerdError::ServerError("mock".into()))
         }

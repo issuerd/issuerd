@@ -420,6 +420,11 @@ pub struct PendingAuthData {
     /// the authorization code.
     #[serde(default)]
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// Resource indicator granted by this authorization request (RFC 8707
+    /// §2); carried verbatim through every continuation into the
+    /// authorization code.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -441,6 +446,10 @@ pub struct AuthCodeData {
     /// (auth-code TTL window) deserializable.
     #[serde(default)]
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// RFC 8707 resource indicator attached to the grant; `#[serde(default)]`
+    /// for the same rolling-upgrade window as `authorization_details`.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 impl AuthCodeData {
@@ -465,6 +474,7 @@ impl AuthCodeData {
             acr_values: pending.acr_values.clone(),
             claims: pending.claims.clone(),
             authorization_details: pending.authorization_details.clone(),
+            resource: pending.resource.clone(),
         }
     }
 }
@@ -964,7 +974,15 @@ async fn handle_auth_request(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
     };
 
-    if let Err(e) = auth_req.validate(&realm, &client) {
+    if let Err(e) = auth_req.validate(&realm, &client).and_then(|()| {
+        // RFC 8707 §2.1: a present `resource` must be on the server's
+        // allowlist (fail-closed; gated on `[mcp] enabled`).
+        crate::routes::protected_resource::validate_resource_param(
+            &state.config,
+            &realm_name,
+            auth_req.resource.as_deref(),
+        )
+    }) {
         warn!(realm = %realm_id, client_id = %auth_req.client_id, error = %e, "authorization request validation failed");
         let mut details = std::collections::HashMap::new();
         details.insert("error".to_string(), e.to_string());
@@ -1356,6 +1374,7 @@ async fn handle_auth_request(
                     locale: Some(resolved_locale.clone()),
                     response_mode: auth_req.response_mode,
                     authorization_details: auth_req.authorization_details.clone(),
+                    resource: auth_req.resource.clone(),
                 };
                 return super::required_actions::begin_actions_continuation(
                     &state,
@@ -1424,6 +1443,7 @@ async fn handle_auth_request(
                 locale: Some(resolved_locale.clone()),
                 response_mode: auth_req.response_mode,
                 authorization_details: auth_req.authorization_details.clone(),
+                resource: auth_req.resource.clone(),
             };
             if super::consent::consent_needed(
                 &state,
@@ -1511,6 +1531,7 @@ async fn handle_auth_request(
                 locale: Some(resolved_locale.clone()),
                 response_mode: auth_req.response_mode,
                 authorization_details: auth_req.authorization_details.clone(),
+                resource: auth_req.resource.clone(),
             };
             let cache_key = pending_auth_cache_key(&realm_id, &flow_id);
             let cache_value = serde_json::to_vec(&pending).unwrap();
@@ -1607,6 +1628,7 @@ async fn handle_auth_request(
                 locale: Some(resolved_locale.clone()),
                 response_mode: auth_req.response_mode,
                 authorization_details: auth_req.authorization_details.clone(),
+                resource: auth_req.resource.clone(),
             };
             let cache_key = pending_auth_cache_key(&realm_id, &flow_id);
             let cache_value = serde_json::to_vec(&pending).unwrap();
@@ -1740,6 +1762,13 @@ pub(crate) async fn mint_authorization_artifacts(
         let overlay = crate::claims::bind_authorization_details_overlay(
             Some(overlay),
             pending.authorization_details.as_deref(),
+        );
+        // Attach the granted resource indicator as the access token's `aud`
+        // (`[client_id, resource]`), as at the token endpoint (RFC 8707 §2.1).
+        let overlay = crate::claims::bind_resource_aud_overlay(
+            overlay,
+            client.client_id.as_str(),
+            pending.resource.as_deref(),
         );
         let token = state
             .token_manager
@@ -3206,6 +3235,30 @@ async fn token_handler_inner(
         return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
 
+    // RFC 8707 §2.1/§2.2: `resource` is honored only on the
+    // authorization_code and refresh_token grants — every other grant
+    // refuses the parameter fail-closed (like `authorization_details`
+    // above) — and any present value must be on the server's allowlist
+    // (gated on `[mcp] enabled`). The grant handlers below additionally
+    // enforce consistency with the underlying grant's resource.
+    if let Some(resource) = token_req.resource.as_deref() {
+        if !matches!(token_req.grant_type, GrantType::AuthorizationCode | GrantType::RefreshToken) {
+            let e = IssuerdError::InvalidTarget(
+                "resource is only supported for the authorization_code and refresh_token grants"
+                    .into(),
+            );
+            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        }
+        if let Err(e) = crate::routes::protected_resource::validate_resource_param(
+            &state.config,
+            &realm_name,
+            Some(resource),
+        ) {
+            warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "token request resource validation failed");
+            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        }
+    }
+
     let response = match token_req.grant_type {
         GrantType::AuthorizationCode => {
             let code = token_req.code.as_deref().unwrap_or("");
@@ -3388,6 +3441,21 @@ async fn token_handler_inner(
                 }
             };
 
+            // RFC 8707 §2.2: the token request may restate the resource
+            // granted with the code verbatim or (when the code carries none)
+            // introduce an allowlisted one — but never contradict the grant.
+            // (Allowlist validation ran in the grant gate above.)
+            let resource = match (&token_req.resource, &code_data.resource) {
+                (Some(requested), Some(granted)) if requested != granted => {
+                    let e = IssuerdError::InvalidTarget(
+                        "resource does not match the resource granted with the code".into(),
+                    );
+                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+                }
+                (Some(requested), _) => Some(requested.clone()),
+                (None, granted) => granted.clone(),
+            };
+
             // Create and store session for auth code grant
             let redirect_uri = match issuerd_core::RedirectUri::new(code_data.redirect_uri.clone())
             {
@@ -3516,6 +3584,13 @@ async fn token_handler_inner(
                 overlay,
                 authorization_details.as_deref(),
             );
+            // Attach the granted resource indicator as the access token's
+            // `aud` (`[client_id, resource]`, RFC 8707 §2.1).
+            let overlay = crate::claims::bind_resource_aud_overlay(
+                overlay,
+                client.client_id.as_str(),
+                resource.as_deref(),
+            );
 
             let access_token = match state
                 .token_manager
@@ -3553,6 +3628,9 @@ async fn token_handler_inner(
                     // details: narrowing at redemption only restricts the
                     // access token (RFC 9396 §6.1).
                     code_data.authorization_details.as_deref(),
+                    // The refresh token carries the granted resource (RFC
+                    // 8707 §2.2); a refresh request may restate it verbatim.
+                    resource.as_deref(),
                 )
                 .await
             {
@@ -3934,6 +4012,7 @@ async fn token_handler_inner(
                     offline,
                     dpop_jkt.as_deref(),
                     None,
+                    None,
                 )
                 .await
             {
@@ -4217,6 +4296,21 @@ async fn token_handler_inner(
                 }
             };
 
+            // RFC 8707 §2.2: the refresh request may restate the grant's
+            // resource verbatim (or omit it to inherit); anything else
+            // widens the grant and is refused. (Allowlist validation ran in
+            // the grant gate above.)
+            if let Some(requested) = &token_req.resource {
+                if Some(requested) != validated.claims.resource.as_ref() {
+                    let e = IssuerdError::InvalidTarget(
+                        "resource does not match the resource granted with the refresh token"
+                            .into(),
+                    );
+                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+                }
+            }
+            let resource = validated.claims.resource.clone();
+
             // Rotate only after the old token is durably revoked; otherwise
             // issue no replacement that could leave both tokens usable.
             {
@@ -4263,6 +4357,13 @@ async fn token_handler_inner(
                 overlay,
                 authorization_details.as_deref(),
             );
+            // The grant's resource indicator on the new access token's `aud`
+            // (RFC 8707 §2.1).
+            let overlay = crate::claims::bind_resource_aud_overlay(
+                overlay,
+                client.client_id.as_str(),
+                resource.as_deref(),
+            );
 
             let access_token = match state
                 .token_manager
@@ -4304,6 +4405,7 @@ async fn token_handler_inner(
                     session.offline,
                     dpop_jkt.as_deref(),
                     granted_details.as_deref(),
+                    resource.as_deref(),
                 )
                 .await
             {
@@ -4752,6 +4854,7 @@ async fn token_handler_inner(
                     offline,
                     dpop_jkt.as_deref(),
                     None,
+                    None,
                 )
                 .await
             {
@@ -5116,6 +5219,7 @@ async fn token_handler_inner(
                     &scope,
                     offline,
                     dpop_jkt.as_deref(),
+                    None,
                     None,
                 )
                 .await
@@ -8188,6 +8292,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -8233,6 +8338,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -8311,6 +8417,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -8385,6 +8492,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -8430,6 +8538,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -9351,6 +9460,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -10753,6 +10863,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         }
     }
 
@@ -12100,6 +12211,7 @@ mod tests {
             acr_values: vec![],
             claims: Some(claims_json),
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -12249,6 +12361,7 @@ mod tests {
                 acr_values: vec![],
                 claims: Some(claims_json),
                 authorization_details: None,
+                resource: None,
             };
             state
                 .cache
@@ -12490,6 +12603,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -12540,6 +12654,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -12585,6 +12700,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -13146,6 +13262,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -13493,6 +13610,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -13660,6 +13778,7 @@ mod tests {
                 &offline_id,
                 &["openid".to_string(), "offline_access".to_string()],
                 true,
+                None,
                 None,
                 None,
             )
@@ -14022,6 +14141,7 @@ mod tests {
                 &session_id,
                 &["openid".to_string()],
                 false,
+                None,
                 None,
                 None,
             )
@@ -15605,6 +15725,7 @@ mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         }
     }
 
@@ -16186,6 +16307,7 @@ mod tests {
             acr_values: vec![],
             claims: None,
             authorization_details: None,
+            resource: None,
         };
         state
             .cache
@@ -17317,6 +17439,7 @@ mod tests {
                     scope: Scope::parse("openid"),
                     cnf: None,
                     authorization_details: None,
+                    resource: None,
                 },
                 header: issuerd_core::JwsHeader {
                     alg: issuerd_core::Algorithm::EdDsa,
@@ -17413,6 +17536,7 @@ mod tests {
                 &sid_a,
                 &["openid".to_string()],
                 false,
+                None,
                 None,
                 None,
             )

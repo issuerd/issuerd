@@ -289,6 +289,7 @@ mod tests {
                 registration: false,
                 request: None,
                 request_uri: None,
+                resource: None,
             };
             ResponsePackaging::from_request(&Realm::default(), "c", &req).default_fragment
         }

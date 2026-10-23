@@ -622,6 +622,27 @@ pub(crate) fn bind_authorization_details_overlay(
     }
 }
 
+/// Merge an RFC 8707 `resource` indicator into a claims overlay as the
+/// access token's `aud` claim: exactly `[client_id, resource]`. Same
+/// mechanics as `bind_authorization_details_overlay` — injected
+/// post-mapper-evaluation, so it replaces any `aud` an Audience mapper
+/// produced. The client id stays FIRST: the refresh grant's client binding
+/// and the userinfo client resolution read the first `aud` entry.
+pub(crate) fn bind_resource_aud_overlay(
+    overlay: Option<Map<String, Value>>,
+    client_id: &str,
+    resource: Option<&str>,
+) -> Option<Map<String, Value>> {
+    match (overlay, resource) {
+        (overlay, None) => overlay,
+        (overlay, Some(resource)) => {
+            let mut map = overlay.unwrap_or_default();
+            map.insert("aud".to_string(), serde_json::json!([client_id, resource]));
+            Some(map)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Requested claims (OIDC Core §5.5 `claims` parameter)
 // ---------------------------------------------------------------------------
@@ -905,6 +926,37 @@ mod tests {
 
         // No pre-existing overlay: one is created.
         let out = bind_authorization_details_overlay(None, Some(&details)).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn bind_resource_aud_overlay_sets_client_first_array() {
+        let resource = "https://issuer.example.com/realms/demo/mcp";
+
+        // None input: overlay passes through untouched.
+        assert_eq!(bind_resource_aud_overlay(None, "client1", None), None);
+        let mut existing = Map::new();
+        existing.insert("sub_claim".to_string(), Value::String("x".into()));
+        assert_eq!(
+            bind_resource_aud_overlay(Some(existing.clone()), "client1", None),
+            Some(existing.clone())
+        );
+
+        // The resource joins the client id in exactly `[client_id, resource]`
+        // order, preserving other overlay keys.
+        let out = bind_resource_aud_overlay(Some(existing), "client1", Some(resource)).unwrap();
+        assert_eq!(out.get("aud"), Some(&serde_json::json!(["client1", resource])));
+        assert_eq!(out.get("sub_claim"), Some(&Value::String("x".into())));
+
+        // A mapper-produced `aud` is replaced wholesale.
+        let mut with_mapper_aud = Map::new();
+        with_mapper_aud.insert("aud".to_string(), serde_json::json!(["client1", "other"]));
+        let out =
+            bind_resource_aud_overlay(Some(with_mapper_aud), "client1", Some(resource)).unwrap();
+        assert_eq!(out.get("aud"), Some(&serde_json::json!(["client1", resource])));
+
+        // No pre-existing overlay: one is created.
+        let out = bind_resource_aud_overlay(None, "client1", Some(resource)).unwrap();
         assert_eq!(out.len(), 1);
     }
 

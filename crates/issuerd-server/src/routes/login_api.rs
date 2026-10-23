@@ -1714,6 +1714,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
 
         let resp = complete_login(
@@ -1866,6 +1867,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -1954,6 +1956,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2031,6 +2034,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2104,6 +2108,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2191,6 +2196,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2260,6 +2266,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2382,6 +2389,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2444,6 +2452,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2691,6 +2700,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2757,6 +2767,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2823,6 +2834,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -2910,6 +2922,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -3167,6 +3180,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let pending_json = serde_json::to_vec(&pending).unwrap();
         state
@@ -3377,6 +3391,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -3441,6 +3456,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -3602,6 +3618,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -3780,6 +3797,7 @@ pub(crate) mod tests {
                 scope: issuerd_core::Scope::parse("openid"),
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         };
         Arc::new(MockTokenIssuer {
@@ -3885,6 +3903,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4051,6 +4070,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4168,6 +4188,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4234,6 +4255,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4300,6 +4322,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4366,6 +4389,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4555,6 +4579,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4621,6 +4646,7 @@ pub(crate) mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         };
         let cache_key = crate::routes::oidc::pending_auth_cache_key(
             &issuerd_core::RealmId::new("master").unwrap(),
@@ -4726,7 +4752,7 @@ pub(crate) mod tests {
         tm.issue_sso_session_token(&user, &client, &realm, &[], &session_id, None, None)
             .await
             .unwrap();
-        tm.issue_refresh_token(&user, &client, &realm, &session_id, &[], false, None, None)
+        tm.issue_refresh_token(&user, &client, &realm, &session_id, &[], false, None, None, None)
             .await
             .unwrap();
         tm.issue_id_token(
@@ -4814,6 +4840,7 @@ pub(crate) mod tests {
             _offline: bool,
             _dpop_jkt: Option<&str>,
             _authorization_details: Option<&[serde_json::Value]>,
+            _resource: Option<&str>,
         ) -> Result<issuerd_token::RefreshToken, issuerd_core::IssuerdError> {
             self.refresh_token_result
                 .clone()

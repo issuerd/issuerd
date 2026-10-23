@@ -3135,6 +3135,12 @@ pub struct RefreshTokenClaims {
     /// the new access token, but the rotated refresh token keeps this set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// RFC 8707 resource indicator of the underlying grant. Like
+    /// `authorization_details`, the refresh token carries the granted value:
+    /// a refresh request may restate it verbatim (or omit it to inherit),
+    /// but never widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 /// Purpose value for reset-credentials action tokens.
@@ -5833,6 +5839,7 @@ mod tests {
                 jkt: "dpop-thumbprint".to_string(),
             }),
             authorization_details: Some(vec![serde_json::json!({"type": "payment_initiation"})]),
+            resource: Some("https://issuer.example.com/realms/master/mcp".to_string()),
         };
         roundtrip(&rtc);
     }
