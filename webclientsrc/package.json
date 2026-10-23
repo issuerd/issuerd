@@ -51,7 +51,7 @@
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.71.1",
     "vite": "^8.1.6",
-    "vitest": "^4.1.12"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "js-yaml": "4.3.2",
