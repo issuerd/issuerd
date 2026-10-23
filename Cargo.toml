@@ -191,7 +191,7 @@ pin-project = "1.1"
 # Password hashing
 argon2 = "0.5"
 pbkdf2 = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 # Secret memory hygiene (zeroize-on-drop for key material buffers)
 zeroize = "1.8"
