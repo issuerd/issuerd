@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **In-repo cargo-fuzz harness for the OIDC/OAuth2 parsers.** A new detached `fuzz/` workspace (never part of the default build) ships three libFuzzer targets exercising the pure `issuerd-protocol` parsing/validation entry points: authorization-request parsing, token-request parsing, and PKCE verifier/challenge verification (the PKCE target also asserts the computed-challenge roundtrip invariant against the RFC 7636 length window). No runtime, API, or dependency changes for the daemon — the targets exist for local security testing and the OpenSSF Scorecard "Fuzzing" check; run them with `cargo +nightly fuzz run <target>` from `fuzz/` (requires `cargo install cargo-fuzz` and a nightly toolchain).
+- **Release assets now ship cosign signatures.** Starting with the next tag release, every archive, SBOM, the conformance-evidence bundle, and `SHA256SUMS.txt` on the GitHub Release carry a `*.sig` signature and `*.crt` certificate produced by cosign in keyless mode (GitHub OIDC identity, Rekor transparency log) — no project key to manage. Verify with `cosign verify-blob --signature <asset>.sig --certificate <asset>.crt --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' --certificate-oidc-issuer https://token.actions.githubusercontent.com <asset>`.
 
 ### Security
 
