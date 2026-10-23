@@ -3164,7 +3164,7 @@ async fn token_handler_inner(
         Some(realm.name.as_ref()),
         &headers,
         "POST",
-        "token",
+        &["protocol/openid-connect/token"],
         None,
     )
     .await
@@ -5668,7 +5668,7 @@ async fn userinfo_handler_inner(
                     realm_name.as_deref(),
                     &headers,
                     method,
-                    "userinfo",
+                    &["protocol/openid-connect/userinfo"],
                     Some(&token),
                 )
                 .await
