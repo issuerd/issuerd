@@ -179,8 +179,11 @@ pub fn validate_external_id_token(
 
     let mut validation = jsonwebtoken::Validation::new(alg);
     validation.leeway = requirements.leeway_secs;
+    validation.validate_nbf = true;
+    validation.required_spec_claims.insert("aud".to_string());
     validation.set_audience(&[requirements.expected_audience]);
     if let Some(iss) = requirements.expected_issuer {
+        validation.required_spec_claims.insert("iss".to_string());
         validation.set_issuer(&[iss]);
     }
 
@@ -301,6 +304,56 @@ mod tests {
         let claims = validate_external_id_token(&fx.jwks, &token, &requirements()).unwrap();
         assert_eq!(claims["sub"], "ext-sub-1");
         assert_eq!(claims["email"], "user@example.com");
+    }
+
+    #[tokio::test]
+    async fn missing_audience_rejected() {
+        let fx = fixture().await;
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("aud");
+        let token = fx.sign(claims).await;
+        assert!(matches!(
+            validate_external_id_token(&fx.jwks, &token, &requirements()),
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_issuer_rejected_when_expected() {
+        let fx = fixture().await;
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("iss");
+        let token = fx.sign(claims).await;
+        assert!(matches!(
+            validate_external_id_token(&fx.jwks, &token, &requirements()),
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn issuer_unchecked_when_not_required() {
+        let fx = fixture().await;
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("iss");
+        let token = fx.sign(claims).await;
+        let req = ExternalIdTokenRequirements {
+            expected_issuer: None,
+            ..requirements()
+        };
+        assert!(validate_external_id_token(&fx.jwks, &token, &req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn future_nbf_rejected() {
+        let fx = fixture().await;
+        let mut claims = valid_claims();
+        let now = chrono::Utc::now().timestamp();
+        claims["nbf"] = serde_json::json!(now + 3600);
+        let token = fx.sign(claims).await;
+        assert!(matches!(
+            validate_external_id_token(&fx.jwks, &token, &requirements()),
+            Err(IssuerdError::InvalidRequest(_))
+        ));
     }
 
     #[tokio::test]

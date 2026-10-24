@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **External ID-token and authorization-response validation is stricter.** Broker ID tokens now require the expected audience and, when configured, issuer, and honor `nbf`. Authorization requests carrying ID or access tokens can no longer select `query` or signed-only `query.jwt`, which exposed credentials in redirect URLs; pure authorization-code query responses remain supported.
 - **RustCrypto timing-safety update.** `p256`, `p384`, and `p521` move to 0.14, bringing `crypto-bigint` to 0.7.6 and fixing RUSTSEC-2026-0387 (timing variability in operations intended to be constant-time). No operator action required.
 - **Dependency security updates.** `ctutils` 0.4.3 → 0.4.5 (RUSTSEC-2026-0385, non-constant-time comparisons), `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety soundness), and the web client's transitive `js-yaml` pinned to 4.3.2 via an npm `overrides` entry (GHSA-2883-xcg3-v3hh, GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj — CPU-exhaustion YAML parsing issues in a build-time-only codegen dependency). No operator action required.
 - **Web client HTTP parser security update.** The transitive `undici` dependency is pinned to 7.30.1 via npm `overrides`, covering GHSA-4qv8-2p9j-2685, GHSA-f72v-6w45-q472, and GHSA-xjj6-f33q-929c (EventSource memory exhaustion, mixed-case SRI algorithm bypass, and content-encoding process crash). No operator action required.
