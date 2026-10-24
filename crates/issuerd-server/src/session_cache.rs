@@ -12,8 +12,8 @@
 //! per request. This module caches the answer under
 //! `cache_keys::session(realm, sid)` as a small JSON value:
 //!
-//! - positive: `{"u": "<user_id>", "v": <u64 version>}`, TTL
-//!   `[cache] read_cache_ttl_secs` (default 60 s, `0` disables the
+//! - positive: `{"u": "<user_id>", "v": <u64 version>, "g": <optional tombstone>}`,
+//!   TTL `[cache] read_cache_ttl_secs` (default 60 s, `0` disables the
 //!   cache entirely — pure-DB behavior);
 //! - negative: `{"x":1}` with a short TTL (absorbs replay floods of
 //!   deleted-session tokens; forged sids are impossible because token
@@ -21,7 +21,12 @@
 //!
 //! Invalidation:
 //! - single-session deletes (logout, admin revoke, idle cleanup) call
-//!   [`invalidate_session`] synchronously — revocation is immediate;
+//!   [`invalidate_session`] synchronously, which writes a fresh unique
+//!   tombstone before dropping the snapshot. Every positive hit compares its
+//!   tombstone with the current marker, so even a positive written after
+//!   deletion cannot validate the session. Tombstones have a bounded 24 h TTL
+//!   and are unique per invalidation, so later deletes do not make an older
+//!   snapshot valid again;
 //! - bulk per-user revocation (user delete, which DB-cascades sessions
 //!   without touching Rust) bumps the `sessv:{realm}:{user_id}` counter via
 //!   [`bump_user_session_version`]; cached snapshots carrying an older
@@ -58,8 +63,15 @@ pub struct SessionSnapshot {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum CacheEntry {
-    Negative { x: u8 },
-    Positive { u: String, v: u64 },
+    Negative {
+        x: u8,
+    },
+    Positive {
+        u: String,
+        v: u64,
+        #[serde(default)]
+        g: Option<String>,
+    },
 }
 
 fn parse_entry(bytes: &[u8]) -> Option<CacheEntry> {
@@ -85,6 +97,22 @@ async fn current_version(
         Ok(None) => Some(0),
         Err(e) => {
             warn!(realm = %realm_id, error = %e, "session version read failed; falling back to storage");
+            None
+        }
+    }
+}
+
+/// Read the unique per-session invalidation marker. The outer `Option`
+/// distinguishes a cache error from an absent tombstone.
+async fn current_tombstone(
+    cache: &Arc<dyn DistributedCache>,
+    realm_id: &RealmId,
+    sid: &SessionId,
+) -> Option<Option<String>> {
+    match cache.get(&cache_keys::session_tombstone(realm_id.as_ref(), sid.as_ref())).await {
+        Ok(value) => Some(value.and_then(|bytes| String::from_utf8(bytes).ok())),
+        Err(e) => {
+            warn!(realm = %realm_id, error = %e, "session tombstone read failed; falling back to storage");
             None
         }
     }
@@ -124,15 +152,20 @@ pub async fn session_snapshot(
                 debug!(realm = %realm_id, "session cache: negative hit");
                 None
             }
-            Some(CacheEntry::Positive { u, v }) => {
+            Some(CacheEntry::Positive { u, v, g }) => {
                 let Ok(user_id) = UserId::new(&u) else {
                     debug!(realm = %realm_id, "session cache: malformed user id; re-reading");
                     return load_and_cache(state, realm_id, sid, ttl_secs).await;
                 };
                 match current_version(&state.cache, realm_id, &user_id).await {
                     Some(current) if current == v => {
-                        debug!(realm = %realm_id, "session cache: hit");
-                        Some(SessionSnapshot { user_id })
+                        match current_tombstone(&state.cache, realm_id, sid).await {
+                            Some(tombstone) if tombstone == g => {
+                                debug!(realm = %realm_id, "session cache: hit");
+                                Some(SessionSnapshot { user_id })
+                            }
+                            _ => load_and_cache(state, realm_id, sid, ttl_secs).await,
+                        }
                     }
                     // Version mismatch (bulk revocation) or version read
                     // failure: re-read from storage.
@@ -160,6 +193,7 @@ async fn load_and_cache(
     ttl_secs: u64,
 ) -> Option<SessionSnapshot> {
     let key = cache_keys::session(realm_id.as_ref(), sid.as_ref());
+    let tombstone_before = current_tombstone(&state.cache, realm_id, sid).await;
     match state.storage.get_user_session(realm_id, sid).await {
         Ok(Some(session)) => {
             // Best-effort version tag: an unreadable counter stores v=0, which
@@ -167,15 +201,20 @@ async fn load_and_cache(
             // version >0 never matches the stored 0, so the entry misses).
             let version =
                 current_version(&state.cache, realm_id, &session.user_id).await.unwrap_or(0);
+            let tombstone_after = current_tombstone(&state.cache, realm_id, sid).await;
             let entry = CacheEntry::Positive {
                 u: session.user_id.to_string(),
                 v: version,
+                g: tombstone_before.clone().flatten(),
             };
-            if let Ok(bytes) = serde_json::to_vec(&entry) {
-                if let Err(e) =
-                    state.cache.set(&key, bytes, Some(Duration::from_secs(ttl_secs))).await
-                {
-                    warn!(realm = %realm_id, error = %e, "session cache write failed");
+            if matches!((&tombstone_before, &tombstone_after), (Some(before), Some(after)) if before == after)
+            {
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    if let Err(e) =
+                        state.cache.set(&key, bytes, Some(Duration::from_secs(ttl_secs))).await
+                    {
+                        warn!(realm = %realm_id, error = %e, "session cache write failed");
+                    }
                 }
             }
             Some(SessionSnapshot {
@@ -211,6 +250,17 @@ pub async fn invalidate_session_entry(
     realm_id: &RealmId,
     sid: &SessionId,
 ) {
+    let tombstone = cache_keys::session_tombstone(realm_id.as_ref(), sid.as_ref());
+    if let Err(e) = cache
+        .set(
+            &tombstone,
+            issuerd_core::utils::generate_id().into_bytes(),
+            Some(Duration::from_secs(24 * 60 * 60)),
+        )
+        .await
+    {
+        warn!(realm = %realm_id, error = %e, "session tombstone write failed");
+    }
     let key = cache_keys::session(realm_id.as_ref(), sid.as_ref());
     if let Err(e) = cache.delete(&key).await {
         warn!(realm = %realm_id, error = %e, "session cache invalidation failed");
@@ -453,5 +503,127 @@ mod tests {
         assert!(session_snapshot(&state, &realm_id, &sid).await.is_some());
         state.storage.delete_user_session(&realm_id, &sid).await.unwrap();
         assert!(session_snapshot(&state, &realm_id, &sid).await.is_none());
+    }
+
+    struct RacingCache {
+        inner: issuerd_cluster::InMemoryCache,
+        sid: String,
+        writes: std::sync::atomic::AtomicUsize,
+        triggered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl RacingCache {
+        fn new(sid: &SessionId) -> Self {
+            Self {
+                inner: issuerd_cluster::InMemoryCache::new(),
+                sid: sid.to_string(),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                triggered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DistributedCache for RacingCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+            self.inner.get(key).await
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            if key == cache_keys::session("master", &self.sid)
+                && self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                self.triggered.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.set(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.delete(key).await
+        }
+
+        async fn get_and_delete(
+            &self,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, issuerd_core::IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+
+        async fn increment(
+            &self,
+            key: &str,
+            ttl: Option<Duration>,
+        ) -> Result<u64, issuerd_core::IssuerdError> {
+            self.inner.increment(key, ttl).await
+        }
+
+        async fn publish(
+            &self,
+            channel: &str,
+            message: Vec<u8>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
+    #[tokio::test]
+    async fn late_positive_write_after_invalidation_is_rejected() {
+        let sid = SessionId::new("sid").unwrap();
+        let cache = Arc::new(RacingCache::new(&sid));
+        let cfg = crate::config::ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let state =
+            Arc::new(ServerState::from_components(&cfg, storage, cache.clone()).await.unwrap());
+        let realm_id = RealmId::new("master").unwrap();
+        let user_id = UserId::new("admin").unwrap();
+        state
+            .storage
+            .create_user_session(&realm_id, &session(&realm_id, &user_id, &sid))
+            .await
+            .unwrap();
+
+        let pending = {
+            let state = state.clone();
+            let realm_id = realm_id.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { session_snapshot(&state, &realm_id, &sid).await })
+        };
+        cache.triggered.notified().await;
+        invalidate_session_entry(cache.as_ref(), &realm_id, &sid).await;
+        state.storage.delete_user_session(&realm_id, &sid).await.unwrap();
+        cache.resume.notify_one();
+
+        assert!(pending.await.unwrap().is_some(), "the in-flight storage answer is returned");
+        let cached = state.cache.get(&cache_key(&realm_id, &sid)).await.unwrap().unwrap();
+        assert!(matches!(parse_entry(&cached), Some(CacheEntry::Positive { .. })));
+        assert!(session_snapshot(&state, &realm_id, &sid).await.is_none());
+        let cached = state.cache.get(&cache_key(&realm_id, &sid)).await.unwrap().unwrap();
+        assert_eq!(cached, br#"{"x":1}"#);
     }
 }

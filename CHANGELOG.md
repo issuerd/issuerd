@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Deleted sessions cannot be resurrected by delayed cache writes.** Positive session snapshots now carry the unique per-session invalidation tombstone observed while loading, and every cache hit revalidates it. Logout and session deletion rotate the bounded 24-hour tombstone before removing the snapshot, so an in-flight read cannot make a deleted session valid again, including after repeated invalidations.
 - **Rendered userinfo entries cannot be stamped with newer invalidation counters.** Generation counters are captured before claims rendering and used verbatim for the cache write, so a mutation between rendering and insertion invalidates the old body on the next request instead of making it appear fresh.
 - **Composite role expansion no longer picks arbitrary same-named client roles.** A realm-role fallback to a client role now requires that role name to be unique across clients; ambiguous legacy references grant nothing rather than privileges from an arbitrary client. Valid realm, same-client, and unique cross-client composites remain supported.
 - **Passwordless login rejects ambiguous email identifiers.** When multiple accounts share an email address, email-code login no longer selects the backend’s first match; it sends no code and binds no account, preserving uniform anti-enumeration challenges and the unique-username fallback.

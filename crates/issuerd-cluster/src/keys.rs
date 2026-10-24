@@ -13,6 +13,12 @@ pub mod cache_keys {
         format!("session:{realm}:{session_id}")
     }
 
+    /// `session-tombstone:{realm}:{session_id}` — unique per-session
+    /// invalidation marker used to reject late cache writes after deletion.
+    pub fn session_tombstone(realm: &str, session_id: &str) -> String {
+        format!("session-tombstone:{realm}:{session_id}")
+    }
+
     /// `login-failure:{realm}:{identifier}`
     pub fn login_failure(realm: &str, identifier: &str) -> String {
         format!("login-failure:{realm}:{identifier}")
