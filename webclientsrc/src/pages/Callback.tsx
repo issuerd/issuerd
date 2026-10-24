@@ -43,6 +43,7 @@ const RESTART_FLAG = 'issuerd_callback_restart'
 export default function Callback() {
   const navigate = useNavigate()
   const setTokenSet = useAuthStore((s) => s.setTokenSet)
+  const getTokenSet = useAuthStore((s) => s.getTokenSet)
   const [error, setError] = useState('')
   const exchangeStarted = useRef(false)
   const realm = sessionStorage.getItem('issuerd_oidc_realm') || CONFIG.REALM
@@ -63,26 +64,18 @@ export default function Callback() {
 
     // If already authenticated (e.g. from a concurrent exchange or prior session),
     // just redirect to the app instead of showing an error.
-    const existingTokens = sessionStorage.getItem('issuerd_tokens')
-    if (existingTokens) {
-      try {
-        const parsed = JSON.parse(existingTokens)
-        const tokenSet = parsed?.[realm]
-        if (tokenSet && tokenSet.expiresAt && tokenSet.expiresAt > Date.now()) {
-          // Sync the in-memory store with the restored session: hydration may
-          // have pinned a different realm's token (or none) on this page load,
-          // which would bounce guarded pages straight back to the login page.
-          setTokenSet(realm, tokenSet)
-          if (hasAdminRoles(tokenSet.accessToken)) {
-            navigate('/realm-picker')
-          } else {
-            window.location.href = `/realms/${realm}/account`
-          }
-          return
-        }
-      } catch {
-        // ignore malformed token storage
+    const tokenSet = getTokenSet(realm)
+    if (tokenSet && tokenSet.expiresAt > Date.now()) {
+      // Sync the in-memory store with the restored session: hydration may
+      // have pinned a different realm's token (or none) on this page load,
+      // which would bounce guarded pages straight back to the login page.
+      setTokenSet(realm, tokenSet)
+      if (hasAdminRoles(tokenSet.accessToken)) {
+        navigate('/realm-picker')
+      } else {
+        window.location.href = `/realms/${realm}/account`
       }
+      return
     }
 
     const params = new URLSearchParams(window.location.search)
@@ -172,6 +165,7 @@ export default function Callback() {
           refreshToken,
           idToken,
           expiresAt: Date.now() + expiresIn * 1000,
+          clientId: CONFIG.CLIENT_ID,
         })
         startSessionRefresh()
 
@@ -186,7 +180,7 @@ export default function Callback() {
     }
 
     exchange()
-  }, [navigate, setTokenSet, realm])
+  }, [navigate, setTokenSet, getTokenSet, realm])
 
   if (error) {
     return (

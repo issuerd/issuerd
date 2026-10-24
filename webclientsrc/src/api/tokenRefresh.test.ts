@@ -46,14 +46,25 @@ describe('tokenRefresh', () => {
   beforeEach(() => {
     stopSessionRefresh()
     vi.clearAllMocks()
+    window.history.pushState({}, '', '/admin/console')
     sessionStorage.clear()
     localStorage.clear()
     useAuthStore.getState().logout()
     initTokenRefresh(vi.fn()) // attaches the activity listeners idempotently
   })
 
-  it('stores rotated tokens on success', async () => {
-    seedTokens()
+  it('refreshes legacy stored admin tokens as admin-cli', async () => {
+    sessionStorage.setItem(
+      'issuerd_tokens',
+      JSON.stringify({
+        master: {
+          accessToken: 'old-access',
+          refreshToken: 'old-refresh',
+          idToken: 'old-id',
+          expiresAt: Date.now() + 300_000,
+        },
+      }),
+    )
     fetchMock.mockResolvedValue(jsonResponse(200, rotatedTokens))
 
     const outcome = await refreshNow()
@@ -62,6 +73,7 @@ describe('tokenRefresh', () => {
     const stored = useAuthStore.getState().getTokenSet('master')!
     expect(stored.accessToken).toBe('new-access')
     expect(stored.refreshToken).toBe('new-refresh')
+    expect(stored.clientId).toBe('admin-cli')
 
     const request: Request = fetchMock.mock.calls[0][0]
     expect(request.url).toBe(
@@ -71,6 +83,37 @@ describe('tokenRefresh', () => {
     expect(body).toContain('grant_type=refresh_token')
     expect(body).toContain('refresh_token=old-refresh')
     expect(body).toContain('client_id=admin-cli')
+  })
+
+  it('refreshes standalone account tokens as account-console without overwriting admin', async () => {
+    window.history.pushState({}, '', '/realms/master/account')
+    useAuthStore.getState().setTokenSet('master', {
+      accessToken: 'old-admin-access',
+      refreshToken: 'old-admin-refresh',
+      idToken: 'old-admin-id',
+      expiresAt: Date.now() + 300_000,
+    })
+    useAuthStore.getState().setTokenSet('master', {
+      accessToken: 'old-account-access',
+      refreshToken: 'old-account-refresh',
+      idToken: 'old-account-id',
+      expiresAt: Date.now() + 300_000,
+      clientId: 'account-console',
+    })
+    fetchMock.mockResolvedValue(jsonResponse(200, rotatedTokens))
+
+    const outcome = await refreshNow()
+
+    expect(outcome).toBe('ok')
+    const request: Request = fetchMock.mock.calls[0][0]
+    const body = await request.text()
+    expect(body).toContain('refresh_token=old-account-refresh')
+    expect(body).toContain('client_id=account-console')
+    expect(body).not.toContain('client_id=admin-cli')
+    const stored = useAuthStore.getState().getTokenSet('master', 'account-console')!
+    expect(stored.accessToken).toBe('new-access')
+    expect(stored.clientId).toBe('account-console')
+    expect(useAuthStore.getState().getTokenSet('master')?.accessToken).toBe('old-admin-access')
   })
 
   it('deduplicates concurrent refreshes', async () => {

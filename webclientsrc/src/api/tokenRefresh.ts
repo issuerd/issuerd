@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
 import { tokenEndpoint } from '@generated'
-import { CONFIG, getAccountRealm } from '../config'
+import { CONFIG, getAccountRealm, getConsoleClientId } from '../config'
 import { useAuthStore } from '../state/authStore'
 
 /**
- * Proactive access-token refresh for the admin console session.
+ * Proactive access-token refresh for the active admin or account console session.
  *
  * Semantics: while the user is interacting with the console, the access token
  * is refreshed shortly before it expires (each successful refresh also slides
@@ -37,7 +37,7 @@ let listenersAttached = false
 
 function currentTokens() {
   const realm = getAccountRealm()
-  return { realm, tokenSet: useAuthStore.getState().getTokenSet(realm) }
+  return { realm, tokenSet: useAuthStore.getState().getTokenSet(realm, getConsoleClientId()) }
 }
 
 function clearTimer() {
@@ -106,7 +106,7 @@ async function doRefresh(): Promise<RefreshOutcome> {
       body: {
         grant_type: 'refresh_token',
         refresh_token: tokenSet.refreshToken,
-        client_id: CONFIG.CLIENT_ID,
+        client_id: tokenSet.clientId ?? CONFIG.CLIENT_ID,
         scope: 'openid profile',
       },
     })
@@ -129,6 +129,7 @@ async function doRefresh(): Promise<RefreshOutcome> {
     refreshToken: data.refresh_token || tokenSet.refreshToken,
     idToken: data.id_token || tokenSet.idToken,
     expiresAt: Date.now() + (data.expires_in || 300) * 1000,
+    clientId: tokenSet.clientId ?? CONFIG.CLIENT_ID,
   })
   schedule()
   return 'ok'

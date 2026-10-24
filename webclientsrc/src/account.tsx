@@ -9,9 +9,10 @@ import AccountApp from './account/App'
 import { queryClient } from './api/queryClient'
 import { useAuthStore } from './state/authStore'
 import { ThemeProvider } from './components/theme-provider'
+import { ACCOUNT_CLIENT_ID } from './config'
 import './styles/global.css'
 
-useAuthStore.getState().hydrate()
+useAuthStore.getState().hydrate(ACCOUNT_CLIENT_ID)
 
 const pathname = window.location.pathname
 const match = pathname.match(/^\/realms\/([^/]+)\/account/)
