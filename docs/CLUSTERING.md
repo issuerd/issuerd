@@ -95,7 +95,7 @@ docker compose -f docker-compose.cluster.yml down -v
 The stack (`docker-compose.cluster.yml`, its own `issuerd-cluster` project):
 
 - `postgres`, `redis` — internal only (no host ports)
-- `issuerd-1`, `issuerd-2` — node ports `18081`/`18082` exposed for
+- `issuerd-1`, `issuerd-2` — node ports `18081`/`18082` bound to loopback for
   debugging/tests; per-node identity via `ISSUERD_CLUSTER__NODE_ID`
 - `lb` (nginx) — the only client-facing endpoint: `http://localhost:8088`
 
@@ -115,7 +115,7 @@ redis = "redis://redis:6379"          # single Redis
 url = "postgres://user:pass@postgres:5432/issuerd"
 
 [proxy]
-trusted_proxies = ["172.32.0.0/24"]   # the LB's subnet — required so login
+trusted_proxies = ["172.32.0.10/32"]  # static LB address only — required so login
                                       # failure keys use the real client IP
 
 [cluster]
@@ -150,8 +150,8 @@ TOML).
 ## Load balancer requirements
 
 - **No sticky sessions** — round-robin / least-conn are both fine.
-- Set `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `Host`; list the LB
-  subnet in `[proxy].trusted_proxies`.
+- Set `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `Host`; list only the
+  LB's exact address(es) in `[proxy].trusted_proxies`, not every peer container.
 - Health-check `/health/ready`: it probes both PostgreSQL and Redis, so a node
   that lost either dependency is drained automatically.
 - nginx caveat: upstream hostnames are resolved once at startup. If a node

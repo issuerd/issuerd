@@ -12,7 +12,7 @@
 #
 # Runs as its own compose project (`issuerd-cluster`) on its own subnet so it
 # never collides with the dev/test stack in docker-compose.yml. Per-node ports
-# 18081/18082 are exposed for debugging and tests; clients should use the LB.
+# 18081/18082 are loopback-only for debugging and tests; clients should use the LB.
 
 name: issuerd-cluster
 
@@ -76,23 +76,24 @@ services:
     environment:
       ISSUERD_CLUSTER__NODE_ID: node-1
     ports:
-      - "18081:8080"
+      - "127.0.0.1:18081:8080"
 
   issuerd-2:
     <<: *issuerd-node
     environment:
       ISSUERD_CLUSTER__NODE_ID: node-2
     ports:
-      - "18082:8080"
+      - "127.0.0.1:18082:8080"
 
   lb:
     image: nginx:alpine
     ports:
-      - "8088:8080"
+      - "127.0.0.1:8088:8080"
     volumes:
       - ./cluster/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     networks:
-      - cluster-net
+      cluster-net:
+        ipv4_address: 172.32.0.10
     depends_on:
       issuerd-1:
         condition: service_healthy
@@ -110,8 +111,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        # Deterministic subnet: cluster/issuerd.toml lists it in
-        # [proxy].trusted_proxies so X-Forwarded-For from the LB is trusted.
+        # Deterministic subnet; only the LB's static address is trusted for
+        # forwarded client IPs (see cluster/issuerd.toml).
         - subnet: 172.32.0.0/24
 
 volumes:

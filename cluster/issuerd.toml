@@ -30,9 +30,9 @@ level = "info"
 enabled = true
 
 [proxy]
-# The cluster-net subnet (see docker-compose.cluster.yml). The nginx LB is the
-# only reverse proxy, so X-Forwarded-For/X-Real-IP from that subnet are trusted.
-trusted_proxies = ["172.32.0.0/24"]
+# Only the nginx LB (static address in docker-compose.cluster.yml) is trusted
+# to supply X-Forwarded-For/X-Real-IP. Peer containers and the NAT gateway are not.
+trusted_proxies = ["172.32.0.10/32"]
 trust_x_forwarded_for = true
 trust_x_real_ip = true
 

@@ -34,7 +34,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     networks:
       backend:
       test:
@@ -53,7 +53,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     networks:
       backend:
       test:
@@ -106,7 +106,7 @@ services:
       KC_METRICS_ENABLED: "true"
       KC_LOG_LEVEL: info
     ports:
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
     networks:
       backend:
       test:
@@ -130,13 +130,13 @@ services:
       DOMAIN: "ISSUERD"
       ADMIN_PASSWORD: "AdminPass123!"
     ports:
-      - "389:389"
-      - "636:636"
-      - "88:88"
-      - "88:88/udp"
-      - "464:464"
-      - "464:464/udp"
-      - "445:445"
+      - "127.0.0.1:389:389"
+      - "127.0.0.1:636:636"
+      - "127.0.0.1:88:88"
+      - "127.0.0.1:88:88/udp"
+      - "127.0.0.1:464:464"
+      - "127.0.0.1:464:464/udp"
+      - "127.0.0.1:445:445"
     volumes:
       - samba-data:/var/lib/samba
       - ./tests/fixtures/samba-dc/shared:/shared
@@ -159,7 +159,7 @@ services:
       LDAP_DOMAIN: "test.issuerd.local"
       LDAP_ADMIN_PASSWORD: "admin"
     ports:
-      - "1389:389"
+      - "127.0.0.1:1389:389"
     # Note: custom bootstrap LDIF removed because osixia/openldap cannot
     # remove a bind-mounted directory during cleanup. Add users via ldapadd
     # after startup if needed.
@@ -186,7 +186,7 @@ services:
     volumes:
       - issuerd_postgres_data:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     networks:
       backend:
       test:

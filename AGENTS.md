@@ -436,7 +436,7 @@ docker compose -f docker-compose.integration.yml up -d
 # Build (root Dockerfile) and start: postgres + redis + issuerd-1/2 + lb
 docker compose -f docker-compose.cluster.yml up -d --build
 
-# LB endpoint: http://localhost:8088 (nodes also exposed on 18081/18082)
+# LB endpoint: http://localhost:8088 (nodes also on loopback-only 18081/18082)
 # Provisioned: realm demo (demo/demo123), master (admin/admin)
 
 # Docker E2E suite against the running stack (skips unless the env var is set)
