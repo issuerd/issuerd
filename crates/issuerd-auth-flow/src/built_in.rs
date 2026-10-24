@@ -516,6 +516,12 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                 if let Some(ref fm) = self.federation_manager {
                     match fm.find_user(&context.realm_id, &username).await {
                         Ok(Some((provider, federated_user))) => {
+                            if !federated_user.enabled {
+                                warn!(username = %issuerd_core::utils::sanitize_log_str(&username), provider_id = %provider.id(), "login rejected: federated user is disabled");
+                                dummy_password_verify(&password);
+                                return AuthStepResult::Failure(IssuerdError::InvalidGrant);
+                            }
+
                             // Same lockout gate and failure tracking as the
                             // local branch, keyed so every spelling the
                             // directory accepts (case, whitespace) shares one
@@ -5082,6 +5088,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(imported.federation_link, Some("ldap-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn password_disabled_unimported_federated_user_rejected() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let provider = Arc::new(CountingFedProvider {
+            validate_result: std::sync::Mutex::new(Ok(true)),
+            validate_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fed_user = issuerd_core::FederatedUser {
+            username: "alice".to_string(),
+            federation_link: "ldap-test".to_string(),
+            enabled: false,
+            ..Default::default()
+        };
+        let fm = Arc::new(MockFedManager {
+            providers: vec![provider.clone()],
+            find_user_result: std::sync::Mutex::new(Ok(Some((provider.clone(), fed_user)))),
+        });
+
+        let auth = UsernamePasswordAuthenticator::new(storage.clone()).with_federation_manager(fm);
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["secret".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert!(ctx.user_id.is_none());
+        assert_eq!(provider.calls(), 0, "disabled users must not reach the directory");
+        let realm = RealmId::new("realm-1").unwrap();
+        assert!(storage.get_user_by_username(&realm, "alice").await.unwrap().is_none());
     }
 
     #[tokio::test]

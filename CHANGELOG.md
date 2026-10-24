@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Federated and passkey authentication enforce current identity state.** Disabled federated identities are rejected before first-login import, and a WebAuthn assertion no longer succeeds when its credential was deleted after the challenge; the verified credential must still exist uniquely and its counter update must persist.
 - **JSON-file snapshots protect key and credential material.** On Unix, new and rewritten snapshots are owner-only (`0600`), and persistence uses a synced same-directory temporary file plus atomic rename instead of truncating the live snapshot in place. Existing snapshots are tightened when loaded and rewritten. In-memory mutation rollback on persistence failure remains unchanged.
 - **External ID-token and authorization-response validation is stricter.** Broker ID tokens now require the expected audience and, when configured, issuer, and honor `nbf`. Authorization requests carrying ID or access tokens can no longer select `query` or signed-only `query.jwt`, which exposed credentials in redirect URLs; pure authorization-code query responses remain supported.
 - **RustCrypto timing-safety update.** `p256`, `p384`, and `p521` move to 0.14, bringing `crypto-bigint` to 0.7.6 and fixing RUSTSEC-2026-0387 (timing variability in operations intended to be constant-time). No operator action required.

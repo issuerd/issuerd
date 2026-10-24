@@ -257,15 +257,30 @@ impl WebAuthnAuthenticator {
         };
         match webauthn.finish_passkey_authentication(&credential, &ceremony) {
             Ok(result) => {
-                // Persist updated authenticator properties (signature counter,
-                // backup flags) on the matched credential before succeeding —
-                // like the OTP replay watermark, a persistence failure fails
-                // the stage rather than silently dropping the update.
-                for (cred, passkey) in stored {
-                    let mut updated_passkey = passkey.clone();
-                    if updated_passkey.update_credential(&result) != Some(true) {
-                        continue;
+                // A credential revoked after the challenge must not authenticate
+                // through its cached ceremony, nor may a duplicate be ambiguous.
+                let mut matches =
+                    stored.iter().filter(|(_, passkey)| passkey.cred_id() == result.cred_id());
+                let Some((cred, passkey)) = matches.next() else {
+                    warn!(realm = %realm.id, user = %user_id, "webauthn assertion credential is not stored");
+                    return self.challenge(realm, user_id, stored).await;
+                };
+                if matches.next().is_some() {
+                    warn!(realm = %realm.id, user = %user_id, "webauthn assertion credential has duplicate stored matches");
+                    return self.challenge(realm, user_id, stored).await;
+                }
+
+                let mut updated_passkey = passkey.clone();
+                let changed = match updated_passkey.update_credential(&result) {
+                    Some(changed) => changed,
+                    None => {
+                        warn!(realm = %realm.id, user = %user_id, "webauthn assertion credential update did not match");
+                        return self.challenge(realm, user_id, stored).await;
                     }
+                };
+                if changed {
+                    // Like the OTP replay watermark, a persistence failure fails
+                    // the stage rather than silently dropping the update.
                     let mut updated = cred.clone();
                     match passkey_to_bytes(&updated_passkey) {
                         Ok(bytes) => updated.secret_data = bytes,
@@ -481,7 +496,8 @@ mod tests {
         assert_eq!(public_key.len(), 65, "expected uncompressed P-256 point");
         let (x, y) = (&public_key[1..33], &public_key[33..65]);
 
-        let cred_id: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(7).wrapping_add(1)).collect();
+        let mut cred_id = vec![0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut cred_id).unwrap();
         let mut auth_data = sha256(RP_ID.as_bytes());
         auth_data.push(0x45); // user present | user verified | attested data
         auth_data.extend([0, 0, 0, 0]); // counter 0
@@ -750,6 +766,59 @@ mod tests {
         // The ceremony state was consumed: re-submitting the same assertion
         // re-challenges instead of succeeding twice.
         assert_challenge_options(auth.authenticate(&mut ctx).await);
+    }
+
+    #[tokio::test]
+    async fn deleted_assertion_credential_rechallenges() {
+        let user = UserId::new("alice").unwrap();
+        let (mut revoked_key, revoked_passkey) = register_soft_key(&user);
+        let (remaining_key, remaining_passkey) = register_soft_key(&user);
+        let storage = storage_with_passkey(&user, &revoked_passkey).await;
+        let revoked_id = storage
+            .get_credentials(&test_realm().id, &user, CredentialType::WebAuthn)
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        let remaining_cred = Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: passkey_to_bytes(&remaining_passkey).unwrap(),
+            credential_data: serde_json::json!({"cred_id": B64.encode(&remaining_key.cred_id)}),
+            priority: 0,
+        };
+        storage
+            .create_credential(&test_realm().id, &user, &remaining_cred)
+            .await
+            .unwrap();
+        let auth = authenticator(storage.clone());
+        let mut ctx = test_context(Some("alice"));
+
+        let options = assert_challenge_options(auth.authenticate(&mut ctx).await);
+        assert_eq!(options["allowCredentials"].as_array().unwrap().len(), 2);
+        storage.delete_credential(&test_realm().id, &user, &revoked_id).await.unwrap();
+
+        // The old ceremony still verifies this genuine assertion, but the
+        // asserted credential is no longer in current storage.
+        let assertion = sign_assertion(&mut revoked_key, &options);
+        ctx.parameters.insert(
+            "webauthn_assertion".to_string(),
+            vec![serde_json::to_string(&assertion).unwrap()],
+        );
+        let options = assert_challenge_options(auth.authenticate(&mut ctx).await);
+        let allowed = options["allowCredentials"].as_array().unwrap();
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0]["id"], B64.encode(&remaining_key.cred_id));
+
+        let creds = storage
+            .get_credentials(&test_realm().id, &user, CredentialType::WebAuthn)
+            .await
+            .unwrap();
+        assert_eq!(creds.len(), 1);
+        let stored: serde_json::Value = serde_json::from_slice(&creds[0].secret_data).unwrap();
+        assert_eq!(stored["cred"]["counter"], 0, "the unmatched passkey must not change");
     }
 
     #[test]
