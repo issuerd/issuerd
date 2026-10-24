@@ -13,9 +13,11 @@
 //! (called with `iss` + `sid`), then continues to the validated
 //! `post_logout_redirect_uri`.
 //!
-//! The receiving client is a loopback axum server on `127.0.0.1:0`, so
-//! delivery exercises the production reqwest dispatcher over real HTTP.
+//! The receiving client is an HTTPS loopback axum server. Its rcgen-generated
+//! CA is explicitly trusted by the harness, which also opts into private
+//! callback addresses so delivery exercises the production reqwest dispatcher.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
@@ -23,16 +25,67 @@ use base64::Engine;
 
 use crate::harness::TestHarness;
 
+const CA_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBoTCCAUegAwIBAgIURJw/8Bi7yH8lMVs1/GnlDFfGFZkwCgYIKoZIzj0EAwIw
+LTErMCkGA1UEAwwiaXNzdWVyZCBpbnRlZ3JhdGlvbiBsb2dvdXQgdGVzdCBDQTAg
+Fw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowLTErMCkGA1UEAwwiaXNz
+dWVyZCBpbnRlZ3JhdGlvbiBsb2dvdXQgdGVzdCBDQTBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABM2aHQ0amexvSJ7HzKhR1/HuSBV8mR3SRi9wTuszGdJLjsAR0WAn
+5VpgPxvn49Ni8Cv6gPDlwGwvndAWLJjmZkSjQzBBMA8GA1UdDwEB/wQFAwMHhgAw
+HQYDVR0OBBYEFK6dX2KG4VMsw/i03uGqc+ieY4FxMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIhAJVXuFxeXVARQbnFKQqBLaLNLv7PRU3LuMJmuo8t
+1ngqAiBEqsG8RCFyjhk7fZipoe5L7n4FJsKGuKChPznnBGRrXA==
+-----END CERTIFICATE-----
+"#;
+
+const SERVER_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBcDCCARagAwIBAgIUdjk9ZjaJ9GBAn04lAoHxJMiSRNowCgYIKoZIzj0EAwIw
+LTErMCkGA1UEAwwiaXNzdWVyZCBpbnRlZ3JhdGlvbiBsb2dvdXQgdGVzdCBDQTAg
+Fw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNn
+ZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOmr
+QjSKYkAnSz6w/8xmOrqxSbG+KzChB5VgucD99ugaTfaadLcHkF6vuQ5quSc6YYSp
+b9ZYh4XPEqQjIe0fJCWjHjAcMBoGA1UdEQQTMBGHBH8AAAGCCWxvY2FsaG9zdDAK
+BggqhkjOPQQDAgNIADBFAiBh7h5yrQ94Hmi0RJsCaJTxIQCBkrL73jVgT0W1EjK+
+TQIhAKUWR6OTgouW0sQlz0hIf0yCrVSw3kgv2SZRNw4svmgE
+-----END CERTIFICATE-----
+"#;
+
+const SERVER_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2Vlk5dIoOG6OS+q3
+ylCfhQiXp0pvqgXfhP5L1M3O3CahRANCAATpq0I0imJAJ0s+sP/MZjq6sUmxvisw
+oQeVYLnA/fboGk32mnS3B5Ber7kOarknOmGEqW/WWIeFzxKkIyHtHyQl
+-----END PRIVATE KEY-----
+"#;
+
 // ---------------------------------------------------------------------------
 // Loopback logout-token receiver
 // ---------------------------------------------------------------------------
 
 struct LogoutReceiver {
     base_url: String,
+    ca_bundle: PathBuf,
+    temp_dir: PathBuf,
     bodies: Arc<Mutex<Vec<String>>>,
 }
 
+impl Drop for LogoutReceiver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 async fn start_receiver() -> LogoutReceiver {
+    crate::harness::ensure_ring_crypto_provider();
+    let temp_dir = std::env::temp_dir()
+        .join(format!("issuerd-logout-receiver-{}", issuerd_core::utils::generate_id()));
+    std::fs::create_dir(&temp_dir).unwrap();
+    let ca_bundle = temp_dir.join("ca.pem");
+    let cert_path = temp_dir.join("cert.pem");
+    let key_path = temp_dir.join("key.pem");
+    std::fs::write(&ca_bundle, CA_CERT_PEM).unwrap();
+    std::fs::write(&cert_path, SERVER_CERT_PEM).unwrap();
+    std::fs::write(&key_path, SERVER_KEY_PEM).unwrap();
+
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&bodies);
     let app = axum::Router::new().route(
@@ -47,9 +100,25 @@ async fn start_receiver() -> LogoutReceiver {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    drop(listener);
+    let config = issuerd_server::config::ServerConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+        tls: Some(issuerd_server::config::TlsConfig {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+        }),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        issuerd_server::bootstrap::run(&config, app, std::future::pending())
+            .await
+            .unwrap();
+    });
     LogoutReceiver {
-        base_url: format!("http://127.0.0.1:{port}"),
+        base_url: format!("https://127.0.0.1:{port}"),
+        ca_bundle,
+        temp_dir,
         bodies,
     }
 }
@@ -72,6 +141,14 @@ impl LogoutReceiver {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+async fn backchannel_harness(ca_bundle: Option<&Path>) -> TestHarness {
+    let mut config = crate::harness::test_config();
+    config.outbound_http.allow_private_addresses = true;
+    config.outbound_http.extra_ca_bundle = ca_bundle.map(Path::to_path_buf);
+    let state = Arc::new(issuerd_server::state::ServerState::from_config(&config).await.unwrap());
+    TestHarness::with_state(state)
+}
 
 /// Decode the payload segment of a JWT without verifying the signature.
 fn jwt_claims(token: &str) -> serde_json::Value {
@@ -160,7 +237,7 @@ async fn wait_for_admin_event(
 #[tokio::test]
 async fn backchannel_logout_delivers_signed_logout_token() {
     let receiver = start_receiver().await;
-    let harness = TestHarness::new().await;
+    let harness = backchannel_harness(Some(receiver.ca_bundle.as_path())).await;
     // Admin events are opt-in per realm (Keycloak default off); this
     // test asserts on the recorded delivery event.
     let mut realm = harness.create_realm("bc-basic").await;
@@ -222,7 +299,7 @@ async fn backchannel_logout_delivers_signed_logout_token() {
 
 #[tokio::test]
 async fn backchannel_delivery_failure_never_blocks_logout() {
-    let harness = TestHarness::new().await;
+    let harness = backchannel_harness(None).await;
     // Admin events are opt-in per realm; the failed delivery must
     // be recorded, so enable recording here.
     let mut realm = harness.create_realm("bc-down").await;
@@ -230,7 +307,7 @@ async fn backchannel_delivery_failure_never_blocks_logout() {
     harness.storage.update_realm(&realm).await.unwrap();
     let client = harness.create_client("bc-down", false).await;
     // Nothing listens on the discard port: connection refused.
-    set_client_attr(&harness, &client, "backchannel_logout_uri", "http://127.0.0.1:9/").await;
+    set_client_attr(&harness, &client, "backchannel_logout_uri", "https://127.0.0.1:9/").await;
     harness.create_user("bc-down", "ingrid", "Password123!").await;
 
     let tokens = login(&harness, "bc-down", &client, "ingrid").await;
@@ -254,7 +331,7 @@ async fn backchannel_delivery_failure_never_blocks_logout() {
 #[tokio::test]
 async fn admin_session_delete_triggers_backchannel_logout() {
     let receiver = start_receiver().await;
-    let harness = TestHarness::new().await;
+    let harness = backchannel_harness(Some(receiver.ca_bundle.as_path())).await;
     let realm = harness.create_realm("bc-admin").await;
     let client = harness.create_client("bc-admin", false).await;
     set_client_attr(&harness, &client, "backchannel_logout_uri", &receiver.base_url).await;
@@ -638,7 +715,7 @@ async fn frontchannel_session_required_false_omits_iss_and_sid() {
 #[tokio::test]
 async fn backchannel_session_required_false_omits_sid() {
     let receiver = start_receiver().await;
-    let harness = TestHarness::new().await;
+    let harness = backchannel_harness(Some(receiver.ca_bundle.as_path())).await;
     harness.create_realm("bc-nosess").await;
     let client = harness.create_client("bc-nosess", false).await;
     set_client_attr(&harness, &client, "backchannel_logout_uri", &receiver.base_url).await;
