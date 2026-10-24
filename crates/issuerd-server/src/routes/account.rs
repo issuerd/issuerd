@@ -1637,7 +1637,7 @@ async fn load_user(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
 ) -> Result<User, Response> {
-    state
+    let user = state
         .storage
         .get_user(&guard.realm_id, &guard.user_id)
         .await
@@ -1645,7 +1645,11 @@ async fn load_user(
             error!(realm = %guard.realm_id, error = %e, "account API: failed to load user");
             internal_error("failed to load user")
         })?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "user not found"))
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "user not found"))?;
+    if !user.enabled {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token"));
+    }
+    Ok(user)
 }
 
 /// Load the realm the guard is bound to (login flags, password policy).
@@ -2140,6 +2144,26 @@ mod tests {
         let access_token = password_grant_token(&state).await;
         let resp = account_me_with_token(&state, &access_token).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_disabled_user_with_live_session() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.enabled = false;
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+        issuerd_cluster::invalidate::invalidate_user_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &user.id,
+        )
+        .await;
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

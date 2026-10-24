@@ -876,7 +876,7 @@ pub(crate) async fn complete_login_with_method(
 
     // Look up the authenticated user; provides the canonical username for the session.
     let user = match state.storage.get_user(&realm_id, &user_id).await {
-        Ok(Some(u)) => u,
+        Ok(Some(u)) if u.enabled => u,
         _ => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
                 .into_response();

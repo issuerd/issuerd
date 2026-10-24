@@ -739,6 +739,10 @@ async fn resolve_session_from_cookie(
     if session.offline {
         return None;
     }
+    match state.storage.get_user(realm_id, &session.user_id).await {
+        Ok(Some(user)) if user.enabled => {}
+        _ => return None,
+    }
 
     // SSO idle-timeout enforcement: remembered sessions get the realm's
     // (longer) remember-me idle window, plain sessions the SSO idle window.
@@ -4618,7 +4622,17 @@ async fn token_handler_inner(
                 )
                 .await
                 {
-                    Ok(user) => Some(user),
+                    Ok(user) => {
+                        if !user.enabled {
+                            warn!(realm = %realm_id, client_id = %client.client_id, "client credentials rejected: service account is disabled");
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(serde_json::json!({"error": "invalid_grant"})),
+                            )
+                                .into_response();
+                        }
+                        Some(user)
+                    }
                     Err(e) => {
                         error!(realm = %realm_id, client_id = %client.client_id, error = %e,
                             "service-account provisioning failed");
@@ -5554,7 +5568,7 @@ async fn is_sessionless_client_token(
             &client,
         )
         .await,
-        Ok(Some(user)) if user.id == claims.sub
+        Ok(Some(user)) if user.id == claims.sub && user.enabled
     )
 }
 
@@ -5582,10 +5596,14 @@ pub(crate) async fn resolve_token_user(
     let reader = crate::claims_cache::ClaimsReader::new(state, realm_id);
     if let Some(session) = session {
         if let Some(bundle) = reader.user_claims(&session.user_id).await {
-            return Some(bundle.user);
+            return Some(bundle.user).filter(|user| user.enabled);
         }
     }
-    reader.user_claims(&claims.sub).await.map(|bundle| bundle.user)
+    reader
+        .user_claims(&claims.sub)
+        .await
+        .map(|bundle| bundle.user)
+        .filter(|user| user.enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -15297,6 +15315,31 @@ mod tests {
         (session_id, cookie_headers(&format!("issuerd_session={}", sso_token.token)))
     }
 
+    #[tokio::test]
+    async fn session_cookie_rejects_disabled_user_with_live_session() {
+        let state = setup_state().await;
+        let now = chrono::Utc::now();
+        let (_sid, headers) = sso_cookie_with_times(&state, now, now).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user = state
+            .storage
+            .get_user(&realm_id, &issuerd_core::UserId::new("admin").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        user.enabled = false;
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+        issuerd_cluster::invalidate::invalidate_user_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &user.id,
+        )
+        .await;
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+
+        assert!(resolve_session_from_cookie(&state, &headers, &realm).await.is_none());
+    }
+
     /// Mint a remember-me cookie value for admin bound to the master realm.
     async fn remember_me_cookie(state: &Arc<ServerState>) -> String {
         let realm_id = RealmId::new("master").unwrap();
@@ -17659,6 +17702,41 @@ mod tests {
         .await
         .unwrap();
         (client, user)
+    }
+
+    #[tokio::test]
+    async fn disabled_service_account_cannot_mint_or_use_client_tokens() {
+        let state = setup_state().await;
+        let (_client, mut user) = seed_service_account_pair(&state, "disabled-sa", true).await;
+        let issued = token_request(
+            &state,
+            "grant_type=client_credentials&client_id=disabled-sa&client_secret=s3cr3t&scope=openid",
+        )
+        .await;
+        assert_eq!(issued.status(), StatusCode::OK);
+        let access_token = extract_json(issued).await["access_token"].as_str().unwrap().to_string();
+
+        user.enabled = false;
+        let realm_id = RealmId::new("master").unwrap();
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+        issuerd_cluster::invalidate::invalidate_user_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &user.id,
+        )
+        .await;
+
+        let rejected = token_request(
+            &state,
+            "grant_type=client_credentials&client_id=disabled-sa&client_secret=s3cr3t&scope=openid",
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {access_token}").parse().unwrap());
+        let userinfo = userinfo_get(&state, headers).await;
+        assert_eq!(userinfo.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
