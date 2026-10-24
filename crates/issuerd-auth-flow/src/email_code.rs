@@ -435,6 +435,11 @@ impl EmailCodeAuthenticator {
         let matches =
             attempts <= max && bool::from(submitted.as_bytes().ct_eq(entry.code.as_bytes()));
         if matches {
+            match self.storage.get_user(&context.realm_id, &user_id).await {
+                Ok(Some(user)) if user.enabled => {}
+                Ok(_) => return otp_challenge(),
+                Err(e) => return AuthStepResult::Failure(e),
+            }
             match self.cache.compare_and_delete(&key, raw_entry).await {
                 Ok(true) => {}
                 Ok(false) => return otp_challenge(),
@@ -730,6 +735,20 @@ mod tests {
         let (result, ctx) = submit_otp(&f, Some("u-1"), &code).await;
         assert!(matches!(result, AuthStepResult::Success), "got {result:?}");
         assert_eq!(ctx.attributes.get("auth_method").map(String::as_str), Some("email_code"));
+    }
+
+    #[tokio::test]
+    async fn disabled_after_mint_cannot_verify() {
+        let f = fixture().await;
+        let mut user =
+            test_user("u-disabled-after-mint", "disabled-now", Some("disabled@example.com"));
+        f.storage.create_user(&user.realm_id, &user).await.unwrap();
+        let (_, code) = mint(&f, "disabled@example.com").await;
+
+        user.enabled = false;
+        f.storage.update_user(&user.realm_id, &user).await.unwrap();
+        let (result, _) = submit_otp(&f, Some("u-disabled-after-mint"), &code).await;
+        assert_otp_challenge(result);
     }
 
     #[tokio::test]
