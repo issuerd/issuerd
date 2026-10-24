@@ -2717,7 +2717,7 @@ pub async fn ciba_auth_handler(
     };
 
     let auth_req_id = issuerd_core::utils::generate_id();
-    let expires_in: u64 = ciba_req.requested_expiry.unwrap_or(120);
+    let expires_in: u64 = ciba_req.requested_expiry.unwrap_or(120).min(600);
     let interval: u64 = 5;
 
     let req_data = CibaAuthReqData {
@@ -6395,7 +6395,11 @@ async fn logout_inner(
         let session = state.storage.get_user_session(&realm_id, sid).await.ok().flatten();
         let destroy = session_from_refresh_token || session.as_ref().is_some_and(|s| !s.offline);
         if destroy {
-            let _ = state.storage.delete_user_session(&realm_id, sid).await;
+            if let Err(e) = state.storage.delete_user_session(&realm_id, sid).await {
+                error!(realm = %realm_id, error = %e, "logout failed: session deletion failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                    .into_response();
+            }
             crate::session_cache::invalidate_session(&state, &realm_id, sid).await;
             if let Some(s) = session {
                 destroyed_sessions.push(s);
@@ -6408,7 +6412,11 @@ async fn logout_inner(
     // `resolve_session_from_cookie` never returns offline sessions.
     if let Some(cookie_session) = resolve_session_from_cookie(&state, &headers, &realm).await {
         if !destroyed_sessions.iter().any(|s| s.id == cookie_session.id) {
-            let _ = state.storage.delete_user_session(&realm_id, &cookie_session.id).await;
+            if let Err(e) = state.storage.delete_user_session(&realm_id, &cookie_session.id).await {
+                error!(realm = %realm_id, error = %e, "logout failed: session deletion failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
+                    .into_response();
+            }
             crate::session_cache::invalidate_session(&state, &realm_id, &cookie_session.id).await;
             destroyed_sessions.push(cookie_session);
         }
@@ -10634,6 +10642,22 @@ mod tests {
         let json = extract_json(response).await;
         assert!(json["auth_req_id"].as_str().unwrap().len() > 10);
         assert!(json["expires_in"].is_number());
+    }
+
+    #[tokio::test]
+    async fn ciba_auth_requested_expiry_is_bounded_without_panicking() {
+        let state = setup_state().await;
+        let client = confidential_client("ciba-expiry-uuid", "ciba-expiry-client", "s3cr3t");
+        state.storage.create_client(&client.realm_id, &client).await.unwrap();
+
+        for requested in ["9223372036854776", "18446744073709551615"] {
+            let body = format!(
+                "client_id=ciba-expiry-client&client_secret=s3cr3t&login_hint=admin&scope=openid&requested_expiry={requested}"
+            );
+            let response = ciba_auth(&state, &body).await;
+            assert_eq!(response.status(), StatusCode::OK, "requested_expiry={requested}");
+            assert_eq!(extract_json(response).await["expires_in"], 600);
+        }
     }
 
     #[tokio::test]

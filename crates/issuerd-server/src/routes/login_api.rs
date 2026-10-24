@@ -679,7 +679,14 @@ pub async fn logout_api_handler(
                         // dispatcher can still see the client sessions.
                         let destroyed =
                             state.storage.get_user_session(&realm.id, sid).await.ok().flatten();
-                        let _ = state.storage.delete_user_session(&realm.id, sid).await;
+                        if let Err(e) = state.storage.delete_user_session(&realm.id, sid).await {
+                            error!(realm = %realm.id, error = %e, "logout failed: session deletion failed");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": "server_error"})),
+                            )
+                                .into_response();
+                        }
                         crate::session_cache::invalidate_session(&state, &realm.id, sid).await;
                         if let Some(destroyed) = destroyed {
                             state
@@ -2499,6 +2506,93 @@ pub(crate) mod tests {
         assert!(location.starts_with("/login.html"));
         assert!(location.contains("error=invalid_grant"));
         assert!(location.contains("execution_id="));
+    }
+
+    async fn logout_delete_failure_state() -> (Arc<ServerState>, axum::http::HeaderMap) {
+        let mut state = ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap();
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let now = chrono::Utc::now();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        let token = state
+            .token_manager
+            .issue_sso_session_token(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_realm_by_name().returning(move |_| Ok(Some(realm.clone())));
+        storage
+            .expect_get_user_session()
+            .returning(move |_, _| Ok(Some(session.clone())));
+        storage.expect_get_user().returning(move |_, _| Ok(Some(user.clone())));
+        storage
+            .expect_delete_user_session()
+            .times(1)
+            .returning(|_, _| Err(issuerd_core::IssuerdError::ServerError("delete failed".into())));
+        state.storage = Arc::new(storage);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_session={}", token.token).parse().unwrap(),
+        );
+        (Arc::new(state), headers)
+    }
+
+    #[tokio::test]
+    async fn logout_api_delete_failure_is_not_reported_as_success() {
+        let (state, headers) = logout_delete_failure_state().await;
+        let response = logout_api_handler(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(axum::http::header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn rp_logout_delete_failure_is_not_reported_as_success() {
+        let (state, headers) = logout_delete_failure_state().await;
+        let response = crate::routes::oidc::logout_handler_get(
+            State(state),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
