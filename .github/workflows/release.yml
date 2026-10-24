@@ -814,6 +814,25 @@ jobs:
             macos-dist/*
             macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
+      - name: Install cosign
+        if: ${{ env.ACT != 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # Keyless (GitHub OIDC) signatures so the release ships .sig/.crt files
+      # next to every asset — the scorecard Signed-Releases check needs
+      # signature files attached to the release, the attestation-store entries
+      # from the step above do not count.
+      - name: Sign release artifacts (cosign, keyless)
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          set -euo pipefail
+          for d in linux-dist linux-glibc228-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
+            for f in "$d"/*; do
+              cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+            done
+          done
+          for f in issuerd_*_conformance-evidence.tar.gz SHA256SUMS.txt; do
+            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+          done
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
@@ -831,6 +850,12 @@ jobs:
             macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
+            *-dist/*.sig
+            *-dist/*.crt
+            issuerd_*_conformance-evidence.tar.gz.sig
+            issuerd_*_conformance-evidence.tar.gz.crt
+            SHA256SUMS.txt.sig
+            SHA256SUMS.txt.crt
       - name: Release contents (always logged — this is what rehearsal inspects)
         run: |
           ls -l *-dist/
