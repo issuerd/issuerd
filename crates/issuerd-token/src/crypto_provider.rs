@@ -13,7 +13,7 @@ use issuerd_core::{
     Algorithm, Base64Url, CryptoProvider, IssuerdError, Jwk, JwkKty, JwkSet, JwkUse, KeyId,
     StoredSigningKey,
 };
-use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+use p256::elliptic_curve::{sec1::ToSec1Point as _, Generate as _};
 use p256::pkcs8::EncodePrivateKey as _;
 use rand::RngCore;
 use ring::signature::KeyPair;
@@ -288,8 +288,7 @@ fn generate_rsa_key(
 }
 
 fn generate_ec_p256(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), IssuerdError> {
-    let mut rng = rand::thread_rng();
-    let secret = p256::SecretKey::random(&mut rng);
+    let secret = p256::SecretKey::generate();
     let pkcs8_der = secret
         .to_pkcs8_der()
         .map_err(|e| IssuerdError::ServerError(format!("EC PKCS#8 encoding failed: {e}")))?
@@ -297,7 +296,7 @@ fn generate_ec_p256(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issue
         .to_vec();
 
     let public = secret.public_key();
-    let encoded = public.to_encoded_point(false);
+    let encoded = public.to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(encoded.x().expect("uncompressed point has x"));
     let y = URL_SAFE_NO_PAD.encode(encoded.y().expect("uncompressed point has y"));
 
@@ -318,8 +317,7 @@ fn generate_ec_p256(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issue
 }
 
 fn generate_ec_p384(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), IssuerdError> {
-    let mut rng = rand::thread_rng();
-    let secret = p384::SecretKey::random(&mut rng);
+    let secret = p384::SecretKey::generate();
     let pkcs8_der = secret
         .to_pkcs8_der()
         .map_err(|e| IssuerdError::ServerError(format!("EC PKCS#8 encoding failed: {e}")))?
@@ -327,7 +325,7 @@ fn generate_ec_p384(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issue
         .to_vec();
 
     let public = secret.public_key();
-    let encoded = public.to_encoded_point(false);
+    let encoded = public.to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(encoded.x().expect("uncompressed point has x"));
     let y = URL_SAFE_NO_PAD.encode(encoded.y().expect("uncompressed point has y"));
 
@@ -348,8 +346,7 @@ fn generate_ec_p384(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issue
 }
 
 fn generate_ec_p521(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), IssuerdError> {
-    let mut rng = rand::thread_rng();
-    let secret = p521::SecretKey::random(&mut rng);
+    let secret = p521::SecretKey::generate();
     let pkcs8_der = secret
         .to_pkcs8_der()
         .map_err(|e| IssuerdError::ServerError(format!("EC PKCS#8 encoding failed: {e}")))?
@@ -357,7 +354,7 @@ fn generate_ec_p521(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issue
         .to_vec();
 
     let public = secret.public_key();
-    let encoded = public.to_encoded_point(false);
+    let encoded = public.to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(encoded.x().expect("uncompressed point has x"));
     let y = URL_SAFE_NO_PAD.encode(encoded.y().expect("uncompressed point has y"));
 
