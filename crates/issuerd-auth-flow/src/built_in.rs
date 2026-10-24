@@ -245,20 +245,22 @@ impl UsernamePasswordAuthenticator {
 
     /// Load the realm's brute-force configuration when protection is enabled.
     ///
-    /// Returns `None` when no tracker is wired, the realm has
-    /// `brute_force_protected = false` (or the realm cannot be loaded) —
-    /// callers must then skip failure tracking and lockout checks entirely.
-    /// The realm lookup happens once per login attempt here, not inside the
-    /// tracker.
-    async fn brute_force_config(&self, context: &AuthContext) -> Option<LoginFailureConfig> {
+    /// Returns `None` only when no tracker is wired or the realm has
+    /// `brute_force_protected = false`. A realm lookup failure is an
+    /// operational error and must never disable lockout checks.
+    async fn brute_force_config(
+        &self,
+        context: &AuthContext,
+    ) -> Result<Option<LoginFailureConfig>, IssuerdError> {
         if self.tracker.is_none() || self.cache.is_none() {
-            return None;
+            return Ok(None);
         }
-        let realm = self.storage.get_realm(&context.realm_id).await.ok()??;
+        let realm =
+            self.storage.get_realm(&context.realm_id).await?.ok_or(IssuerdError::NotFound)?;
         if !realm.brute_force_protected {
-            return None;
+            return Ok(None);
         }
-        Some(LoginFailureConfig::from_realm(&realm))
+        Ok(Some(LoginFailureConfig::from_realm(&realm)))
     }
 
     /// Lockout gate run before any password check: `Some` is the result to
@@ -346,8 +348,7 @@ impl UsernamePasswordAuthenticator {
         let user = issuerd_core::User {
             id: issuerd_core::UserId::new(issuerd_core::utils::generate_id()).unwrap(),
             realm_id: realm_id.clone(),
-            username: issuerd_core::Username::new(&fed.username)
-                .expect("federated username must be valid"),
+            username: issuerd_core::Username::new(&fed.username)?,
             email: fed.email.as_deref().map(Email::new).transpose().unwrap_or(None),
             email_verified: fed.email_verified,
             first_name: fed.first_name.as_deref().and_then(|s| DisplayName::new(s).ok()),
@@ -431,7 +432,10 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
 
                 // Brute-force check, gated on the realm's brute-force
                 // protection toggle.
-                let brute_force = self.brute_force_config(context).await;
+                let brute_force = match self.brute_force_config(context).await {
+                    Ok(config) => config,
+                    Err(e) => return AuthStepResult::Failure(e),
+                };
                 if let Some(rejection) =
                     self.lockout_rejection(context, &user.username, brute_force.as_ref()).await
                 {
@@ -527,7 +531,10 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                             // directory accepts (case, whitespace) shares one
                             // budget.
                             let failure_id = federated_failure_identifier(&username);
-                            let brute_force = self.brute_force_config(context).await;
+                            let brute_force = match self.brute_force_config(context).await {
+                                Ok(config) => config,
+                                Err(e) => return AuthStepResult::Failure(e),
+                            };
                             if let Some(rejection) = self
                                 .lockout_rejection(context, &failure_id, brute_force.as_ref())
                                 .await
@@ -5171,6 +5178,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn federated_import_invalid_username_returns_error() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let federated = issuerd_core::FederatedUser {
+            username: "x".repeat(Username::MAX_LEN + 1),
+            federation_link: "ldap-test".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let result =
+            auth.import_federated_user(&RealmId::new("realm-1").unwrap(), &federated).await;
+        assert!(matches!(result, Err(IssuerdError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
     async fn password_federated_import_storage_error_fails_login() {
         let mut mock = issuerd_core::MockStorage::new();
         mock.expect_get_user_by_username().returning(|_, _| Ok(None));
@@ -5865,6 +5888,31 @@ mod tests {
         let mut ctx = test_context();
         ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
         ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_server_error(result);
+    }
+
+    #[tokio::test]
+    async fn password_realm_lookup_failure_does_not_disable_brute_force_checks() {
+        let user = test_user();
+        let credential = password_cred(hash_password("password").into_bytes());
+        let mut mock = issuerd_core::MockStorage::new();
+        mock.expect_get_user_by_username().returning(move |_, _| Ok(Some(user.clone())));
+        mock.expect_get_realm()
+            .returning(|_| Err(issuerd_core::IssuerdError::ServerError("realm down".into())));
+        mock.expect_get_credentials()
+            .returning(move |_, _, _| Ok(vec![credential.clone()]));
+        let cache: Arc<dyn issuerd_core::DistributedCache> =
+            Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = UsernamePasswordAuthenticator::with_tracker(
+            Arc::new(mock),
+            Arc::new(LoginFailureTracker::new()),
+            cache,
+        );
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+
         let result = auth.authenticate(&mut ctx).await;
         assert_auth_server_error(result);
     }

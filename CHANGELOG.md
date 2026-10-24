@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Password brute-force configuration and federated first import fail closed.** A realm lookup error can no longer silently disable lockout checks and failure recording. Invalid federated usernames now return an authentication error instead of panicking during first-login import, matching the per-record sync behavior.
 - **Back-channel logout and guarded fetches use SSRF-safe transport.** Back-channel callbacks now require HTTPS and publicly routable addresses, refuse redirects, and pin DNS validation to the exact addresses dialed, closing rebinding and internal-POST paths. Internal HTTPS callbacks require explicit `[outbound_http] allow_private_addresses = true`; private CAs use `extra_ca_bundle`. Delivery remains best-effort and API compatibility is preserved.
 - **Email-code login rechecks account enablement at verification.** Disabling an account after a code is issued now prevents that code from authenticating; storage errors fail closed and the existing uniform challenge behavior is preserved.
 - **The convenience admin-token endpoint enforces the complete authentication policy.** It now applies the same out-of-band second-factor gate as password/device grants (with an optional `totp` request field and replay/lockout handling), rejects pending required actions, and refuses a disabled `admin-cli` client before creating a session or issuing an Admin-API-capable token.
