@@ -20,10 +20,10 @@
 //!
 //! The IdP-facing calls (discovery, JWKS, token, userinfo — URLs a realm
 //! admin configures or the discovery document names) are SSRF-gated too:
-//! every address they dial, on every redirect hop, must be publicly
-//! routable, unless the operator sets `[outbound_http]
-//! allow_private_identity_providers`. Their response bodies are capped in
-//! both modes.
+//! HTTPS is required and every address they dial, on every redirect hop, must
+//! be publicly routable, unless the operator sets `[outbound_http]
+//! allow_private_identity_providers` for an internal development IdP. Redirects
+//! never downgrade HTTPS to HTTP. Response bodies are capped in both modes.
 
 use issuerd_core::{
     BrokerClient, BrokerDiscoveryDocument, BrokerIdpSettings, BrokerTokenResponse,
@@ -191,6 +191,9 @@ fn idp_redirect_verdict(
 ) -> Result<(), &'static str> {
     if previous.len() >= MAX_IDP_REDIRECTS {
         return Err("too many redirects");
+    }
+    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
+        return Err("redirect to an insecure scheme");
     }
     if is_non_public_ip_literal(next) {
         return Err("redirect to a non-public address");
@@ -373,6 +376,9 @@ impl ReqwestBrokerClient {
         }
         let refuse = |why: &str| idp_unreachable(url, why);
         let parsed = url::Url::parse(url).map_err(|e| refuse(&format!("url parse: {e}")))?;
+        if parsed.scheme() != "https" {
+            return Err(refuse("non-https scheme"));
+        }
         if is_non_public_ip_literal(&parsed) {
             return Err(refuse("non-public address literal"));
         }
@@ -1014,10 +1020,11 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let server_key = rcgen::KeyPair::generate().unwrap();
-        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-            .unwrap()
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
+        let server_cert =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "idp.test".to_string()])
+                .unwrap()
+                .signed_by(&server_key, &ca_cert, &ca_key)
+                .unwrap();
 
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
             server_cert.pem().into_bytes(),
@@ -1029,10 +1036,29 @@ mod tests {
         // axum_server registers the socket with the tokio runtime.
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = axum::Router::new().route(
-            "/jwks",
-            axum::routing::get(|| async { axum::Json(serde_json::json!({"keys": []})) }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/jwks",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"keys": []})) }),
+            )
+            .route(
+                "/doc",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+            )
+            .route(
+                "/big",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"pad": "x".repeat(MAX_IDP_BODY_BYTES)}))
+                }),
+            )
+            .route(
+                "/to",
+                axum::routing::get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move { axum::response::Redirect::temporary(&q["url"]) },
+                ),
+            );
         tokio::spawn(async move {
             axum_server::from_tcp_rustls(listener, tls)
                 .unwrap()
@@ -1116,17 +1142,27 @@ mod tests {
         }
     }
 
-    /// Plain http and public hosts pass the up-front check; in direct mode
-    /// hostnames are left to the resolver (no lookup here).
+    /// HTTPS public hosts pass the up-front check; plain HTTP requires the
+    /// explicit unrestricted development mode.
     #[tokio::test]
-    async fn idp_up_front_check_allows_http_and_public_targets() {
+    async fn idp_up_front_check_enforces_https_by_default() {
         let client = gated_client(IdpEgress::Direct, idp_client_builder(&[], IdpEgress::Direct));
         for url in [
             "http://idp.example.com/.well-known/openid-configuration",
             "http://8.8.8.8/x",
         ] {
+            assert_idp_unreachable(&client.check_idp_url(url).await.unwrap_err(), url);
+        }
+        for url in [
+            "https://idp.example.com/.well-known/openid-configuration",
+            "https://8.8.8.8/x",
+        ] {
             client.check_idp_url(url).await.unwrap();
         }
+
+        let development =
+            gated_client(IdpEgress::Unrestricted, idp_client_builder(&[], IdpEgress::Unrestricted));
+        development.check_idp_url("http://localhost:8080").await.unwrap();
     }
 
     /// The resolver hands the connector exactly the checked addresses and
@@ -1146,9 +1182,14 @@ mod tests {
     fn idp_redirect_verdict_rules() {
         let u = |s: &str| url::Url::parse(s).unwrap();
         let origin = [u("https://idp.example.com/a")];
-        // Hops to public hosts (names or literals) are followed.
-        assert!(idp_redirect_verdict(&u("http://other.example.org/b"), &origin, false).is_ok());
+        // HTTPS-to-HTTP downgrades are refused; HTTPS public hops are followed.
+        assert!(idp_redirect_verdict(&u("http://other.example.org/b"), &origin, false).is_err());
         assert!(idp_redirect_verdict(&u("https://8.8.8.8/b"), &origin, false).is_ok());
+        let development_origin = [u("http://idp.example.com/a")];
+        assert!(
+            idp_redirect_verdict(&u("http://other.example.org/b"), &development_origin, false)
+                .is_ok()
+        );
         // Non-public literals are refused (the resolver never sees them).
         for hop in [
             "http://127.0.0.1/b",
@@ -1164,8 +1205,8 @@ mod tests {
         assert!(idp_redirect_verdict(&u("https://idp.example.com/b"), &nine, false).is_ok());
         let ten = vec![u("https://idp.example.com/a"); 10];
         assert!(idp_redirect_verdict(&u("https://idp.example.com/b"), &ten, false).is_err());
-        // Behind a proxy only same-host hops are followed.
-        assert!(idp_redirect_verdict(&u("http://idp.example.com/b"), &origin, true).is_ok());
+        // Behind a proxy only same-host hops are followed, and never downgraded.
+        assert!(idp_redirect_verdict(&u("http://idp.example.com/b"), &origin, true).is_err());
         assert!(idp_redirect_verdict(&u("https://other.example.org/b"), &origin, true).is_err());
     }
 
@@ -1175,7 +1216,7 @@ mod tests {
         let client = gated_client(IdpEgress::Proxied, idp_client_builder(&[], IdpEgress::Proxied));
         let url = "http://localhost:8500/v1/agent";
         assert_idp_unreachable(&client.check_idp_url(url).await.unwrap_err(), url);
-        client.check_idp_url("http://8.8.8.8/x").await.unwrap();
+        client.check_idp_url("https://8.8.8.8/x").await.unwrap();
     }
 
     /// The IdP gate lifts only under `allow_private_identity_providers` — the
@@ -1227,19 +1268,20 @@ mod tests {
 
     /// Direct mode end to end, without DNS: `idp.test` stands in for a public
     /// IdP host (a reqwest DNS override pins it to the loopback server).
-    /// Plain http works and public hops are followed; a hop to a non-public
-    /// literal, or to a name that resolves non-public, is refused; the body
-    /// is capped.
+    /// HTTPS and public hops are followed; a hop to a non-public literal, or
+    /// to a name that resolves non-public, is refused; the body is capped.
     #[tokio::test]
     async fn idp_direct_mode_follows_public_hops_only_and_caps_the_body() {
-        let port = start_loopback_http_idp().await;
+        let (base, root) = start_loopback_tls_json().await;
+        let port = base.parse::<url::Url>().unwrap().port().unwrap();
         let pinned = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let builder = idp_client_builder(&[], IdpEgress::Direct).resolve("idp.test", pinned);
+        let builder = idp_client_builder(std::slice::from_ref(&root), IdpEgress::Direct)
+            .resolve("idp.test", pinned);
         let client = gated_client(IdpEgress::Direct, builder);
-        let base = format!("http://idp.test:{port}");
+        let base = base.replace("127.0.0.1", "idp.test");
 
         assert_eq!(client.get_json(&format!("{base}/doc")).await.unwrap()["ok"], true);
-        let hop = format!("{base}/to?url=http://idp.test:{port}/doc");
+        let hop = format!("{base}/to?url={base}/doc");
         assert_eq!(client.get_json(&hop).await.unwrap()["ok"], true);
 
         for target in [

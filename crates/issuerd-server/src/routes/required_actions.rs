@@ -366,6 +366,14 @@ pub(crate) fn error_response(copy: &PageCopy, status: StatusCode, msg: &str) -> 
         .into_response()
 }
 
+pub(crate) fn required_action_operational_error(copy: &PageCopy) -> Response {
+    error_response(
+        copy,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &copy.msg("error.actionFailed", "The action could not be completed. Please try again."),
+    )
+}
+
 /// Encode `value` as a JavaScript string literal (including the surrounding
 /// quotes) safe for embedding in an inline `<script>`: `"` and `\` are
 /// escaped, `<`/`>` become unicode escapes so the payload can never close the
@@ -806,7 +814,8 @@ fn render_action_page(
                  </form>"
             )
         }
-        // Unknown actions are skipped before rendering; this is unreachable.
+        // Registered custom actions without a dedicated form fail closed on
+        // this unsupported-action page; unregistered ids never reach rendering.
         other => format!(
             "<h1>{}</h1><p>{}</p>",
             copy.msg("action.unsupported.heading", "Unsupported action"),
@@ -1057,12 +1066,24 @@ async fn required_action_page_inner(
     let copy =
         PageCopy::for_realm(&state, &realm, entry.pending.locale.as_deref(), accept_language);
 
-    // Work through the remaining list: completed/unknown actions are dropped
-    // until a renderable action is found or the login can finish.
+    // Work through the remaining list until a renderable action is found or
+    // the login can finish. Only a verified email may be dropped here;
+    // unresolved actions are operational failures, not skippable steps.
     loop {
         let Some(action) = entry.remaining_actions.first().cloned() else {
             return finish_continuation(&state, &realm_id, &entry, &copy).await;
         };
+        match state.plugin_registry.get_required_action(&action).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(realm = %realm_id, action = %action, "required action is not registered");
+                return required_action_operational_error(&copy);
+            }
+            Err(e) => {
+                error!(realm = %realm_id, action = %action, error = %e, "required action registry lookup failed");
+                return required_action_operational_error(&copy);
+            }
+        }
         match action.as_str() {
             "VERIFY_EMAIL" => {
                 let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
@@ -1203,12 +1224,17 @@ async fn required_action_page_inner(
                     error.as_deref(),
                 );
             }
-            other => {
-                // Unknown action ids: never block the login on a page this
-                // server cannot render.
-                warn!(action = other, "skipping unsupported required action");
-                entry.remaining_actions.remove(0);
+            _ => {
+                let error = entry.error.take();
                 store_entry(&state, &realm_id, &execution, &entry).await;
+                return render_action_page(
+                    &copy,
+                    &realm_name,
+                    &execution,
+                    &action,
+                    error.as_deref(),
+                    None,
+                );
             }
         }
     }
@@ -1331,11 +1357,15 @@ pub async fn required_action_submit(
     };
     let action_impl = match state.plugin_registry.get_required_action(&action).await {
         Ok(Some(a)) => a,
-        _ => {
-            warn!(action = %action, "required action not registered; skipping");
-            entry.remaining_actions.remove(0);
+        Ok(None) => {
+            error!(realm = %realm_id, action = %action, "required action is not registered");
             store_entry(&state, &realm_id, &execution, &entry).await;
-            return redirect_back();
+            return required_action_operational_error(&copy);
+        }
+        Err(e) => {
+            error!(realm = %realm_id, action = %action, error = %e, "required action registry lookup failed");
+            store_entry(&state, &realm_id, &execution, &entry).await;
+            return required_action_operational_error(&copy);
         }
     };
 
@@ -2292,6 +2322,83 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(body_string(resp).await.contains("expired"));
+    }
+
+    async fn unknown_action_continuation() -> (Arc<ServerState>, RealmId, User, String, String) {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "unknown-action", &["UNREGISTERED_CUSTOM_ACTION"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["UNREGISTERED_CUSTOM_ACTION"]),
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let execution = execution_from_location(&resp);
+        let cookie_name = flow_cookie_name_of(&resp);
+        (state, realm_id, user, execution, cookie_name)
+    }
+
+    async fn assert_unknown_action_is_terminal(
+        resp: Response,
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        user_id: &UserId,
+        execution: &str,
+    ) {
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(LOCATION).is_none());
+        let body = body_string(resp).await;
+        assert!(body.contains("The action could not be completed"));
+        assert!(!body.contains("UNREGISTERED_CUSTOM_ACTION"));
+
+        let entry = stored_actions_entry(state, realm_id, execution).await;
+        assert_eq!(entry.remaining_actions, vec!["UNREGISTERED_CUSTOM_ACTION"]);
+        let user = state.storage.get_user(realm_id, user_id).await.unwrap().unwrap();
+        assert_eq!(user.required_actions, vec!["UNREGISTERED_CUSTOM_ACTION"]);
+        let sessions = state
+            .storage
+            .list_sessions(realm_id, Some(user_id.clone()), &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert!(sessions.is_empty(), "unknown action must not create a session");
+        let codes = state.cache.scan_keys("auth_code:master:*").await.unwrap();
+        assert!(codes.is_empty(), "unknown action must not create an authorization code");
+    }
+
+    #[tokio::test]
+    async fn get_unknown_action_is_terminal_and_preserves_entry() {
+        let (state, realm_id, user, execution, _cookie) = unknown_action_continuation().await;
+
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_unknown_action_is_terminal(resp, &state, &realm_id, &user.id, &execution).await;
+    }
+
+    #[tokio::test]
+    async fn post_unknown_action_is_terminal_and_restores_entry() {
+        let (state, realm_id, user, execution, cookie_name) = unknown_action_continuation().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, format!("{cookie_name}=1").parse().unwrap());
+
+        let resp = required_action_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            headers,
+            Bytes::from(""),
+        )
+        .await;
+
+        assert_unknown_action_is_terminal(resp, &state, &realm_id, &user.id, &execution).await;
     }
 
     #[tokio::test]
