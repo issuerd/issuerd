@@ -417,6 +417,7 @@ async fn handle_spnego_with_count(
 
                 let code = issuerd_core::utils::generate_id();
                 let code_data = super::oidc::AuthCodeData {
+                    realm_id: realm_id.0.clone(),
                     user_id: user.id.0.clone(),
                     client_id: client.client_id.to_string(),
                     redirect_uri: redirect_uri_str.clone(),

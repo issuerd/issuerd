@@ -2208,6 +2208,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_me_rejects_client_token_with_user_id_collision() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.id = issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap();
+        client.client_id = ClientIdentifier::new("admin").unwrap();
+        client.public_client = false;
+        client.secret = Some("collision-secret".to_string());
+        client.service_accounts_enabled = false;
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+
+        let response = crate::routes::oidc::token_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            "grant_type=client_credentials&client_id=admin&client_secret=collision-secret&scope=openid"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = body_json(response).await["access_token"].as_str().unwrap().to_string();
+
+        let response = account_me_with_token(&state, &token).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn account_me_rejects_dpop_bound_token_presented_as_bearer() {
         let state = test_state().await;
         let realm_id = RealmId::new("master").unwrap();

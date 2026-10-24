@@ -429,6 +429,8 @@ pub struct PendingAuthData {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuthCodeData {
+    #[serde(default)]
+    pub realm_id: String,
     pub user_id: String,
     pub client_id: String,
     pub redirect_uri: String,
@@ -461,6 +463,7 @@ impl AuthCodeData {
         auth_time: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
+            realm_id: pending.realm_id.clone(),
             user_id: user_id.0.clone(),
             client_id: pending.client_id.clone(),
             redirect_uri: pending.redirect_uri.clone(),
@@ -479,7 +482,12 @@ impl AuthCodeData {
     }
 }
 
-/// Persist an authorization code for the token endpoint (`auth_code:{code}`).
+fn auth_code_cache_key(realm_id: &str, code: &str) -> String {
+    format!("auth_code:{realm_id}:{code}")
+}
+
+/// Persist an authorization code for the token endpoint under its realm-scoped
+/// `auth_code:{realm}:{code}` key.
 ///
 /// `ttl` is the code's redemption window — callers pass
 /// [`crate::config::OAuthConfig::auth_code_ttl`] (`[oauth]
@@ -494,9 +502,11 @@ pub(crate) async fn store_auth_code(
     data: &AuthCodeData,
     ttl: std::time::Duration,
 ) -> Result<(), IssuerdError> {
+    RealmId::new(&data.realm_id)
+        .map_err(|_| IssuerdError::InvalidRequest("authorization code realm is invalid".into()))?;
     // Serialization cannot fail: every field is a plain String/Option/Vec.
     let value = serde_json::to_vec(data).unwrap();
-    cache.set(&format!("auth_code:{code}"), value, Some(ttl)).await
+    cache.set(&auth_code_cache_key(&data.realm_id, code), value, Some(ttl)).await
 }
 
 /// Fail-closed surface for a failed [`store_auth_code`] write on the
@@ -3353,7 +3363,7 @@ async fn token_handler_inner(
     let response = match token_req.grant_type {
         GrantType::AuthorizationCode => {
             let code = token_req.code.as_deref().unwrap_or("");
-            let cache_key = format!("auth_code:{code}");
+            let cache_key = auth_code_cache_key(&realm_id.0, code);
             // Atomic consume: an authorization code is single-use, so any
             // exchange attempt — successful or not — burns it.
             let code_data: Option<AuthCodeData> = match state.cache.get_and_delete(&cache_key).await
@@ -3427,6 +3437,15 @@ async fn token_handler_inner(
                         .into_response();
                 }
             };
+
+            if code_data.realm_id != realm_id.0 {
+                warn!(realm = %realm_id, client_id = %client.client_id, "authorization code presented in wrong realm");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
 
             // RFC 6749 §4.1.3 / OIDC Core 3.1.3.3: the code must have been
             // issued to the client that is redeeming it.
@@ -5467,7 +5486,10 @@ pub(crate) async fn session_invalidated(
 
 /// Recognize session-less client-credentials tokens by shape: `sub` equals
 /// the requesting client's own `client_id` (legacy synthetic shape), or the
-/// id of the client-linked service-account user.
+/// id of the client-linked service-account user. An identifier collision with
+/// a stored user is never treated as session-less: it may be a real user token
+/// whose session was revoked, and resolving that ambiguity as a client token
+/// would let a synthetic token impersonate the user.
 async fn is_sessionless_client_token(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
@@ -5475,7 +5497,14 @@ async fn is_sessionless_client_token(
 ) -> bool {
     let client_name = claims.azp.clone().unwrap_or_else(|| claims.aud.as_str().to_string());
     if claims.sub.as_ref() == client_name {
-        return true;
+        return match state.storage.get_user(realm_id, &claims.sub).await {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(e) => {
+                warn!(realm = %realm_id, error = %e, "failed to resolve client-token subject; failing closed");
+                false
+            }
+        };
     }
     let Ok(identifier) = ClientIdentifier::new(&client_name) else {
         return false;
@@ -8384,6 +8413,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -8402,7 +8432,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -8425,11 +8455,127 @@ mod tests {
         assert!(json["access_token"].as_str().unwrap().len() > 10);
     }
 
+    async fn seed_matching_realm_identities(state: &Arc<ServerState>) -> issuerd_core::Realm {
+        let master_id = RealmId::new("master").unwrap();
+        let realm = issuerd_core::Realm {
+            id: RealmId::new("other-realm-id").unwrap(),
+            name: issuerd_core::RealmName::new("other").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+
+        let mut user = state
+            .storage
+            .get_user(&master_id, &issuerd_core::UserId::new("admin").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        user.realm_id = realm.id.clone();
+        state.storage.create_user(&realm.id, &user).await.unwrap();
+
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&master_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.id = issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap();
+        client.realm_id = realm.id.clone();
+        state.storage.create_client(&realm.id, &client).await.unwrap();
+        realm
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_is_bound_to_issuing_realm() {
+        let state = setup_state().await;
+        let other = seed_matching_realm_identities(&state).await;
+        let code = issuerd_core::utils::generate_id();
+        let mut code_data = sample_auth_code_data();
+        code_data.user_id = "admin".to_string();
+        code_data.client_id = "admin-cli".to_string();
+        store_auth_code(&state.cache, &code, &code_data, std::time::Duration::from_secs(600))
+            .await
+            .unwrap();
+
+        let body = format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli"
+        );
+        let response = token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some(other.name.to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(response).await["error"], "invalid_grant");
+
+        let embedded_mismatch = issuerd_core::utils::generate_id();
+        state
+            .cache
+            .set(
+                &auth_code_cache_key(&other.id.0, &embedded_mismatch),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        let body = format!(
+            "grant_type=authorization_code&code={embedded_mismatch}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli"
+        );
+        let response = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some(other.name.to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(response).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn token_auth_code_without_realm_binding_is_rejected() {
+        let state = setup_state().await;
+        let code = issuerd_core::utils::generate_id();
+        let mut code_data = sample_auth_code_data();
+        code_data.user_id = "admin".to_string();
+        code_data.client_id = "admin-cli".to_string();
+        let mut legacy = serde_json::to_value(code_data).unwrap();
+        legacy.as_object_mut().unwrap().remove("realm_id");
+        state
+            .cache
+            .set(
+                &auth_code_cache_key("master", &code),
+                serde_json::to_vec(&legacy).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let body = format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://localhost:8080/cb&client_id=admin-cli"
+        );
+        let response = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(response).await["error"], "invalid_grant");
+    }
+
     /// Redeem an authorization code carrying the given scope list and return
     /// the token-endpoint response.
     async fn redeem_auth_code_with_scope(state: &Arc<ServerState>, scope: &[&str]) -> Response {
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -8448,7 +8594,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -8509,6 +8655,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -8527,7 +8674,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -8584,6 +8731,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -8602,7 +8750,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -8630,6 +8778,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -8648,7 +8797,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -9552,6 +9701,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "nonexistent-user".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -9570,7 +9720,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -10955,6 +11105,7 @@ mod tests {
 
     fn sample_auth_code_data() -> AuthCodeData {
         AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "user-1".to_string(),
             client_id: "client-1".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -10988,7 +11139,7 @@ mod tests {
         let cache = Arc::new(issuerd_cluster::InMemoryCache::new());
         let as_dyn: Arc<dyn issuerd_core::DistributedCache> = cache.clone();
         store_auth_code(&as_dyn, "code-2", &data, ttl).await.unwrap();
-        let stored = issuerd_core::DistributedCache::get(cache.as_ref(), "auth_code:code-2")
+        let stored = issuerd_core::DistributedCache::get(cache.as_ref(), "auth_code:master:code-2")
             .await
             .unwrap();
         assert!(stored.is_some(), "persisted code must be readable");
@@ -12303,6 +12454,7 @@ mod tests {
             "phone_number": null, "phone_number_verified": null, "address": null
         }});
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "claimsuser".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -12321,7 +12473,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -12453,6 +12605,7 @@ mod tests {
             let code = issuerd_core::utils::generate_id();
             let claims_json = serde_json::json!({"userinfo": {"name": null}});
             let code_data = AuthCodeData {
+                realm_id: "master".to_string(),
                 user_id: user_id.to_string(),
                 client_id: "admin-cli".to_string(),
                 redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -12471,7 +12624,7 @@ mod tests {
             state
                 .cache
                 .set(
-                    &format!("auth_code:{code}"),
+                    &auth_code_cache_key("master", &code),
                     serde_json::to_vec(&code_data).unwrap(),
                     Some(std::time::Duration::from_secs(600)),
                 )
@@ -12695,6 +12848,7 @@ mod tests {
         let code = issuerd_core::utils::generate_id();
         let verifier = "a".repeat(43);
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -12713,7 +12867,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -12746,6 +12900,7 @@ mod tests {
         // A challenge with NO method: RFC 7636 §4.3 defaults it to plain, so
         // it is rejected exactly like an explicit plain method.
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -12764,7 +12919,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -12792,6 +12947,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -12810,7 +12966,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -13354,6 +13510,7 @@ mod tests {
         let state = setup_state().await;
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -13372,7 +13529,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
@@ -14007,6 +14164,14 @@ mod tests {
         let sid = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
         let claims = access_claims("admin-cli", Some(sid), "admin-cli");
         assert!(!session_invalidated(&state, &claims).await);
+    }
+
+    #[tokio::test]
+    async fn session_invalidated_user_client_id_collision_is_not_sessionless() {
+        let state = setup_state().await;
+        let sid = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let claims = access_claims("admin", Some(sid), "admin");
+        assert!(session_invalidated(&state, &claims).await);
     }
 
     #[tokio::test]
@@ -16399,6 +16564,7 @@ mod tests {
     async fn redeem_code_for_session(state: &Arc<ServerState>, session_id: &SessionId) -> Response {
         let code = issuerd_core::utils::generate_id();
         let code_data = AuthCodeData {
+            realm_id: "master".to_string(),
             user_id: "admin".to_string(),
             client_id: "admin-cli".to_string(),
             redirect_uri: "http://localhost:8080/cb".to_string(),
@@ -16417,7 +16583,7 @@ mod tests {
         state
             .cache
             .set(
-                &format!("auth_code:{code}"),
+                &auth_code_cache_key("master", &code),
                 serde_json::to_vec(&code_data).unwrap(),
                 Some(std::time::Duration::from_secs(600)),
             )
