@@ -129,7 +129,7 @@ ring = "0.17"
 # standard targets — cmake is only a fallback for exotic/FIPS builds).
 # default-features = false drops `use_pem` — no PEM parsing entry points are
 # used.
-jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 # Feature-only pin (same major line jsonwebtoken requires): issuerd-token
 # enables `prebuilt-nasm` so Windows x86_64 builds use aws-lc-sys' shipped
 # pre-assembled .obj files — no NASM install needed.
