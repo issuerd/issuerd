@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use issuerd_core::{
-    AuthContext, AuthStepResult, Challenge, DistributedCache, IssuerdError, Realm, RealmId,
-    Storage, User, UserId,
+    AuthContext, AuthStepResult, Challenge, DistributedCache, IssuerdError, Pagination, Realm,
+    RealmId, Storage, User, UserId,
 };
 use ring::rand::SecureRandom;
 use subtle::ConstantTimeEq;
@@ -287,8 +287,20 @@ impl EmailCodeAuthenticator {
         realm_id: &RealmId,
         login: &str,
     ) -> Result<Option<User>, IssuerdError> {
-        if let Some(user) = self.storage.get_user_by_email(realm_id, login).await? {
-            return Ok(Some(user));
+        let candidates = self
+            .storage
+            .list_users(realm_id, login, &Pagination { first: 0, max: 2 })
+            .await?;
+        let mut matches = candidates
+            .into_iter()
+            .filter(|user| user.email.as_ref().is_some_and(|email| email.as_str() == login));
+        let first = matches.next();
+        if first.is_some() && matches.next().is_some() {
+            debug!("email-code login identifier is ambiguous; not sending a code");
+            return Ok(None);
+        }
+        if first.is_some() {
+            return Ok(first);
         }
         self.storage.get_user_by_username(realm_id, login).await
     }
@@ -853,6 +865,21 @@ mod tests {
         let result = f.authenticator.authenticate(&mut ctx).await;
         assert_otp_challenge(result);
         assert!(ctx.user_id.is_none());
+        assert!(f.mailer.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_email_is_rejected_without_binding_or_sending() {
+        let f = fixture().await;
+        let first = test_user("u-shared-1", "alice", Some("shared@example.com"));
+        let second = test_user("u-shared-2", "admin", Some("shared@example.com"));
+        f.storage.create_user(&first.realm_id, &first).await.unwrap();
+        f.storage.create_user(&second.realm_id, &second).await.unwrap();
+
+        let mut ctx = with_param(context(), "username", "shared@example.com");
+        let result = f.authenticator.authenticate(&mut ctx).await;
+        assert_otp_challenge(result);
+        assert!(ctx.user_id.is_none(), "an ambiguous email must not select an account");
         assert!(f.mailer.sent().is_empty());
     }
 
