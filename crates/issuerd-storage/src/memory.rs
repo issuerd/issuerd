@@ -662,6 +662,32 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    async fn consume_totp_step(
+        &self,
+        realm: &RealmId,
+        user: &UserId,
+        credential_id: &CredentialId,
+        matched_step: u64,
+    ) -> Result<bool, IssuerdError> {
+        let type_key = serde_json::to_string(&CredentialType::Totp).unwrap_or_default();
+        let key = (realm.clone(), user.clone(), type_key);
+        let Some(mut list) = self.credentials.get_mut(&key) else {
+            return Ok(false);
+        };
+        let Some(credential) = list.iter_mut().find(|credential| {
+            &credential.id == credential_id && credential.credential_type == CredentialType::Totp
+        }) else {
+            return Ok(false);
+        };
+        let last_used_step =
+            credential.credential_data.get("last_used_step").and_then(|step| step.as_u64());
+        if last_used_step.is_some_and(|step| step >= matched_step) {
+            return Ok(false);
+        }
+        credential.credential_data["last_used_step"] = serde_json::json!(matched_step);
+        Ok(true)
+    }
+
     async fn delete_credential(
         &self,
         realm: &RealmId,
@@ -2082,6 +2108,93 @@ mod tests {
             .await
             .unwrap();
         assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consume_totp_step_enforces_monotonic_watermark() {
+        let storage = InMemoryStorage::new();
+        let realm = test_realm();
+        let user = test_user("realm-1");
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let password = test_credential();
+        let mut totp = test_credential();
+        totp.id = CredentialId::new("cred-totp").unwrap();
+        totp.credential_type = CredentialType::Totp;
+        totp.credential_data = serde_json::json!({
+            "algorithm": "HmacSHA1",
+            "digits": 6,
+            "period": 30
+        });
+        storage.create_credential(&realm.id, &user.id, &password).await.unwrap();
+        storage.create_credential(&realm.id, &user.id, &totp).await.unwrap();
+
+        let missing = CredentialId::new("missing").unwrap();
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &missing, 41).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &password.id, 41).await.unwrap());
+        assert!(storage.consume_totp_step(&realm.id, &user.id, &totp.id, 41).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 41).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 40).await.unwrap());
+        assert!(storage.consume_totp_step(&realm.id, &user.id, &totp.id, 42).await.unwrap());
+
+        let mut expected = totp.clone();
+        expected.credential_data["last_used_step"] = serde_json::json!(42);
+        let stored = storage
+            .get_credentials(&realm.id, &user.id, CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(stored, vec![expected]);
+        let stored_password = storage
+            .get_credentials(&realm.id, &user.id, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(stored_password, vec![password]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn consume_totp_step_concurrent_same_step_has_one_winner() {
+        const BURST: usize = 128;
+
+        let storage = std::sync::Arc::new(InMemoryStorage::new());
+        let realm = test_realm();
+        let user = test_user("realm-1");
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let mut totp = test_credential();
+        totp.credential_type = CredentialType::Totp;
+        totp.credential_data = serde_json::json!({"last_used_step": 40});
+        storage.create_credential(&realm.id, &user.id, &totp).await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let realm_id = realm.id.clone();
+            let user_id = user.id.clone();
+            let credential_id = totp.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .consume_totp_step(&realm_id, &user_id, &credential_id, 41)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
+        let stored = storage
+            .get_credentials(&realm.id, &user.id, CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(stored[0].credential_data["last_used_step"], serde_json::json!(41));
     }
 
     // ------------------------------------------------------------------

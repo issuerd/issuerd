@@ -386,6 +386,20 @@ impl Storage for JsonFileStorage {
         self.persist()
     }
 
+    async fn consume_totp_step(
+        &self,
+        realm: &RealmId,
+        user: &UserId,
+        credential_id: &CredentialId,
+        matched_step: u64,
+    ) -> Result<bool, IssuerdError> {
+        if self.inner.consume_totp_step(realm, user, credential_id, matched_step).await? {
+            self.persist()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     async fn delete_credential(
         &self,
         realm: &RealmId,
@@ -1863,6 +1877,75 @@ mod tests {
             credential_data: serde_json::json!({"id": id}),
             priority,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn json_consume_totp_step_persists_only_successful_atomic_updates() {
+        const BURST: usize = 64;
+
+        let path = unique_test_path("json-consume-totp");
+        let storage = std::sync::Arc::new(JsonFileStorage::new(&path).unwrap());
+        let realm = test_realm();
+        let user = test_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let password = sample_credential("cred-password", CredentialType::Password, 1);
+        let mut totp = sample_credential("cred-totp", CredentialType::Totp, 2);
+        totp.credential_data = serde_json::json!({
+            "algorithm": "HmacSHA1",
+            "digits": 6,
+            "last_used_step": 40
+        });
+        storage.create_credential(&realm.id, &user.id, &password).await.unwrap();
+        storage.create_credential(&realm.id, &user.id, &totp).await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let realm_id = realm.id.clone();
+            let user_id = user.id.clone();
+            let credential_id = totp.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .consume_totp_step(&realm_id, &user_id, &credential_id, 41)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
+
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 41).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 40).await.unwrap());
+        assert!(storage.consume_totp_step(&realm.id, &user.id, &totp.id, 42).await.unwrap());
+
+        let persisted_before_rejections = std::fs::read(&path).unwrap();
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 42).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &password.id, 43).await.unwrap());
+        let missing = CredentialId::new("missing").unwrap();
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &missing, 43).await.unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), persisted_before_rejections);
+
+        let inner_credentials = storage.list_credentials(&realm.id, &user.id).await.unwrap();
+        let mut expected_totp = totp.clone();
+        expected_totp.credential_data["last_used_step"] = serde_json::json!(42);
+        assert!(inner_credentials.contains(&expected_totp));
+        assert!(inner_credentials.contains(&password));
+
+        let reloaded = JsonFileStorage::new(&path).unwrap();
+        let persisted_credentials = reloaded.list_credentials(&realm.id, &user.id).await.unwrap();
+        assert_eq!(persisted_credentials, inner_credentials);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     fn sample_session(id: &str, realm_id: &RealmId, user_id: &UserId) -> UserSession {
