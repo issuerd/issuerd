@@ -108,18 +108,16 @@ fn rp_name(realm: &Realm) -> &str {
 /// Contract (mirrors the OTP stage):
 ///
 /// - No user in context, the `second_factor_ok` attribute set (OTP already
-///   satisfied this login), a missing realm, or no WebAuthn credentials →
-///   `Attempted` (pass-through; the stage is gated by the
-///   conditional-user-configured condition).
+///   satisfied this login), or no WebAuthn credentials → `Attempted`
+///   (pass-through; the stage is gated by the conditional-user-configured
+///   condition).
 /// - No `webauthn_assertion` parameter → fresh authentication options are
 ///   generated, the ceremony state is cached, and a
 ///   [`Challenge::WebAuthn`] carrying the options JSON is returned.
 /// - A `webauthn_assertion` parameter → the cached ceremony state is consumed
 ///   and the assertion verified. On success the credential counters are
-///   persisted and the stage succeeds. A bad/expired/missing state or an
-///   invalid assertion is NEVER a `Failure` — conditional-stage failures are
-///   swallowed by the executor, which would bypass the second factor — the
-///   stage re-challenges with fresh options instead.
+///   persisted and the stage succeeds. Bad/expired/missing state and invalid
+///   assertions re-challenge; operational failures are terminal.
 pub struct WebAuthnAuthenticator {
     storage: Arc<dyn Storage>,
     cache: Arc<dyn DistributedCache>,
@@ -154,7 +152,8 @@ impl WebAuthnAuthenticator {
             .storage
             .get_credentials(realm_id, user_id, CredentialType::WebAuthn)
             .await?;
-        let mut out = Vec::with_capacity(creds.len());
+        let credential_count = creds.len();
+        let mut out = Vec::with_capacity(credential_count);
         for cred in creds {
             match passkey_from_bytes(&cred.secret_data) {
                 Ok(passkey) => out.push((cred, passkey)),
@@ -162,6 +161,11 @@ impl WebAuthnAuthenticator {
                     warn!(realm = %realm_id, user = %user_id, error = %e, "skipping corrupt passkey credential")
                 }
             }
+        }
+        if out.is_empty() && credential_count > 0 {
+            return Err(IssuerdError::ServerError(
+                "no usable passkeys in stored WebAuthn credentials".to_string(),
+            ));
         }
         Ok(out)
     }
@@ -219,8 +223,8 @@ impl WebAuthnAuthenticator {
         })
     }
 
-    /// Verify a submitted assertion against the cached ceremony state. Any
-    /// failure re-challenges with fresh options (never `Failure`).
+    /// Verify a submitted assertion against the cached ceremony state.
+    /// Expected assertion failures re-challenge; operational failures are terminal.
     async fn verify_assertion(
         &self,
         realm: &Realm,
@@ -233,22 +237,29 @@ impl WebAuthnAuthenticator {
         // verifies, so a rejected assertion cannot be replayed.
         let state_bytes = match self.cache.get_and_delete(&key).await {
             Ok(Some(b)) => b,
-            _ => {
+            Ok(None) => {
                 warn!(realm = %realm.id, user = %user_id, "webauthn ceremony state missing or expired");
                 return self.challenge(realm, user_id, stored).await;
             }
-        };
-        let parsed =
-            (|| -> Result<(PublicKeyCredential, PasskeyAuthentication), serde_json::Error> {
-                let credential: PublicKeyCredential = serde_json::from_str(assertion_json)?;
-                let ceremony: PasskeyAuthentication = serde_json::from_slice(&state_bytes)?;
-                Ok((credential, ceremony))
-            })();
-        let (credential, ceremony) = match parsed {
-            Ok(v) => v,
             Err(e) => {
-                warn!(realm = %realm.id, user = %user_id, error = %e, "unparsable webauthn assertion or state");
+                warn!(realm = %realm.id, user = %user_id, error = %e, "webauthn ceremony state read failed");
+                return AuthStepResult::Failure(e);
+            }
+        };
+        let credential: PublicKeyCredential = match serde_json::from_str(assertion_json) {
+            Ok(credential) => credential,
+            Err(e) => {
+                warn!(realm = %realm.id, user = %user_id, error = %e, "unparsable webauthn assertion");
                 return self.challenge(realm, user_id, stored).await;
+            }
+        };
+        let ceremony: PasskeyAuthentication = match serde_json::from_slice(&state_bytes) {
+            Ok(ceremony) => ceremony,
+            Err(e) => {
+                warn!(realm = %realm.id, user = %user_id, error = %e, "unparsable cached webauthn ceremony state");
+                return AuthStepResult::Failure(IssuerdError::ServerError(format!(
+                    "invalid cached WebAuthn ceremony state: {e}"
+                )));
             }
         };
         let webauthn = match build_webauthn(&self.rp_id, &self.rp_origin, rp_name(realm)) {
@@ -334,13 +345,13 @@ impl issuerd_core::Authenticator for WebAuthnAuthenticator {
             return AuthStepResult::Attempted;
         }
 
-        // A missing realm degrades to pass-through instead of failing: at a
-        // Conditional flow stage the executor swallows failures
-        // (skip_conditional_scope), so a Failure here would let the login
-        // succeed WITHOUT a second factor.
         let realm = match self.storage.get_realm(&context.realm_id).await {
             Ok(Some(realm)) => realm,
-            Ok(None) => return AuthStepResult::Attempted,
+            Ok(None) => {
+                return AuthStepResult::Failure(IssuerdError::ServerError(
+                    "realm not found during WebAuthn authentication".to_string(),
+                ))
+            }
             Err(e) => return AuthStepResult::Failure(e),
         };
 
@@ -591,6 +602,44 @@ mod tests {
         )
     }
 
+    struct UnreadableCache;
+
+    #[async_trait::async_trait]
+    impl DistributedCache for UnreadableCache {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            Err(IssuerdError::ServerError("cache down".into()))
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected: Option<Vec<u8>>,
+            _new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            Ok(true)
+        }
+        async fn publish(&self, _channel: &str, _message: Vec<u8>) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+        async fn subscribe(
+            &self,
+            _channel: &str,
+            _handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            Ok(())
+        }
+    }
+
     fn assert_challenge_options(result: AuthStepResult) -> serde_json::Value {
         match result {
             AuthStepResult::Challenge(Challenge::WebAuthn { challenge, .. }) => {
@@ -666,7 +715,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_realm_is_attempted() {
+    async fn only_corrupt_credentials_is_operational_failure() {
+        let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        storage.create_realm(&test_realm()).await.unwrap();
+        let user = UserId::new("alice").unwrap();
+        let cred = Credential {
+            id: CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"not a passkey".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        storage.create_credential(&test_realm().id, &user, &cred).await.unwrap();
+        let auth = authenticator(storage);
+        let mut ctx = test_context(Some("alice"));
+        assert!(matches!(
+            auth.authenticate(&mut ctx).await,
+            AuthStepResult::Failure(IssuerdError::ServerError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_realm_is_operational_failure() {
         // Storage has a credential but no realm row.
         let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
         let user = UserId::new("alice").unwrap();
@@ -683,7 +755,10 @@ mod tests {
         storage.create_credential(&test_realm().id, &user, &cred).await.unwrap();
         let auth = authenticator(storage);
         let mut ctx = test_context(Some("alice"));
-        assert!(matches!(auth.authenticate(&mut ctx).await, AuthStepResult::Attempted));
+        assert!(matches!(
+            auth.authenticate(&mut ctx).await,
+            AuthStepResult::Failure(IssuerdError::ServerError(_))
+        ));
     }
 
     #[tokio::test]
@@ -714,6 +789,25 @@ mod tests {
             .insert("webauthn_assertion".to_string(), vec!["not json".to_string()]);
         // No ceremony state cached → fresh options, never a Failure.
         assert_challenge_options(auth.authenticate(&mut ctx).await);
+    }
+
+    #[tokio::test]
+    async fn ceremony_cache_read_failure_is_operational_failure() {
+        let user = UserId::new("alice").unwrap();
+        let (_key, passkey) = register_soft_key(&user);
+        let auth = WebAuthnAuthenticator::new(
+            storage_with_passkey(&user, &passkey).await,
+            Arc::new(UnreadableCache),
+            RP_ID.to_string(),
+            rp_origin(),
+        );
+        let mut ctx = test_context(Some("alice"));
+        ctx.parameters
+            .insert("webauthn_assertion".to_string(), vec!["not json".to_string()]);
+        assert!(matches!(
+            auth.authenticate(&mut ctx).await,
+            AuthStepResult::Failure(IssuerdError::ServerError(_))
+        ));
     }
 
     #[tokio::test]

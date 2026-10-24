@@ -19,10 +19,8 @@
 //!   `context.user_id`, so the endpoint does not leak account existence.
 //! - `otp` present → verify the submitted code against the cache entry.
 //!   Codes are single-use and expire with the cache entry's TTL. A wrong
-//!   code is NEVER a `Failure` — the stage re-challenges instead (same
-//!   reasoning as [`crate::built_in::OtpFormAuthenticator`]: at a
-//!   conditional stage the executor swallows failures, which would bypass
-//!   the factor).
+//!   code is NEVER a `Failure` — the stage re-challenges instead of returning
+//!   an expected user failure that Optional/Conditional stages may skip.
 //! - `resend=1`/`resend=true` → mint and send a fresh code for the already
 //!   bound user, subject to per-user and per-source send limits.
 //!

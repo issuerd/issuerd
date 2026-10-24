@@ -1058,7 +1058,16 @@ pub trait Authenticator: Send + Sync {
 pub trait RequiredAction: Send + Sync {
     fn id(&self) -> &str;
     fn display_name(&self) -> &str;
+    /// Legacy infallible evaluation. Callers that can propagate operational
+    /// failures should use [`RequiredAction::try_evaluate`].
     async fn evaluate(&self, context: &AuthContext) -> bool;
+    /// Evaluate whether this action is pending without hiding operational errors.
+    ///
+    /// The default preserves source compatibility for existing implementations
+    /// that only provide [`RequiredAction::evaluate`].
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        Ok(self.evaluate(context).await)
+    }
     async fn process(&self, context: &mut AuthContext) -> RequiredActionResult;
 }
 

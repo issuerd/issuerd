@@ -44,6 +44,19 @@ pub enum ExecutionStatus {
     Skipped,
 }
 
+fn is_operational_failure(error: &IssuerdError) -> bool {
+    matches!(
+        error,
+        IssuerdError::ServerError(_)
+            | IssuerdError::TemporarilyUnavailable
+            | IssuerdError::UnsupportedOperation
+            | IssuerdError::KeyEncryption(_)
+            | IssuerdError::NotFound
+            | IssuerdError::Conflict
+            | IssuerdError::InvalidRequest(_)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // FlowExecutor
 // ---------------------------------------------------------------------------
@@ -121,6 +134,9 @@ impl FlowExecutor {
             StageOutcome::Challenge(c) => Ok(FlowOutcome::Challenge(c, execution_id.clone())),
             StageOutcome::Failure(e) => {
                 state.execution_status.insert(stage.id.clone(), ExecutionStatus::Failed);
+                if stage.requirement == Requirement::Optional && is_operational_failure(&e) {
+                    return Ok(FlowOutcome::Failure(e));
+                }
                 // Handle according to requirement
                 match stage.requirement {
                     Requirement::Required | Requirement::Alternative | Requirement::Conditional => {
@@ -223,6 +239,13 @@ impl FlowExecutor {
                             state
                                 .execution_status
                                 .insert(stage.id.clone(), ExecutionStatus::Failed);
+                            if matches!(
+                                req,
+                                ActiveRequirement::Optional | ActiveRequirement::Conditional
+                            ) && is_operational_failure(&e)
+                            {
+                                return Ok(FlowOutcome::Failure(e));
+                            }
                             match req {
                                 ActiveRequirement::Required | ActiveRequirement::Alternative => {
                                     return Ok(FlowOutcome::Failure(e));
@@ -342,7 +365,7 @@ impl FlowExecutor {
                     }
                     StageOutcome::Failure(e) => {
                         state.execution_status.insert(stage.id.clone(), ExecutionStatus::Failed);
-                        if req == ActiveRequirement::Required {
+                        if req == ActiveRequirement::Required || is_operational_failure(&e) {
                             return Ok(FlowOutcome::Failure(e));
                         }
                         if req == ActiveRequirement::Conditional {
@@ -426,7 +449,7 @@ impl FlowExecutor {
             AuthStepResult::Success => Ok(StageOutcome::Success),
             AuthStepResult::Failure(e) => {
                 let flow = state.flow_path.last().map(Alias::as_str).unwrap_or("?");
-                if matches!(e, IssuerdError::ServerError(_) | IssuerdError::UnsupportedOperation) {
+                if is_operational_failure(&e) {
                     warn!(
                         realm = %context.realm_id,
                         flow = %flow,
@@ -461,10 +484,13 @@ impl FlowExecutor {
 
         // Evaluate required actions
         for id in self.registry.list_required_action_ids() {
-            if let Some(action) = self.registry.get_required_action(&id).await? {
-                if action.evaluate(context).await {
-                    result.required_actions.push(id);
-                }
+            let action = self.registry.get_required_action(&id).await?.ok_or_else(|| {
+                IssuerdError::ServerError(format!(
+                    "required action listed but not registered: {id}"
+                ))
+            })?;
+            if action.try_evaluate(context).await? {
+                result.required_actions.push(id);
             }
         }
 
@@ -725,6 +751,28 @@ mod tests {
         assert_action_success(issuerd_core::RequiredActionResult::Failure(
             IssuerdError::AccessDenied,
         ));
+    }
+
+    #[test]
+    fn operational_failure_classification_preserves_user_failures() {
+        for error in [
+            IssuerdError::ServerError("storage down".into()),
+            IssuerdError::TemporarilyUnavailable,
+            IssuerdError::UnsupportedOperation,
+            IssuerdError::KeyEncryption("key failure".into()),
+            IssuerdError::NotFound,
+            IssuerdError::Conflict,
+            IssuerdError::InvalidRequest("bad configuration".into()),
+        ] {
+            assert!(is_operational_failure(&error), "{error:?}");
+        }
+        for error in [
+            IssuerdError::InvalidGrant,
+            IssuerdError::AccessDenied,
+            IssuerdError::InvalidToken,
+        ] {
+            assert!(!is_operational_failure(&error), "{error:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1215,6 +1263,57 @@ mod tests {
         let outcome = executor.execute(&config, &mut ctx).await.unwrap();
         let result = assert_success(outcome);
         assert_eq!(result.required_actions, vec!["terms"]);
+    }
+
+    #[tokio::test]
+    async fn required_action_try_evaluate_error_propagates() {
+        #[derive(Clone)]
+        struct FailingAction;
+
+        #[async_trait]
+        impl RequiredAction for FailingAction {
+            fn id(&self) -> &str {
+                "failing"
+            }
+            fn display_name(&self) -> &str {
+                "failing"
+            }
+            async fn evaluate(&self, _ctx: &AuthContext) -> bool {
+                false
+            }
+            async fn try_evaluate(&self, _ctx: &AuthContext) -> Result<bool, IssuerdError> {
+                Err(IssuerdError::ServerError("evaluation failed".into()))
+            }
+            async fn process(&self, _ctx: &mut AuthContext) -> issuerd_core::RequiredActionResult {
+                issuerd_core::RequiredActionResult::Success
+            }
+        }
+
+        let auth = TestAuthenticator::new("auth", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth"))
+            .returning(move |_| Ok(Some(Arc::new(auth.clone()))));
+        reg.expect_list_required_action_ids().return_const(vec!["failing".to_string()]);
+        reg.expect_get_required_action()
+            .with(mockall::predicate::eq("failing"))
+            .returning(|_| Ok(Some(Arc::new(FailingAction))));
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![stage("s1", Requirement::Required, "auth", 1)],
+        };
+        let mut ctx = test_auth_context();
+        let result = executor.execute(&config, &mut ctx).await;
+        assert!(matches!(result, Err(IssuerdError::ServerError(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -1945,6 +2044,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_webauthn_storage_failure_is_terminal() {
+        let password = TestAuthenticator::new("auth-password", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_realm()
+            .returning(|_| Err(IssuerdError::ServerError("storage down".into())));
+        let webauthn = Arc::new(crate::webauthn::WebAuthnAuthenticator::new(
+            Arc::new(storage),
+            Arc::new(issuerd_cluster::InMemoryCache::new()),
+            "localhost".to_string(),
+            url::Url::parse("http://localhost:8080").unwrap(),
+        ));
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-password"))
+            .returning(move |_| Ok(Some(Arc::new(password.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-webauthn"))
+            .returning(move |_| Ok(Some(webauthn.clone())));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                stage("password", Requirement::Required, "auth-password", 1),
+                stage("webauthn", Requirement::Optional, "auth-webauthn", 2),
+            ],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        assert_server_error(outcome);
+    }
+
+    #[tokio::test]
     async fn conditional_stage_failure_skips_scope() {
         let auth1 = TestAuthenticator::new("auth1", |_| {
             AuthStepResult::Failure(IssuerdError::InvalidGrant)
@@ -1973,6 +2115,46 @@ mod tests {
         // s1 fails conditional -> skip s2 -> no user_id -> AccessDenied
         let err = assert_failure(outcome);
         assert_eq!(err, IssuerdError::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn conditional_credential_read_failure_is_terminal() {
+        let password = TestAuthenticator::new("auth-password", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_credentials()
+            .returning(|_, _, _| Err(IssuerdError::ServerError("storage down".into())));
+        let condition = Arc::new(crate::built_in::ConditionalUserConfiguredAuthenticator::new(
+            Arc::new(storage),
+        ));
+
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("auth-password"))
+            .returning(move |_| Ok(Some(Arc::new(password.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("conditional-user-configured"))
+            .returning(move |_| Ok(Some(condition.clone())));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                stage("password", Requirement::Required, "auth-password", 1),
+                stage("condition", Requirement::Conditional, "conditional-user-configured", 2),
+            ],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        assert_server_error(outcome);
     }
 
     #[tokio::test]
@@ -2026,12 +2208,44 @@ mod tests {
         assert_invalid_request(outcome);
     }
 
+    #[tokio::test]
+    async fn unknown_optional_authenticator_fails_closed() {
+        let password = TestAuthenticator::new("password", |ctx| {
+            ctx.user_id = Some(UserId::new("alice").unwrap());
+            AuthStepResult::Success
+        });
+        let mut reg = MockPluginRegistry::new();
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("password"))
+            .returning(move |_| Ok(Some(Arc::new(password.clone()))));
+        reg.expect_get_authenticator()
+            .with(mockall::predicate::eq("missing"))
+            .returning(|_| Ok(None));
+        reg.expect_list_required_action_ids().return_const(vec![]);
+
+        let executor = FlowExecutor::new(Arc::new(reg), &[]);
+        let config = FlowConfig {
+            alias: Alias::new("browser").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            provider_id: "basic-flow".to_string(),
+            top_level: true,
+            built_in: true,
+            stages: vec![
+                stage("password", Requirement::Required, "password", 1),
+                stage("optional", Requirement::Optional, "missing", 2),
+            ],
+        };
+        let mut ctx = test_auth_context();
+        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
+        assert_invalid_request(outcome);
+    }
+
     // -----------------------------------------------------------------------
-    // finalize_outcome: required action None
+    // finalize_outcome: listed required action missing from the registry
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn finalize_required_action_none() {
+    async fn finalize_required_action_listed_but_missing_errors() {
         let auth = TestAuthenticator::new("auth", |ctx| {
             ctx.user_id = Some(UserId::new("alice").unwrap());
             AuthStepResult::Success
@@ -2056,8 +2270,8 @@ mod tests {
             stages: vec![stage("s1", Requirement::Required, "auth", 1)],
         };
         let mut ctx = test_auth_context();
-        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
-        assert_success(outcome);
+        let outcome = executor.execute(&config, &mut ctx).await;
+        assert!(matches!(outcome, Err(IssuerdError::ServerError(_))));
     }
 
     #[tokio::test]
@@ -2463,7 +2677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_outcome_action_not_found() {
+    async fn finalize_outcome_missing_action_does_not_succeed() {
         let auth = TestAuthenticator::new("auth", |ctx| {
             ctx.user_id = Some(UserId::new("alice").unwrap());
             AuthStepResult::Success
@@ -2488,9 +2702,8 @@ mod tests {
             stages: vec![stage("s1", Requirement::Required, "auth", 1)],
         };
         let mut ctx = test_auth_context();
-        let outcome = executor.execute(&config, &mut ctx).await.unwrap();
-        let result = assert_success(outcome);
-        assert!(result.required_actions.is_empty());
+        let outcome = executor.execute(&config, &mut ctx).await;
+        assert!(matches!(outcome, Err(IssuerdError::ServerError(_))));
     }
 
     #[tokio::test]
@@ -2508,6 +2721,7 @@ mod tests {
         assert_eq!(action.id(), "my-action");
         assert_eq!(action.display_name(), "my-action");
         assert!(action.evaluate(&test_auth_context()).await);
+        assert!(action.try_evaluate(&test_auth_context()).await.unwrap());
         assert_action_success(action.process(&mut test_auth_context()).await);
     }
 
