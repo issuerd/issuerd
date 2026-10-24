@@ -8,4 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The unoptimized verification model exceeds the CI runner's memory budget.
+# Optimize the model without disabling assertions, memory checks, or unwinding.
+export CARGO_PROFILE_DEV_OPT_LEVEL="${CARGO_PROFILE_DEV_OPT_LEVEL:-3}"
+
 exec cargo kani -p issuerd-protocol "$@"
