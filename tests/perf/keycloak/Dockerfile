@@ -20,8 +20,8 @@
 #
 # Build (from tests/perf/):
 #   docker compose -f docker-compose.perf.yml build keycloak
-# (needs the local keycloak/keycloak:26.7.4 base image; no network at runtime)
-FROM keycloak/keycloak:26.7.4@sha256:82a77884f3af238beab1e7afd63b5f530e1b5c0590bd7aa60b40a40463e29b2c AS builder
+# (needs the local keycloak/keycloak:26.8.1-0 base image; no network at runtime)
+FROM keycloak/keycloak:26.8.1-0@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244 AS builder
 
 ENV KC_DB=postgres \
     KC_HEALTH_ENABLED=true \
@@ -29,7 +29,7 @@ ENV KC_DB=postgres \
 
 RUN /opt/keycloak/bin/kc.sh build
 
-FROM keycloak/keycloak:26.7.4@sha256:82a77884f3af238beab1e7afd63b5f530e1b5c0590bd7aa60b40a40463e29b2c
+FROM keycloak/keycloak:26.8.1-0@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
 
 COPY --from=builder /opt/keycloak/ /opt/keycloak/
 
