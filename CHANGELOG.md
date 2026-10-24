@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **SPNEGO enforces PKCE instead of discarding malformed challenges.** Public clients must present a valid S256 challenge, and non-S256 or malformed values are rejected before session/code creation. This closes the previous `.ok().flatten()` path that could silently turn malformed PKCE into a code without a verifier.
 - **Password brute-force configuration and federated first import fail closed.** A realm lookup error can no longer silently disable lockout checks and failure recording. Invalid federated usernames now return an authentication error instead of panicking during first-login import, matching the per-record sync behavior.
 - **Back-channel logout and guarded fetches use SSRF-safe transport.** Back-channel callbacks now require HTTPS and publicly routable addresses, refuse redirects, and pin DNS validation to the exact addresses dialed, closing rebinding and internal-POST paths. Internal HTTPS callbacks require explicit `[outbound_http] allow_private_addresses = true`; private CAs use `extra_ca_bundle`. Delivery remains best-effort and API compatibility is preserved.
 - **Email-code login rechecks account enablement at verification.** Disabling an account after a code is issued now prevents that code from authenticating; storage errors fail closed and the existing uniform challenge behavior is preserved.

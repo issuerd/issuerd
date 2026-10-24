@@ -280,13 +280,50 @@ async fn handle_spnego_with_count(
                     )
                         .into_response();
                 }
-                // Public clients must bind the code with PKCE, same as /auth.
-                if client.public_client && !params.contains_key("code_challenge") {
+                let code_challenge = match params
+                    .get("code_challenge")
+                    .map(|s| issuerd_core::Base64Url::new(s.clone()))
+                    .transpose()
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "invalid code_challenge"
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                let code_challenge_method = match params
+                    .get("code_challenge_method")
+                    .map(|s| serde_json::from_value(serde_json::Value::String(s.clone())))
+                    .transpose()
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "invalid code_challenge_method"
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                if (client.public_client && code_challenge.is_none())
+                    || ((client.public_client || code_challenge.is_some())
+                        && code_challenge_method
+                            != Some(issuerd_core::PkceCodeChallengeMethod::S256))
+                {
                     return (
                         StatusCode::BAD_REQUEST,
                         axum::Json(serde_json::json!({
                             "error": "invalid_request",
-                            "error_description": "code_challenge required for public clients"
+                            "error_description": "code_challenge with S256 required for public clients"
                         })),
                     )
                         .into_response();
@@ -429,18 +466,8 @@ async fn handle_spnego_with_count(
                         .transpose()
                         .ok()
                         .flatten(),
-                    code_challenge: params
-                        .get("code_challenge")
-                        .map(|s| issuerd_core::Base64Url::new(s.clone()))
-                        .transpose()
-                        .ok()
-                        .flatten(),
-                    code_challenge_method: params
-                        .get("code_challenge_method")
-                        .map(|s| serde_json::from_value(serde_json::Value::String(s.clone())))
-                        .transpose()
-                        .ok()
-                        .flatten(),
+                    code_challenge,
+                    code_challenge_method,
                     session_id: Some(session_id.0.clone()),
                     auth_time: Some(now),
                     acr_values: vec![],
@@ -853,6 +880,68 @@ mod tests {
         let location = response.headers().get("Location").unwrap().to_str().unwrap();
         assert!(location.starts_with("http://localhost/callback?code="));
         assert!(location.contains("&state=xyz"));
+    }
+
+    #[tokio::test]
+    async fn spnego_public_client_requires_valid_s256() {
+        let mgr = Arc::new(MockFederationManager {
+            providers: Ok(vec![Arc::new(MockKerberosProvider {
+                result: Ok(issuerd_core::SpnegoAuthResult {
+                    status: issuerd_core::SpnegoStatus::Authenticated,
+                    principal: Some("alice@EXAMPLE.COM".to_string()),
+                    response_token: None,
+                }),
+            })]),
+        });
+        let state = test_state_with_manager(mgr).await;
+        seed_test_client(&state).await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("test-client").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        client.public_client = true;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+
+        let call = |params: HashMap<String, String>| {
+            let state = state.clone();
+            async move {
+                handle_spnego(
+                    State(state),
+                    axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                        "master".to_string(),
+                    ))),
+                    axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                        "127.0.0.1".parse().unwrap(),
+                    )),
+                    negotiate_headers("token"),
+                    axum::extract::Query(params),
+                )
+                .await
+            }
+        };
+
+        let verifier = "a".repeat(43);
+        let challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(&verifier);
+        for (candidate, method) in [("!!!", "S256"), (challenge.as_str(), "plain")] {
+            let mut params = query_with_redirect();
+            params.insert("code_challenge".to_string(), candidate.to_string());
+            params.insert("code_challenge_method".to_string(), method.to_string());
+            let response = call(params).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{candidate}/{method}");
+        }
+
+        let mut params = query_with_redirect();
+        params.insert("code_challenge".to_string(), challenge);
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
+        let response = call(params).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(response.headers().get("Location").unwrap().to_str().unwrap().contains("code="));
     }
 
     #[tokio::test]
