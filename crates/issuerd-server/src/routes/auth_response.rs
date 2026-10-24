@@ -18,7 +18,7 @@
 //! parameters as hidden inputs of an auto-submitting HTML form.
 
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use issuerd_core::{IssuerdError, Realm};
+use issuerd_core::{IssuerdError, Realm, RedirectUri};
 use issuerd_protocol::authorization::ResponseMode;
 
 use crate::{routes::oidc, state::ServerState};
@@ -158,6 +158,10 @@ pub(crate) async fn authorization_response(
 
 /// Deliver an (already final) parameter set per the resolved mode.
 fn deliver(redirect_uri: &str, params: &[(&str, &str)], mode: EffectiveMode) -> Response {
+    if let Err(error) = RedirectUri::new(redirect_uri) {
+        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(oidc::error_response(&error)))
+            .into_response();
+    }
     match mode {
         EffectiveMode::Query | EffectiveMode::QueryJwt => {
             Redirect::to(&oidc::build_redirect_url(redirect_uri, params, false)).into_response()
@@ -327,6 +331,23 @@ mod tests {
         assert!(html.contains("<noscript>"));
         // The parameters must not be baked into any redirect URL.
         assert!(!html.contains("?code="));
+    }
+
+    #[tokio::test]
+    async fn legacy_active_content_form_post_redirect_is_rejected() {
+        let legacy: RedirectUri = serde_json::from_str("\"javascript:alert(1)\"").unwrap();
+        let resp = deliver(legacy.as_str(), &[("code", "c-1")], EffectiveMode::FormPost);
+
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(resp.headers().get(axum::http::header::LOCATION).is_none());
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "invalid_request");
+        assert!(!String::from_utf8_lossy(&body).contains("javascript:"));
     }
 
     #[tokio::test]

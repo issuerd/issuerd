@@ -442,7 +442,8 @@ impl PartialEq<&str> for ClientIdentifier {
 pub struct RedirectUri(String);
 
 impl RedirectUri {
-    /// Create a new `RedirectUri`, validating that it is a parseable URL.
+    /// Create a new `RedirectUri`, validating that it is a parseable URL whose
+    /// scheme cannot execute active content in a browser.
     pub fn new(uri: impl Into<String>) -> Result<Self, IssuerdError> {
         let s = uri.into();
         // `Url::parse` silently strips tabs/newlines per WHATWG; reject them
@@ -454,6 +455,9 @@ impl RedirectUri {
         }
         let parsed = Url::parse(&s)
             .map_err(|e| IssuerdError::InvalidRequest(format!("invalid redirect_uri: {e}")))?;
+        if matches!(parsed.scheme(), "javascript" | "data" | "vbscript") {
+            return Err(IssuerdError::InvalidRequest("redirect_uri scheme is not allowed".into()));
+        }
         Ok(Self(parsed.to_string()))
     }
 
@@ -4795,6 +4799,26 @@ mod tests {
         assert_eq!(r.as_ref(), "https://app.example.com/cb");
         assert_eq!(r, "https://app.example.com/cb");
         // reverse partial_eq not implemented
+    }
+
+    #[test]
+    fn redirect_uri_rejects_active_content_schemes() {
+        for uri in [
+            "javascript:alert(1)",
+            "  JaVaScRiPt:alert(1)  ",
+            "data:text/html,<script>alert(1)</script>",
+            "DATA:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+            "vbscript:msgbox(1)",
+            "VbScRiPt:msgbox(1)",
+        ] {
+            assert!(RedirectUri::new(uri).is_err(), "expected {uri:?} to fail");
+        }
+    }
+
+    #[test]
+    fn redirect_uri_accepts_custom_native_scheme() {
+        let uri = RedirectUri::new("com.example.app:/oauth2redirect").unwrap();
+        assert_eq!(uri.as_str(), "com.example.app:/oauth2redirect");
     }
 
     // ------------------------------------------------------------------
