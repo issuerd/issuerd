@@ -1971,7 +1971,7 @@ async fn finish_continuation(
         &session_id,
         entry.auth_time,
         true,
-        entry.auth_method.clone().unwrap_or(issuerd_core::AuthMethod::Password),
+        entry.auth_method.unwrap_or(issuerd_core::AuthMethod::Password),
         entry.method_label.as_deref().unwrap_or("password"),
     )
     .await
