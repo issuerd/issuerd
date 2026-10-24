@@ -956,23 +956,13 @@ async fn finalize_brokered_login(
         ctx.attributes
             .insert("realm_verify_email_enabled".to_string(), "true".to_string());
     }
-    let mut actions = Vec::new();
-    for action_id in state.plugin_registry.list_required_action_ids() {
-        // A brokered user's sign-in method IS the external IdP, so they
-        // legitimately have no local password: the "no password →
-        // UPDATE_PASSWORD" auto-rule must not fire on broker logins (Keycloak
-        // behaves the same). An explicit admin assignment is still honored.
-        if action_id == "UPDATE_PASSWORD"
-            && !user.required_actions.iter().any(|a| a == "UPDATE_PASSWORD")
-        {
-            continue;
+    let actions = match evaluate_broker_required_actions(state, &user, &ctx).await {
+        Ok(actions) => actions,
+        Err(_) => {
+            let copy = PageCopy::for_realm(state, realm, pending.locale.as_deref(), None);
+            return super::required_actions::required_action_operational_error(&copy);
         }
-        match state.plugin_registry.get_required_action(&action_id).await {
-            Ok(Some(action)) if action.evaluate(&ctx).await => actions.push(action_id),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, action = %action_id, "required action evaluation failed"),
-        }
-    }
+    };
 
     let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
     if !actions.is_empty() {
@@ -998,6 +988,57 @@ async fn finalize_brokered_login(
         "identity_provider",
     )
     .await
+}
+
+async fn evaluate_broker_required_actions(
+    state: &Arc<ServerState>,
+    user: &User,
+    ctx: &issuerd_core::AuthContext,
+) -> Result<Vec<String>, IssuerdError> {
+    // Listed actions drive automatic evaluation. Explicit assignments are
+    // resolved as well so a legacy registry may omit optional actions from its
+    // listing without making an assigned action invisible.
+    let mut action_ids = state.plugin_registry.list_required_action_ids();
+    for assigned in &user.required_actions {
+        if !action_ids.contains(assigned) {
+            action_ids.push(assigned.clone());
+        }
+    }
+
+    let update_password_assigned =
+        user.required_actions.iter().any(|action| action == "UPDATE_PASSWORD");
+    let mut pending = Vec::new();
+    for action_id in action_ids {
+        // A brokered user's sign-in method IS the external IdP, so they
+        // legitimately have no local password: the "no password →
+        // UPDATE_PASSWORD" auto-rule must not fire on broker logins (Keycloak
+        // behaves the same). An explicit admin assignment is still honored.
+        if action_id == "UPDATE_PASSWORD" && !update_password_assigned {
+            continue;
+        }
+        let action = match state.plugin_registry.get_required_action(&action_id).await {
+            Ok(Some(action)) => action,
+            Ok(None) => {
+                tracing::error!(action = %action_id, "required action is not registered");
+                return Err(IssuerdError::ServerError(format!(
+                    "required action listed or assigned but not registered: {action_id}"
+                )));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, action = %action_id, "required action registry lookup failed");
+                return Err(e);
+            }
+        };
+        match action.try_evaluate(ctx).await {
+            Ok(true) => pending.push(action_id),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(error = %e, action = %action_id, "required action evaluation failed");
+                return Err(e);
+            }
+        }
+    }
+    Ok(pending)
 }
 
 /// User attribute recording which realm roles (by name) this provider's role
@@ -1808,6 +1849,53 @@ mod tests {
             .await
             .unwrap();
         (Arc::new(state), storage, cache)
+    }
+
+    async fn test_state_with_registry(
+        registry: BrokerTestRegistry,
+    ) -> (Arc<ServerState>, TestStorage, TestCache) {
+        let cfg = ServerConfig::default();
+        let storage: TestStorage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache: TestCache = Arc::new(issuerd_cluster::InMemoryCache::new());
+        let mut state = ServerState::from_components(&cfg, storage.clone(), cache.clone())
+            .await
+            .unwrap();
+        state.plugin_registry = Arc::new(registry);
+        (Arc::new(state), storage, cache)
+    }
+
+    struct BrokerTestRegistry {
+        listed: Vec<String>,
+        action: Option<Arc<dyn issuerd_core::RequiredAction>>,
+        lookup_error: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_auth_flow::plugin_registry::PluginRegistry for BrokerTestRegistry {
+        async fn get_authenticator(
+            &self,
+            _id: &str,
+        ) -> Result<Option<Arc<dyn issuerd_core::Authenticator>>, IssuerdError> {
+            Ok(None)
+        }
+
+        async fn get_required_action(
+            &self,
+            id: &str,
+        ) -> Result<Option<Arc<dyn issuerd_core::RequiredAction>>, IssuerdError> {
+            if let Some(error) = self.lookup_error {
+                return Err(IssuerdError::ServerError(error.to_string()));
+            }
+            Ok(self.action.clone().filter(|action| action.id() == id))
+        }
+
+        fn list_authenticator_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn list_required_action_ids(&self) -> Vec<String> {
+            self.listed.clone()
+        }
     }
 
     /// [`test_state`] with the external IdP HTTP client stubbed out.
@@ -2803,6 +2891,152 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let location = location(&resp);
         assert!(location.starts_with("/realms/master/login/required-action/"), "{location}");
+    }
+
+    async fn finalize_test_login(state: &Arc<ServerState>, user: User, flow: &str) -> Response {
+        let realm = state.resolve_realm(MASTER).await.unwrap().unwrap();
+        let pending = pending_auth_data(&realm.id, flow);
+        finalize_brokered_login(
+            state,
+            &realm,
+            &broker_idp_config(IDP_ALIAS),
+            pending,
+            user,
+            &broker_identity(),
+            MapperPass::Skip,
+        )
+        .await
+    }
+
+    async fn assert_no_login_artifacts(
+        storage: &TestStorage,
+        cache: &TestCache,
+        realm_id: &RealmId,
+        user_id: &UserId,
+    ) {
+        let sessions = storage
+            .list_sessions(realm_id, Some(user_id.clone()), &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert!(sessions.is_empty(), "failed evaluation must not create a session");
+        let codes = cache.scan_keys(&format!("auth_code:{}:*", realm_id.0)).await.unwrap();
+        assert!(codes.is_empty(), "failed evaluation must not create an authorization code");
+    }
+
+    #[tokio::test]
+    async fn finalize_required_action_storage_error_aborts_before_login() {
+        let mut failing_storage = issuerd_core::MockStorage::new();
+        failing_storage.expect_get_user().returning(|_, _| {
+            Err(IssuerdError::ServerError("required-action storage down".to_string()))
+        });
+        let action = Arc::new(issuerd_auth_flow::built_in::VerifyEmailRequiredAction::new(
+            Arc::new(failing_storage),
+        ));
+        let registry = BrokerTestRegistry {
+            listed: vec!["VERIFY_EMAIL".to_string()],
+            action: Some(action),
+            lookup_error: None,
+        };
+        let (state, storage, cache) = test_state_with_registry(registry).await;
+        let realm_id = master_realm_id();
+        let mut user = broker_user(&realm_id, "storage-failure", true);
+        user.required_actions = vec!["VERIFY_EMAIL".to_string()];
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let user_id = user.id.clone();
+
+        let resp = finalize_test_login(&state, user, "flow-action-storage-error").await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_text(resp).await;
+        assert!(body.contains("The action could not be completed"));
+        assert!(!body.contains("required-action storage down"));
+        assert_no_login_artifacts(&storage, &cache, &realm_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_required_action_registry_error_aborts_before_login() {
+        let registry = BrokerTestRegistry {
+            listed: vec!["VERIFY_EMAIL".to_string()],
+            action: None,
+            lookup_error: Some("registry unavailable"),
+        };
+        let (state, storage, cache) = test_state_with_registry(registry).await;
+        let realm_id = master_realm_id();
+        let user = broker_user(&realm_id, "registry-failure", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let user_id = user.id.clone();
+
+        let resp = finalize_test_login(&state, user, "flow-action-registry-error").await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_text(resp).await;
+        assert!(body.contains("The action could not be completed"));
+        assert!(!body.contains("registry unavailable"));
+        assert_no_login_artifacts(&storage, &cache, &realm_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_listed_but_missing_action_aborts_before_login() {
+        let registry = BrokerTestRegistry {
+            listed: vec!["MISSING_ACTION".to_string()],
+            action: None,
+            lookup_error: None,
+        };
+        let (state, storage, cache) = test_state_with_registry(registry).await;
+        let realm_id = master_realm_id();
+        let user = broker_user(&realm_id, "missing-action", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let user_id = user.id.clone();
+
+        let resp = finalize_test_login(&state, user, "flow-action-listed-missing").await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_no_login_artifacts(&storage, &cache, &realm_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_unknown_assigned_action_aborts_before_login() {
+        let registry = BrokerTestRegistry {
+            listed: Vec::new(),
+            action: None,
+            lookup_error: None,
+        };
+        let (state, storage, cache) = test_state_with_registry(registry).await;
+        let realm_id = master_realm_id();
+        let mut user = broker_user(&realm_id, "unknown-action", true);
+        user.required_actions = vec!["UNREGISTERED_CUSTOM_ACTION".to_string()];
+        storage.create_user(&realm_id, &user).await.unwrap();
+        let user_id = user.id.clone();
+
+        let resp = finalize_test_login(&state, user, "flow-action-unknown-assigned").await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_no_login_artifacts(&storage, &cache, &realm_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_unlisted_resolvable_assigned_action_still_runs() {
+        let (state, storage, _cache) = test_state().await;
+        let action = Arc::new(issuerd_auth_flow::built_in::TermsAndConditionsRequiredAction::new(
+            storage.clone(),
+        ));
+        let registry = BrokerTestRegistry {
+            listed: Vec::new(),
+            action: Some(action),
+            lookup_error: None,
+        };
+        let mut state = Arc::try_unwrap(state).ok().expect("sole state owner");
+        state.plugin_registry = Arc::new(registry);
+        let state = Arc::new(state);
+        let realm_id = master_realm_id();
+        let mut user = broker_user(&realm_id, "legacy-optional-action", true);
+        user.required_actions = vec!["TERMS_AND_CONDITIONS".to_string()];
+        storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = finalize_test_login(&state, user, "flow-action-unlisted-resolvable").await;
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(location(&resp).starts_with("/realms/master/login/required-action/"));
     }
 
     // -- find_available_username ----------------------------------------------
