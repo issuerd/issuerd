@@ -43,8 +43,8 @@ use issuerd_protocol::token::{GrantType, TokenRequest, TOKEN_TYPE_ACCESS_TOKEN};
 use tracing::{debug, info, warn};
 
 use super::oidc::{
-    emit_oidc_event, error_response, persist_session, resolve_token_user, session_invalidated,
-    token_response, TokenResponse,
+    cache_failure_response, emit_oidc_event, error_response, persist_session, resolve_token_user,
+    session_invalidated, token_response, TokenResponse,
 };
 use crate::state::ServerState;
 
@@ -76,9 +76,13 @@ pub(crate) async fn token_exchange_grant(
 
     // RFC 7009 revocation blocklist — the same key the userinfo and
     // introspection paths check.
-    if matches!(state.cache.get(&format!("revoked:{subject_token}")).await, Ok(Some(_))) {
-        warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: revoked subject token presented");
-        return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
+    match state.cache.get(&format!("revoked:{subject_token}")).await {
+        Ok(Some(_)) => {
+            warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: revoked subject token presented");
+            return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
+        }
+        Ok(None) => {}
+        Err(e) => return cache_failure_response(&e),
     }
 
     // Stateless validation: signature, expiry, issuer family. `aud` is not
@@ -609,6 +613,7 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::middleware::{proxy_ip::ClientIp, realm::ResolvedRealm};
+    use issuerd_core::IssuerdError;
 
     /// Master-realm state where admin-cli has opted into token exchange and
     /// admin holds a session-backed access token issued for admin-cli.
@@ -617,8 +622,73 @@ mod tests {
         subject_token: String,
     }
 
+    #[derive(Default)]
+    struct RevocationFailureCache {
+        inner: issuerd_cluster::InMemoryCache,
+    }
+
+    #[async_trait::async_trait]
+    impl issuerd_core::DistributedCache for RevocationFailureCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            if key.starts_with("revoked:") {
+                return Err(IssuerdError::ServerError("cache down".to_string()));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.set(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), IssuerdError> {
+            self.inner.delete(key).await
+        }
+
+        async fn get_and_delete(&self, key: &str) -> Result<Option<Vec<u8>>, IssuerdError> {
+            self.inner.get_and_delete(key).await
+        }
+
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<Vec<u8>>,
+            new: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+
+        async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
+            self.inner.publish(channel, message).await
+        }
+
+        async fn subscribe(
+            &self,
+            channel: &str,
+            handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), IssuerdError> {
+            self.inner.subscribe(channel, handler).await
+        }
+    }
+
     async fn exchange_fixture() -> ExchangeFixture {
-        let state = Arc::new(ServerState::from_config(&ServerConfig::default()).await.unwrap());
+        exchange_fixture_with_cache(Arc::new(issuerd_cluster::InMemoryCache::new())).await
+    }
+
+    async fn exchange_fixture_with_cache(
+        cache: Arc<dyn issuerd_core::DistributedCache>,
+    ) -> ExchangeFixture {
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let state = Arc::new(
+            ServerState::from_components(&ServerConfig::default(), storage, cache)
+                .await
+                .unwrap(),
+        );
         let realm_id = RealmId::new("master").unwrap();
         let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
         let mut client = state
@@ -710,6 +780,15 @@ mod tests {
             json["issued_token_type"].as_str().unwrap(),
             "urn:ietf:params:oauth:token-type:access_token"
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_revocation_lookup_failure_is_temporarily_unavailable() {
+        let fixture =
+            exchange_fixture_with_cache(Arc::new(RevocationFailureCache::default())).await;
+        let resp = exchange(&fixture.state, &fixture.subject_token).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(resp).await["error"], "temporarily_unavailable");
     }
 
     #[tokio::test]

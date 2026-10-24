@@ -257,7 +257,7 @@ async fn concurrent_token_refresh_no_duplicate() {
     let statuses: Vec<u16> = join_all(futures).await;
 
     let success_count = statuses.iter().filter(|&&s| s == 200).count();
-    assert!(success_count >= 1, "at least one refresh should succeed");
+    assert_eq!(success_count, 1, "exactly one refresh may consume the token");
     assert!(statuses.iter().all(|&s| s == 200 || s == 400));
 }
 

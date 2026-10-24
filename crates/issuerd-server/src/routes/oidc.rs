@@ -4206,29 +4206,6 @@ async fn token_handler_inner(
                 Ok(marker) => marker.is_some(),
                 Err(e) => return cache_failure_response(&e),
             };
-            if revoked {
-                warn!(realm = %realm_id, client_id = %client.client_id, "revoked refresh token presented");
-                let mut details = std::collections::HashMap::new();
-                details.insert("grant_type".to_string(), "refresh_token".to_string());
-                emit_oidc_event(
-                    &state,
-                    &realm_id,
-                    EventType::RefreshTokenError,
-                    &ip,
-                    Some(client.id.clone()),
-                    None,
-                    None,
-                    Some("invalid_grant".to_string()),
-                    details,
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "invalid_grant"})),
-                )
-                    .into_response();
-            }
-
             let validated = match state.token_service.validate_refresh_token(refresh_token) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4292,6 +4269,11 @@ async fn token_handler_inner(
                 }
                 (None, proof) => proof,
             };
+
+            if revoked {
+                return refresh_replay_response(&state, &realm, &client, &ip, &validated.claims)
+                    .await;
+            }
 
             // Realm not_before: tokens issued before the realm's cutoff are
             // revoked wholesale (0 = no cutoff).
@@ -4435,22 +4417,32 @@ async fn token_handler_inner(
                 return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
             }
 
-            // Rotate only after the old token is durably revoked; otherwise
-            // issue no replacement that could leave both tokens usable.
+            // Atomically claim the old token before issuing its successor.
+            // The first increment creates the revocation marker with the
+            // token's remaining lifetime; every concurrent or later attempt
+            // observes an already-claimed token.
+            let now = issuerd_core::utils::now_secs() as i64;
+            let remaining = validated.claims.exp.saturating_sub(now).max(0) as u64;
+            match state
+                .cache
+                .increment(
+                    &format!("revoked_refresh:{refresh_token}"),
+                    Some(std::time::Duration::from_secs(remaining.max(1))),
+                )
+                .await
             {
-                let now = issuerd_core::utils::now_secs() as i64;
-                let remaining = validated.claims.exp.saturating_sub(now).max(0) as u64;
-                if let Err(e) = state
-                    .cache
-                    .set(
-                        &format!("revoked_refresh:{refresh_token}"),
-                        vec![1],
-                        Some(std::time::Duration::from_secs(remaining.max(1))),
+                Ok(1) => {}
+                Ok(_) => {
+                    return refresh_replay_response(
+                        &state,
+                        &realm,
+                        &client,
+                        &ip,
+                        &validated.claims,
                     )
-                    .await
-                {
-                    return cache_failure_response(&e);
+                    .await;
                 }
+                Err(e) => return cache_failure_response(&e),
             }
 
             let mut overlay = crate::claims::build_claims_overlay(
@@ -5436,6 +5428,45 @@ async fn token_handler_inner(
     // header — RFC-required only on `use_dpop_nonce` responses, which carry
     // it at the verification site.)
     crate::dpop::with_nonce_header(response, dpop_response_nonce.as_deref())
+}
+
+async fn refresh_replay_response(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    client: &issuerd_core::Client,
+    ip: &std::net::IpAddr,
+    claims: &issuerd_core::RefreshTokenClaims,
+) -> Response {
+    if issuerd_core::typestate::extract_realm_from_issuer(claims.iss.as_str())
+        == Some(realm.name.as_str())
+    {
+        if let Err(e) = state.storage.delete_user_session(&realm.id, &claims.sid).await {
+            error!(realm = %realm.id, client_id = %client.client_id, error = %e, "refresh replay family revocation failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(error_response(&IssuerdError::TemporarilyUnavailable)),
+            )
+                .into_response();
+        }
+        crate::session_cache::invalidate_session(state, &realm.id, &claims.sid).await;
+    }
+
+    warn!(realm = %realm.id, client_id = %client.client_id, "revoked refresh token presented; token family revoked");
+    let mut details = std::collections::HashMap::new();
+    details.insert("grant_type".to_string(), "refresh_token".to_string());
+    emit_oidc_event(
+        state,
+        &realm.id,
+        EventType::RefreshTokenError,
+        ip,
+        Some(client.id.clone()),
+        None,
+        None,
+        Some("invalid_grant".to_string()),
+        details,
+    )
+    .await;
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"}))).into_response()
 }
 
 fn verify_pkce(verifier: &str, challenge: &str, method: Option<PkceCodeChallengeMethod>) -> bool {
@@ -6664,36 +6695,60 @@ pub async fn revoke_handler(
 
     match RevocationRequest::parse(&body_params) {
         Ok(req) => {
-            // Resolve the token type: honor the hint, otherwise probe whether
-            // the token validates as a refresh token. Refresh tokens land in
-            // `revoked_refresh:` (checked by the refresh grant), access tokens
-            // in `revoked:` (checked by introspection); TTL = remaining
-            // token lifetime so revocation cannot expire before the token.
+            // The hint chooses lookup order, not the revocation bucket. If the
+            // hinted type does not validate, RFC 7009 requires trying the other
+            // supported type before deciding how to revoke the token.
             let now = issuerd_core::utils::now_secs() as i64;
             let default_ttl = std::time::Duration::from_secs(86400);
-            let as_refresh = match req.token_type_hint {
-                Some(issuerd_core::TokenTypeHint::AccessToken) => None,
-                _ => state.token_service.validate_refresh_token(&req.token).ok(),
+            let prefer_access =
+                matches!(req.token_type_hint, Some(issuerd_core::TokenTypeHint::AccessToken));
+            let mut as_refresh = if prefer_access {
+                None
+            } else {
+                state.token_service.validate_refresh_token(&req.token).ok()
             };
-            let (cache_key, ttl) = match as_refresh {
-                Some(validated) => {
+            let as_access = if as_refresh.is_none() {
+                state.token_service.validate_access_token(&req.token).ok()
+            } else {
+                None
+            };
+            if prefer_access && as_access.is_none() {
+                as_refresh = state.token_service.validate_refresh_token(&req.token).ok();
+            }
+
+            let matches_client = |iss: &issuerd_core::Issuer, aud: &issuerd_core::Audience| {
+                issuerd_core::typestate::extract_realm_from_issuer(iss.as_str())
+                    == Some(realm.name.as_str())
+                    && aud.contains(client.client_id.as_ref())
+            };
+            let mut validated_token = false;
+            let mut owned_token = false;
+            let (cache_key, ttl) = match (&as_refresh, &as_access) {
+                (Some(validated), _) => {
+                    validated_token = true;
+                    owned_token = matches_client(&validated.claims.iss, &validated.claims.aud);
                     let remaining = validated.claims.exp.saturating_sub(now).max(1) as u64;
                     (
                         format!("revoked_refresh:{}", req.token),
                         std::time::Duration::from_secs(remaining),
                     )
                 }
-                None => {
-                    let ttl = state
-                        .token_service
-                        .validate_access_token(&req.token)
-                        .ok()
-                        .map(|v| v.claims.exp.saturating_sub(now).max(1) as u64)
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(default_ttl);
-                    (format!("revoked:{}", req.token), ttl)
+                (None, Some(validated)) => {
+                    validated_token = true;
+                    owned_token = matches_client(&validated.claims.iss, &validated.claims.aud);
+                    let remaining = validated.claims.exp.saturating_sub(now).max(1) as u64;
+                    (format!("revoked:{}", req.token), std::time::Duration::from_secs(remaining))
                 }
+                (None, None) => (format!("revoked:{}", req.token), default_ttl),
             };
+            if validated_token && !owned_token {
+                warn!(realm = %realm_id, client_id = %client.client_id, "revocation rejected: token belongs to another client or realm");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_client"})),
+                )
+                    .into_response();
+            }
             if let Err(e) = state.cache.set(&cache_key, vec![1], Some(ttl)).await {
                 return cache_failure_response(&e);
             }
@@ -16756,6 +16811,17 @@ mod tests {
         ) -> Result<bool, IssuerdError> {
             self.inner.compare_and_swap(key, expected, new).await
         }
+        async fn increment(
+            &self,
+            key: &str,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<u64, IssuerdError> {
+            if self.fail_set && is_security_state_key(key) {
+                return Err(IssuerdError::ServerError("cache down".to_string()));
+            }
+            self.writes.lock().unwrap().push((key.to_string(), ttl));
+            self.inner.increment(key, ttl).await
+        }
         async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
             self.inner.publish(channel, message).await
         }
@@ -17835,11 +17901,8 @@ mod tests {
 
     // -- Revocation endpoint -------------------------------------------------
 
-    /// `token_type_hint=access_token` is honored literally: the marker lands
-    /// in the access-token bucket even when the presented token happens to
-    /// validate as a refresh token.
     #[tokio::test]
-    async fn revoke_with_access_token_hint_uses_access_bucket() {
+    async fn revoke_with_access_token_hint_still_revokes_refresh_token() {
         let state = setup_state().await;
         let json = password_grant_tokens(&state).await;
         let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
@@ -17853,19 +17916,123 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            state.cache.get(&format!("revoked:{refresh_token}")).await.unwrap().is_some(),
-            "the access bucket is written"
+        assert!(state.cache.get(&format!("revoked:{refresh_token}")).await.unwrap().is_none());
+        assert!(state
+            .cache
+            .get(&format!("revoked_refresh:{refresh_token}"))
+            .await
+            .unwrap()
+            .is_some());
+
+        let response = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_token_owned_by_another_client() {
+        let state = setup_state().await;
+        let other = confidential_client("rev-other-uuid", "rev-other", "other-secret");
+        state
+            .storage
+            .create_client(&RealmId::new("master").unwrap(), &other)
+            .await
+            .unwrap();
+        let json = password_grant_tokens(&state).await;
+        let access_token = json["access_token"].as_str().unwrap().to_string();
+
+        let resp = revoke_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "token={access_token}&token_type_hint=access_token&client_id=rev-other&client_secret=other-secret"
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+        assert!(state.cache.get(&format!("revoked:{access_token}")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_token_owned_by_another_realm() {
+        let state = setup_state().await;
+        let other = seed_matching_realm_identities(&state).await;
+        let json = password_grant_tokens(&state).await;
+        let refresh_token = json["refresh_token"].as_str().unwrap().to_string();
+
+        let resp = revoke_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some(other.name.to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!("token={refresh_token}&token_type_hint=refresh_token&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(resp).await["error"], "invalid_client");
+        assert!(state
+            .cache
+            .get(&format!("revoked_refresh:{refresh_token}"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_replay_revokes_successor_and_session_family() {
+        let state = setup_state().await;
+        let json = password_grant_tokens(&state).await;
+        let original = json["refresh_token"].as_str().unwrap().to_string();
+        let session_id = state.token_service.validate_refresh_token(&original).unwrap().claims.sid;
+
+        let rotated = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={original}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let rotated = extract_json(rotated).await;
+        let successor = rotated["refresh_token"].as_str().unwrap().to_string();
+        let successor_access = rotated["access_token"].as_str().unwrap().to_string();
+
+        let replay = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={original}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert!(state
+            .storage
+            .get_user_session(&RealmId::new("master").unwrap(), &session_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let descendant = token_request(
+            &state,
+            &format!("grant_type=refresh_token&refresh_token={successor}&client_id=admin-cli"),
+        )
+        .await;
+        assert_eq!(descendant.status(), StatusCode::BAD_REQUEST);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {successor_access}").parse().unwrap(),
         );
-        assert!(
-            state
-                .cache
-                .get(&format!("revoked_refresh:{refresh_token}"))
-                .await
-                .unwrap()
-                .is_none(),
-            "the refresh bucket is NOT written when the hint says access_token"
-        );
+        let userinfo = userinfo_handler_get(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            headers,
+        )
+        .await;
+        assert_eq!(userinfo.status(), StatusCode::UNAUTHORIZED);
     }
 
     // -- Client authentication for RFC 7009/7662 endpoints -------------------
