@@ -1610,6 +1610,11 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        self.provision_markers.remove(name);
+        Ok(())
+    }
+
     async fn claim_provision_marker(&self, name: &str, value: &str) -> Result<bool, IssuerdError> {
         match self.provision_markers.entry(name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
@@ -5189,6 +5194,10 @@ mod tests {
         restored.load_snapshot(snapshot);
         assert_eq!(restored.get_provision_marker("p1").await.unwrap(), Some("v2".to_string()));
         assert_eq!(restored.get_provision_marker("p2").await.unwrap(), Some("x".to_string()));
+
+        restored.delete_provision_marker("p1").await.unwrap();
+        assert_eq!(restored.get_provision_marker("p1").await.unwrap(), None);
+        assert!(restored.claim_provision_marker("p1", "retry").await.unwrap());
     }
 
     // ------------------------------------------------------------------

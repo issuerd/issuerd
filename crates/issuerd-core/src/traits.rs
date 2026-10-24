@@ -653,6 +653,16 @@ pub trait Storage: Send + Sync {
     // Provision markers
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError>;
     async fn set_provision_marker(&self, name: &str, value: &str) -> Result<(), IssuerdError>;
+    /// Remove an in-progress marker after a failed provisioning attempt so a
+    /// later boot can retry. Deleting a missing marker is a successful no-op.
+    /// Legacy external backends may not support deletion; an in-progress
+    /// marker must never be treated as a completed provision in that case.
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        let _ = name;
+        Err(IssuerdError::ServerError(
+            "provision marker deletion is not supported by this storage backend".to_string(),
+        ))
+    }
     /// Atomically claim a provision marker: returns `true` when this call
     /// created the marker, `false` when it already existed. The default
     /// implementation is check-then-set (not atomic); backends with
@@ -2210,6 +2220,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), value.to_string());
+            Ok(())
+        }
+        async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+            self.provision_markers.lock().unwrap().remove(name);
             Ok(())
         }
         async fn list_signing_keys(&self) -> Result<Vec<StoredSigningKey>, IssuerdError> {

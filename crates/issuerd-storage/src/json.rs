@@ -1018,6 +1018,11 @@ impl Storage for JsonFileStorage {
         Ok(())
     }
 
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        self.inner.delete_provision_marker(name).await?;
+        self.persist()
+    }
+
     // ------------------------------------------------------------------
     // Signing keys
     // ------------------------------------------------------------------
@@ -1682,6 +1687,19 @@ mod tests {
 
     fn unique_test_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("issuerd-{tag}-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn json_provision_marker_delete_persists() {
+        let path = unique_test_path("provision-delete");
+        let storage = JsonFileStorage::new(&path).unwrap();
+        storage.set_provision_marker("retry", "in_progress").await.unwrap();
+        storage.delete_provision_marker("retry").await.unwrap();
+        assert_eq!(storage.get_provision_marker("retry").await.unwrap(), None);
+
+        let reloaded = JsonFileStorage::new(&path).unwrap();
+        assert_eq!(reloaded.get_provision_marker("retry").await.unwrap(), None);
+        let _ = std::fs::remove_file(path);
     }
 
     fn full_realm() -> Realm {

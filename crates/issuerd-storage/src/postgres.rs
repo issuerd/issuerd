@@ -2654,6 +2654,15 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        sqlx::query("DELETE FROM provision_markers WHERE name = $1")
+            .bind(name)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        Ok(())
+    }
+
     async fn claim_provision_marker(&self, name: &str, value: &str) -> Result<bool, IssuerdError> {
         let result = sqlx::query(
             r#"INSERT INTO provision_markers (name, value)
@@ -3693,6 +3702,17 @@ mod tests {
         let session =
             test_session(&realm.id, &UserId::new(uuid::Uuid::new_v4().to_string()).unwrap());
         assert!(storage.create_user_session(&realm.id, &session).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn pg_provision_marker_delete_allows_reclaim() {
+        let (storage, _container) = setup_pg().await;
+        assert!(storage.claim_provision_marker("retry", "in_progress").await.unwrap());
+        assert!(!storage.claim_provision_marker("retry", "in_progress").await.unwrap());
+        storage.delete_provision_marker("retry").await.unwrap();
+        assert_eq!(storage.get_provision_marker("retry").await.unwrap(), None);
+        assert!(storage.claim_provision_marker("retry", "in_progress").await.unwrap());
     }
 
     #[tokio::test]
