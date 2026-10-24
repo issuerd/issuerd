@@ -5806,18 +5806,20 @@ pub(crate) async fn enforce_oob_second_factor(
         if let Some(matched_step) =
             issuerd_auth_flow::totp::verify(secret, code, now, &realm.otp_policy, last_used_step)
         {
-            // Persist the replay watermark before reporting success so the
-            // same code cannot be reused for another grant.
-            let mut updated = cred.clone();
-            updated.credential_data["last_used_step"] = serde_json::json!(matched_step);
-            state
+            // Atomically claim this step before reporting success so a
+            // concurrent submission of the same code cannot also succeed.
+            match state
                 .storage
-                .update_credential(realm_id, &user.id, &updated)
+                .consume_totp_step(realm_id, &user.id, &cred.id, matched_step)
                 .await
-                .map_err(|e| {
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(OobSecondFactorReject::InvalidOtp),
+                Err(e) => {
                     warn!(realm = %realm_id, user_id = %user.id, error = %e, "direct grant: failed to persist TOTP replay watermark");
-                    OobSecondFactorReject::Internal(e)
-                })?;
+                    return Err(OobSecondFactorReject::Internal(e));
+                }
+            }
             if let Err(e) = state
                 .login_failure_tracker
                 .clear_otp_attempts(realm_id, username, state.cache.as_ref())
@@ -8483,6 +8485,28 @@ mod tests {
             password_grant_with(&state, &format!("&totp={code}")).await.status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_password_grant_same_otp_has_single_winner() {
+        let state = setup_state().await;
+        add_master_totp_credential(&state, "admin").await;
+        let code = current_test_totp();
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            let code = code.clone();
+            attempts.spawn(async move {
+                password_grant_with(&state, &format!("&totp={code}")).await.status()
+            });
+        }
+        let mut successes = 0;
+        while let Some(status) = attempts.join_next().await {
+            if status.unwrap() == StatusCode::OK {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
     }
 
     #[tokio::test]

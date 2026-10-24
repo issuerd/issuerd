@@ -928,15 +928,23 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
             if let Some(matched_step) =
                 crate::totp::verify(secret, &otp, now, &policy, last_used_step)
             {
-                // Persist the replay watermark before reporting success so the
-                // same code cannot be reused for another login.
-                let mut updated = cred.clone();
-                updated.credential_data["last_used_step"] = json!(matched_step);
-                if let Err(e) =
-                    self.storage.update_credential(&context.realm_id, &user_id, &updated).await
+                // Atomically claim this step before reporting success so a
+                // concurrent submission of the same code cannot also succeed.
+                match self
+                    .storage
+                    .consume_totp_step(&context.realm_id, &user_id, &cred.id, matched_step)
+                    .await
                 {
-                    warn!(user_id = %user_id, error = %e, "failed to persist TOTP replay watermark");
-                    return AuthStepResult::Failure(e);
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return AuthStepResult::Challenge(Challenge::OtpForm {
+                            action_url: "".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(user_id = %user_id, error = %e, "failed to persist TOTP replay watermark");
+                        return AuthStepResult::Failure(e);
+                    }
                 }
                 if let OtpThrottle::Open(ref username) = throttle {
                     self.reset_otp_failures(&context.realm_id, username).await;
