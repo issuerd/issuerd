@@ -54,6 +54,7 @@
     "vitest": "^4.1.12"
   },
   "overrides": {
-    "js-yaml": "4.3.2"
+    "js-yaml": "4.3.2",
+    "undici": "7.30.1"
   }
 }
