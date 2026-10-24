@@ -334,6 +334,46 @@ impl TestHarness {
         client
     }
 
+    pub async fn account_console_client(&self, realm: &str) -> issuerd_core::Client {
+        let realm_id = issuerd_core::RealmId::new(realm).unwrap();
+        let identifier = issuerd_core::ClientIdentifier::new("account-console").unwrap();
+        if let Some(client) =
+            self.storage.get_client_by_client_id(&realm_id, &identifier).await.unwrap()
+        {
+            return client;
+        }
+        let mut client = issuerd_admin_api::realms::build_account_console_client(
+            &realm_id,
+            realm,
+            &self.base_url,
+        )
+        .unwrap();
+        client.redirect_uris.push(RedirectUri::new("http://localhost:8080/cb").unwrap());
+        self.storage.create_client(&realm_id, &client).await.unwrap();
+        client
+    }
+
+    pub async fn authenticate_account_console_user(
+        &self,
+        realm: &str,
+        username: &str,
+        password: &str,
+    ) -> TokenBundleLegacy {
+        self.account_console_client(realm).await;
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(verifier);
+        self.authenticate_user_with_pkce(
+            realm,
+            "account-console",
+            username,
+            password,
+            &challenge,
+            "S256",
+            verifier,
+        )
+        .await
+    }
+
     pub async fn create_user(
         &self,
         realm: &str,

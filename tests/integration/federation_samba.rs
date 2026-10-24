@@ -467,7 +467,7 @@ async fn samba_dc_federated_password_write_through() {
 
     // First login imports testuser2 with federation_link = samba-ldap.
     let tokens = harness
-        .authenticate_user("samba-wt", &client.client_id, "testuser2", "Password123!")
+        .authenticate_account_console_user("samba-wt", "testuser2", "Password123!")
         .await;
     let user = harness
         .storage

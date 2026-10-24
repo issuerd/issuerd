@@ -71,15 +71,18 @@ impl ServerState {
         )
     }
 
-    /// Resolve the realm's bound top-level flow and an executor that can run
-    /// it: the flow set is loaded from storage per request — one
-    /// indexed query on Postgres, trivial on the in-memory/json backends, and
-    /// deliberately uncached so admin flow edits take effect immediately. The
-    /// realm's binding field (`bound`, `None` → `default_alias`) picks the
-    /// top-level flow; when the read fails (logged) or the alias is not in
-    /// storage, the `fallback` code constructor keeps bootstrapping and legacy
-    /// rigs working. The executor is built over the full loaded list so
-    /// `sub_flow_alias` stages resolve.
+    /// Legacy infallible flow resolution for external embedders. New
+    /// authentication request handlers must use [`Self::try_bound_flow_executor`]
+    /// so a broken explicit binding or storage read cannot select a weaker flow.
+    ///
+    /// The flow set is loaded from storage per call — one indexed query on
+    /// Postgres, trivial on the in-memory/json backends, and deliberately
+    /// uncached so admin flow edits take effect immediately. The realm's binding
+    /// field (`bound`, `None` → `default_alias`) picks the top-level flow; when
+    /// the read fails (logged) or the alias is not in storage, the `fallback`
+    /// code constructor preserves this method's historical behavior. The
+    /// executor is built over the full loaded list so `sub_flow_alias` stages
+    /// resolve.
     ///
     /// Only the browser and registration bindings are consumed at runtime
     /// (here and in the login/registration routes). The direct-grant,
@@ -111,6 +114,34 @@ impl ServerState {
             .cloned()
             .unwrap_or_else(|| fallback(realm.id.clone()));
         (flow, self.typed_executor_with_flows(&flows))
+    }
+
+    /// Resolve a top-level flow without allowing a configuration or storage
+    /// failure to downgrade authentication. An explicitly bound alias must
+    /// exist as a top-level flow in the successfully loaded storage list. Only
+    /// an unbound realm may use `fallback` when `default_alias` is absent.
+    ///
+    /// The executor retains the complete loaded list so sub-flow resolution is
+    /// identical for stored flows and the legacy unbound fallback.
+    pub async fn try_bound_flow_executor(
+        &self,
+        realm: &Realm,
+        bound: Option<&str>,
+        default_alias: &str,
+        fallback: fn(RealmId) -> FlowConfig,
+    ) -> Result<(FlowConfig, issuerd_auth_flow::typestate::TypedFlowExecutor), IssuerdError> {
+        let flows = self.storage.list_flow_configs(&realm.id).await?;
+        let alias = bound.unwrap_or(default_alias);
+        let flow = match flows.iter().find(|f| f.top_level && f.alias.as_str() == alias) {
+            Some(flow) => flow.clone(),
+            None if bound.is_none() => fallback(realm.id.clone()),
+            None => {
+                return Err(IssuerdError::ServerError(format!(
+                    "explicitly bound top-level flow '{alias}' not found"
+                )))
+            }
+        };
+        Ok((flow, self.typed_executor_with_flows(&flows)))
     }
 
     /// Resolve the realm segment from a request URL to a realm.
@@ -354,7 +385,7 @@ impl ServerState {
     ) -> Result<Self, IssuerdError> {
         // Crypto: load the shared signing-key set from storage so every node
         // signs with the same active key and validates its peers' tokens.
-        let crypto = bootstrap_crypto_provider(storage.as_ref()).await?;
+        let (crypto, initial_keys) = bootstrap_crypto_provider(storage.as_ref()).await?;
         let jwks = crypto.get_public_keys().await?;
 
         // TokenService. The default signing algorithm matches the bootstrapped
@@ -377,12 +408,15 @@ impl ServerState {
         // Propagate keys added (or rotated) by peer nodes into this node's
         // keystore and JWKS snapshot. Only PostgreSQL storage is shared
         // between nodes, so polling is pointless for the other backends.
+        let signing_key_fingerprint =
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&initial_keys)));
         let keyset_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         if matches!(config.storage, crate::config::StorageConfig::Postgres { .. }) {
             spawn_jwks_refresh_task(
                 storage.clone(),
                 crypto.clone(),
                 token_manager.clone(),
+                signing_key_fingerprint.clone(),
                 config.cluster.jwks_refresh_interval_secs,
                 keyset_generation.clone(),
             );
@@ -498,10 +532,11 @@ impl ServerState {
         };
 
         let logout_notifier: Arc<dyn issuerd_core::SessionLogoutNotifier> =
-            Arc::new(crate::routes::logout::BackchannelLogoutDispatcher::new(
+            Arc::new(crate::routes::logout::BackchannelLogoutDispatcher::new_with_policy(
                 storage.clone(),
                 token_manager.clone(),
                 &extra_roots,
+                config.outbound_http.allow_private_addresses,
             )?);
 
         // Same-node signing-key reload hook: re-read the shared
@@ -513,13 +548,16 @@ impl ServerState {
             let storage = storage.clone();
             let crypto = crypto.clone();
             let token_manager = token_manager.clone();
+            let signing_key_fingerprint = signing_key_fingerprint.clone();
             let keyset_generation = keyset_generation.clone();
             Arc::new(move || {
                 let storage = storage.clone();
                 let crypto = crypto.clone();
                 let token_manager = token_manager.clone();
+                let signing_key_fingerprint = signing_key_fingerprint.clone();
                 let keyset_generation = keyset_generation.clone();
                 tokio::spawn(async move {
+                    let mut current_fingerprint = signing_key_fingerprint.lock().await;
                     let keys = match storage.list_signing_keys().await {
                         Ok(keys) => keys,
                         Err(e) => {
@@ -535,6 +573,7 @@ impl ServerState {
                         tracing::warn!(error = %e, "signing-key reload: JWKS snapshot reload failed");
                         return;
                     }
+                    *current_fingerprint = signing_keys_fingerprint(&keys);
                     keyset_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 });
             })
@@ -636,7 +675,10 @@ impl ServerState {
 /// untouched.
 async fn bootstrap_crypto_provider(
     storage: &dyn Storage,
-) -> Result<Arc<issuerd_token::RingCryptoProvider>, IssuerdError> {
+) -> Result<
+    (Arc<issuerd_token::RingCryptoProvider>, Vec<issuerd_core::StoredSigningKey>),
+    IssuerdError,
+> {
     let crypto_config = issuerd_token::CryptoConfig::default();
     let mut keys = storage.list_signing_keys().await?;
     if keys.is_empty() {
@@ -652,16 +694,43 @@ async fn bootstrap_crypto_provider(
         keys = storage.list_signing_keys().await?;
     }
     let provider = issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys)?;
-    Ok(Arc::new(provider))
+    Ok((Arc::new(provider), keys))
 }
 
-/// Periodically re-read the shared signing-key set from storage and, when it
-/// changed, reload the keystore and the JWKS snapshot so keys added or rotated
-/// by peer nodes propagate to this node without a restart.
+type SharedSigningKeyFingerprint = Arc<tokio::sync::Mutex<[u8; 32]>>;
+
+/// Fingerprint every field consumed by a keystore reload without retaining a
+/// second long-lived copy of private material. Per-key hashes are sorted so
+/// storage ordering cannot affect the result.
+fn signing_keys_fingerprint(keys: &[issuerd_core::StoredSigningKey]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut key_hashes: Vec<[u8; 32]> = keys
+        .iter()
+        .map(|key| {
+            let encoded =
+                serde_json::to_vec(key).expect("serializing a stored signing key cannot fail");
+            Sha256::digest(encoded).into()
+        })
+        .collect();
+    key_hashes.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update((keys.len() as u64).to_be_bytes());
+    for hash in key_hashes {
+        hasher.update(hash);
+    }
+    hasher.finalize().into()
+}
+
+/// Periodically re-read the shared signing-key set from storage and, when its
+/// canonical fingerprint changed, reload the keystore and the JWKS snapshot so
+/// key and active-status changes by peer nodes propagate without a restart.
 fn spawn_jwks_refresh_task(
     storage: Arc<dyn Storage>,
     crypto: Arc<issuerd_token::RingCryptoProvider>,
     token_manager: Arc<TokenManager<issuerd_token::RingCryptoProvider>>,
+    signing_key_fingerprint: SharedSigningKeyFingerprint,
     interval_secs: u64,
     keyset_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -672,6 +741,7 @@ fn spawn_jwks_refresh_task(
         interval.tick().await;
         loop {
             interval.tick().await;
+            let mut current_fingerprint = signing_key_fingerprint.lock().await;
             let keys = match storage.list_signing_keys().await {
                 Ok(keys) => keys,
                 Err(e) => {
@@ -679,21 +749,8 @@ fn spawn_jwks_refresh_task(
                     continue;
                 }
             };
-            let current_kids: Vec<String> = match crypto.get_public_keys().await {
-                Ok(set) => {
-                    let mut kids: Vec<String> =
-                        set.keys.iter().map(|k| k.kid.to_string()).collect();
-                    kids.sort();
-                    kids
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "JWKS refresh: cannot read current JWKS");
-                    continue;
-                }
-            };
-            let mut stored_kids: Vec<String> = keys.iter().map(|k| k.kid.to_string()).collect();
-            stored_kids.sort();
-            if stored_kids == current_kids {
+            let stored_fingerprint = signing_keys_fingerprint(&keys);
+            if stored_fingerprint == *current_fingerprint {
                 continue;
             }
             if let Err(e) = crypto.reload_keys(&keys) {
@@ -704,6 +761,7 @@ fn spawn_jwks_refresh_task(
                 tracing::warn!(error = %e, "JWKS refresh: JWKS snapshot reload failed");
                 continue;
             }
+            *current_fingerprint = stored_fingerprint;
             keyset_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(keys = keys.len(), "reloaded signing keys from shared storage");
         }
@@ -1346,16 +1404,20 @@ mod tests {
         assert_eq!(realms.len(), 1);
     }
 
-    #[tokio::test]
-    async fn bound_flow_executor_loads_storage_flows_with_code_fallback() {
-        let cfg = ServerConfig::default();
-        let state = ServerState::from_config(&cfg).await.unwrap();
+    async fn flow_resolution_state() -> (ServerState, Realm) {
+        let state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
         let realm = state
             .storage
             .get_realm(&RealmId::new("master").unwrap())
             .await
             .unwrap()
             .unwrap();
+        (state, realm)
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_loads_storage_flows() {
+        let (state, realm) = flow_resolution_state().await;
 
         // Realm creation seeded the builtin flows into storage.
         let stored = state.storage.list_flow_configs(&realm.id).await.unwrap();
@@ -1367,19 +1429,64 @@ mod tests {
         custom.built_in = false;
         state.storage.create_flow_config(&realm.id, &custom).await.unwrap();
         let (flow, _executor) = state
-            .bound_flow_executor(&realm, Some("custom-top"), "browser", default_browser_flow)
-            .await;
+            .try_bound_flow_executor(&realm, Some("custom-top"), "browser", default_browser_flow)
+            .await
+            .unwrap();
         assert_eq!(flow.alias.as_str(), "custom-top");
         assert_eq!(flow.stages.len(), 1, "stored flow, not the 7-stage code default");
 
-        // An unbound realm (None) resolves the default alias from storage; an
-        // unknown binding falls back to the code constructor.
-        let (flow, _executor) =
-            state.bound_flow_executor(&realm, None, "browser", default_browser_flow).await;
-        assert_eq!(flow.alias.as_str(), "browser");
         let (flow, _executor) = state
-            .bound_flow_executor(&realm, Some("missing"), "browser", default_browser_flow)
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await
+            .unwrap();
+        assert_eq!(flow.alias.as_str(), "browser");
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_missing_explicit_alias_fails_closed() {
+        let (state, realm) = flow_resolution_state().await;
+
+        let result = state
+            .try_bound_flow_executor(&realm, Some("missing"), "browser", default_browser_flow)
             .await;
+        let Err(error) = result else {
+            panic!("a missing explicitly bound alias must not use the password-capable default");
+        };
+        assert!(matches!(&error, IssuerdError::ServerError(_)));
+        assert!(error.to_string().contains("'missing'"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_list_error_fails_closed() {
+        let (mut state, realm) = flow_resolution_state().await;
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_list_flow_configs()
+            .once()
+            .returning(|_| Err(IssuerdError::ServerError("flow list unavailable".to_string())));
+        state.storage = Arc::new(storage);
+
+        let result = state
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await;
+        let Err(error) = result else {
+            panic!("a storage read failure must not use the code default");
+        };
+        assert_eq!(error, IssuerdError::ServerError("flow list unavailable".to_string()));
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_unbound_missing_default_uses_code_fallback() {
+        let (state, realm) = flow_resolution_state().await;
+        state.storage.delete_flow_config(&realm.id, "browser").await.unwrap();
+        let stored = state.storage.list_flow_configs(&realm.id).await.unwrap();
+        assert!(!stored.is_empty(), "the flow list still loads successfully");
+        assert!(!stored.iter().any(|f| f.top_level && f.alias.as_str() == "browser"));
+
+        let (flow, _executor) = state
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await
+            .unwrap();
         assert_eq!(flow.alias.as_str(), "browser");
         assert_eq!(flow.stages.len(), 7, "code default browser flow as fallback");
     }
@@ -1440,6 +1547,152 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signing_key_fingerprint_covers_all_reload_inputs() {
+        let first = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(true);
+        let second = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(false);
+        let keys = vec![first, second];
+        let baseline = signing_keys_fingerprint(&keys);
+
+        let mut changed = keys.clone();
+        changed[0].kid = keys[1].kid.clone();
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "kid");
+
+        let mut changed = keys.clone();
+        changed[0].alg = issuerd_core::Algorithm::Rs384;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "algorithm");
+
+        let mut changed = keys.clone();
+        changed[0].created_at += chrono::Duration::seconds(1);
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "created_at");
+
+        let mut changed = keys.clone();
+        changed[0].active = false;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "active");
+
+        let mut changed = keys.clone();
+        changed[0].public_jwk.x = keys[1].public_jwk.x.clone();
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "public JWK");
+
+        let mut changed = keys.clone();
+        changed[0].private_der[0] ^= 1;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "private material");
+
+        assert_ne!(signing_keys_fingerprint(&keys[..1]), baseline, "adding or removing a key");
+    }
+
+    #[tokio::test]
+    async fn jwks_refresh_task_does_not_reload_for_reordering() {
+        use std::sync::atomic::Ordering;
+
+        let keys = vec![
+            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+                .unwrap()
+                .to_stored(true),
+            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+                .unwrap()
+                .to_stored(true),
+        ];
+        let crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::from_signing_keys(
+                issuerd_token::CryptoConfig::default(),
+                &keys,
+            )
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let token_manager = Arc::new(TokenManager::with_default_alg(
+            crypto.clone(),
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            jwks,
+            issuerd_token::CryptoConfig::default().default_alg,
+        ));
+
+        let mut reordered = keys.clone();
+        reordered.reverse();
+        let mut mock_storage = issuerd_core::MockStorage::new();
+        mock_storage.expect_list_signing_keys().returning(move || Ok(reordered.clone()));
+        let storage: Arc<dyn issuerd_core::Storage> = Arc::new(mock_storage);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_jwks_refresh_task(
+            storage,
+            crypto,
+            token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&keys))),
+            1,
+            generation.clone(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            0,
+            "reordering an otherwise identical key set must not trigger a reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwks_refresh_task_reloads_active_only_changes() {
+        use std::sync::atomic::Ordering;
+
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let key = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(true);
+        storage.create_signing_key(&key).await.unwrap();
+        let crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::from_signing_keys(
+                issuerd_token::CryptoConfig::default(),
+                std::slice::from_ref(&key),
+            )
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let token_manager = Arc::new(TokenManager::with_default_alg(
+            crypto.clone(),
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            jwks,
+            issuerd_token::CryptoConfig::default().default_alg,
+        ));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_jwks_refresh_task(
+            storage.clone(),
+            crypto.clone(),
+            token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(std::slice::from_ref(&key)))),
+            1,
+            generation.clone(),
+        );
+
+        let mut disabled = key.clone();
+        disabled.active = false;
+        storage.update_signing_key(&disabled).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while generation.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            generation.load(Ordering::Relaxed) >= 1,
+            "an active-only storage change must trigger a reload"
+        );
+        let err = crypto
+            .sign(r#"{"sub":"user-1"}"#, disabled.alg, &disabled.kid)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("disabled"),
+            "the reloaded keystore must reject signing with the disabled key: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn jwks_refresh_task_reloads_only_on_key_set_changes() {
         use std::sync::atomic::Ordering;
@@ -1474,6 +1727,7 @@ mod tests {
             storage.clone(),
             crypto.clone(),
             token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&keys))),
             1,
             generation.clone(),
         );

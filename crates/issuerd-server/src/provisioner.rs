@@ -53,7 +53,8 @@ impl Provisioner {
 
     /// Apply the provision config to storage **once**.
     ///
-    /// If the provision marker already exists, this is a no-op.
+    /// If the marker is already `applied`, this is a no-op. Other nodes wait
+    /// for an in-progress attempt instead of treating it as completed.
     /// `base_url` (typically the configured issuer URL) is used to build the
     /// redirect URIs of the per-realm built-in clients.
     pub async fn apply_once(
@@ -73,21 +74,37 @@ impl Provisioner {
         let marker = self.config.marker_name();
 
         // Claim the marker atomically *before* applying: a concurrent first
-        // boot must not run the whole provisioning twice (P3-14).
-        if !storage.claim_provision_marker(marker, "applied").await? {
-            info!(marker = %marker, "provision already applied; skipping");
-            return Ok(());
+        // boot must not run the whole provisioning twice (P3-14). Only a
+        // fully completed attempt is marked applied.
+        loop {
+            if storage.claim_provision_marker(marker, "in_progress").await? {
+                break;
+            }
+            if Self::wait_for_other_provisioner(storage, marker).await? {
+                info!(marker = %marker, "provision already applied; skipping");
+                return Ok(());
+            }
         }
 
         info!(marker = %marker, "applying provision config");
-        self.apply_realms(storage, base_url).await?;
-        self.apply_roles(storage).await?;
-        self.apply_clients(storage, mcp_enabled).await?;
-        // Groups after clients: group client-role mappings resolve clients.
-        self.apply_groups(storage).await?;
-        self.apply_users(storage).await?;
-        self.apply_identity_providers(storage).await?;
-        self.apply_flow_configs(storage).await?;
+        let result = async {
+            self.apply_realms(storage, base_url).await?;
+            self.apply_roles(storage).await?;
+            self.apply_clients(storage, mcp_enabled).await?;
+            // Groups after clients: group client-role mappings resolve clients.
+            self.apply_groups(storage).await?;
+            self.apply_users(storage).await?;
+            self.apply_identity_providers(storage).await?;
+            self.apply_flow_configs(storage).await?;
+            storage.set_provision_marker(marker, "applied").await
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(cleanup_error) = storage.delete_provision_marker(marker).await {
+                warn!(marker = %marker, error = %cleanup_error, "failed to clear in-progress provision marker");
+            }
+            return Err(error);
+        }
 
         info!(marker = %marker, "provision config applied successfully");
         Ok(())
@@ -96,6 +113,32 @@ impl Provisioner {
     // ------------------------------------------------------------------
     // Realms
     // ------------------------------------------------------------------
+
+    /// Return true only when the peer's attempt has completed successfully.
+    /// An interrupted marker is never mistaken for a completed provision.
+    async fn wait_for_other_provisioner(
+        storage: &dyn Storage,
+        marker: &str,
+    ) -> Result<bool, issuerd_core::IssuerdError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match storage.get_provision_marker(marker).await?.as_deref() {
+                Some("applied") => return Ok(true),
+                Some("in_progress") if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Some("in_progress") => {
+                    return Err(issuerd_core::IssuerdError::TemporarilyUnavailable);
+                }
+                Some(_) => {
+                    return Err(issuerd_core::IssuerdError::ServerError(
+                        "unrecognized provisioning marker state".to_string(),
+                    ));
+                }
+                None => return Ok(false),
+            }
+        }
+    }
 
     async fn apply_realms(
         &self,
@@ -1117,6 +1160,29 @@ mod tests {
         assert_eq!(realm.internationalization_enabled, defaults.internationalization_enabled);
         assert_eq!(realm.supported_locales, defaults.supported_locales);
         assert_eq!(realm.default_locale, defaults.default_locale);
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_clears_marker_and_allows_retry() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.roles.push(ProvisionRole {
+            realm: "missing-realm".to_string(),
+            name: "unresolvable".to_string(),
+            description: None,
+        });
+        let mut provisioner = Provisioner { config };
+
+        assert!(provisioner.apply_once(&storage, "http://localhost:8080").await.is_err());
+        assert_eq!(storage.get_provision_marker("test-marker").await.unwrap(), None);
+
+        provisioner.config.roles.pop();
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+        assert_eq!(
+            storage.get_provision_marker("test-marker").await.unwrap(),
+            Some("applied".to_string())
+        );
+        assert!(storage.get_realm_by_name("testrealm").await.unwrap().is_some());
     }
 
     #[tokio::test]

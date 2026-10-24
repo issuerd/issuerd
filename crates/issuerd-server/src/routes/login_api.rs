@@ -165,6 +165,8 @@ pub struct AdminTokenRequest {
     pub realm: String,
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -369,13 +371,36 @@ pub async fn login_handler(
     }
 
     // Run flow. The resume position is the flow stage id stored inside the
-    // pending entry — not the browser-facing random flow id. The
-    // realm's browser-flow binding selects the top-level flow from storage
-    // (code default as fallback); the executor sees the full stored flow set
-    // so sub-flow stages resolve.
-    let (flow, executor) = state
-        .bound_flow_executor(&realm, realm.browser_flow.as_deref(), "browser", default_browser_flow)
-        .await;
+    // pending entry — not the browser-facing random flow id. Explicit bindings
+    // and storage reads must succeed; only an unbound legacy realm may use the
+    // code default when its default alias is absent. The executor sees the
+    // full stored flow set so sub-flow stages resolve.
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
+            &realm,
+            realm.browser_flow.as_deref(),
+            "browser",
+            default_browser_flow,
+        )
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "browser flow resolution failed");
+            if is_browser_form {
+                let mut redirect = url::form_urlencoded::Serializer::new(String::new());
+                redirect.append_pair("execution_id", &body.execution_id.0);
+                redirect.append_pair("realm", &realm_name);
+                redirect.append_pair("error", "server_error");
+                return Redirect::to(&format!("/login.html?{}", redirect.finish())).into_response();
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+                .into_response();
+        }
+    };
 
     let outcome = match executor.continue_flow(&flow, &pending.execution_id, ctx).await {
         Ok(o) => o,
@@ -633,10 +658,11 @@ pub async fn login_handler(
     path = "/api/v1/auth/logout",
     tag = "Internal",
     summary = "Log out the first-party SPA session",
-    description = "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout) and clears those plus the `issuerd_remember_{realm}` cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
+    description = "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout), revokes remember-me tokens, and clears those cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
     operation_id = "auth_logout",
     responses(
         (status = 204, description = "Logged out; session cookies cleared"),
+        (status = 503, description = "Revocation state unavailable; retry logout"),
     ),
 )]
 #[instrument(skip(state, headers))]
@@ -679,7 +705,14 @@ pub async fn logout_api_handler(
                         // dispatcher can still see the client sessions.
                         let destroyed =
                             state.storage.get_user_session(&realm.id, sid).await.ok().flatten();
-                        let _ = state.storage.delete_user_session(&realm.id, sid).await;
+                        if let Err(e) = state.storage.delete_user_session(&realm.id, sid).await {
+                            error!(realm = %realm.id, error = %e, "logout failed: session deletion failed");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": "server_error"})),
+                            )
+                                .into_response();
+                        }
                         crate::session_cache::invalidate_session(&state, &realm.id, sid).await;
                         if let Some(destroyed) = destroyed {
                             state
@@ -692,6 +725,10 @@ pub async fn logout_api_handler(
             }
         } else if name == "issuerd_remember" || name.starts_with("issuerd_remember_") {
             clear_names.push(name.to_string());
+            let result = crate::session_cache::revoke_remember_cookie(&state, value).await;
+            if let Some(response) = super::oidc::cache_operation_result(result) {
+                return response;
+            }
         }
     }
 
@@ -876,7 +913,7 @@ pub(crate) async fn complete_login_with_method(
 
     // Look up the authenticated user; provides the canonical username for the session.
     let user = match state.storage.get_user(&realm_id, &user_id).await {
-        Ok(Some(u)) => u,
+        Ok(Some(u)) if u.enabled => u,
         _ => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
                 .into_response();
@@ -921,7 +958,7 @@ pub(crate) async fn complete_login_with_method(
     // Consent gate: a consent-required client (or prompt=consent
     // carried in the pending entry) pauses here — after authentication,
     // before session/code issuance — until the user grants the scopes.
-    if super::consent::consent_needed(
+    let needs_consent = match super::consent::consent_needed(
         state,
         &realm_id,
         &client,
@@ -931,6 +968,13 @@ pub(crate) async fn complete_login_with_method(
     )
     .await
     {
+        Ok(needed) => needed,
+        Err(e) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(super::oidc::error_response(&e)))
+                .into_response();
+        }
+    };
+    if needs_consent {
         let entry = super::consent::PendingConsentData {
             user_id: user_id.0.clone(),
             session_id: session_id.0.clone(),
@@ -1270,6 +1314,28 @@ pub async fn admin_token_handler(
             .into_response();
     }
 
+    if !user.required_actions.is_empty() {
+        warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request rejected: required actions pending");
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
+            .into_response();
+    }
+
+    if let Err(reject) =
+        super::oidc::enforce_oob_second_factor(&state, &realm, &user, body.totp.as_deref()).await
+    {
+        return match reject {
+            super::oidc::OobSecondFactorReject::Internal(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(super::oidc::error_response(&e)))
+                    .into_response()
+            }
+            _ => {
+                warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request rejected: second factor required or invalid");
+                (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
+                    .into_response()
+            }
+        };
+    }
+
     // Successful authentication clears the failure counter.
     if brute_force.is_some() {
         let _ = state
@@ -1284,7 +1350,14 @@ pub async fn admin_token_handler(
         .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
         .await
     {
-        Ok(Some(c)) => c,
+        Ok(Some(c)) if c.enabled => c,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized_client"})),
+            )
+                .into_response();
+        }
         Ok(None) => {
             error!(realm = %realm_id, "admin-cli client not found");
             return (
@@ -1766,6 +1839,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1791,6 +1865,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "wrong".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1816,6 +1891,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1831,6 +1907,102 @@ pub(crate) mod tests {
 
     async fn setup_state() -> Arc<ServerState> {
         Arc::new(ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap())
+    }
+
+    async fn seed_admin_totp(state: &Arc<ServerState>) -> issuerd_core::OtpPolicy {
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &credential).await.unwrap();
+        realm.otp_policy
+    }
+
+    fn admin_token_request(totp: Option<String>) -> AdminTokenRequest {
+        AdminTokenRequest {
+            realm: "master".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            totp,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_token_enforces_totp() {
+        let state = setup_state().await;
+        let policy = seed_admin_totp(&state).await;
+
+        let response = admin_token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let step = issuerd_core::utils::now_secs() / u64::from(policy.period_secs);
+        let code = issuerd_auth_flow::totp::totp_at(
+            b"12345678901234567890",
+            step,
+            policy.digits,
+            &policy.algorithm,
+        );
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(Some(code))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_token_rejects_pending_required_actions() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.required_actions = vec!["UPDATE_PASSWORD".to_string()];
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_token_rejects_disabled_admin_client() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.enabled = false;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(response).await["error"], "unauthorized_client");
     }
 
     /// Request headers carrying the flow correlation cookie that the authorize
@@ -1920,6 +2092,83 @@ pub(crate) mod tests {
         assert!(json["code"].as_str().unwrap().len() > 5);
         assert!(json["id_token"].is_null());
         assert_eq!(json["redirect_uri"], "http://localhost:8080/cb");
+    }
+
+    #[tokio::test]
+    async fn login_missing_explicit_browser_flow_fails_closed() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.browser_flow = Some("missing-strict-mfa".to_string());
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let execution_id = FlowStageId::new("username-password").unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: execution_id.clone(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+            resource: None,
+        };
+        let cache_key = crate::routes::oidc::pending_auth_cache_key(&realm_id, &execution_id.0);
+        state
+            .cache
+            .set(
+                &cache_key,
+                serde_json::to_vec(&pending).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let response = login_handler(
+            State(state),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            Query(std::collections::HashMap::new()),
+            headers_with_flow_cookie(&execution_id.0),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&LoginRequest {
+                    execution_id,
+                    username: "admin".to_string(),
+                    password: "admin".to_string(),
+                    otp: None,
+                    remember_me: None,
+                    webauthn_assertion: None,
+                    resend: None,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = extract_json(response).await;
+        assert_eq!(json["error"], "server_error");
+        assert!(json.get("code").is_none(), "no code may be issued: {json}");
     }
 
     #[tokio::test]
@@ -2501,6 +2750,93 @@ pub(crate) mod tests {
         assert!(location.contains("execution_id="));
     }
 
+    async fn logout_delete_failure_state() -> (Arc<ServerState>, axum::http::HeaderMap) {
+        let mut state = ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap();
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+        let now = chrono::Utc::now();
+        let session = issuerd_core::UserSession {
+            id: session_id.clone(),
+            realm_id: realm_id.clone(),
+            user_id: user.id.clone(),
+            login_username: user.username.clone(),
+            auth_method: AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        };
+        state.storage.create_user_session(&realm_id, &session).await.unwrap();
+        let token = state
+            .token_manager
+            .issue_sso_session_token(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &session_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_realm_by_name().returning(move |_| Ok(Some(realm.clone())));
+        storage
+            .expect_get_user_session()
+            .returning(move |_, _| Ok(Some(session.clone())));
+        storage.expect_get_user().returning(move |_, _| Ok(Some(user.clone())));
+        storage
+            .expect_delete_user_session()
+            .times(1)
+            .returning(|_, _| Err(issuerd_core::IssuerdError::ServerError("delete failed".into())));
+        state.storage = Arc::new(storage);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_session={}", token.token).parse().unwrap(),
+        );
+        (Arc::new(state), headers)
+    }
+
+    #[tokio::test]
+    async fn logout_api_delete_failure_is_not_reported_as_success() {
+        let (state, headers) = logout_delete_failure_state().await;
+        let response = logout_api_handler(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(axum::http::header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn rp_logout_delete_failure_is_not_reported_as_success() {
+        let (state, headers) = logout_delete_failure_state().await;
+        let response = crate::routes::oidc::logout_handler_get(
+            State(state),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn logout_api_returns_no_content() {
         let state = setup_state().await;
@@ -2529,6 +2865,7 @@ pub(crate) mod tests {
                 realm: "nonexistent".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2546,6 +2883,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "nobody".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2581,6 +2919,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "nocreds".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2606,6 +2945,7 @@ pub(crate) mod tests {
                     realm: "master".to_string(),
                     username: "admin".to_string(),
                     password: password.to_string(),
+                    totp: None,
                 }),
             )
         };
@@ -2668,6 +3008,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3069,6 +3410,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "badutf8".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3114,6 +3456,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "badhash".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3366,6 +3709,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn logout_api_revokes_remember_cookie() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let claims = issuerd_token::action_tokens::action_token_claims(
+            &issuerd_core::UserId::new("admin").unwrap(),
+            &realm_id,
+            issuerd_core::ACTION_TOKEN_PURPOSE_REMEMBER_ME,
+            3600,
+        );
+        let cookie =
+            issuerd_token::action_tokens::issue_action_token(state.crypto.as_ref(), &claims)
+                .await
+                .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_remember_master={cookie}").parse().unwrap(),
+        );
+
+        let response = logout_api_handler(State(state.clone()), headers).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .cache
+                .get(&issuerd_cluster::cache_keys::remember_token_revoked("master", &claims.jti))
+                .await
+                .unwrap()
+                .is_some(),
+            "logout must revoke the signed token, not only clear its browser cookie"
+        );
+    }
+
+    #[tokio::test]
     async fn login_continue_flow_unknown_execution_id() {
         let state = setup_state().await;
         let execution_id = FlowStageId::new("unknown-stage").unwrap();
@@ -3586,6 +3963,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3682,6 +4060,37 @@ pub(crate) mod tests {
         async fn authenticate(&self, context: &mut AuthContext) -> issuerd_core::AuthStepResult {
             context.user_id = Some(self.user_id.clone());
             issuerd_core::AuthStepResult::Success
+        }
+    }
+
+    struct AttemptedAuthenticator(&'static str);
+
+    #[async_trait::async_trait]
+    impl issuerd_core::Authenticator for AttemptedAuthenticator {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn display_name(&self) -> &str {
+            self.0
+        }
+        fn requires_user(&self) -> bool {
+            true
+        }
+        fn configured_for(&self, _context: &AuthContext) -> bool {
+            true
+        }
+        async fn authenticate(&self, _context: &mut AuthContext) -> issuerd_core::AuthStepResult {
+            issuerd_core::AuthStepResult::Attempted
+        }
+    }
+
+    fn register_attempted_defaults(registry: &mut crate::state::SimplePluginRegistry) {
+        for id in [
+            "conditional-user-configured",
+            "auth-otp-form",
+            "auth-webauthn",
+        ] {
+            registry.register_authenticator(Arc::new(AttemptedAuthenticator(id)));
         }
     }
 
@@ -3833,13 +4242,15 @@ pub(crate) mod tests {
         });
         mock_storage.expect_create_user_session().returning(|_, _| Ok(()));
         mock_storage.expect_get_user().returning(|_, _| Ok(None));
-        // No stored flows: the runtime falls back to the code default flow.
+        // The unbound mock realm successfully loads an empty flow list, so the
+        // legacy default-alias fallback applies.
         mock_storage.expect_list_flow_configs().returning(|_| Ok(vec![]));
 
         let mut reg = crate::state::SimplePluginRegistry::new();
         reg.register_authenticator(Arc::new(HardcodedUserAuthenticator {
             user_id: issuerd_core::UserId::new("ghost").unwrap(),
         }));
+        register_attempted_defaults(&mut reg);
 
         let state = Arc::new(ServerState {
             config: ServerConfig::default(),
@@ -4000,13 +4411,15 @@ pub(crate) mod tests {
             }))
         });
         mock_storage.expect_get_realm().returning(|_| Ok(None));
-        // No stored flows: the runtime falls back to the code default flow.
+        // The unbound mock realm successfully loads an empty flow list, so the
+        // legacy default-alias fallback applies.
         mock_storage.expect_list_flow_configs().returning(|_| Ok(vec![]));
 
         let mut reg = crate::state::SimplePluginRegistry::new();
         reg.register_authenticator(Arc::new(HardcodedUserAuthenticator {
             user_id: issuerd_core::UserId::new("u1").unwrap(),
         }));
+        register_attempted_defaults(&mut reg);
 
         let state = Arc::new(ServerState {
             config: ServerConfig::default(),
@@ -4476,6 +4889,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "norole".to_string(),
                 password: "secret".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -4546,6 +4960,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;

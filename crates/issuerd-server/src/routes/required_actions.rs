@@ -77,11 +77,17 @@ fn action_required_tag() -> String {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingActionsData {
     /// The original authorization request; replayed by
-    /// [`super::login_api::complete_login`] once the last action clears.
+    /// [`super::login_api::complete_login_with_method`] once the last action clears.
     pub pending: PendingAuthData,
     pub user_id: String,
     pub session_id: String,
     pub auth_time: chrono::DateTime<chrono::Utc>,
+    /// Original method for brokered/SPNEGO logins; legacy password entries
+    /// predate these fields and use the password fallback at completion.
+    #[serde(default)]
+    pub auth_method: Option<issuerd_core::AuthMethod>,
+    #[serde(default)]
+    pub method_label: Option<String>,
     /// Action ids still to complete, in evaluation order.
     pub remaining_actions: Vec<String>,
     /// VERIFY_EMAIL: set once the message has been sent so re-rendering the
@@ -122,18 +128,98 @@ fn continuation_url(realm_name: &str, execution: &str) -> String {
     )
 }
 
-/// Start the required-action continuation: store the paused state and
-/// redirect the browser to the first action page.
-///
-/// Called from both login completion points (password login POST and the
-/// authorize endpoint's SSO/cookie path) when the flow succeeded with
-/// `result.required_actions` non-empty.
+/// Evaluate required actions after a broker or Kerberos authentication.
+/// These users have no local password by design, but an explicit password
+/// update assignment remains enforceable. Any evaluation failure aborts login.
+pub(crate) async fn evaluate_federated_required_actions(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    user: &User,
+    ip_address: Option<std::net::IpAddr>,
+) -> Result<Vec<String>, IssuerdError> {
+    let mut attributes = HashMap::new();
+    if realm.verify_email_enabled {
+        attributes.insert("realm_verify_email_enabled".to_string(), "true".to_string());
+    }
+    let ctx = AuthContext {
+        realm_id: realm.id.clone(),
+        client_id: None,
+        user_id: Some(user.id.clone()),
+        session_id: None,
+        ip_address,
+        parameters: HashMap::new(),
+        attributes,
+        current_challenge: None,
+    };
+    let mut action_ids = state.plugin_registry.list_required_action_ids();
+    for assigned in &user.required_actions {
+        if !action_ids.contains(assigned) {
+            action_ids.push(assigned.clone());
+        }
+    }
+
+    let update_password_assigned =
+        user.required_actions.iter().any(|action| action == "UPDATE_PASSWORD");
+    let mut pending = Vec::new();
+    for action_id in action_ids {
+        if action_id == "UPDATE_PASSWORD" && !update_password_assigned {
+            continue;
+        }
+        let action = match state.plugin_registry.get_required_action(&action_id).await {
+            Ok(Some(action)) => action,
+            Ok(None) => {
+                error!(action = %action_id, "required action is not registered");
+                return Err(IssuerdError::ServerError(format!(
+                    "required action listed or assigned but not registered: {action_id}"
+                )));
+            }
+            Err(e) => {
+                error!(error = %e, action = %action_id, "required action registry lookup failed");
+                return Err(e);
+            }
+        };
+        match action.try_evaluate(&ctx).await {
+            Ok(true) => pending.push(action_id),
+            Ok(false) => {}
+            Err(e) => {
+                error!(error = %e, action = %action_id, "required action evaluation failed");
+                return Err(e);
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// Start the required-action continuation for a password-authenticated flow.
 pub(crate) async fn begin_actions_continuation(
     state: &Arc<ServerState>,
     realm_name: &str,
     pending: PendingAuthData,
     result: TypedFlowResult<ActionsPending>,
     is_browser_form: bool,
+) -> Response {
+    begin_actions_continuation_with_method(
+        state,
+        realm_name,
+        pending,
+        result,
+        is_browser_form,
+        issuerd_core::AuthMethod::Password,
+        "password",
+    )
+    .await
+}
+
+/// Store the paused state and redirect to the first action page, retaining
+/// the original authentication method for session creation and audit events.
+pub(crate) async fn begin_actions_continuation_with_method(
+    state: &Arc<ServerState>,
+    realm_name: &str,
+    pending: PendingAuthData,
+    result: TypedFlowResult<ActionsPending>,
+    is_browser_form: bool,
+    auth_method: issuerd_core::AuthMethod,
+    method_label: &str,
 ) -> Response {
     debug!(
         realm = %pending.realm_id,
@@ -156,6 +242,8 @@ pub(crate) async fn begin_actions_continuation(
         user_id: result.user_id.0.clone(),
         session_id: result.session_id.0.clone(),
         auth_time: result.auth_time,
+        auth_method: Some(auth_method),
+        method_label: Some(method_label.to_string()),
         remaining_actions: result.required_actions.clone(),
         pending,
         email_sent: false,
@@ -364,6 +452,14 @@ pub(crate) fn error_response(copy: &PageCopy, status: StatusCode, msg: &str) -> 
         ),
     )
         .into_response()
+}
+
+pub(crate) fn required_action_operational_error(copy: &PageCopy) -> Response {
+    error_response(
+        copy,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &copy.msg("error.actionFailed", "The action could not be completed. Please try again."),
+    )
 }
 
 /// Encode `value` as a JavaScript string literal (including the surrounding
@@ -806,7 +902,8 @@ fn render_action_page(
                  </form>"
             )
         }
-        // Unknown actions are skipped before rendering; this is unreachable.
+        // Registered custom actions without a dedicated form fail closed on
+        // this unsupported-action page; unregistered ids never reach rendering.
         other => format!(
             "<h1>{}</h1><p>{}</p>",
             copy.msg("action.unsupported.heading", "Unsupported action"),
@@ -1057,12 +1154,24 @@ async fn required_action_page_inner(
     let copy =
         PageCopy::for_realm(&state, &realm, entry.pending.locale.as_deref(), accept_language);
 
-    // Work through the remaining list: completed/unknown actions are dropped
-    // until a renderable action is found or the login can finish.
+    // Work through the remaining list until a renderable action is found or
+    // the login can finish. Only a verified email may be dropped here;
+    // unresolved actions are operational failures, not skippable steps.
     loop {
         let Some(action) = entry.remaining_actions.first().cloned() else {
             return finish_continuation(&state, &realm_id, &entry, &copy).await;
         };
+        match state.plugin_registry.get_required_action(&action).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(realm = %realm_id, action = %action, "required action is not registered");
+                return required_action_operational_error(&copy);
+            }
+            Err(e) => {
+                error!(realm = %realm_id, action = %action, error = %e, "required action registry lookup failed");
+                return required_action_operational_error(&copy);
+            }
+        }
         match action.as_str() {
             "VERIFY_EMAIL" => {
                 let user_id = match issuerd_core::UserId::new(entry.user_id.clone()) {
@@ -1203,12 +1312,17 @@ async fn required_action_page_inner(
                     error.as_deref(),
                 );
             }
-            other => {
-                // Unknown action ids: never block the login on a page this
-                // server cannot render.
-                warn!(action = other, "skipping unsupported required action");
-                entry.remaining_actions.remove(0);
+            _ => {
+                let error = entry.error.take();
                 store_entry(&state, &realm_id, &execution, &entry).await;
+                return render_action_page(
+                    &copy,
+                    &realm_name,
+                    &execution,
+                    &action,
+                    error.as_deref(),
+                    None,
+                );
             }
         }
     }
@@ -1331,11 +1445,15 @@ pub async fn required_action_submit(
     };
     let action_impl = match state.plugin_registry.get_required_action(&action).await {
         Ok(Some(a)) => a,
-        _ => {
-            warn!(action = %action, "required action not registered; skipping");
-            entry.remaining_actions.remove(0);
+        Ok(None) => {
+            error!(realm = %realm_id, action = %action, "required action is not registered");
             store_entry(&state, &realm_id, &execution, &entry).await;
-            return redirect_back();
+            return required_action_operational_error(&copy);
+        }
+        Err(e) => {
+            error!(realm = %realm_id, action = %action, error = %e, "required action registry lookup failed");
+            store_entry(&state, &realm_id, &execution, &entry).await;
+            return required_action_operational_error(&copy);
         }
     };
 
@@ -1550,6 +1668,11 @@ pub async fn verify_email_handler(
     let entry_key = pending_actions_cache_key(&realm_id, execution);
     if let Ok(Some(bytes)) = state.cache.get(&entry_key).await {
         if let Ok(mut entry) = serde_json::from_slice::<PendingActionsData>(&bytes) {
+            // The execution query parameter is independent of the token. Only
+            // a continuation bound to the token's realm and user may change.
+            if entry.pending.realm_id != realm_id.0 || entry.user_id != user_id.0 {
+                return link_expired();
+            }
             if entry.remaining_actions.iter().any(|a| a == "VERIFY_EMAIL") {
                 entry.remaining_actions.retain(|a| a != "VERIFY_EMAIL");
                 let ip = entry.pending.ip_address.unwrap_or_else(|| "127.0.0.1".parse().unwrap());
@@ -1769,6 +1892,8 @@ pub async fn execute_actions_handler(
         user_id: user_id.0.clone(),
         session_id: issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap().0,
         auth_time: chrono::Utc::now(),
+        auth_method: None,
+        method_label: None,
         remaining_actions: continuation.actions.clone(),
         email_sent: false,
         error: None,
@@ -1838,7 +1963,7 @@ async fn finish_continuation(
         session_id.clone(),
         entry.auth_time,
     );
-    super::login_api::complete_login(
+    super::login_api::complete_login_with_method(
         state,
         realm_id,
         &entry.pending,
@@ -1846,6 +1971,8 @@ async fn finish_continuation(
         &session_id,
         entry.auth_time,
         true,
+        entry.auth_method.unwrap_or(issuerd_core::AuthMethod::Password),
+        entry.method_label.as_deref().unwrap_or("password"),
     )
     .await
 }
@@ -2289,6 +2416,83 @@ mod tests {
         assert!(body_string(resp).await.contains("expired"));
     }
 
+    async fn unknown_action_continuation() -> (Arc<ServerState>, RealmId, User, String, String) {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "unknown-action", &["UNREGISTERED_CUSTOM_ACTION"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["UNREGISTERED_CUSTOM_ACTION"]),
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let execution = execution_from_location(&resp);
+        let cookie_name = flow_cookie_name_of(&resp);
+        (state, realm_id, user, execution, cookie_name)
+    }
+
+    async fn assert_unknown_action_is_terminal(
+        resp: Response,
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        user_id: &UserId,
+        execution: &str,
+    ) {
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(LOCATION).is_none());
+        let body = body_string(resp).await;
+        assert!(body.contains("The action could not be completed"));
+        assert!(!body.contains("UNREGISTERED_CUSTOM_ACTION"));
+
+        let entry = stored_actions_entry(state, realm_id, execution).await;
+        assert_eq!(entry.remaining_actions, vec!["UNREGISTERED_CUSTOM_ACTION"]);
+        let user = state.storage.get_user(realm_id, user_id).await.unwrap().unwrap();
+        assert_eq!(user.required_actions, vec!["UNREGISTERED_CUSTOM_ACTION"]);
+        let sessions = state
+            .storage
+            .list_sessions(realm_id, Some(user_id.clone()), &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert!(sessions.is_empty(), "unknown action must not create a session");
+        let codes = state.cache.scan_keys("auth_code:master:*").await.unwrap();
+        assert!(codes.is_empty(), "unknown action must not create an authorization code");
+    }
+
+    #[tokio::test]
+    async fn get_unknown_action_is_terminal_and_preserves_entry() {
+        let (state, realm_id, user, execution, _cookie) = unknown_action_continuation().await;
+
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_unknown_action_is_terminal(resp, &state, &realm_id, &user.id, &execution).await;
+    }
+
+    #[tokio::test]
+    async fn post_unknown_action_is_terminal_and_restores_entry() {
+        let (state, realm_id, user, execution, cookie_name) = unknown_action_continuation().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, format!("{cookie_name}=1").parse().unwrap());
+
+        let resp = required_action_submit(
+            State(state.clone()),
+            Path(("master".to_string(), execution.clone())),
+            headers,
+            Bytes::from(""),
+        )
+        .await;
+
+        assert_unknown_action_is_terminal(resp, &state, &realm_id, &user.id, &execution).await;
+    }
+
     #[tokio::test]
     async fn update_password_continuation_completes_login() {
         let state = test_state().await;
@@ -2563,6 +2767,156 @@ mod tests {
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
         assert!(location.contains("code="), "unexpected redirect: {location}");
+    }
+
+    async fn store_verify_email_token(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        user: &User,
+        token: &str,
+    ) {
+        let data = VerifyEmailTokenData {
+            user_id: user.id.0.clone(),
+            email: user.email.as_ref().unwrap().as_str().to_string(),
+        };
+        state
+            .cache
+            .set(
+                &verify_email_cache_key(realm_id, token),
+                serde_json::to_vec(&data).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn redeem_verify_email(
+        state: &Arc<ServerState>,
+        token: &str,
+        execution: &str,
+    ) -> Response {
+        let query = HashMap::from([
+            ("token".to_string(), token.to_string()),
+            ("execution".to_string(), execution.to_string()),
+        ]);
+        verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await
+    }
+
+    async fn stored_actions_entry(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        execution: &str,
+    ) -> PendingActionsData {
+        let bytes = state
+            .cache
+            .get(&pending_actions_cache_key(realm_id, execution))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_email_execution_requires_matching_user_and_preserves_legitimate_flow() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let alice = test_user(&realm_id, "alice", &["VERIFY_EMAIL"]);
+        let bob = test_user(&realm_id, "bob", &["VERIFY_EMAIL"]);
+        state.storage.create_user(&realm_id, &alice).await.unwrap();
+        state.storage.create_user(&realm_id, &bob).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&bob, &["VERIFY_EMAIL"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+
+        // Alice's valid token must not advance Bob's independently named
+        // continuation, even when the attacker knows Bob's execution id.
+        store_verify_email_token(&state, &realm_id, &alice, "alice-token").await;
+        let resp = redeem_verify_email(&state, "alice-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("This verification link is invalid or has expired."),
+            "body: {body}"
+        );
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert_eq!(entry.user_id, bob.id.0);
+        assert_eq!(entry.remaining_actions, vec!["VERIFY_EMAIL"]);
+        let stored_bob = state.storage.get_user(&realm_id, &bob.id).await.unwrap().unwrap();
+        assert!(!stored_bob.email_verified);
+        assert_eq!(stored_bob.required_actions, vec!["VERIFY_EMAIL"]);
+
+        // Bob's own token still clears the same continuation, which then
+        // advances into the original login completion.
+        store_verify_email_token(&state, &realm_id, &bob, "bob-token").await;
+        let resp = redeem_verify_email(&state, "bob-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("Email address verified"));
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert!(entry.remaining_actions.is_empty());
+
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution)),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location =
+            resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
+        assert!(location.contains("code="), "unexpected redirect: {location}");
+    }
+
+    #[tokio::test]
+    async fn verify_email_execution_requires_matching_realm() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "realm-bound", &["VERIFY_EMAIL"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["VERIFY_EMAIL"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+        let mut entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        entry.pending.realm_id = "another-realm".to_string();
+        state
+            .cache
+            .set(
+                &pending_actions_cache_key(&realm_id, &execution),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        store_verify_email_token(&state, &realm_id, &user, "realm-token").await;
+        let resp = redeem_verify_email(&state, "realm-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("This verification link is invalid or has expired."),
+            "body: {body}"
+        );
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert_eq!(entry.remaining_actions, vec!["VERIFY_EMAIL"]);
     }
 
     /// A link mailed to the old address must not verify an address the user
@@ -2964,6 +3318,8 @@ mod tests {
             user_id: "user-1".to_string(),
             session_id: issuerd_core::utils::generate_id(),
             auth_time: Utc::now(),
+            auth_method: None,
+            method_label: None,
             remaining_actions: vec![],
             email_sent: false,
             error: None,
@@ -2976,6 +3332,25 @@ mod tests {
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
         assert_eq!(location, "https://app.example.com/after");
+    }
+
+    #[tokio::test]
+    async fn finish_continuation_preserves_spnego_method() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut entry = bare_entry(&realm_id, &[]);
+        entry.user_id = "admin".to_string();
+        entry.auth_method = Some(issuerd_core::AuthMethod::Spnego);
+        entry.method_label = Some("spnego".to_string());
+
+        let response =
+            finish_continuation(&state, &realm_id, &entry, &PageCopy::builtin("en")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let session_id = issuerd_core::SessionId::new(entry.session_id).unwrap();
+        let session =
+            state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        assert_eq!(session.auth_method, issuerd_core::AuthMethod::Spnego);
     }
 
     // -----------------------------------------------------------------------
@@ -2999,6 +3374,8 @@ mod tests {
             user_id: UserId::new(issuerd_core::utils::generate_id()).unwrap().0,
             session_id: issuerd_core::utils::generate_id(),
             auth_time: Utc::now(),
+            auth_method: None,
+            method_label: None,
             remaining_actions: actions.iter().map(|s| s.to_string()).collect(),
             email_sent: false,
             error: None,

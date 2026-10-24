@@ -194,6 +194,42 @@ pub trait Storage: Send + Sync {
         user: &UserId,
         cred: &Credential,
     ) -> Result<(), IssuerdError>;
+    /// Consume a TOTP step by advancing the credential's replay watermark.
+    ///
+    /// Returns `true` only when the credential exists, is a TOTP credential,
+    /// and its current watermark is absent or strictly less than `matched_step`.
+    /// Stale, replayed, missing, and non-TOTP credentials return `false`; all
+    /// other credential fields are preserved and storage errors are propagated.
+    ///
+    /// The default implementation is a compatibility fallback for third-party
+    /// and test stores and is not atomic across concurrent calls. Deployed
+    /// backends must override this method with an atomic compare-and-update.
+    async fn consume_totp_step(
+        &self,
+        realm: &RealmId,
+        user: &UserId,
+        credential_id: &CredentialId,
+        matched_step: u64,
+    ) -> Result<bool, IssuerdError> {
+        let credential =
+            self.get_credentials(realm, user, CredentialType::Totp).await?.into_iter().find(
+                |credential| {
+                    &credential.id == credential_id
+                        && credential.credential_type == CredentialType::Totp
+                },
+            );
+        let Some(mut credential) = credential else {
+            return Ok(false);
+        };
+        let last_used_step =
+            credential.credential_data.get("last_used_step").and_then(|step| step.as_u64());
+        if last_used_step.is_some_and(|step| step >= matched_step) {
+            return Ok(false);
+        }
+        credential.credential_data["last_used_step"] = serde_json::json!(matched_step);
+        self.update_credential(realm, user, &credential).await?;
+        Ok(true)
+    }
     async fn delete_credential(
         &self,
         realm: &RealmId,
@@ -617,6 +653,16 @@ pub trait Storage: Send + Sync {
     // Provision markers
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError>;
     async fn set_provision_marker(&self, name: &str, value: &str) -> Result<(), IssuerdError>;
+    /// Remove an in-progress marker after a failed provisioning attempt so a
+    /// later boot can retry. Deleting a missing marker is a successful no-op.
+    /// Legacy external backends may not support deletion; an in-progress
+    /// marker must never be treated as a completed provision in that case.
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        let _ = name;
+        Err(IssuerdError::ServerError(
+            "provision marker deletion is not supported by this storage backend".to_string(),
+        ))
+    }
     /// Atomically claim a provision marker: returns `true` when this call
     /// created the marker, `false` when it already existed. The default
     /// implementation is check-then-set (not atomic); backends with
@@ -1058,7 +1104,16 @@ pub trait Authenticator: Send + Sync {
 pub trait RequiredAction: Send + Sync {
     fn id(&self) -> &str;
     fn display_name(&self) -> &str;
+    /// Legacy infallible evaluation. Callers that can propagate operational
+    /// failures should use [`RequiredAction::try_evaluate`].
     async fn evaluate(&self, context: &AuthContext) -> bool;
+    /// Evaluate whether this action is pending without hiding operational errors.
+    ///
+    /// The default preserves source compatibility for existing implementations
+    /// that only provide [`RequiredAction::evaluate`].
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        Ok(self.evaluate(context).await)
+    }
     async fn process(&self, context: &mut AuthContext) -> RequiredActionResult;
 }
 
@@ -1507,9 +1562,9 @@ mod tests {
         }
     }
 
-    /// Records `create_user` calls and serves fixed client/role/scope/group
-    /// rows plus a marker map; every other method is unimplemented. The batch
-    /// default methods under test are NOT overridden, so the trait defaults run.
+    /// Records `create_user` calls and serves fixed client/role/scope/group/
+    /// credential rows plus a marker map; every other method is unimplemented.
+    /// The default methods under test are NOT overridden, so the trait defaults run.
     #[derive(Default)]
     struct StubStorage {
         created_users: std::sync::Mutex<Vec<String>>,
@@ -1517,6 +1572,7 @@ mod tests {
         client_roles: Vec<Role>,
         client_scopes: Vec<ClientScope>,
         groups: Vec<Group>,
+        credentials: std::sync::Mutex<Vec<Credential>>,
         provision_markers: std::sync::Mutex<HashMap<String, String>>,
     }
 
@@ -1655,7 +1711,14 @@ mod tests {
             user: &UserId,
             cred_type: CredentialType,
         ) -> Result<Vec<Credential>, IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            Ok(self
+                .credentials
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|credential| credential.credential_type == cred_type)
+                .cloned()
+                .collect())
         }
         async fn list_credentials(
             &self,
@@ -1678,7 +1741,11 @@ mod tests {
             user: &UserId,
             cred: &Credential,
         ) -> Result<(), IssuerdError> {
-            unimplemented!("StubStorage implements only what the default-method tests use")
+            let mut credentials = self.credentials.lock().unwrap();
+            if let Some(existing) = credentials.iter_mut().find(|current| current.id == cred.id) {
+                *existing = cred.clone();
+            }
+            Ok(())
         }
         async fn delete_credential(
             &self,
@@ -2155,6 +2222,10 @@ mod tests {
                 .insert(name.to_string(), value.to_string());
             Ok(())
         }
+        async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+            self.provision_markers.lock().unwrap().remove(name);
+            Ok(())
+        }
         async fn list_signing_keys(&self) -> Result<Vec<StoredSigningKey>, IssuerdError> {
             unimplemented!("StubStorage implements only what the default-method tests use")
         }
@@ -2180,6 +2251,40 @@ mod tests {
             vec!["alice".to_string(), "bob".to_string(), "carol".to_string()],
             "the default loops over create_user for every user"
         );
+    }
+
+    #[tokio::test]
+    async fn default_consume_totp_step_is_monotonic_and_preserves_credential() {
+        let totp = Credential {
+            id: CredentialId::new("cred-totp").unwrap(),
+            credential_type: CredentialType::Totp,
+            user_label: Some("Phone".to_string()),
+            created_date: Utc::now(),
+            secret_data: b"secret".to_vec(),
+            credential_data: serde_json::json!({"algorithm": "HmacSHA1", "digits": 6}),
+            priority: 3,
+        };
+        let mut password = totp.clone();
+        password.id = CredentialId::new("cred-password").unwrap();
+        password.credential_type = CredentialType::Password;
+        let storage = StubStorage {
+            credentials: std::sync::Mutex::new(vec![totp.clone(), password.clone()]),
+            ..Default::default()
+        };
+        let realm = RealmId::new("r1").unwrap();
+        let user = UserId::new("u1").unwrap();
+        let missing = CredentialId::new("missing").unwrap();
+
+        assert!(!storage.consume_totp_step(&realm, &user, &missing, 10).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm, &user, &password.id, 10).await.unwrap());
+        assert!(storage.consume_totp_step(&realm, &user, &totp.id, 10).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm, &user, &totp.id, 10).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm, &user, &totp.id, 9).await.unwrap());
+        assert!(storage.consume_totp_step(&realm, &user, &totp.id, 11).await.unwrap());
+
+        let mut expected = totp;
+        expected.credential_data["last_used_step"] = serde_json::json!(11);
+        assert_eq!(*storage.credentials.lock().unwrap(), vec![expected, password]);
     }
 
     #[tokio::test]

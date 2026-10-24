@@ -13,6 +13,12 @@ pub mod cache_keys {
         format!("session:{realm}:{session_id}")
     }
 
+    /// `session-tombstone:{realm}:{session_id}` — unique per-session
+    /// invalidation marker used to reject late cache writes after deletion.
+    pub fn session_tombstone(realm: &str, session_id: &str) -> String {
+        format!("session-tombstone:{realm}:{session_id}")
+    }
+
     /// `login-failure:{realm}:{identifier}`
     pub fn login_failure(realm: &str, identifier: &str) -> String {
         format!("login-failure:{realm}:{identifier}")
@@ -131,6 +137,12 @@ pub mod cache_keys {
         format!("action:{token_id}")
     }
 
+    /// `remember-revoked:{realm}:{token_id}` — logout revocation of a
+    /// remember-me cookie, retained through its remaining expiry window.
+    pub fn remember_token_revoked(realm: &str, token_id: &str) -> String {
+        format!("remember-revoked:{realm}:{token_id}")
+    }
+
     /// `dpop-nonce:{realm}:{nonce}` — server-provided DPoP nonces
     /// (RFC 9449 §8/§9, opt-in via `[dpop.nonce]`). Existence is the only
     /// state: entries carry a marker value, expire with the configured nonce
@@ -224,6 +236,10 @@ mod tests {
     #[test]
     fn action_token_key_format() {
         assert_eq!(cache_keys::action_token("tok-123"), "action:tok-123");
+        assert_eq!(
+            cache_keys::remember_token_revoked("master", "tok-123"),
+            "remember-revoked:master:tok-123"
+        );
     }
 
     #[test]

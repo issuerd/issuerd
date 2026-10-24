@@ -109,7 +109,7 @@ List-valued keys (`cors.allowed_origins`, `proxy.trusted_proxies`, `cluster.redi
 
 ### The other compose stacks
 
-- **`docker-compose.cluster.yml`** (project `issuerd-cluster`) — two Issuerd nodes behind an nginx load balancer on `http://localhost:8088`, sharing PostgreSQL + Redis, with per-node ports `18081`/`18082` exposed for debugging. This is the reference for the multi-node contract; see [CLUSTERING.md](CLUSTERING.md).
+- **`docker-compose.cluster.yml`** (project `issuerd-cluster`) — two Issuerd nodes behind an nginx load balancer on `http://localhost:8088`, sharing PostgreSQL + Redis, with per-node ports `18081`/`18082` bound to loopback for debugging. This is the reference for the multi-node contract; see [CLUSTERING.md](CLUSTERING.md).
 - **`docker-compose.integration.yml`** — contributor test infrastructure, not a deployment model: a reference Keycloak 24 (host port 8081) for protocol comparison, Samba AD DC and OpenLDAP for federation testing, Bind9 DNS, and a dedicated PostgreSQL (host port 5433). Not intended for production use.
 
 ## Bare-metal / VM deployment

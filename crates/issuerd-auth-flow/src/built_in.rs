@@ -245,20 +245,22 @@ impl UsernamePasswordAuthenticator {
 
     /// Load the realm's brute-force configuration when protection is enabled.
     ///
-    /// Returns `None` when no tracker is wired, the realm has
-    /// `brute_force_protected = false` (or the realm cannot be loaded) —
-    /// callers must then skip failure tracking and lockout checks entirely.
-    /// The realm lookup happens once per login attempt here, not inside the
-    /// tracker.
-    async fn brute_force_config(&self, context: &AuthContext) -> Option<LoginFailureConfig> {
+    /// Returns `None` only when no tracker is wired or the realm has
+    /// `brute_force_protected = false`. A realm lookup failure is an
+    /// operational error and must never disable lockout checks.
+    async fn brute_force_config(
+        &self,
+        context: &AuthContext,
+    ) -> Result<Option<LoginFailureConfig>, IssuerdError> {
         if self.tracker.is_none() || self.cache.is_none() {
-            return None;
+            return Ok(None);
         }
-        let realm = self.storage.get_realm(&context.realm_id).await.ok()??;
+        let realm =
+            self.storage.get_realm(&context.realm_id).await?.ok_or(IssuerdError::NotFound)?;
         if !realm.brute_force_protected {
-            return None;
+            return Ok(None);
         }
-        Some(LoginFailureConfig::from_realm(&realm))
+        Ok(Some(LoginFailureConfig::from_realm(&realm)))
     }
 
     /// Lockout gate run before any password check: `Some` is the result to
@@ -346,8 +348,7 @@ impl UsernamePasswordAuthenticator {
         let user = issuerd_core::User {
             id: issuerd_core::UserId::new(issuerd_core::utils::generate_id()).unwrap(),
             realm_id: realm_id.clone(),
-            username: issuerd_core::Username::new(&fed.username)
-                .expect("federated username must be valid"),
+            username: issuerd_core::Username::new(&fed.username)?,
             email: fed.email.as_deref().map(Email::new).transpose().unwrap_or(None),
             email_verified: fed.email_verified,
             first_name: fed.first_name.as_deref().and_then(|s| DisplayName::new(s).ok()),
@@ -431,7 +432,10 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
 
                 // Brute-force check, gated on the realm's brute-force
                 // protection toggle.
-                let brute_force = self.brute_force_config(context).await;
+                let brute_force = match self.brute_force_config(context).await {
+                    Ok(config) => config,
+                    Err(e) => return AuthStepResult::Failure(e),
+                };
                 if let Some(rejection) =
                     self.lockout_rejection(context, &user.username, brute_force.as_ref()).await
                 {
@@ -516,12 +520,21 @@ impl issuerd_core::Authenticator for UsernamePasswordAuthenticator {
                 if let Some(ref fm) = self.federation_manager {
                     match fm.find_user(&context.realm_id, &username).await {
                         Ok(Some((provider, federated_user))) => {
+                            if !federated_user.enabled {
+                                warn!(username = %issuerd_core::utils::sanitize_log_str(&username), provider_id = %provider.id(), "login rejected: federated user is disabled");
+                                dummy_password_verify(&password);
+                                return AuthStepResult::Failure(IssuerdError::InvalidGrant);
+                            }
+
                             // Same lockout gate and failure tracking as the
                             // local branch, keyed so every spelling the
                             // directory accepts (case, whitespace) shares one
                             // budget.
                             let failure_id = federated_failure_identifier(&username);
-                            let brute_force = self.brute_force_config(context).await;
+                            let brute_force = match self.brute_force_config(context).await {
+                                Ok(config) => config,
+                                Err(e) => return AuthStepResult::Failure(e),
+                            };
                             if let Some(rejection) = self
                                 .lockout_rejection(context, &failure_id, brute_force.as_ref())
                                 .await
@@ -880,10 +893,8 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
             }
         };
 
-        // The realm OTP policy drives validation. A missing realm degrades to
-        // the Keycloak defaults instead of failing: at a Conditional flow
-        // stage the executor swallows failures (skip_conditional_scope), so a
-        // Failure here would let the login succeed WITHOUT a second factor.
+        // The realm OTP policy drives validation; a missing realm uses the
+        // Keycloak defaults. Storage errors remain operational failures.
         let (policy, failure_config) = match self.storage.get_realm(&context.realm_id).await {
             Ok(Some(realm)) => {
                 let failure_config = otp_failure_config(&realm);
@@ -917,15 +928,23 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
             if let Some(matched_step) =
                 crate::totp::verify(secret, &otp, now, &policy, last_used_step)
             {
-                // Persist the replay watermark before reporting success so the
-                // same code cannot be reused for another login.
-                let mut updated = cred.clone();
-                updated.credential_data["last_used_step"] = json!(matched_step);
-                if let Err(e) =
-                    self.storage.update_credential(&context.realm_id, &user_id, &updated).await
+                // Atomically claim this step before reporting success so a
+                // concurrent submission of the same code cannot also succeed.
+                match self
+                    .storage
+                    .consume_totp_step(&context.realm_id, &user_id, &cred.id, matched_step)
+                    .await
                 {
-                    warn!(user_id = %user_id, error = %e, "failed to persist TOTP replay watermark");
-                    return AuthStepResult::Failure(e);
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return AuthStepResult::Challenge(Challenge::OtpForm {
+                            action_url: "".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(user_id = %user_id, error = %e, "failed to persist TOTP replay watermark");
+                        return AuthStepResult::Failure(e);
+                    }
                 }
                 if let OtpThrottle::Open(ref username) = throttle {
                     self.reset_otp_failures(&context.realm_id, username).await;
@@ -940,10 +959,9 @@ impl issuerd_core::Authenticator for OtpFormAuthenticator {
             }
         }
 
-        // A wrong code is NEVER a Failure: conditional-stage failures are
-        // swallowed by the executor (see above), which would bypass the second
-        // factor. It already counted toward the per-user lockout (see
-        // `throttle`); re-challenge so the user can retry.
+        // A wrong code is an expected user failure: re-challenge instead of
+        // returning an InvalidGrant that Optional/Conditional stages may skip.
+        // It already counted toward the per-user lockout (see `throttle`).
         debug!(user_id = %user_id, "TOTP code rejected; re-challenging");
         AuthStepResult::Challenge(Challenge::OtpForm {
             action_url: "".to_string(),
@@ -1060,8 +1078,8 @@ impl issuerd_core::Authenticator for ConditionalUserConfiguredAuthenticator {
         {
             Ok(c) => c,
             Err(e) => {
-                warn!(user_id = %user_id, error = %e, "failed to read TOTP credentials; treating second factor as unconfigured");
-                return AuthStepResult::Attempted;
+                warn!(user_id = %user_id, error = %e, "failed to read TOTP credentials");
+                return AuthStepResult::Failure(e);
             }
         };
         if !totp.is_empty() {
@@ -1075,8 +1093,8 @@ impl issuerd_core::Authenticator for ConditionalUserConfiguredAuthenticator {
         {
             Ok(c) => c,
             Err(e) => {
-                warn!(user_id = %user_id, error = %e, "failed to read WebAuthn credentials; treating second factor as unconfigured");
-                return AuthStepResult::Attempted;
+                warn!(user_id = %user_id, error = %e, "failed to read WebAuthn credentials");
+                return AuthStepResult::Failure(e);
             }
         };
 
@@ -1527,6 +1545,23 @@ impl VerifyEmailRequiredAction {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
+
+    async fn evaluate_inner(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        let user_id = match context.user_id {
+            Some(ref id) => id.clone(),
+            None => return Ok(false),
+        };
+        let user = self.storage.get_user(&context.realm_id, &user_id).await?;
+        Ok(user.is_some_and(|user| {
+            user.required_actions.iter().any(|a| a == "VERIFY_EMAIL")
+                || (context
+                    .attributes
+                    .get("realm_verify_email_enabled")
+                    .is_some_and(|v| v == "true")
+                    && user.email.is_some()
+                    && !user.email_verified)
+        }))
+    }
 }
 
 #[async_trait]
@@ -1541,22 +1576,12 @@ impl issuerd_core::RequiredAction for VerifyEmailRequiredAction {
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
     async fn evaluate(&self, context: &AuthContext) -> bool {
-        let user_id = match context.user_id {
-            Some(ref id) => id.clone(),
-            None => return false,
-        };
-        match self.storage.get_user(&context.realm_id, &user_id).await {
-            Ok(Some(user)) => {
-                user.required_actions.iter().any(|a| a == "VERIFY_EMAIL")
-                    || (context
-                        .attributes
-                        .get("realm_verify_email_enabled")
-                        .is_some_and(|v| v == "true")
-                        && user.email.is_some()
-                        && !user.email_verified)
-            }
-            _ => false,
-        }
+        self.evaluate_inner(context).await.unwrap_or(false)
+    }
+
+    #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        self.evaluate_inner(context).await
     }
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
@@ -1601,6 +1626,50 @@ impl UpdatePasswordRequiredAction {
         self.federation_manager = Some(fm);
         self
     }
+
+    async fn evaluate_inner(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        let user_id = match context.user_id {
+            Some(ref id) => id.clone(),
+            None => return Ok(false),
+        };
+        // Explicitly assigned by an admin?
+        let mut federated = false;
+        if let Some(user) = self.storage.get_user(&context.realm_id, &user_id).await? {
+            if user.required_actions.iter().any(|a| a == "UPDATE_PASSWORD") {
+                return Ok(true);
+            }
+            federated = user.federation_link.is_some();
+        }
+        // Email-code realms sign in without a password by design, so having
+        // no password credential is normal there — the auto-rule below must
+        // not fire (same reasoning as the broker-login carve-out). The
+        // explicit admin assignment above is still honored.
+        if let Some(realm) = self.storage.get_realm(&context.realm_id).await? {
+            if realm.attributes.get(REALM_ATTR_EMAIL_CODE_LOGIN).is_some_and(|v| v == "true") {
+                return Ok(false);
+            }
+        }
+        let creds = self
+            .storage
+            .get_credentials(&context.realm_id, &user_id, CredentialType::Password)
+            .await?;
+        // An admin-set temporary password must always be rotated.
+        if creds
+            .iter()
+            .any(|c| c.credential_data.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false))
+        {
+            return Ok(true);
+        }
+        // Federated users authenticate against the external directory —
+        // their password is not a local credential, so the
+        // no-local-password auto-rule does not apply (same carve-out as
+        // the email-code realm above).
+        if federated {
+            return Ok(false);
+        }
+        // No password at all: force an update (P3-17).
+        Ok(creds.is_empty())
+    }
 }
 
 #[async_trait]
@@ -1615,49 +1684,12 @@ impl issuerd_core::RequiredAction for UpdatePasswordRequiredAction {
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
     async fn evaluate(&self, context: &AuthContext) -> bool {
-        let user_id = match context.user_id {
-            Some(ref id) => id.clone(),
-            None => return false,
-        };
-        // Explicitly assigned by an admin?
-        let mut federated = false;
-        if let Ok(Some(user)) = self.storage.get_user(&context.realm_id, &user_id).await {
-            if user.required_actions.iter().any(|a| a == "UPDATE_PASSWORD") {
-                return true;
-            }
-            federated = user.federation_link.is_some();
-        }
-        // Email-code realms sign in without a password by design, so having
-        // no password credential is normal there — the auto-rule below must
-        // not fire (same reasoning as the broker-login carve-out). The
-        // explicit admin assignment above is still honored.
-        if let Ok(Some(realm)) = self.storage.get_realm(&context.realm_id).await {
-            if realm.attributes.get(REALM_ATTR_EMAIL_CODE_LOGIN).is_some_and(|v| v == "true") {
-                return false;
-            }
-        }
-        match self
-            .storage
-            .get_credentials(&context.realm_id, &user_id, CredentialType::Password)
-            .await
-        {
-            // An admin-set temporary password must always be rotated.
-            Ok(creds)
-                if creds.iter().any(|c| {
-                    c.credential_data.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false)
-                }) =>
-            {
-                true
-            }
-            // Federated users authenticate against the external directory —
-            // their password is not a local credential, so the
-            // no-local-password auto-rule does not apply (same carve-out as
-            // the email-code realm above).
-            Ok(_) if federated => false,
-            // No password at all: force an update (P3-17).
-            Ok(creds) => creds.is_empty(),
-            Err(_) => false,
-        }
+        self.evaluate_inner(context).await.unwrap_or(false)
+    }
+
+    #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        self.evaluate_inner(context).await
     }
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
@@ -1748,6 +1780,20 @@ impl UpdateProfileRequiredAction {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
+
+    async fn evaluate_inner(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        if context.attributes.get("realm_update_profile_on_first_login")
+            == Some(&"true".to_string())
+        {
+            return Ok(true);
+        }
+        let user_id = match context.user_id {
+            Some(ref id) => id.clone(),
+            None => return Ok(false),
+        };
+        let user = self.storage.get_user(&context.realm_id, &user_id).await?;
+        Ok(user.is_some_and(|user| user.required_actions.iter().any(|a| a == "UPDATE_PROFILE")))
+    }
 }
 
 #[async_trait]
@@ -1762,19 +1808,12 @@ impl issuerd_core::RequiredAction for UpdateProfileRequiredAction {
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
     async fn evaluate(&self, context: &AuthContext) -> bool {
-        if context.attributes.get("realm_update_profile_on_first_login")
-            == Some(&"true".to_string())
-        {
-            return true;
-        }
-        let user_id = match context.user_id {
-            Some(ref id) => id.clone(),
-            None => return false,
-        };
-        match self.storage.get_user(&context.realm_id, &user_id).await {
-            Ok(Some(user)) => user.required_actions.iter().any(|a| a == "UPDATE_PROFILE"),
-            _ => false,
-        }
+        self.evaluate_inner(context).await.unwrap_or(false)
+    }
+
+    #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        self.evaluate_inner(context).await
     }
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
@@ -1899,6 +1938,17 @@ impl ConfigureTotpRequiredAction {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
+
+    async fn evaluate_inner(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        // Only fires when explicitly assigned to the user — unlike earlier
+        // drafts it must not trigger for every TOTP-less account.
+        let user_id = match context.user_id {
+            Some(ref id) => id.clone(),
+            None => return Ok(false),
+        };
+        let user = self.storage.get_user(&context.realm_id, &user_id).await?;
+        Ok(user.is_some_and(|user| user.required_actions.iter().any(|a| a == "CONFIGURE_TOTP")))
+    }
 }
 
 #[async_trait]
@@ -1913,16 +1963,12 @@ impl issuerd_core::RequiredAction for ConfigureTotpRequiredAction {
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
     async fn evaluate(&self, context: &AuthContext) -> bool {
-        // Only fires when explicitly assigned to the user — unlike earlier
-        // drafts it must not trigger for every TOTP-less account.
-        let user_id = match context.user_id {
-            Some(ref id) => id.clone(),
-            None => return false,
-        };
-        match self.storage.get_user(&context.realm_id, &user_id).await {
-            Ok(Some(user)) => user.required_actions.iter().any(|a| a == "CONFIGURE_TOTP"),
-            _ => false,
-        }
+        self.evaluate_inner(context).await.unwrap_or(false)
+    }
+
+    #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        self.evaluate_inner(context).await
     }
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
@@ -2008,6 +2054,19 @@ impl TermsAndConditionsRequiredAction {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
+
+    async fn evaluate_inner(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        let user_id = match context.user_id {
+            Some(ref id) => id.clone(),
+            None => return Ok(false),
+        };
+        let user = self.storage.get_user(&context.realm_id, &user_id).await?;
+        Ok(user.is_some_and(|user| {
+            user.required_actions.iter().any(|a| a == "TERMS_AND_CONDITIONS")
+                && user.attributes.get("terms_accepted").and_then(|v| v.first())
+                    != Some(&"true".to_string())
+        }))
+    }
 }
 
 #[async_trait]
@@ -2022,18 +2081,12 @@ impl issuerd_core::RequiredAction for TermsAndConditionsRequiredAction {
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
     async fn evaluate(&self, context: &AuthContext) -> bool {
-        let user_id = match context.user_id {
-            Some(ref id) => id.clone(),
-            None => return false,
-        };
-        match self.storage.get_user(&context.realm_id, &user_id).await {
-            Ok(Some(user)) => {
-                user.required_actions.iter().any(|a| a == "TERMS_AND_CONDITIONS")
-                    && user.attributes.get("terms_accepted").and_then(|v| v.first())
-                        != Some(&"true".to_string())
-            }
-            _ => false,
-        }
+        self.evaluate_inner(context).await.unwrap_or(false)
+    }
+
+    #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
+    async fn try_evaluate(&self, context: &AuthContext) -> Result<bool, IssuerdError> {
+        self.evaluate_inner(context).await
     }
 
     #[instrument(skip(self, context), fields(action = %self.id(), realm = %context.realm_id))]
@@ -2920,6 +2973,22 @@ mod tests {
         // The directory carve-out suppresses only the no-local-password rule,
         // never the temporary-password rotation.
         assert!(action.evaluate(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn update_password_temporary_credential_read_failure_propagates() {
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_user().returning(|_, _| Ok(Some(test_user())));
+        storage.expect_get_realm().returning(|_| Ok(Some(test_realm())));
+        storage
+            .expect_get_credentials()
+            .returning(|_, _, _| Err(IssuerdError::ServerError("credential read failed".into())));
+        let action = UpdatePasswordRequiredAction::new(Arc::new(storage));
+        let mut ctx = test_context();
+        ctx.user_id = Some(UserId::new("alice").unwrap());
+
+        let error = action.try_evaluate(&ctx).await.unwrap_err();
+        assert_eq!(error, IssuerdError::ServerError("credential read failed".into()));
     }
 
     #[tokio::test]
@@ -4456,14 +4525,15 @@ mod tests {
 
     #[tokio::test]
     async fn conditional_user_configured_storage_error() {
-        // Using InMemoryStorage with non-existent user will return empty credentials, not error.
-        // We test the storage error path by using a user that doesn't exist and verifying it returns Attempted.
-        let storage = Arc::new(InMemoryStorage::new());
-        let auth = ConditionalUserConfiguredAuthenticator::new(storage);
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_credentials()
+            .returning(|_, _, _| Err(IssuerdError::ServerError("storage down".into())));
+        let auth = ConditionalUserConfiguredAuthenticator::new(Arc::new(storage));
         let mut ctx = test_context();
-        ctx.user_id = Some(UserId::new("nobody").unwrap());
+        ctx.user_id = Some(UserId::new("alice").unwrap());
         let result = auth.authenticate(&mut ctx).await;
-        assert_auth_attempted(result);
+        assert_auth_server_error(result);
     }
 
     // -----------------------------------------------------------------------
@@ -5082,6 +5152,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(imported.federation_link, Some("ldap-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn password_disabled_unimported_federated_user_rejected() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let provider = Arc::new(CountingFedProvider {
+            validate_result: std::sync::Mutex::new(Ok(true)),
+            validate_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fed_user = issuerd_core::FederatedUser {
+            username: "alice".to_string(),
+            federation_link: "ldap-test".to_string(),
+            enabled: false,
+            ..Default::default()
+        };
+        let fm = Arc::new(MockFedManager {
+            providers: vec![provider.clone()],
+            find_user_result: std::sync::Mutex::new(Ok(Some((provider.clone(), fed_user)))),
+        });
+
+        let auth = UsernamePasswordAuthenticator::new(storage.clone()).with_federation_manager(fm);
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["secret".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert!(ctx.user_id.is_none());
+        assert_eq!(provider.calls(), 0, "disabled users must not reach the directory");
+        let realm = RealmId::new("realm-1").unwrap();
+        assert!(storage.get_user_by_username(&realm, "alice").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn federated_import_invalid_username_returns_error() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let federated = issuerd_core::FederatedUser {
+            username: "x".repeat(Username::MAX_LEN + 1),
+            federation_link: "ldap-test".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let result =
+            auth.import_federated_user(&RealmId::new("realm-1").unwrap(), &federated).await;
+        assert!(matches!(result, Err(IssuerdError::InvalidRequest(_))));
     }
 
     #[tokio::test]
@@ -5779,6 +5896,31 @@ mod tests {
         let mut ctx = test_context();
         ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
         ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+        let result = auth.authenticate(&mut ctx).await;
+        assert_auth_server_error(result);
+    }
+
+    #[tokio::test]
+    async fn password_realm_lookup_failure_does_not_disable_brute_force_checks() {
+        let user = test_user();
+        let credential = password_cred(hash_password("password").into_bytes());
+        let mut mock = issuerd_core::MockStorage::new();
+        mock.expect_get_user_by_username().returning(move |_, _| Ok(Some(user.clone())));
+        mock.expect_get_realm()
+            .returning(|_| Err(issuerd_core::IssuerdError::ServerError("realm down".into())));
+        mock.expect_get_credentials()
+            .returning(move |_, _, _| Ok(vec![credential.clone()]));
+        let cache: Arc<dyn issuerd_core::DistributedCache> =
+            Arc::new(issuerd_cluster::InMemoryCache::new());
+        let auth = UsernamePasswordAuthenticator::with_tracker(
+            Arc::new(mock),
+            Arc::new(LoginFailureTracker::new()),
+            cache,
+        );
+        let mut ctx = test_context();
+        ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+        ctx.parameters.insert("password".to_string(), vec!["password".to_string()]);
+
         let result = auth.authenticate(&mut ctx).await;
         assert_auth_server_error(result);
     }

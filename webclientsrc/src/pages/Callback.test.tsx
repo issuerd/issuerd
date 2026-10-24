@@ -123,6 +123,7 @@ describe('Callback', () => {
     await waitFor(() =>
       expect(useAuthStore.getState().getTokenSet('master')?.accessToken).toBe('tok')
     )
+    expect(useAuthStore.getState().getTokenSet('master')?.clientId).toBe('admin-cli')
     // Attempt markers are cleaned up after a successful exchange.
     expect(sessionStorage.getItem('issuerd_oidc_state')).toBeNull()
     expect(sessionStorage.getItem('issuerd_code_verifier')).toBeNull()

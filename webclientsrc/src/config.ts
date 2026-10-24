@@ -26,22 +26,34 @@ export function consoleHref(path: string): string {
   return `${CONSOLE_BASENAME}${path}`
 }
 
+export const ACCOUNT_CLIENT_ID = 'account-console'
+const ACCOUNT_PATH = /^\/realms\/([^/]+)\/account/
+
 /** Realm of the account-console bundle, parsed from the URL path (`/realms/{realm}/account/...`). */
 export function getAccountRealm(): string {
   if (typeof window === 'undefined') return CONFIG.REALM
-  const match = window.location.pathname.match(/^\/realms\/([^/]+)\/account/)
+  const match = window.location.pathname.match(ACCOUNT_PATH)
   return match?.[1] || CONFIG.REALM
 }
 
+export function getConsoleClientId(): string {
+  if (typeof window !== 'undefined' && ACCOUNT_PATH.test(window.location.pathname)) {
+    return ACCOUNT_CLIENT_ID
+  }
+  return CONFIG.CLIENT_ID
+}
+
 // Configure the generated API client exactly once. The auth resolver covers
-// both bundles: account-console tokens are stored per-realm in sessionStorage,
-// admin-console tokens in the in-memory tokenSet.
+// both bundles: tokens are stored per realm and client in sessionStorage, with
+// the in-memory tokenSet as a same-client fallback.
 client.setConfig({
   baseUrl: CONFIG.API_BASE,
   auth: () => {
     const realm = getAccountRealm()
-    const fromStorage = useAuthStore.getState().getTokenSet(realm)
+    const clientId = getConsoleClientId()
+    const fromStorage = useAuthStore.getState().getTokenSet(realm, clientId)
     const fromState = useAuthStore.getState().tokenSet
-    return fromStorage?.accessToken ?? fromState?.accessToken ?? undefined
+    const stateToken = (fromState?.clientId ?? CONFIG.CLIENT_ID) === clientId ? fromState : null
+    return fromStorage?.accessToken ?? stateToken?.accessToken ?? undefined
   },
 })

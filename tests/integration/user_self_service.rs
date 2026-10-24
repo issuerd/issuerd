@@ -1666,21 +1666,52 @@ async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// Authenticate and return just the access token.
-async fn account_token(harness: &TestHarness, realm: &str, client_id: &str, user: &str) -> String {
+/// Authenticate through the first-party account client and return the access token.
+async fn account_token(harness: &TestHarness, realm: &str, user: &str) -> String {
     harness
-        .authenticate_user(realm, client_id, user, "Password123!")
+        .authenticate_account_console_user(realm, user, "Password123!")
         .await
         .access_token
+}
+
+#[tokio::test]
+async fn account_api_rejects_interactive_arbitrary_client_token() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("acct-foreign-client").await;
+    let client = harness.create_client("acct-foreign-client", false).await;
+    let user = harness.create_user("acct-foreign-client", "victim", "Password123!").await;
+    let token = harness
+        .authenticate_user(
+            "acct-foreign-client",
+            client.client_id.as_ref(),
+            "victim",
+            "Password123!",
+        )
+        .await
+        .access_token;
+    let claims = jwt_claims(&token);
+    assert_eq!(claims["azp"], client.client_id.to_string());
+    let sid = issuerd_core::SessionId::new(claims["sid"].as_str().unwrap()).unwrap();
+    assert!(harness.storage.get_user_session(&realm.id, &sid).await.unwrap().is_some());
+
+    let resp = put_json_auth(
+        &harness,
+        "/realms/acct-foreign-client/account/api/me",
+        &token,
+        serde_json::json!({"email": "attacker@example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let stored = harness.storage.get_user(&realm.id, &user.id).await.unwrap().unwrap();
+    assert_eq!(stored.email.as_ref().unwrap().as_str(), "victim@example.com");
 }
 
 #[tokio::test]
 async fn account_update_me_updates_profile_fields() {
     let harness = TestHarness::new().await;
     let realm = harness.create_realm("acct-me").await;
-    let client = harness.create_client("acct-me", false).await;
     let user = harness.create_user("acct-me", "oliver", "Password123!").await;
-    let token = account_token(&harness, "acct-me", client.client_id.as_ref(), "oliver").await;
+    let token = account_token(&harness, "acct-me", "oliver").await;
 
     // Set first name, clear last name; absent fields stay unchanged.
     let resp = put_json_auth(
@@ -1712,9 +1743,8 @@ async fn account_update_me_username_change_respects_realm_toggle() {
     let mut realm = harness.create_realm("acct-user").await;
     realm.edit_username_allowed = false;
     harness.storage.update_realm(&realm).await.unwrap();
-    let client = harness.create_client("acct-user", false).await;
     let user = harness.create_user("acct-user", "petra", "Password123!").await;
-    let token = account_token(&harness, "acct-user", client.client_id.as_ref(), "petra").await;
+    let token = account_token(&harness, "acct-user", "petra").await;
 
     // Disallowed: 400 and the stored username is unchanged.
     let resp = put_json_auth(
@@ -1761,9 +1791,8 @@ async fn account_update_me_email_change_triggers_verification_email() {
     let mut realm = harness.create_realm("acct-email").await;
     realm.verify_email_enabled = true;
     harness.storage.update_realm(&realm).await.unwrap();
-    let client = harness.create_client("acct-email", false).await;
     let user = harness.create_user("acct-email", "quincy", "Password123!").await;
-    let token = account_token(&harness, "acct-email", client.client_id.as_ref(), "quincy").await;
+    let token = account_token(&harness, "acct-email", "quincy").await;
 
     let resp = put_json_auth(
         &harness,
@@ -1810,9 +1839,8 @@ async fn account_update_me_email_change_without_verify_just_clears_flag() {
     // but the change still invalidates the previous verification.
     let harness = TestHarness::new().await;
     let realm = harness.create_realm("acct-email2").await;
-    let client = harness.create_client("acct-email2", false).await;
     let user = harness.create_user("acct-email2", "rachel", "Password123!").await;
-    let token = account_token(&harness, "acct-email2", client.client_id.as_ref(), "rachel").await;
+    let token = account_token(&harness, "acct-email2", "rachel").await;
 
     let resp = put_json_auth(
         &harness,
@@ -1843,10 +1871,9 @@ async fn account_update_me_email_change_without_verify_just_clears_flag() {
 async fn account_update_me_duplicate_email_rejected_unless_allowed() {
     let harness = TestHarness::new().await;
     let mut realm = harness.create_realm("acct-dupe").await;
-    let client = harness.create_client("acct-dupe", false).await;
     let _other = harness.create_user("acct-dupe", "sam", "Password123!").await;
     let user = harness.create_user("acct-dupe", "tina", "Password123!").await;
-    let token = account_token(&harness, "acct-dupe", client.client_id.as_ref(), "tina").await;
+    let token = account_token(&harness, "acct-dupe", "tina").await;
 
     // sam@example.com is taken; duplicates are disallowed by default.
     let resp = put_json_auth(
@@ -1893,7 +1920,7 @@ async fn account_change_password_wrong_current_is_rejected() {
     let client = harness.create_client("acct-pw", false).await;
     let _user = harness.create_user("acct-pw", "uma", "OldPassword1!").await;
     let tokens = harness
-        .authenticate_user("acct-pw", client.client_id.as_ref(), "uma", "OldPassword1!")
+        .authenticate_account_console_user("acct-pw", "uma", "OldPassword1!")
         .await;
 
     let resp = harness
@@ -1921,7 +1948,7 @@ async fn account_change_password_policy_violations_are_machine_readable() {
     let client = harness.create_client("acct-pwp", false).await;
     let _user = harness.create_user("acct-pwp", "vera", "OldPassword1!").await;
     let tokens = harness
-        .authenticate_user("acct-pwp", client.client_id.as_ref(), "vera", "OldPassword1!")
+        .authenticate_account_console_user("acct-pwp", "vera", "OldPassword1!")
         .await;
 
     let resp = harness
@@ -1950,7 +1977,7 @@ async fn account_change_password_roundtrip() {
     let client = harness.create_client("acct-pwt", false).await;
     let _user = harness.create_user("acct-pwt", "wendy", "OldPassword1!").await;
     let tokens = harness
-        .authenticate_user("acct-pwt", client.client_id.as_ref(), "wendy", "OldPassword1!")
+        .authenticate_account_console_user("acct-pwt", "wendy", "OldPassword1!")
         .await;
 
     let resp = harness
@@ -1973,9 +2000,8 @@ async fn account_change_password_roundtrip() {
 async fn account_credentials_reports_presence_flags() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("acct-cred").await;
-    let client = harness.create_client("acct-cred", false).await;
     let _user = harness.create_user("acct-cred", "xena", "Password123!").await;
-    let token = account_token(&harness, "acct-cred", client.client_id.as_ref(), "xena").await;
+    let token = account_token(&harness, "acct-cred", "xena").await;
 
     let resp = harness.get_auth("/realms/acct-cred/account/api/credentials", &token).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1989,7 +2015,7 @@ async fn account_consents_list_and_revoke() {
     let realm = harness.create_realm("acct-consent").await;
     let client = harness.create_client("acct-consent", false).await;
     let user = harness.create_user("acct-consent", "yara", "Password123!").await;
-    let token = account_token(&harness, "acct-consent", client.client_id.as_ref(), "yara").await;
+    let token = account_token(&harness, "acct-consent", "yara").await;
 
     // The consent-grant flow is not part of this scenario, so seed the row directly.
     let consent = issuerd_core::Consent {
@@ -2034,12 +2060,11 @@ async fn account_consents_list_and_revoke() {
 async fn account_api_mutations_reject_token_from_different_realm() {
     let harness = TestHarness::new().await;
     let _realm_a = harness.create_realm("acct-realm-a").await;
-    let client_a = harness.create_client("acct-realm-a", false).await;
     let _user_a = harness.create_user("acct-realm-a", "zack", "Password123!").await;
     // realm-b must exist so the request reaches the issuer/realm comparison.
     let _realm_b = harness.create_realm("acct-realm-b").await;
 
-    let token = account_token(&harness, "acct-realm-a", client_a.client_id.as_ref(), "zack").await;
+    let token = account_token(&harness, "acct-realm-a", "zack").await;
 
     let resp = put_json_auth(
         &harness,

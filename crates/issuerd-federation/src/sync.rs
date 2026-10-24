@@ -62,6 +62,21 @@ impl<'a> UserSynchronizer<'a> {
         let mut to_update: Vec<(User, Option<Vec<String>>)> = Vec::new();
 
         for fed in users {
+            let username = match Username::new(&fed.username) {
+                Ok(username) => username,
+                Err(e) => {
+                    result.failed += 1;
+                    if detailed_failure_logs < MAX_DETAILED_FAILURE_LOGS {
+                        detailed_failure_logs += 1;
+                        tracing::warn!(
+                            username = %issuerd_core::utils::sanitize_log_str(&fed.username),
+                            error = %e,
+                            "sync upsert failed: invalid federated username"
+                        );
+                    }
+                    continue;
+                }
+            };
             if let Some(local) = existing.get(&fed.username) {
                 if local.federation_link.as_deref() == Some(&fed.federation_link) {
                     let mut updated = local.clone();
@@ -90,8 +105,7 @@ impl<'a> UserSynchronizer<'a> {
                     User {
                         id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
                         realm_id: self.realm_id.clone(),
-                        username: Username::new(&fed.username)
-                            .expect("federated username must be valid"),
+                        username,
                         email: fed.email.as_deref().map(Email::new).transpose().unwrap_or(None),
                         email_verified: fed.email_verified,
                         first_name: fed
@@ -865,6 +879,76 @@ mod tests {
             group.attributes.get(issuerd_core::roles::LDAP_SYNC_MARKER_ATTRIBUTE),
             Some(&vec!["true".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn sync_all_invalid_username_skips_record_and_continues() {
+        let (storage, realm) = realm_storage().await;
+        let existing = User {
+            id: UserId::new("existing-bob").unwrap(),
+            realm_id: realm.clone(),
+            username: Username::new("bob").unwrap(),
+            email: Some(Email::new("old@example.com").unwrap()),
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: Some("mock".to_string()),
+            attributes: HashMap::new(),
+            required_actions: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.create_user(&realm, &existing).await.unwrap();
+
+        let overlong = "x".repeat(Username::MAX_LEN + 1);
+        let provider = MockProvider {
+            users: Mutex::new(vec![
+                FederatedUser {
+                    username: overlong.clone(),
+                    federation_link: "mock".to_string(),
+                    enabled: true,
+                    groups: Some(vec!["invalid-users".to_string()]),
+                    ..Default::default()
+                },
+                FederatedUser {
+                    username: "alice".to_string(),
+                    federation_link: "mock".to_string(),
+                    enabled: true,
+                    groups: Some(vec!["developers".to_string()]),
+                    ..Default::default()
+                },
+                FederatedUser {
+                    username: "bob".to_string(),
+                    federation_link: "mock".to_string(),
+                    email: Some("new@example.com".to_string()),
+                    enabled: false,
+                    groups: Some(vec!["operators".to_string()]),
+                    ..Default::default()
+                },
+            ]),
+            sync_since_result: Mutex::new(Ok(SyncResult {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                failed: 0,
+                last_sync: Utc::now(),
+            })),
+        };
+        let sync = UserSynchronizer::new(&provider, storage.clone(), realm.clone());
+        let result = sync.sync_all().await.unwrap();
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.failed, 1);
+        assert!(storage.get_user_by_username(&realm, &overlong).await.unwrap().is_none());
+        assert!(storage.get_group_by_name(&realm, "invalid-users").await.unwrap().is_none());
+
+        let bob = storage.get_user_by_username(&realm, "bob").await.unwrap().unwrap();
+        assert_eq!(bob.email, Some(Email::new("new@example.com").unwrap()));
+        assert!(!bob.enabled);
+        assert_eq!(group_names_of(&storage, &realm, "alice").await, ["developers"]);
+        assert_eq!(group_names_of(&storage, &realm, "bob").await, ["operators"]);
     }
 
     #[tokio::test]

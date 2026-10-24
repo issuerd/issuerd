@@ -199,6 +199,7 @@ async fn add_composites(
         .map(|c| c.name.clone())
         .collect();
     updated.composite = !updated.composites.is_empty();
+    crate::roles::require_new_admin_roles_grantable(auth, Some(parent), &updated, &all)?;
     state.storage.update_role(realm_id, &updated).await?;
     issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), realm_id).await;
     crate::audit::emit_admin_event(
@@ -1190,5 +1191,125 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(names.is_empty(), "another client's role is not a child: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn manage_clients_cannot_add_direct_or_transitive_admin_composite() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        create_role(&state, &realm.id, "role-admin", "manage-realm", None).await;
+        let mut wrapper =
+            create_role(&state, &realm.id, "role-wrapper", "admin-wrapper", Some(&client)).await;
+        wrapper.composite = true;
+        wrapper.composites = vec![issuerd_core::RoleName::new("manage-realm").unwrap()];
+        state.storage.update_role(&realm.id, &wrapper).await.unwrap();
+
+        let uri = format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id);
+        let direct = send_reps(
+            &app,
+            "POST",
+            uri.clone(),
+            r#"[{"id":"role-admin","name":"request-name-is-ignored"}]"#,
+        )
+        .await;
+        assert_eq!(direct, StatusCode::FORBIDDEN);
+
+        let transitive =
+            send_reps(&app, "POST", uri, r#"[{"id":"role-wrapper","name":"admin-wrapper"}]"#).await;
+        assert_eq!(transitive, StatusCode::FORBIDDEN);
+        let parent = state
+            .storage
+            .get_client_role_by_name(&realm.id, &client.id, "app-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(parent.composites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manage_clients_can_add_non_admin_composite() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        create_role(&state, &realm.id, "role-c", "app-child", Some(&client)).await;
+
+        let status = send_reps(
+            &app,
+            "POST",
+            format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id),
+            r#"[{"id":"role-c","name":"app-child"}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let parent = state
+            .storage
+            .get_client_role_by_name(&realm.id, &client.id, "app-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.composites, vec![issuerd_core::RoleName::new("app-child").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn manage_realm_can_add_admin_composite() {
+        let state = manager_state();
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        create_role(&state, &realm.id, "role-admin", "manage-realm", None).await;
+
+        let status = send_reps(
+            &app,
+            "POST",
+            format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id),
+            r#"[{"id":"role-admin","name":"manage-realm"}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn manage_clients_can_remove_existing_admin_composite() {
+        let state = crate::test_utils::tests::test_state(vec![issuerd_core::RoleName::new(
+            "manage-clients",
+        )
+        .unwrap()]);
+        let app = composite_routes(state.clone());
+        let realm = create_realm(&state).await;
+        let client = create_client(&state, &realm.id).await;
+        let mut parent =
+            create_role(&state, &realm.id, "role-p", "app-parent", Some(&client)).await;
+        create_role(&state, &realm.id, "role-admin", "manage-realm", None).await;
+        parent.composite = true;
+        parent.composites = vec![issuerd_core::RoleName::new("manage-realm").unwrap()];
+        state.storage.update_role(&realm.id, &parent).await.unwrap();
+
+        let status = send_reps(
+            &app,
+            "DELETE",
+            format!("/admin/realms/test/clients/{}/roles/app-parent/composites", client.id),
+            r#"[{"id":"role-admin","name":"manage-realm"}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let parent = state
+            .storage
+            .get_client_role_by_name(&realm.id, &client.id, "app-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(parent.composites.is_empty());
     }
 }

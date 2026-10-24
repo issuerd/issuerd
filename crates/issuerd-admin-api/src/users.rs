@@ -27,64 +27,10 @@ use crate::{
         UserCountQueryParams, UserQueryParams, UserRepresentation,
     },
     error::AdminApiError,
+    roles::require_grantable,
     state::AdminApiState,
 };
-use tracing::{info, instrument, warn};
-
-/// Realm roles the admin API authorizes on (the `require_roles` vocabulary).
-const ADMIN_ROLES: [&str; 7] = [
-    "manage-realm",
-    "view-realm",
-    "manage-users",
-    "view-users",
-    "manage-clients",
-    "view-clients",
-    "impersonation",
-];
-
-/// Whether a caller holding the `held` realm roles may grant the admin role
-/// `role`: they hold it, or hold the `manage-*` role covering a `view-*` one.
-fn may_grant_admin_role(held: &[&str], role: &str) -> bool {
-    held.contains(&role)
-        || role
-            .strip_prefix("view-")
-            .is_some_and(|area| held.contains(&format!("manage-{area}").as_str()))
-}
-
-/// Refuse a grant (role mapping or group membership) whose composite closure
-/// carries an admin role the caller may not grant — Keycloak's rule that an
-/// administrator cannot map admin roles they do not hold. Without it a
-/// `manage-users`-only admin could map `manage-realm` onto itself.
-/// `manage-realm` holders are exempt: they can already reshape any composite
-/// (and therefore reach every role), so the grant adds nothing.
-async fn require_grantable(
-    state: &Arc<AdminApiState>,
-    auth: &AdminAuth,
-    realm_id: &RealmId,
-    granted: Vec<Role>,
-) -> Result<(), AdminApiError> {
-    let held: Vec<&str> = auth
-        .claims
-        .realm_access
-        .as_ref()
-        .map(|ra| ra.roles.iter().map(|r| r.as_str()).collect())
-        .unwrap_or_default();
-    if granted.is_empty() || held.contains(&"manage-realm") {
-        return Ok(());
-    }
-    let all = issuerd_core::list_all_roles(state.storage.as_ref(), realm_id).await?;
-    let denied = issuerd_core::expand_composites(granted, &all).into_iter().find(|r| {
-        !r.client_role
-            && ADMIN_ROLES.contains(&r.name.as_str())
-            && !may_grant_admin_role(&held, r.name.as_str())
-    });
-    if let Some(role) = denied {
-        warn!(role = %role.name, admin = %auth.claims.sub,
-            "admin API authorization denied: caller may not grant this admin role");
-        return Err(AdminApiError::Forbidden);
-    }
-    Ok(())
-}
+use tracing::{info, instrument};
 
 /// Roles a group membership confers (its mappings plus composites); a group
 /// that does not exist confers none.
@@ -270,12 +216,16 @@ pub async fn create_user(
     reject_reserved_username(&user.username)?;
     reject_service_account_link(&user.attributes)?;
     user.realm_id = realm_id.clone();
-    // Hash password credentials exactly like the reset-password endpoint so
-    // onboarding with an initial password actually works. The realm password
-    // policy applies to password credentials; the user is new, so there is no
-    // password history to check against.
+    // Password policy can only be evaluated against plaintext. Other credential
+    // types retain their opaque secret_data import behavior.
     let mut credentials: Vec<Credential> = Vec::new();
     for cred_rep in body.credentials.as_deref().unwrap_or_default() {
+        if cred_rep.credential_type == CredentialType::Password && cred_rep.value.is_none() {
+            return Err(AdminApiError::BadRequest(
+                "password credentials require a plaintext value; raw secret_data is not accepted"
+                    .to_string(),
+            ));
+        }
         let mut cred: Credential = cred_rep.clone().try_into()?;
         if let Some(value) = cred_rep.value.clone() {
             if cred.credential_type == CredentialType::Password {
@@ -651,21 +601,10 @@ pub async fn reset_password(
             state.storage.update_user(&realm_id, &user).await?;
         }
     } else {
-        // No plain-text value: store the representation-derived credential
-        // as-is (legacy path — no policy/history handling applies).
-        let mut cred: Credential = body.try_into()?;
-        cred.credential_type = CredentialType::Password;
-        // Reset replaces, not appends: remove existing password credentials so
-        // the old password stops working (the verify loops accept ANY matching
-        // password credential).
-        for old in state
-            .storage
-            .get_credentials(&realm_id, &user_id, CredentialType::Password)
-            .await?
-        {
-            state.storage.delete_credential(&realm_id, &user_id, &old.id).await?;
-        }
-        state.storage.create_credential(&realm_id, &user_id, &cred).await?;
+        return Err(AdminApiError::BadRequest(
+            "password credentials require a plaintext value; raw secret_data is not accepted"
+                .to_string(),
+        ));
     }
     issuerd_cluster::invalidate::invalidate_user_claims(state.cache.as_ref(), &realm_id, &user_id)
         .await;
@@ -3411,6 +3350,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_user_requires_plaintext_for_password_credentials() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+        let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        realm.password_policy.require_digits = true;
+        state.storage.update_realm(&realm).await.unwrap();
+
+        let weak_hash = Argon2::default()
+            .hash_password(b"onlylowercase", &SaltString::generate(&mut OsRng))
+            .unwrap()
+            .to_string();
+        for credential in [
+            serde_json::json!({"type": "password", "secret_data": weak_hash}),
+            serde_json::json!({"type": "password"}),
+        ] {
+            let body = serde_json::json!({
+                "username": "bob",
+                "credentials": [credential],
+            })
+            .to_string();
+            let status =
+                send(&app, "POST", format!("/admin/realms/{realm_name}/users"), &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                state
+                    .storage
+                    .get_user_by_username(&RealmId::new("realm-1").unwrap(), "bob")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a password credential without plaintext must not create a user"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_accepts_secret_data_for_non_password_credentials() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_user(&state).await;
+        let secret = "JBSWY3DPEHPK3PXP";
+        let body = serde_json::json!({
+            "username": "otp-user",
+            "credentials": [{"type": "totp", "secret_data": secret}],
+        })
+        .to_string();
+
+        let status = send(&app, "POST", format!("/admin/realms/{realm_name}/users"), &body).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let user = state
+            .storage
+            .get_user_by_username(&realm_id, "otp-user")
+            .await
+            .unwrap()
+            .unwrap();
+        let credentials = state
+            .storage
+            .get_credentials(&realm_id, &user.id, CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].secret_data.as_slice(), secret.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn reset_password_requires_plaintext_and_preserves_current_password() {
+        let state = test_state(roles(&["manage-users"]));
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        realm.password_policy.history_size = 3;
+        state.storage.update_realm(&realm).await.unwrap();
+
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"First!pass1"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let realm_id = RealmId::new("realm-1").unwrap();
+        let uid = UserId::new(&user_id).unwrap();
+        let current = state
+            .storage
+            .get_credentials(&realm_id, &uid, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        let original_id = current[0].id.clone();
+        let original_secret = current[0].secret_data.clone();
+        let reused_hash = String::from_utf8(original_secret.clone()).unwrap();
+
+        for body in [
+            serde_json::json!({"type": "password", "secret_data": reused_hash}).to_string(),
+            serde_json::json!({"type": "password"}).to_string(),
+        ] {
+            let response = do_reset_password(&app, &realm_name, &user_id, &body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let after = state
+                .storage
+                .get_credentials(&realm_id, &uid, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].id, original_id);
+            assert_eq!(after[0].secret_data, original_secret);
+        }
     }
 
     #[tokio::test]

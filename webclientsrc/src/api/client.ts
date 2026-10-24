@@ -3,12 +3,12 @@
 
 import { authLogout } from '@generated'
 import { client } from '@generated/client.gen'
-import { getAccountRealm } from '../config'
+import { getAccountRealm, getConsoleClientId } from '../config'
 import { useAuthStore } from '../state/authStore'
 import { initTokenRefresh, refreshNow, stopSessionRefresh } from './tokenRefresh'
 
 // The singleton client's base URL and auth resolver are configured once in
-// ../config.ts; this module adds the admin console's session handling: a 401
+// ../config.ts; this module adds the consoles' shared session handling: a 401
 // triggers one token refresh + request retry, and only when the refresh says
 // the session is over (or a retried request still comes back 401) do we log
 // out and return to the sign-in page.
@@ -35,7 +35,9 @@ client.interceptors.response.use(async (response, request, options) => {
   const outcome = await refreshNow()
   if (outcome !== 'ok') return response // 'expired' already triggered forceLogout
 
-  const tokens = useAuthStore.getState().getTokenSet(getAccountRealm())
+  const tokens = useAuthStore
+    .getState()
+    .getTokenSet(getAccountRealm(), getConsoleClientId())
   if (!tokens) return response
 
   const headers = new Headers(request.headers)

@@ -10,7 +10,7 @@ use axum::{
 };
 #[cfg(test)]
 use issuerd_core::RoleName;
-use issuerd_core::{OperationType, Pagination, ResourceType};
+use issuerd_core::{OperationType, Pagination, ResourceType, Role};
 use std::sync::Arc;
 
 use crate::{
@@ -22,10 +22,105 @@ use crate::{
     error::AdminApiError,
     state::AdminApiState,
 };
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Shared role-mapping helpers (users / groups / client scope-mappings)
 // ---------------------------------------------------------------------------
+
+/// Realm roles the admin API authorizes on (the `require_roles` vocabulary).
+const ADMIN_ROLES: [&str; 7] = [
+    "manage-realm",
+    "view-realm",
+    "manage-users",
+    "view-users",
+    "manage-clients",
+    "view-clients",
+    "impersonation",
+];
+
+fn held_realm_roles(auth: &AdminAuth) -> Vec<&str> {
+    auth.claims
+        .realm_access
+        .as_ref()
+        .map(|ra| ra.roles.iter().map(|r| r.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a caller holding the `held` realm roles may grant the admin role
+/// `role`: they hold it, or hold the `manage-*` role covering a `view-*` one.
+fn may_grant_admin_role(held: &[&str], role: &str) -> bool {
+    held.contains(&role)
+        || role
+            .strip_prefix("view-")
+            .is_some_and(|area| held.contains(&format!("manage-{area}").as_str()))
+}
+
+fn require_effective_roles_grantable(
+    auth: &AdminAuth,
+    effective: Vec<Role>,
+) -> Result<(), AdminApiError> {
+    let held = held_realm_roles(auth);
+    if held.contains(&"manage-realm") {
+        return Ok(());
+    }
+    let denied = effective.into_iter().find(|r| {
+        !r.client_role
+            && ADMIN_ROLES.contains(&r.name.as_str())
+            && !may_grant_admin_role(&held, r.name.as_str())
+    });
+    if let Some(role) = denied {
+        warn!(role = %role.name, admin = %auth.claims.sub,
+            "admin API authorization denied: caller may not grant this admin role");
+        return Err(AdminApiError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Refuse a role mutation that newly introduces an admin role into its
+/// effective composite closure when the caller may not grant that role.
+/// Existing effective roles are compared by id so retaining or removing
+/// privileges does not require the caller to hold them.
+pub(crate) fn require_new_admin_roles_grantable(
+    auth: &AdminAuth,
+    previous: Option<&Role>,
+    candidate: &Role,
+    all_roles: &[Role],
+) -> Result<(), AdminApiError> {
+    if held_realm_roles(auth).contains(&"manage-realm") {
+        return Ok(());
+    }
+    let previous_ids: std::collections::HashSet<_> = previous
+        .map(|role| issuerd_core::expand_composites(vec![role.clone()], all_roles))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|role| role.id)
+        .collect();
+    let introduced = issuerd_core::expand_composites(vec![candidate.clone()], all_roles)
+        .into_iter()
+        .filter(|role| !previous_ids.contains(&role.id))
+        .collect();
+    require_effective_roles_grantable(auth, introduced)
+}
+
+/// Refuse a grant (role mapping or group membership) whose composite closure
+/// carries an admin role the caller may not grant — Keycloak's rule that an
+/// administrator cannot map admin roles they do not hold. Without it a
+/// `manage-users`-only admin could map `manage-realm` onto itself.
+/// `manage-realm` holders are exempt: they can already reshape any composite
+/// (and therefore reach every role), so the grant adds nothing.
+pub(crate) async fn require_grantable(
+    state: &Arc<AdminApiState>,
+    auth: &AdminAuth,
+    realm_id: &issuerd_core::RealmId,
+    granted: Vec<Role>,
+) -> Result<(), AdminApiError> {
+    if granted.is_empty() || held_realm_roles(auth).contains(&"manage-realm") {
+        return Ok(());
+    }
+    let all = issuerd_core::list_all_roles(state.storage.as_ref(), realm_id).await?;
+    require_effective_roles_grantable(auth, issuerd_core::expand_composites(granted, &all))
+}
 
 /// Resolve a `Vec<RoleRepresentation>` request body into stored roles by id.
 /// A body entry without an id is a 400; an unknown id is a 404 (Keycloak

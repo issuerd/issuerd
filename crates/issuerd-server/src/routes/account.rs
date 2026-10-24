@@ -1637,7 +1637,7 @@ async fn load_user(
     state: &Arc<ServerState>,
     guard: &AccountSessionGuard,
 ) -> Result<User, Response> {
-    state
+    let user = state
         .storage
         .get_user(&guard.realm_id, &guard.user_id)
         .await
@@ -1645,7 +1645,11 @@ async fn load_user(
             error!(realm = %guard.realm_id, error = %e, "account API: failed to load user");
             internal_error("failed to load user")
         })?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "user not found"))
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "user not found"))?;
+    if !user.enabled {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token"));
+    }
+    Ok(user)
 }
 
 /// Load the realm the guard is bound to (login flags, password policy).
@@ -1790,6 +1794,15 @@ fn token_is_expired(token: &str) -> bool {
         .is_some_and(|exp| exp < chrono::Utc::now().timestamp())
 }
 
+fn is_first_party_authorized_party(claims: &issuerd_core::AccessTokenClaims) -> bool {
+    let authorized_party = match claims.azp.as_deref() {
+        Some(azp) => Some(azp),
+        None if claims.aud.values().len() == 1 => Some(claims.aud.as_str()),
+        None => None,
+    };
+    matches!(authorized_party, Some("account-console" | "admin-cli"))
+}
+
 #[allow(clippy::result_large_err)]
 async fn extract_auth(
     state: &Arc<ServerState>,
@@ -1867,6 +1880,26 @@ async fn extract_auth(
             Ok(ctx) => ctx,
             Err(resp) => return Err(resp),
         };
+
+    // The account API is an internal first-party SPA API, not a public
+    // resource endpoint for tokens issued to arbitrary relying parties.
+    if !is_first_party_authorized_party(&validated.claims) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid_token"})),
+        )
+            .into_response());
+    }
+
+    // Client-credentials tokens have no interactive stored session. The
+    // shared validity gate recognizes their synthetic sid; this API must not.
+    if session.is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid_token"})),
+        )
+            .into_response());
+    }
 
     // Bearer-only API: a DPoP-bound token (`cnf.jkt`) must be presented with
     // a proof (RFC 9449 §7.1), which this API does not accept — reject the
@@ -2107,20 +2140,25 @@ mod tests {
     }
 
     /// Password-grant an access token for the master `admin` user.
-    async fn password_grant_token(state: &Arc<ServerState>) -> String {
+    async fn password_grant_token_for_client(state: &Arc<ServerState>, client_id: &str) -> String {
         let resp = crate::routes::oidc::token_handler(
             State(state.clone()),
             axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
             axum::http::HeaderMap::new(),
-            "grant_type=password&username=admin&password=admin&client_id=admin-cli&scope=openid"
-                .to_string(),
+            format!(
+                "grant_type=password&username=admin&password=admin&client_id={client_id}&scope=openid"
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["access_token"].as_str().unwrap().to_string()
+    }
+
+    async fn password_grant_token(state: &Arc<ServerState>) -> String {
+        password_grant_token_for_client(state, "admin-cli").await
     }
 
     async fn account_me_with_token(state: &Arc<ServerState>, access_token: &str) -> Response {
@@ -2135,11 +2173,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_me_accepts_token_with_live_session() {
+    async fn account_me_accepts_admin_cli_token_with_live_session() {
         let state = test_state().await;
         let access_token = password_grant_token(&state).await;
         let resp = account_me_with_token(&state, &access_token).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn account_me_accepts_account_console_token_with_live_session() {
+        let state = test_state().await;
+        let access_token = password_grant_token_for_client(&state, "account-console").await;
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_interactive_token_from_ordinary_relying_party() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.id = issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap();
+        client.client_id = ClientIdentifier::new("ordinary-rp").unwrap();
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+
+        let access_token = password_grant_token_for_client(&state, "ordinary-rp").await;
+        let validated = state.token_service.validate_access_token(&access_token).unwrap();
+        let sid = validated.claims.sid.clone().expect("interactive token sid");
+        assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_some());
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_first_party_audience_fallback_is_unambiguous() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let mut claims = state.token_service.validate_access_token(&access_token).unwrap().claims;
+
+        claims.azp = None;
+        assert!(is_first_party_authorized_party(&claims));
+        claims.aud = issuerd_core::Audience::from_values(vec![
+            "admin-cli".to_string(),
+            "account-console".to_string(),
+        ])
+        .unwrap();
+        assert!(!is_first_party_authorized_party(&claims));
+
+        claims.aud = issuerd_core::Audience::new("account-console").unwrap();
+        assert!(is_first_party_authorized_party(&claims));
+        claims.azp = Some("ordinary-rp".to_string());
+        assert!(!is_first_party_authorized_party(&claims));
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_disabled_user_with_live_session() {
+        let state = test_state().await;
+        let access_token = password_grant_token(&state).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.enabled = false;
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+        issuerd_cluster::invalidate::invalidate_user_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &user.id,
+        )
+        .await;
+
+        let resp = account_me_with_token(&state, &access_token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2205,6 +2315,81 @@ mod tests {
 
         let resp = account_me_with_token(&state, &access_token).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_sessionless_first_party_client_credentials_token() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.public_client = false;
+        client.secret = Some("client-credentials-secret".to_string());
+        client.service_accounts_enabled = true;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+        issuerd_cluster::invalidate::invalidate_client_claims(
+            state.cache.as_ref(),
+            &realm_id,
+            &client.id,
+            client.client_id.as_ref(),
+        )
+        .await;
+
+        let response = crate::routes::oidc::token_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            "grant_type=client_credentials&client_id=admin-cli&client_secret=client-credentials-secret&scope=openid"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = body_json(response).await["access_token"].as_str().unwrap().to_string();
+        let validated = state.token_service.validate_access_token(&token).unwrap();
+        assert_eq!(validated.claims.azp.as_deref(), Some("admin-cli"));
+        let sid = validated.claims.sid.clone().expect("synthetic client-token sid");
+        assert!(state.storage.get_user_session(&realm_id, &sid).await.unwrap().is_none());
+
+        let response = account_me_with_token(&state, &token).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_me_rejects_client_token_with_user_id_collision() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.id = issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap();
+        client.client_id = ClientIdentifier::new("admin").unwrap();
+        client.public_client = false;
+        client.secret = Some("collision-secret".to_string());
+        client.service_accounts_enabled = false;
+        state.storage.create_client(&realm_id, &client).await.unwrap();
+
+        let response = crate::routes::oidc::token_handler(
+            State(state.clone()),
+            master_realm(),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            "grant_type=client_credentials&client_id=admin&client_secret=collision-secret&scope=openid"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = body_json(response).await["access_token"].as_str().unwrap().to_string();
+
+        let response = account_me_with_token(&state, &token).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

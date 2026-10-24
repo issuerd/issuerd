@@ -271,8 +271,6 @@ async fn revoked_consent_via_account_api_retriggers_page() {
     let harness = TestHarness::new().await;
     harness.create_realm("consent-revoke").await;
     let client = create_consent_client(&harness, "consent-revoke").await;
-    // A second, consent-free client mints the account-console token.
-    let account_client = harness.create_client("consent-revoke", false).await;
     harness.create_user("consent-revoke", "frida", "Password123!").await;
 
     // Grant consent.
@@ -289,12 +287,7 @@ async fn revoked_consent_via_account_api_retriggers_page() {
 
     // Revoke through the account console API.
     let token = harness
-        .authenticate_user(
-            "consent-revoke",
-            account_client.client_id.as_ref(),
-            "frida",
-            "Password123!",
-        )
+        .authenticate_account_console_user("consent-revoke", "frida", "Password123!")
         .await
         .access_token;
     let resp = harness

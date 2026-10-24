@@ -5,10 +5,100 @@
 
 use async_trait::async_trait;
 use issuerd_core::*;
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::memory::InMemoryStorage;
+
+#[cfg(unix)]
+static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+struct SnapshotTempFile {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+#[cfg(unix)]
+impl SnapshotTempFile {
+    fn commit(mut self, destination: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, destination)?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SnapshotTempFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn create_snapshot_temp(destination: &Path) -> std::io::Result<(File, SnapshotTempFile)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file_name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "json storage path has no file name")
+    })?;
+    let parent = snapshot_parent(destination);
+
+    for _ in 0..128 {
+        let sequence = NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temp_path = parent.join(temp_name);
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp_path) {
+            Ok(file) => {
+                let temp = SnapshotTempFile {
+                    path: temp_path,
+                    remove_on_drop: true,
+                };
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                return Ok((file, temp));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique json storage temporary file",
+    ))
+}
+
+#[cfg(unix)]
+fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let (mut file, temp) = create_snapshot_temp(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    temp.commit(path)?;
+    File::open(snapshot_parent(path))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
 
 /// Slow, file-backed JSON storage intended for manual testing only.
 ///
@@ -104,7 +194,7 @@ impl JsonFileStorage {
         let data = serde_json::to_string_pretty(&snapshot).map_err(|e| {
             IssuerdError::ServerError(format!("failed to serialize json storage: {e}"))
         })?;
-        std::fs::write(&self.path, data)
+        write_snapshot(&self.path, data.as_bytes())
             .map_err(|e| IssuerdError::ServerError(format!("failed to write json storage: {e}")))?;
         Ok(())
     }
@@ -294,6 +384,20 @@ impl Storage for JsonFileStorage {
     ) -> Result<(), IssuerdError> {
         self.inner.update_credential(realm, user, cred).await?;
         self.persist()
+    }
+
+    async fn consume_totp_step(
+        &self,
+        realm: &RealmId,
+        user: &UserId,
+        credential_id: &CredentialId,
+        matched_step: u64,
+    ) -> Result<bool, IssuerdError> {
+        if self.inner.consume_totp_step(realm, user, credential_id, matched_step).await? {
+            self.persist()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn delete_credential(
@@ -912,6 +1016,11 @@ impl Storage for JsonFileStorage {
         self.inner.set_provision_marker(name, value).await?;
         self.persist()?;
         Ok(())
+    }
+
+    async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        self.inner.delete_provision_marker(name).await?;
+        self.persist()
     }
 
     // ------------------------------------------------------------------
@@ -1580,6 +1689,19 @@ mod tests {
         std::env::temp_dir().join(format!("issuerd-{tag}-{}.json", uuid::Uuid::new_v4()))
     }
 
+    #[tokio::test]
+    async fn json_provision_marker_delete_persists() {
+        let path = unique_test_path("provision-delete");
+        let storage = JsonFileStorage::new(&path).unwrap();
+        storage.set_provision_marker("retry", "in_progress").await.unwrap();
+        storage.delete_provision_marker("retry").await.unwrap();
+        assert_eq!(storage.get_provision_marker("retry").await.unwrap(), None);
+
+        let reloaded = JsonFileStorage::new(&path).unwrap();
+        assert_eq!(reloaded.get_provision_marker("retry").await.unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn full_realm() -> Realm {
         let mut r = test_realm();
         r.login_theme = Some(ThemeName::new("issuerd").unwrap());
@@ -1773,6 +1895,75 @@ mod tests {
             credential_data: serde_json::json!({"id": id}),
             priority,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn json_consume_totp_step_persists_only_successful_atomic_updates() {
+        const BURST: usize = 64;
+
+        let path = unique_test_path("json-consume-totp");
+        let storage = std::sync::Arc::new(JsonFileStorage::new(&path).unwrap());
+        let realm = test_realm();
+        let user = test_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let password = sample_credential("cred-password", CredentialType::Password, 1);
+        let mut totp = sample_credential("cred-totp", CredentialType::Totp, 2);
+        totp.credential_data = serde_json::json!({
+            "algorithm": "HmacSHA1",
+            "digits": 6,
+            "last_used_step": 40
+        });
+        storage.create_credential(&realm.id, &user.id, &password).await.unwrap();
+        storage.create_credential(&realm.id, &user.id, &totp).await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let realm_id = realm.id.clone();
+            let user_id = user.id.clone();
+            let credential_id = totp.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .consume_totp_step(&realm_id, &user_id, &credential_id, 41)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
+
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 41).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 40).await.unwrap());
+        assert!(storage.consume_totp_step(&realm.id, &user.id, &totp.id, 42).await.unwrap());
+
+        let persisted_before_rejections = std::fs::read(&path).unwrap();
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &totp.id, 42).await.unwrap());
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &password.id, 43).await.unwrap());
+        let missing = CredentialId::new("missing").unwrap();
+        assert!(!storage.consume_totp_step(&realm.id, &user.id, &missing, 43).await.unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), persisted_before_rejections);
+
+        let inner_credentials = storage.list_credentials(&realm.id, &user.id).await.unwrap();
+        let mut expected_totp = totp.clone();
+        expected_totp.credential_data["last_used_step"] = serde_json::json!(42);
+        assert!(inner_credentials.contains(&expected_totp));
+        assert!(inner_credentials.contains(&password));
+
+        let reloaded = JsonFileStorage::new(&path).unwrap();
+        let persisted_credentials = reloaded.list_credentials(&realm.id, &user.id).await.unwrap();
+        assert_eq!(persisted_credentials, inner_credentials);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     fn sample_session(id: &str, realm_id: &RealmId, user_id: &UserId) -> UserSession {
@@ -2831,5 +3022,116 @@ mod tests {
             assert!(err.to_string().contains("default list"));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only_permissions(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "unexpected permissions for {path:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_storage_permissions_stay_owner_only_after_creation_and_rewrites() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_test_path("json-permissions");
+        let storage = JsonFileStorage::new(&path).unwrap();
+        let realm = test_realm();
+        storage.create_realm(&realm).await.unwrap();
+        assert_owner_only_permissions(&path);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        storage.create_user(&realm.id, &test_user()).await.unwrap();
+        assert_owner_only_permissions(&path);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(storage);
+        let storage = JsonFileStorage::new(&path).unwrap();
+        assert_owner_only_permissions(&path);
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_snapshot_temp_file_is_owner_only_and_removed_on_drop() {
+        let path = unique_test_path("json-temp-permissions");
+        let (file, temp) = create_snapshot_temp(&path).unwrap();
+        let temp_path = temp.path.clone();
+
+        assert_owner_only_permissions(&temp_path);
+        assert!(!path.exists());
+
+        drop(file);
+        drop(temp);
+        assert!(!temp_path.exists());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_snapshot_atomic_replacement_preserves_open_old_snapshot() {
+        use std::io::Read as _;
+
+        let root = unique_test_path("json-atomic-replacement");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("snapshot.json");
+        write_snapshot(&path, b"old snapshot").unwrap();
+        let mut old_reader = std::fs::File::open(&path).unwrap();
+
+        write_snapshot(&path, b"new snapshot").unwrap();
+
+        let mut old_contents = String::new();
+        old_reader.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, "old snapshot");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new snapshot");
+        assert_owner_only_permissions(&path);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        drop(old_reader);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_snapshot_rename_failure_preserves_destination_and_cleans_temp() {
+        let root = unique_test_path("json-atomic-failure");
+        std::fs::create_dir(&root).unwrap();
+        let destination = root.join("snapshot.json");
+        std::fs::create_dir(&destination).unwrap();
+        let existing = destination.join("existing");
+        std::fs::write(&existing, "old snapshot").unwrap();
+
+        assert!(write_snapshot(&destination, b"new snapshot").is_err());
+
+        assert_eq!(std::fs::read(&existing).unwrap(), b"old snapshot");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_snapshot_atomic_write_does_not_overwrite_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_path("json-atomic-symlink");
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("target.json");
+        let path = root.join("snapshot.json");
+        std::fs::write(&target, "target snapshot").unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_snapshot(&path, b"new snapshot").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"target snapshot");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new snapshot");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_owner_only_permissions(&path);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

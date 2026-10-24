@@ -657,6 +657,65 @@ mod tests {
         assert_eq!(reps[0].resource_type, issuerd_core::ResourceType::Client);
     }
 
+    #[tokio::test]
+    async fn admin_event_query_redacts_legacy_realm_pairwise_sector_key() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-realm").unwrap()
+            ]);
+        let app = admin_event_routes(state.clone());
+        let realm = issuerd_core::Realm {
+            id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            name: issuerd_core::RealmName::new("test").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+        let representation = serde_json::json!({
+            "realm": "test",
+            "attributes": {
+                "pairwise_sector_key": "legacy-sector-key",
+                "visible": "unchanged"
+            }
+        })
+        .to_string();
+        let event = issuerd_core::AdminEvent {
+            id: issuerd_core::EventId::new("ae-legacy").unwrap(),
+            realm_id: realm.id.clone(),
+            auth_realm_id: Some(issuerd_core::RealmId::new("master").unwrap()),
+            auth_client_id: Some(issuerd_core::ClientId::new("admin-cli").unwrap()),
+            auth_user_id: Some(issuerd_core::UserId::new("admin").unwrap()),
+            operation_type: issuerd_core::OperationType::Update,
+            resource_type: issuerd_core::ResourceType::Realm,
+            resource_path: "realms/test".to_string(),
+            representation: Some(representation),
+            error: None,
+            event_time: Utc::now(),
+        };
+        state.storage.save_admin_event(&event).await.unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/realms/test/admin-events")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("legacy-sector-key"));
+        let reps: Vec<AdminEventRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reps.len(), 1);
+        let audited: serde_json::Value =
+            serde_json::from_str(reps[0].representation.as_deref().unwrap()).unwrap();
+        assert_eq!(audited["attributes"]["visible"], "unchanged");
+        assert!(audited["attributes"]
+            .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+            .is_none());
+    }
+
     // ------------------------------------------------------------------
     // Events config + clear + expiration clamping
     // ------------------------------------------------------------------

@@ -9880,7 +9880,7 @@
           "Realms"
         ],
         "summary": "Export the full realm",
-        "description": "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********` (`bindCredential` too for callers without `manage-realm`). Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
+        "description": "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********`. Groups are a flat list with hierarchy carried by `parent_id`. Requires `manage-realm` role.",
         "operationId": "export_realm",
         "parameters": [
           {
@@ -10576,7 +10576,7 @@
           "Groups"
         ],
         "summary": "List group members",
-        "description": "Returns the users that are members of the group, paginated. Requires `view-realm` or `manage-realm` role.",
+        "description": "Returns the users that are members of the group, paginated. Requires `view-users` or `manage-users` role.",
         "operationId": "get_group_members",
         "parameters": [
           {
@@ -17090,11 +17090,14 @@
           "Internal"
         ],
         "summary": "Log out the first-party SPA session",
-        "description": "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout) and clears those plus the `issuerd_remember_{realm}` cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
+        "description": "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout), revokes remember-me tokens, and clears those cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
         "operationId": "auth_logout",
         "responses": {
           "204": {
             "description": "Logged out; session cookies cleared"
+          },
+          "503": {
+            "description": "Revocation state unavailable; retry logout"
           }
         }
       }
@@ -20791,7 +20794,7 @@
               "object",
               "null"
             ],
-            "description": "Arbitrary realm-level attributes.",
+            "description": "Arbitrary realm-level attributes. The server-held\n`pairwise_sector_key` is accepted on writes but omitted from responses\nand admin-event representations.",
             "additionalProperties": {
               "type": "string"
             },

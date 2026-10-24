@@ -46,7 +46,7 @@ jobs:
         run: |
           cargo install --locked kani-verifier
           cargo kani setup
-      - run: cargo kani -p issuerd-protocol
+      - run: scripts/kani.sh
 
   flux:
     name: cargo flux (refinement types)

@@ -95,9 +95,8 @@ pub fn default_browser_flow(realm_id: RealmId) -> FlowConfig {
             // second factor. Optional stages are not scope-skipped, and the
             // stage itself is a no-op (Attempted) for users without passkeys,
             // so password-only logins are unchanged. The stage converts every
-            // user-facing failure into a re-challenge internally; like at a
-            // Conditional stage, a genuine infra Failure is swallowed by the
-            // executor — see the authenticator's contract docs.
+            // user-facing failure into a re-challenge internally; genuine
+            // infrastructure failures terminate the Optional stage and the flow.
             FlowStage {
                 id: FlowStageId::new("auth-webauthn").unwrap(),
                 requirement: Requirement::Optional,

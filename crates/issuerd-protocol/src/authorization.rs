@@ -198,6 +198,14 @@ impl AuthorizationRequest {
             ));
         }
 
+        if self.response_type.default_response_mode_is_fragment()
+            && matches!(self.response_mode, Some(ResponseMode::Query | ResponseMode::QueryJwt))
+        {
+            return Err(IssuerdError::InvalidRequest(
+                "query response_mode is not allowed for token-bearing response_type".into(),
+            ));
+        }
+
         for scope in &self.scope {
             // `openid` is the OIDC protocol marker, not a client scope:
             // every client may request it (Keycloak parity — otherwise a
@@ -325,7 +333,8 @@ pub fn authorization_details_is_subset(
     requested.iter().all(|r| granted.contains(r))
 }
 
-fn parse_prompt(value: Option<&String>) -> Result<Vec<Prompt>, IssuerdError> {
+/// Parse and validate the space-delimited OIDC `prompt` parameter.
+pub fn parse_prompt(value: Option<&String>) -> Result<Vec<Prompt>, IssuerdError> {
     let prompts = parse_space_separated(value);
     if prompts.is_empty() {
         return Ok(Vec::new());
@@ -1414,6 +1423,54 @@ mod tests {
             attributes: std::collections::HashMap::new(),
             ..make_client_defaults()
         }
+    }
+
+    #[rstest]
+    #[case(ResponseType::Token)]
+    #[case(ResponseType::IdToken)]
+    #[case(ResponseType::CodeIdToken)]
+    #[case(ResponseType::CodeToken)]
+    #[case(ResponseType::IdTokenToken)]
+    #[case(ResponseType::CodeIdTokenToken)]
+    fn validate_response_mode_policy_for_token_bearing_types(#[case] response_type: ResponseType) {
+        let client = openid_profile_client();
+        for response_mode in [ResponseMode::Query, ResponseMode::QueryJwt] {
+            let mut req = auth_req(response_type.clone(), "openid", vec![]);
+            req.response_mode = Some(response_mode);
+            let err = req.validate(&Realm::default(), &client).unwrap_err();
+            assert!(
+                matches!(&err, IssuerdError::InvalidRequest(message) if message.contains("query response_mode")),
+                "{} must reject {}: {err}",
+                response_type.as_str(),
+                response_mode.as_str()
+            );
+        }
+
+        for response_mode in [
+            None,
+            Some(ResponseMode::Fragment),
+            Some(ResponseMode::FormPost),
+            Some(ResponseMode::Jwt),
+            Some(ResponseMode::FragmentJwt),
+            Some(ResponseMode::FormPostJwt),
+        ] {
+            let mut req = auth_req(response_type.clone(), "openid", vec![]);
+            req.response_mode = response_mode;
+            assert!(
+                req.validate(&Realm::default(), &client).is_ok(),
+                "{} must allow {response_mode:?}",
+                response_type.as_str()
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(ResponseMode::Query)]
+    #[case(ResponseMode::QueryJwt)]
+    fn validate_query_response_modes_allowed_for_pure_code(#[case] response_mode: ResponseMode) {
+        let mut req = auth_req(ResponseType::Code, "openid", vec![]);
+        req.response_mode = Some(response_mode);
+        assert!(req.validate(&Realm::default(), &openid_profile_client()).is_ok());
     }
 
     #[test]

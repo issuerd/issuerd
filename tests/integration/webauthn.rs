@@ -313,10 +313,9 @@ fn extract_page_options(page: &str) -> serde_json::Value {
 async fn account_passkey_registration_e2e() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("wa-acct").await;
-    let client = harness.create_client("wa-acct", false).await;
     let _user = harness.create_user("wa-acct", "peter", "Password123!").await;
     let token = harness
-        .authenticate_user("wa-acct", client.client_id.as_ref(), "peter", "Password123!")
+        .authenticate_account_console_user("wa-acct", "peter", "Password123!")
         .await
         .access_token;
 
@@ -366,10 +365,9 @@ async fn account_passkey_registration_e2e() {
 async fn account_passkey_finish_without_start_is_rejected() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("wa-nostart").await;
-    let client = harness.create_client("wa-nostart", false).await;
     let _user = harness.create_user("wa-nostart", "quinn", "Password123!").await;
     let token = harness
-        .authenticate_user("wa-nostart", client.client_id.as_ref(), "quinn", "Password123!")
+        .authenticate_account_console_user("wa-nostart", "quinn", "Password123!")
         .await
         .access_token;
 
@@ -415,11 +413,10 @@ async fn account_passkey_endpoints_reject_foreign_realm_token() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("wa-realm-a").await;
     let _realm = harness.create_realm("wa-realm-b").await;
-    let client = harness.create_client("wa-realm-a", false).await;
     let _user = harness.create_user("wa-realm-a", "rachel", "Password123!").await;
     // A token issued by realm A must not manage passkeys in realm B.
     let token = harness
-        .authenticate_user("wa-realm-a", client.client_id.as_ref(), "rachel", "Password123!")
+        .authenticate_account_console_user("wa-realm-a", "rachel", "Password123!")
         .await
         .access_token;
 
@@ -448,7 +445,7 @@ async fn passkey_login_end_to_end() {
     let client = harness.create_client("wa-e2e", false).await;
     let user = harness.create_user("wa-e2e", "sam", "Password123!").await;
     let token = harness
-        .authenticate_user("wa-e2e", client.client_id.as_ref(), "sam", "Password123!")
+        .authenticate_account_console_user("wa-e2e", "sam", "Password123!")
         .await
         .access_token;
     let mut key = new_soft_key();
@@ -526,7 +523,7 @@ async fn passkey_json_caller_gets_challenge_contract() {
     let client = harness.create_client("wa-json", false).await;
     let _user = harness.create_user("wa-json", "tara", "Password123!").await;
     let token = harness
-        .authenticate_user("wa-json", client.client_id.as_ref(), "tara", "Password123!")
+        .authenticate_account_console_user("wa-json", "tara", "Password123!")
         .await
         .access_token;
     let mut key = new_soft_key();

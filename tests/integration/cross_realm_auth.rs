@@ -56,7 +56,6 @@ async fn account_api_rejects_token_from_different_realm() {
     let harness = TestHarness::new().await;
 
     let _realm_a = harness.create_realm("realm-a").await;
-    let client_a = harness.create_client("realm-a", false).await;
     let _user_a = harness.create_user("realm-a", "alice", "password-a").await;
 
     // realm-b must actually exist so the request reaches the issuer/realm
@@ -64,7 +63,7 @@ async fn account_api_rejects_token_from_different_realm() {
     let _realm_b = harness.create_realm("realm-b").await;
 
     let tokens_a = harness
-        .authenticate_user("realm-a", &client_a.client_id, "alice", "password-a")
+        .authenticate_account_console_user("realm-a", "alice", "password-a")
         .await;
 
     // Use realm-a's access token against realm-b's account API.

@@ -656,14 +656,15 @@ pub struct OutboundHttpConfig {
     /// zero valid certificates aborts the boot (fail closed — an operator
     /// typo must not silently fall back to public roots only).
     pub extra_ca_bundle: Option<PathBuf>,
-    /// **Test rigs only** — allow the SSRF-guarded outbound fetches (client
-    /// `jwks_url` documents, pairwise `sector_identifier_uri` documents,
-    /// JAR-by-reference `request_uri` objects) to dial private, loopback,
+    /// **Test rigs and explicit internal endpoints only** — allow the
+    /// SSRF-guarded outbound calls (client `jwks_url` documents, pairwise
+    /// `sector_identifier_uri` documents, JAR-by-reference `request_uri`
+    /// objects, and back-channel logout POSTs) to dial private, loopback,
     /// link-local, and otherwise non-publicly-routable addresses. The
-    /// https-only scheme check, the no-redirect policy, the body-size cap,
-    /// and the timeout stay enforced. Never enable in production: the guard
-    /// is what keeps those attacker-influenced URLs from probing the
-    /// internal network. Default false.
+    /// https-only scheme check, the no-redirect policy, applicable body-size
+    /// caps, and the timeout stay enforced. Never enable in production: the
+    /// guard is what keeps configured URLs from probing the internal network.
+    /// Default false.
     #[serde(default)]
     pub allow_private_addresses: bool,
     /// Allow the identity-broker calls (discovery, JWKS, token, userinfo, the
@@ -678,32 +679,34 @@ pub struct OutboundHttpConfig {
 }
 
 impl OutboundHttpConfig {
-    /// Load the configured extra root certificates. `Ok([])` when the knob is
-    /// unset; a bad path, unparseable content, or an empty bundle is a
-    /// boot-fatal error.
+    /// Load the configured extra root certificates. An empty root list when
+    /// the knob is unset; a bad path, unparseable content, or an empty bundle
+    /// is a boot-fatal error.
     pub fn load_extra_roots(&self) -> Result<Vec<reqwest::Certificate>, IssuerdError> {
-        let Some(path) = &self.extra_ca_bundle else {
-            return Ok(Vec::new());
+        let roots = if let Some(path) = &self.extra_ca_bundle {
+            let bytes = std::fs::read(path).map_err(|e| {
+                IssuerdError::ServerError(format!(
+                    "outbound_http.extra_ca_bundle: cannot read {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|e| {
+                IssuerdError::ServerError(format!(
+                    "outbound_http.extra_ca_bundle: {} is not a valid PEM certificate bundle: {e}",
+                    path.display()
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(IssuerdError::ServerError(format!(
+                    "outbound_http.extra_ca_bundle: {} contains no certificates",
+                    path.display()
+                )));
+            }
+            certs
+        } else {
+            Vec::new()
         };
-        let bytes = std::fs::read(path).map_err(|e| {
-            IssuerdError::ServerError(format!(
-                "outbound_http.extra_ca_bundle: cannot read {}: {e}",
-                path.display()
-            ))
-        })?;
-        let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|e| {
-            IssuerdError::ServerError(format!(
-                "outbound_http.extra_ca_bundle: {} is not a valid PEM certificate bundle: {e}",
-                path.display()
-            ))
-        })?;
-        if certs.is_empty() {
-            return Err(IssuerdError::ServerError(format!(
-                "outbound_http.extra_ca_bundle: {} contains no certificates",
-                path.display()
-            )));
-        }
-        Ok(certs)
+        Ok(roots)
     }
 }
 
@@ -1333,7 +1336,7 @@ key_base64 = "{}"
         let cfg = ServerConfig::load(Some(path.clone())).unwrap();
         assert!(cfg.outbound_http.allow_private_addresses);
         // Absent in the file: the default (false) applies.
-        fs::write(&path, "[outbound_http]\nextra_ca_bundle = \"/etc/ssl/corp.pem\"\n").unwrap();
+        fs::write(&path, "[outbound_http]\n").unwrap();
         let cfg = ServerConfig::load(Some(path)).unwrap();
         assert!(!cfg.outbound_http.allow_private_addresses);
         let _ = fs::remove_dir_all(&dir);

@@ -20,7 +20,8 @@ use crate::traits::Storage;
 
 /// Expand composite roles. Resolution rules: composites of a client role look
 /// up the name in the same client first, then realm roles; composites of a
-/// realm role look up realm roles first, then any client role with that name.
+/// realm role look up realm roles first, then a client role only when its name
+/// is unique across clients. Ambiguous legacy references grant nothing.
 /// Cycle-safe via a visited set.
 pub fn expand_composites(seeds: Vec<Role>, all_roles: &[Role]) -> Vec<Role> {
     let realm_by_name: std::collections::HashMap<&str, &Role> = all_roles
@@ -49,9 +50,11 @@ pub fn expand_composites(seeds: Vec<Role>, all_roles: &[Role]) -> Vec<Role> {
                     .or_else(|| realm_by_name.get(composite_name.as_str()).copied())
             } else {
                 realm_by_name.get(composite_name.as_str()).copied().or_else(|| {
-                    all_roles
+                    let mut matches = all_roles
                         .iter()
-                        .find(|r| r.client_role && r.name.as_str() == composite_name.as_str())
+                        .filter(|r| r.client_role && r.name.as_str() == composite_name.as_str());
+                    let first = matches.next()?;
+                    matches.next().is_none().then_some(first)
                 })
             };
             if let Some(composite) = resolved {
@@ -804,6 +807,17 @@ mod tests {
             let all = vec![a.clone(), decoy, target];
             let expanded = expand_composites(vec![a], &all);
             assert_eq!(sorted_names(&expanded), vec!["a", "c-only"]);
+        }
+
+        #[test]
+        fn ambiguous_client_composite_names_are_not_selected() {
+            let parent = mk_role("r-parent", "parent", &["shared"]);
+            let first = mk_client_role("r-first", "shared", "client-a");
+            let second = mk_client_role("r-second", "shared", "client-b");
+            let all = vec![parent.clone(), first, second];
+
+            let expanded = expand_composites(vec![parent], &all);
+            assert_eq!(sorted_names(&expanded), vec!["parent"]);
         }
 
         #[tokio::test]

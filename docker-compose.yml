@@ -35,7 +35,7 @@ services:
     image: issuerd/issuerd:latest
     container_name: issuerd-demo-server
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./examples/issuerd.demo.toml:/etc/issuerd/issuerd.toml:ro
       - ./examples/provision.demo.yaml:/etc/issuerd/provision.yaml:ro

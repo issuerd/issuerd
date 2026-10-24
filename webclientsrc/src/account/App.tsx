@@ -4,7 +4,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { tokenEndpoint } from '@generated'
-import { getAccountRealm } from '../config'
+import { ACCOUNT_CLIENT_ID, getAccountRealm } from '../config'
 import { useAuthStore } from '../state/authStore'
 import AccountLayout from './components/AccountLayout'
 import ProfilePage from './pages/ProfilePage'
@@ -18,6 +18,7 @@ interface TokenSet {
   refreshToken: string
   idToken: string
   expiresAt: number
+  clientId: string
 }
 
 async function exchangeAuthorizationCode(realm: string, code: string, urlState: string): Promise<TokenSet> {
@@ -40,7 +41,7 @@ async function exchangeAuthorizationCode(realm: string, code: string, urlState: 
       grant_type: 'authorization_code',
       code,
       redirect_uri: redirectUri,
-      client_id: 'account-console',
+      client_id: ACCOUNT_CLIENT_ID,
       code_verifier: codeVerifier,
     },
   })
@@ -58,12 +59,13 @@ async function exchangeAuthorizationCode(realm: string, code: string, urlState: 
     refreshToken: data.refresh_token || '',
     idToken: data.id_token || '',
     expiresAt: Date.now() + (data.expires_in || 300) * 1000,
+    clientId: ACCOUNT_CLIENT_ID,
   }
 }
 
 function AccountApp() {
   const realm = useMemo(() => getAccountRealm(), [])
-  const isAuthenticated = useAuthStore((s) => s.isAuthenticated(realm))
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated(realm, ACCOUNT_CLIENT_ID))
   const setTokenSet = useAuthStore((s) => s.setTokenSet)
   const [isExchanging, setIsExchanging] = useState(false)
   const [exchangeError, setExchangeError] = useState('')
