@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **JSON-file snapshots protect key and credential material.** On Unix, new and rewritten snapshots are owner-only (`0600`), and persistence uses a synced same-directory temporary file plus atomic rename instead of truncating the live snapshot in place. Existing snapshots are tightened when loaded and rewritten. In-memory mutation rollback on persistence failure remains unchanged.
 - **External ID-token and authorization-response validation is stricter.** Broker ID tokens now require the expected audience and, when configured, issuer, and honor `nbf`. Authorization requests carrying ID or access tokens can no longer select `query` or signed-only `query.jwt`, which exposed credentials in redirect URLs; pure authorization-code query responses remain supported.
 - **RustCrypto timing-safety update.** `p256`, `p384`, and `p521` move to 0.14, bringing `crypto-bigint` to 0.7.6 and fixing RUSTSEC-2026-0387 (timing variability in operations intended to be constant-time). No operator action required.
 - **Dependency security updates.** `ctutils` 0.4.3 → 0.4.5 (RUSTSEC-2026-0385, non-constant-time comparisons), `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety soundness), and the web client's transitive `js-yaml` pinned to 4.3.2 via an npm `overrides` entry (GHSA-2883-xcg3-v3hh, GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj — CPU-exhaustion YAML parsing issues in a build-time-only codegen dependency). No operator action required.
