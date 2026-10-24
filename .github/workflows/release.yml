@@ -60,7 +60,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - id: meta
         name: Tag must match workspace version and CHANGELOG section
         run: |
@@ -119,7 +119,7 @@ jobs:
 
           All workspace crates are published at ${VERSION} — \`cargo install issuerd --version ${VERSION}\` or \`issuerd = "${VERSION}"\` as a dependency.
           EOF
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-notes
           path: release-notes.md
@@ -145,8 +145,8 @@ jobs:
     needs: [validate, release]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       # Per-arch tag only; the docker-manifest job merges both arches into the
       # user-facing tags. No sbom/provenance here: attested pushes turn the tag
       # into an OCI index, which cannot be nested into the final manifest list.
@@ -161,13 +161,13 @@ jobs:
             echo "tags<<EOF"; cat tags.txt; echo "EOF"
             echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: ${{ env.ACT != 'true' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       # Under act: build + load locally only (no push).
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
           # No .dockerbuild build-record artifact — download-artifact cannot
           # fetch those, and the release job downloads artifacts by pattern.
@@ -197,7 +197,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The tarball ships the exact binary the Docker image ships: build the
       # canonical root Dockerfile and copy the binary out of it.
       - name: Build the canonical image and extract the binary
@@ -216,7 +216,7 @@ jobs:
           "$HOME/.local/bin/syft" version
       - name: Package the archive
         run: bash scripts/package-release.sh linux "${{ needs.validate.outputs.version }}" ./issuerd ./dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-dist
           path: dist/
@@ -234,7 +234,7 @@ jobs:
     # gating — plain Docker on an ubuntu runner, rehearses like linux-binary.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Build the glibc 2.28 image
         run: docker build -f Dockerfile.glibc228 -t issuerd:glibc228 .
       # Real execution on a clean glibc 2.28 userland (the runtime stage
@@ -265,7 +265,7 @@ jobs:
           "$HOME/.local/bin/syft" version
       - name: Package the archive
         run: bash scripts/package-release.sh linux-glibc228 "${{ needs.validate.outputs.version }}" ./issuerd ./dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-glibc228-dist
           path: dist/
@@ -282,8 +282,8 @@ jobs:
     # scripts/cross-linux-arm64.sh for local/rehearsal builds.)
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -292,13 +292,13 @@ jobs:
       - name: Build the web client
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.95.0   # pinned, same as the canonical Dockerfile
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-auditable
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@f6d2da492bc023ecc4c78229b5041ff8870ea3bc # cargo-auditable
+      - uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856 # cargo-llvm-cov
       # Native arch — plain apt, no multiarch/ports.ubuntu.com setup.
       - name: System dependencies (libgssapi, openssl)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
@@ -307,7 +307,7 @@ jobs:
       # Docker-dependent suites live in the integration targets.
       - name: Unit tests + coverage
         run: cargo llvm-cov --locked --workspace --lib --lcov --output-path arm64-lcov.info
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-arm64-coverage
           path: arm64-lcov.info
@@ -336,14 +336,14 @@ jobs:
           "$HOME/.local/bin/syft" version
       - name: Package the archive
         run: bash scripts/package-release.sh linux-arm64 "${{ needs.validate.outputs.version }}" ./build/arm64/issuerd ./dist-arm64
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-arm64-dist
           path: dist-arm64/
           if-no-files-found: error
       # The docker-arm64 job repacks this exact binary (plus its arm64
       # Kerberos libs) into the runtime image via Dockerfile.prebuilt.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-arm64-imagectx
           path: build/arm64/
@@ -356,9 +356,9 @@ jobs:
     needs: [validate, release, linux-arm64]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: linux-arm64-imagectx
           path: image-arm64
@@ -371,12 +371,12 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: echo "tags=issuerd/issuerd:$VERSION-arm64" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: ${{ env.ACT != 'true' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
           # No .dockerbuild build-record artifact (see the amd64 job).
           DOCKER_BUILD_RECORD_UPLOAD: false
@@ -402,8 +402,8 @@ jobs:
     needs: [validate, docker, docker-arm64]
     runs-on: ubuntu-24.04
     steps:
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: ${{ env.ACT != 'true' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -432,7 +432,7 @@ jobs:
     needs: [validate, docker-manifest]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Syncs the Hub repo page (Repository overview) from the committed
       # .github/dockerhub-overview.md — pushed images don't auto-sync a
       # README, so the page stays empty without this. Hub API (verified live
@@ -472,8 +472,8 @@ jobs:
     needs: [validate, release]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -483,8 +483,8 @@ jobs:
       - name: Build the web client
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # cargo publish verify-builds each staged crate; issuerd-federation's
       # libgssapi-sys build script needs the MIT Kerberos dev package.
       - name: Install Kerberos dev libraries (libgssapi-sys)
@@ -516,9 +516,9 @@ jobs:
         shell: bash
     steps:
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -534,13 +534,13 @@ jobs:
         name: Strawberry Perl (vendored openssl build)
         run: choco install strawberryperl --no-progress -y
       - if: ${{ env.ACT != 'true' }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - if: ${{ env.ACT != 'true' }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # cargo-auditable embeds the dependency tree in the binary (same as the
       # Dockerfile) so the SBOM scan sees every crate.
       - if: ${{ env.ACT != 'true' }}
-        uses: taiki-e/install-action@cargo-auditable
+        uses: taiki-e/install-action@f6d2da492bc023ecc4c78229b5041ff8870ea3bc # cargo-auditable
       - if: ${{ env.ACT != 'true' }}
         name: Build the release binary
         env:
@@ -561,7 +561,7 @@ jobs:
         name: Package the archive
         run: bash scripts/package-release.sh windows "${{ needs.validate.outputs.version }}" target/release/issuerd.exe ./dist
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: windows-dist
           path: dist/
@@ -586,9 +586,9 @@ jobs:
         shell: bash
     steps:
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -604,13 +604,13 @@ jobs:
         name: Strawberry Perl (vendored openssl build)
         run: choco install strawberryperl --no-progress -y
       - if: ${{ env.ACT != 'true' }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - if: ${{ env.ACT != 'true' }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # cargo-auditable embeds the dependency tree in the binary (same as the
       # Dockerfile) so the SBOM scan sees every crate.
       - if: ${{ env.ACT != 'true' }}
-        uses: taiki-e/install-action@cargo-auditable
+        uses: taiki-e/install-action@f6d2da492bc023ecc4c78229b5041ff8870ea3bc # cargo-auditable
       - if: ${{ env.ACT != 'true' }}
         name: Build the release binary
         env:
@@ -639,7 +639,7 @@ jobs:
         name: Package the archive
         run: bash scripts/package-release.sh windows-arm64 "${{ needs.validate.outputs.version }}" target/release/issuerd.exe ./dist
       - if: ${{ env.ACT != 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: windows-arm64-dist
           path: dist/
@@ -669,8 +669,8 @@ jobs:
       # test steps agree (openssl-src tracks the var via rerun-if-env-changed).
       OPENSSL_SRC_PERL: /usr/bin/perl
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
@@ -680,13 +680,13 @@ jobs:
       - name: Build the web client
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # cargo-auditable embeds the dependency tree in the binary (same as the
       # Dockerfile) so the SBOM scan sees every crate.
-      - uses: taiki-e/install-action@cargo-auditable
+      - uses: taiki-e/install-action@f6d2da492bc023ecc4c78229b5041ff8870ea3bc # cargo-auditable
       # Native build, no cross tooling: openssl-sys probes
       # /opt/homebrew/opt/openssl@3 (preinstalled on the image; brew install
       # is idempotent), Kerberos comes from the system GSS.framework
@@ -711,7 +711,7 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
       - name: Package the archive
         run: bash scripts/package-release.sh macos "${{ needs.validate.outputs.version }}" target/release/issuerd ./dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-dist
           path: dist/
@@ -733,7 +733,7 @@ jobs:
         run: cargo test --locked --release --workspace --lib --target x86_64-apple-darwin
       - name: Package the x86_64 archive
         run: bash scripts/package-release.sh macos-amd64 "${{ needs.validate.outputs.version }}" target/x86_64-apple-darwin/release/issuerd ./dist-amd64
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-amd64-dist
           path: dist-amd64/
@@ -756,10 +756,10 @@ jobs:
       # auto-upload *.dockerbuild build-record artifacts that download-artifact
       # cannot fetch (both v0.1.3 runs died on exactly that). Pull only what
       # this job uses.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: '*-dist'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-notes
           # Named artifacts extract into cwd, not a per-artifact directory —
@@ -767,7 +767,7 @@ jobs:
           path: release-notes
       # Packed by heavy.yml's conformance job (single tarball). Absent under
       # act — the heavy call is skipped there.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         if: ${{ env.ACT != 'true' }}
         with:
           name: conformance-evidence
@@ -803,7 +803,7 @@ jobs:
           cat SHA256SUMS.txt
       - name: Build-provenance attestation
         if: ${{ env.ACT != 'true' }}
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
             linux-dist/*
@@ -814,9 +814,28 @@ jobs:
             macos-dist/*
             macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
+      - name: Install cosign
+        if: ${{ env.ACT != 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # Keyless (GitHub OIDC) signatures so the release ships .sig/.crt files
+      # next to every asset — the scorecard Signed-Releases check needs
+      # signature files attached to the release, the attestation-store entries
+      # from the step above do not count.
+      - name: Sign release artifacts (cosign, keyless)
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          set -euo pipefail
+          for d in linux-dist linux-glibc228-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
+            for f in "$d"/*; do
+              cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+            done
+          done
+          for f in issuerd_*_conformance-evidence.tar.gz SHA256SUMS.txt; do
+            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+          done
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           body_path: release-notes/release-notes.md
           make_latest: true
@@ -831,6 +850,12 @@ jobs:
             macos-amd64-dist/*
             issuerd_*_conformance-evidence.tar.gz
             SHA256SUMS.txt
+            *-dist/*.sig
+            *-dist/*.crt
+            issuerd_*_conformance-evidence.tar.gz.sig
+            issuerd_*_conformance-evidence.tar.gz.crt
+            SHA256SUMS.txt.sig
+            SHA256SUMS.txt.crt
       - name: Release contents (always logged — this is what rehearsal inspects)
         run: |
           ls -l *-dist/

@@ -66,6 +66,7 @@ issuerd/
 │                            # (the default `issuerd` login.css is also compiled into the
 │                            #  binary as the last-resort fallback — see issuerd-server build.rs)
 ├── lints/                   # Dylint lint libraries (detached workspaces, own pinned nightly toolchains)
+├── fuzz/                    # cargo-fuzz libFuzzer targets for issuerd-protocol (detached workspace; `cargo +nightly fuzz run <target>`)
 └── webclientsrc/            # Embedded React/Vite admin + account SPA (optional)
 ```
 
@@ -171,8 +172,14 @@ This makes the Problems tab match `cargo clippy --workspace --all-targets --all-
 
 ### Verification Tooling (static analysis & model checking)
 
-Beyond fmt/clippy/test, the repo wires in four extra analysis tools. The GitHub
-Actions layout:
+Beyond fmt/clippy/test, the repo wires in four extra analysis tools, plus
+in-repo fuzzing for the protocol parsers. The fuzz harness lives in `fuzz/` —
+a detached cargo-fuzz workspace (own empty `[workspace]` table, like `lints/`,
+so `cargo build --workspace` never builds it) with libFuzzer targets for the
+pure `issuerd-protocol` parsing/validation functions; run it with
+`cargo +nightly fuzz run <target>` from `fuzz/` (needs
+`cargo install cargo-fuzz` and a nightly toolchain; no CI job, run on demand).
+The GitHub Actions layout:
 
 - `.github/workflows/ci.yml` (push to `main` + PRs) — the per-commit gates:
   `cargo fmt --all -- --check`, `check --locked --all-targets --all-features`,
@@ -185,9 +192,10 @@ Actions layout:
   `cargo test --doc` covers doctests, which llvm-cov cannot instrument on
   stable; Vitest `--coverage` for the web client; both reduced to shields.io
   endpoint-badge JSONs by `scripts/coverage_badges.py` and pushed to the
-  `badges` branch on main — self-hosted, no external coverage service; the
-  lcov export and the web client's HTML report are uploaded as workflow
-  artifacts), and an `openapi-sync` job that regenerates the spec and diffs
+  `badges` branch on main — self-hosted badges, no external coverage service;
+  Cobertura reports are uploaded to GitHub Code Quality for the native
+  pull-request coverage rule; the lcov export and the web client's HTML report
+  are uploaded as workflow artifacts), and an `openapi-sync` job that regenerates the spec and diffs
   it against the committed `webclientsrc/openapi.json`.
   Docker-dependent test suites skip gracefully here.
 - `.github/workflows/changelog.yml` (PRs) — fails the PR unless it touches
@@ -239,6 +247,7 @@ Actions layout:
 | cargo-audit | RUSTSEC advisory scan of Cargo.lock | `cargo audit` | justified ignores: `.cargo/audit.toml` |
 | cargo-deny | advisories + licenses + bans + sources | `cargo deny check` | config: `deny.toml` |
 | cargo-geiger | unsafe-code census | `cargo geiger --all-features` | informational report |
+| cargo-fuzz | coverage-guided fuzzing (libFuzzer) of the `issuerd-protocol` parsers | `cargo +nightly fuzz run <target>` (from `fuzz/`) | detached workspace like `lints/` (never in the default build); targets: `fuzz/fuzz_targets/` (authorization/token request parsing, PKCE verify); no CI job — run on demand |
 | dylint | log-hygiene policy lints (`lints/issuerd_log_hygiene`): 4 syntax-only + 2 type-aware (secret-typed values, unsanitized `username`) | `scripts/dylint.sh` (or `scripts/test.sh dylint`) | detached workspace + own pinned nightly (must predate rustc's `--env-set` removal — dylint#2078); discovered via `[workspace.metadata.dylint]`; deny-by-default lints; `dylint.toml` config knobs documented in the crate README |
 | Kani | model checking of proof harnesses | `scripts/kani.sh` | harnesses: `#[cfg(kani)]` module in `issuerd-protocol/src/pkce.rs` — both green |
 | Flux | refinement types | `scripts/flux.sh` | crates opt in via `[package.metadata.flux]`; annotations from the `flux-rs` git shim |

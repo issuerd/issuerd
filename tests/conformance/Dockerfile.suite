@@ -8,7 +8,7 @@
 # network.
 
 # --- Stage 1: build the suite JAR from the pristine upstream sources ---
-FROM maven:3-eclipse-temurin-21 AS jar
+FROM maven:3-eclipse-temurin-21@sha256:d23342b1a070a07555f4ef20c085a81aa40e5f5b3288ebf8ddae2f67e9d760c8 AS jar
 WORKDIR /build
 COPY conformance-suite/ ./
 # BuildKit cache keeps the maven repository across builds on this host
@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/root/.m2 \
     clean package
 
 # --- Stage 2: runtime ---
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:25-jre@sha256:dbb43d81099eec91e0800226ed2296d03146ee7857165b95112372ad0d67e87f
 
 # curl: used by the compose healthcheck and for in-container debugging.
 RUN apt-get update \

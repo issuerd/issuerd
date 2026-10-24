@@ -129,7 +129,7 @@ ring = "0.17"
 # standard targets — cmake is only a fallback for exotic/FIPS builds).
 # default-features = false drops `use_pem` — no PEM parsing entry points are
 # used.
-jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 # Feature-only pin (same major line jsonwebtoken requires): issuerd-token
 # enables `prebuilt-nasm` so Windows x86_64 builds use aws-lc-sys' shipped
 # pre-assembled .obj files — no NASM install needed.
@@ -137,9 +137,9 @@ aws-lc-rs = "1.15"
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pki-types = "1.14"
-p256 = "0.13"
-p384 = "0.13"
-p521 = "0.13"
+p256 = "0.14"
+p384 = "0.14"
+p521 = "0.14"
 rand = "0.8"
 
 # Storage
@@ -191,7 +191,7 @@ pin-project = "1.1"
 # Password hashing
 argon2 = "0.5"
 pbkdf2 = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 # Secret memory hygiene (zeroize-on-drop for key material buffers)
 zeroize = "1.8"
@@ -200,7 +200,7 @@ zeroize = "1.8"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1", "tokio1-rustls-tls"] }
 
 # Base64
-base64 = "0.22"
+base64 = "0.23"
 
 # Test certificate generation
 rcgen = "0.13"
@@ -222,7 +222,7 @@ clap = { version = "4.5", features = ["derive"] }
 include_dir = "0.7"
 mime_guess = "2.0"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-enable-ansi-support = "0.2"
+enable-ansi-support = "0.3"
 sd-notify = "0.4"
 tracing-journald = "0.3"
 

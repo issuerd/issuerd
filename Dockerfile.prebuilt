@@ -21,7 +21,7 @@
 #
 # Keep ENTRYPOINT/CMD in sync with the canonical Dockerfile.
 
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
 FROM ${RUNTIME_IMAGE}
 
 COPY rootfs/ /

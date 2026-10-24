@@ -1,0 +1,68 @@
+# Dependabot configuration. The `no-changelog` label keeps dependency PRs
+# exempt from the CHANGELOG gate (see .github/workflows/changelog.yml).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+
+  - package-ecosystem: npm
+    directory: /webclientsrc
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+
+  # Docker base images — one entry per directory containing a Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /examples/agentic-mcp/apps/ChatApp
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /examples/agentic-mcp/apps/McpServer
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /examples/agentic-mcp/setup
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /tests/conformance
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /tests/fixtures/samba-dc
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: docker
+    directory: /tests/perf/keycloak
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
