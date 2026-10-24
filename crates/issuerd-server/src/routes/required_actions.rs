@@ -1550,6 +1550,11 @@ pub async fn verify_email_handler(
     let entry_key = pending_actions_cache_key(&realm_id, execution);
     if let Ok(Some(bytes)) = state.cache.get(&entry_key).await {
         if let Ok(mut entry) = serde_json::from_slice::<PendingActionsData>(&bytes) {
+            // The execution query parameter is independent of the token. Only
+            // a continuation bound to the token's realm and user may change.
+            if entry.pending.realm_id != realm_id.0 || entry.user_id != user_id.0 {
+                return link_expired();
+            }
             if entry.remaining_actions.iter().any(|a| a == "VERIFY_EMAIL") {
                 entry.remaining_actions.retain(|a| a != "VERIFY_EMAIL");
                 let ip = entry.pending.ip_address.unwrap_or_else(|| "127.0.0.1".parse().unwrap());
@@ -2563,6 +2568,156 @@ mod tests {
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
         assert!(location.contains("code="), "unexpected redirect: {location}");
+    }
+
+    async fn store_verify_email_token(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        user: &User,
+        token: &str,
+    ) {
+        let data = VerifyEmailTokenData {
+            user_id: user.id.0.clone(),
+            email: user.email.as_ref().unwrap().as_str().to_string(),
+        };
+        state
+            .cache
+            .set(
+                &verify_email_cache_key(realm_id, token),
+                serde_json::to_vec(&data).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn redeem_verify_email(
+        state: &Arc<ServerState>,
+        token: &str,
+        execution: &str,
+    ) -> Response {
+        let query = HashMap::from([
+            ("token".to_string(), token.to_string()),
+            ("execution".to_string(), execution.to_string()),
+        ]);
+        verify_email_handler(
+            State(state.clone()),
+            Path("master".to_string()),
+            Query(query),
+            HeaderMap::new(),
+        )
+        .await
+    }
+
+    async fn stored_actions_entry(
+        state: &Arc<ServerState>,
+        realm_id: &RealmId,
+        execution: &str,
+    ) -> PendingActionsData {
+        let bytes = state
+            .cache
+            .get(&pending_actions_cache_key(realm_id, execution))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_email_execution_requires_matching_user_and_preserves_legitimate_flow() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let alice = test_user(&realm_id, "alice", &["VERIFY_EMAIL"]);
+        let bob = test_user(&realm_id, "bob", &["VERIFY_EMAIL"]);
+        state.storage.create_user(&realm_id, &alice).await.unwrap();
+        state.storage.create_user(&realm_id, &bob).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&bob, &["VERIFY_EMAIL"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+
+        // Alice's valid token must not advance Bob's independently named
+        // continuation, even when the attacker knows Bob's execution id.
+        store_verify_email_token(&state, &realm_id, &alice, "alice-token").await;
+        let resp = redeem_verify_email(&state, "alice-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("This verification link is invalid or has expired."),
+            "body: {body}"
+        );
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert_eq!(entry.user_id, bob.id.0);
+        assert_eq!(entry.remaining_actions, vec!["VERIFY_EMAIL"]);
+        let stored_bob = state.storage.get_user(&realm_id, &bob.id).await.unwrap().unwrap();
+        assert!(!stored_bob.email_verified);
+        assert_eq!(stored_bob.required_actions, vec!["VERIFY_EMAIL"]);
+
+        // Bob's own token still clears the same continuation, which then
+        // advances into the original login completion.
+        store_verify_email_token(&state, &realm_id, &bob, "bob-token").await;
+        let resp = redeem_verify_email(&state, "bob-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("Email address verified"));
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert!(entry.remaining_actions.is_empty());
+
+        let resp = required_action_page(
+            State(state.clone()),
+            Path(("master".to_string(), execution)),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location =
+            resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
+        assert!(location.contains("code="), "unexpected redirect: {location}");
+    }
+
+    #[tokio::test]
+    async fn verify_email_execution_requires_matching_realm() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user = test_user(&realm_id, "realm-bound", &["VERIFY_EMAIL"]);
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+
+        let resp = begin_actions_continuation(
+            &state,
+            "master",
+            test_pending(&realm_id),
+            pending_result(&user, &["VERIFY_EMAIL"]),
+            true,
+        )
+        .await;
+        let execution = execution_from_location(&resp);
+        let mut entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        entry.pending.realm_id = "another-realm".to_string();
+        state
+            .cache
+            .set(
+                &pending_actions_cache_key(&realm_id, &execution),
+                serde_json::to_vec(&entry).unwrap(),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        store_verify_email_token(&state, &realm_id, &user, "realm-token").await;
+        let resp = redeem_verify_email(&state, "realm-token", &execution).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("This verification link is invalid or has expired."),
+            "body: {body}"
+        );
+        let entry = stored_actions_entry(&state, &realm_id, &execution).await;
+        assert_eq!(entry.remaining_actions, vec!["VERIFY_EMAIL"]);
     }
 
     /// A link mailed to the old address must not verify an address the user
