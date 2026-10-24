@@ -102,6 +102,8 @@ pub async fn create_client_role(
     role.realm_id = realm_id.clone();
     role.client_role = true;
     role.client_id = Some(client.id.clone());
+    let all = issuerd_core::list_all_roles(state.storage.as_ref(), &realm_id).await?;
+    crate::roles::require_new_admin_roles_grantable(&auth, None, &role, &all)?;
     state.storage.create_role(&realm_id, &role).await?;
     issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), &realm_id).await;
     crate::audit::emit_admin_event(
@@ -185,6 +187,7 @@ pub async fn update_client_role(
         .get_client_role_by_name(&realm_id, &client.id, &role_name)
         .await?
         .ok_or(AdminApiError::NotFound)?;
+    let previous = existing.clone();
     // Renaming onto another role of the same client must be a conflict, not a
     // silent duplicate.
     if body.name != role_name {
@@ -209,6 +212,8 @@ pub async fn update_client_role(
     if body.attributes.is_none() {
         updated.attributes = existing.attributes;
     }
+    let all = issuerd_core::list_all_roles(state.storage.as_ref(), &realm_id).await?;
+    crate::roles::require_new_admin_roles_grantable(&auth, Some(&previous), &updated, &all)?;
     state.storage.update_role(&realm_id, &updated).await?;
     issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), &realm_id).await;
     crate::audit::emit_admin_event(
@@ -331,6 +336,54 @@ mod tests {
         };
         state.storage.create_client(&realm.id, &client).await.unwrap();
         (realm.name.to_string(), client.id.to_string())
+    }
+
+    fn state_with_roles(roles: &[&str]) -> Arc<AdminApiState> {
+        crate::test_utils::tests::test_state(
+            roles.iter().map(|name| issuerd_core::RoleName::new(*name).unwrap()).collect(),
+        )
+    }
+
+    async fn create_role(
+        state: &Arc<AdminApiState>,
+        id: &str,
+        name: &str,
+        client_id: Option<&str>,
+        composites: &[&str],
+    ) -> issuerd_core::Role {
+        let client_id = client_id.map(|id| issuerd_core::ClientId::new(id).unwrap());
+        let role = issuerd_core::Role {
+            id: issuerd_core::RoleId::new(id).unwrap(),
+            name: issuerd_core::RoleName::new(name).unwrap(),
+            description: None,
+            realm_id: issuerd_core::RealmId::new("realm-1").unwrap(),
+            client_role: client_id.is_some(),
+            client_id,
+            composite: !composites.is_empty(),
+            composites: composites
+                .iter()
+                .map(|name| issuerd_core::RoleName::new(*name).unwrap())
+                .collect(),
+            attributes: std::collections::HashMap::new(),
+        };
+        state.storage.create_role(&role.realm_id, &role).await.unwrap();
+        role
+    }
+
+    async fn send_json(app: &Router, method: &str, uri: String, body: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
     }
 
     #[tokio::test]
@@ -600,5 +653,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    async fn stored_role(
+        state: &Arc<AdminApiState>,
+        client_id: &str,
+        role_name: &str,
+    ) -> Option<issuerd_core::Role> {
+        state
+            .storage
+            .get_client_role_by_name(
+                &issuerd_core::RealmId::new("realm-1").unwrap(),
+                &issuerd_core::ClientId::new(client_id).unwrap(),
+                role_name,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manage_clients_cannot_create_direct_or_transitive_admin_composite() {
+        let state = state_with_roles(&["manage-clients"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-admin", "manage-realm", None, &[]).await;
+        create_role(&state, "role-wrapper", "admin-wrapper", Some(&client_id), &["manage-realm"])
+            .await;
+
+        let uri = format!("/admin/realms/{realm_name}/clients/{client_id}/roles");
+        for (name, child) in [
+            ("direct-admin", "manage-realm"),
+            ("transitive-admin", "admin-wrapper"),
+        ] {
+            let body = format!(r#"{{"name":"{name}","composite":true,"composites":["{child}"]}}"#);
+            let status = send_json(&app, "POST", uri.clone(), &body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+            assert!(stored_role(&state, &client_id, name).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_clients_can_create_non_admin_composite() {
+        let state = state_with_roles(&["manage-clients"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-child", "app-child", Some(&client_id), &[]).await;
+
+        let status = send_json(
+            &app,
+            "POST",
+            format!("/admin/realms/{realm_name}/clients/{client_id}/roles"),
+            r#"{"name":"app-parent","composite":true,"composites":["app-child"]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let parent = stored_role(&state, &client_id, "app-parent").await.unwrap();
+        assert_eq!(parent.composites, vec![issuerd_core::RoleName::new("app-child").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn manage_realm_can_create_admin_composite() {
+        let state = state_with_roles(&["manage-clients", "manage-realm"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-admin", "manage-realm", None, &[]).await;
+
+        let status = send_json(
+            &app,
+            "POST",
+            format!("/admin/realms/{realm_name}/clients/{client_id}/roles"),
+            r#"{"name":"app-parent","composite":true,"composites":["manage-realm"]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn manage_clients_cannot_update_to_direct_or_transitive_admin_composite() {
+        let state = state_with_roles(&["manage-clients"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-parent", "app-parent", Some(&client_id), &[]).await;
+        create_role(&state, "role-admin", "manage-realm", None, &[]).await;
+        create_role(&state, "role-wrapper", "admin-wrapper", Some(&client_id), &["manage-realm"])
+            .await;
+
+        let uri = format!("/admin/realms/{realm_name}/clients/{client_id}/roles/app-parent");
+        for child in ["manage-realm", "admin-wrapper"] {
+            let body =
+                format!(r#"{{"name":"app-parent","composite":true,"composites":["{child}"]}}"#);
+            let status = send_json(&app, "PUT", uri.clone(), &body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{child}");
+            let parent = stored_role(&state, &client_id, "app-parent").await.unwrap();
+            assert!(parent.composites.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_clients_can_retain_or_remove_existing_admin_composite() {
+        let state = state_with_roles(&["manage-clients"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-admin", "manage-realm", None, &[]).await;
+        create_role(&state, "role-child", "app-child", Some(&client_id), &[]).await;
+        create_role(&state, "role-parent", "app-parent", Some(&client_id), &["manage-realm"]).await;
+
+        let uri = format!("/admin/realms/{realm_name}/clients/{client_id}/roles/app-parent");
+        let retained = send_json(
+            &app,
+            "PUT",
+            uri.clone(),
+            r#"{"name":"app-parent","description":"retained","composite":true,"composites":["manage-realm"]}"#,
+        )
+        .await;
+        assert_eq!(retained, StatusCode::NO_CONTENT);
+        let parent = stored_role(&state, &client_id, "app-parent").await.unwrap();
+        assert_eq!(parent.composites, vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+
+        let removed = send_json(
+            &app,
+            "PUT",
+            uri,
+            r#"{"name":"app-parent","composite":true,"composites":["app-child"]}"#,
+        )
+        .await;
+        assert_eq!(removed, StatusCode::NO_CONTENT);
+        let parent = stored_role(&state, &client_id, "app-parent").await.unwrap();
+        assert_eq!(parent.composites, vec![issuerd_core::RoleName::new("app-child").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn manage_realm_can_update_to_admin_composite() {
+        let state = state_with_roles(&["manage-clients", "manage-realm"]);
+        let app = client_role_routes(state.clone());
+        let (realm_name, client_id) = realm_and_client(&state).await;
+        create_role(&state, "role-parent", "app-parent", Some(&client_id), &[]).await;
+        create_role(&state, "role-admin", "manage-realm", None, &[]).await;
+
+        let status = send_json(
+            &app,
+            "PUT",
+            format!("/admin/realms/{realm_name}/clients/{client_id}/roles/app-parent"),
+            r#"{"name":"app-parent","composite":true,"composites":["manage-realm"]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 }

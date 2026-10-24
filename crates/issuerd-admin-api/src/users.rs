@@ -27,64 +27,10 @@ use crate::{
         UserCountQueryParams, UserQueryParams, UserRepresentation,
     },
     error::AdminApiError,
+    roles::require_grantable,
     state::AdminApiState,
 };
-use tracing::{info, instrument, warn};
-
-/// Realm roles the admin API authorizes on (the `require_roles` vocabulary).
-const ADMIN_ROLES: [&str; 7] = [
-    "manage-realm",
-    "view-realm",
-    "manage-users",
-    "view-users",
-    "manage-clients",
-    "view-clients",
-    "impersonation",
-];
-
-/// Whether a caller holding the `held` realm roles may grant the admin role
-/// `role`: they hold it, or hold the `manage-*` role covering a `view-*` one.
-fn may_grant_admin_role(held: &[&str], role: &str) -> bool {
-    held.contains(&role)
-        || role
-            .strip_prefix("view-")
-            .is_some_and(|area| held.contains(&format!("manage-{area}").as_str()))
-}
-
-/// Refuse a grant (role mapping or group membership) whose composite closure
-/// carries an admin role the caller may not grant — Keycloak's rule that an
-/// administrator cannot map admin roles they do not hold. Without it a
-/// `manage-users`-only admin could map `manage-realm` onto itself.
-/// `manage-realm` holders are exempt: they can already reshape any composite
-/// (and therefore reach every role), so the grant adds nothing.
-async fn require_grantable(
-    state: &Arc<AdminApiState>,
-    auth: &AdminAuth,
-    realm_id: &RealmId,
-    granted: Vec<Role>,
-) -> Result<(), AdminApiError> {
-    let held: Vec<&str> = auth
-        .claims
-        .realm_access
-        .as_ref()
-        .map(|ra| ra.roles.iter().map(|r| r.as_str()).collect())
-        .unwrap_or_default();
-    if granted.is_empty() || held.contains(&"manage-realm") {
-        return Ok(());
-    }
-    let all = issuerd_core::list_all_roles(state.storage.as_ref(), realm_id).await?;
-    let denied = issuerd_core::expand_composites(granted, &all).into_iter().find(|r| {
-        !r.client_role
-            && ADMIN_ROLES.contains(&r.name.as_str())
-            && !may_grant_admin_role(&held, r.name.as_str())
-    });
-    if let Some(role) = denied {
-        warn!(role = %role.name, admin = %auth.claims.sub,
-            "admin API authorization denied: caller may not grant this admin role");
-        return Err(AdminApiError::Forbidden);
-    }
-    Ok(())
-}
+use tracing::{info, instrument};
 
 /// Roles a group membership confers (its mappings plus composites); a group
 /// that does not exist confers none.
