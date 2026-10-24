@@ -11,14 +11,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use issuerd_core::{AuthMethod, EventType, User, UserId, Username};
+use issuerd_core::{AuthMethod, User, UserId, Username};
 
 use crate::{
     middleware::{proxy_ip::ClientIp, realm::ResolvedRealm},
     state::ServerState,
 };
-
-use super::oidc::emit_oidc_event;
 
 /// SPNEGO / Kerberos endpoint.
 ///
@@ -415,175 +413,199 @@ async fn handle_spnego_with_count(
                         .into_response();
                 }
 
-                let client_id = client.id.clone();
-                let session_id =
-                    issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
-                let now = chrono::Utc::now();
-                let session = issuerd_core::UserSession {
-                    id: session_id.clone(),
-                    realm_id: realm_id.clone(),
-                    user_id: user.id.clone(),
-                    login_username: user.username.clone(),
-                    auth_method: AuthMethod::Spnego,
-                    remember_me: false,
-                    offline: false,
-                    ip_address: ip,
-                    started: now,
-                    last_session_refresh: now,
-                    auth_time: now,
-                    impersonator: None,
-                    clients: vec![issuerd_core::ClientSession {
-                        id: issuerd_core::ClientSessionId::new(issuerd_core::utils::generate_id())
-                            .unwrap(),
-                        client_id: client_id.clone(),
-                        session_id: session_id.clone(),
-                        redirect_uri: Some(redirect_uri),
-                        state: params.get("state").cloned(),
-                        auth_method: AuthMethod::Spnego,
-                        timestamp: now,
-                    }],
+                let prompt =
+                    match issuerd_protocol::authorization::parse_prompt(params.get("prompt")) {
+                        Ok(prompt) => prompt,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(super::oidc::error_response(&e)),
+                            )
+                                .into_response();
+                        }
+                    };
+                let response_mode = match params
+                    .get("response_mode")
+                    .map(|mode| mode.parse::<issuerd_protocol::authorization::ResponseMode>())
+                    .transpose()
+                {
+                    Ok(mode) => mode,
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "invalid response_mode"
+                            })),
+                        )
+                            .into_response();
+                    }
                 };
-                if let Err(e) = state.storage.create_user_session(&realm_id, &session).await {
-                    tracing::error!(error = %e, "failed to persist kerberos session");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(serde_json::json!({"error": "session_persistence_failed"})),
-                    )
-                        .into_response();
-                }
-
-                let code = issuerd_core::utils::generate_id();
-                let code_data = super::oidc::AuthCodeData {
+                let nonce = match params
+                    .get("nonce")
+                    .map(|nonce| issuerd_core::Nonce::new(nonce.clone()))
+                    .transpose()
+                {
+                    Ok(nonce) => nonce,
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "invalid nonce"
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                let packaging = super::auth_response::ResponsePackaging {
+                    realm: &realm,
+                    client_id: client.client_id.as_str(),
+                    requested_mode: response_mode,
+                    default_fragment: false,
+                };
+                let prompt_none = prompt.contains(&issuerd_protocol::authorization::Prompt::None);
+                let pending = super::oidc::PendingAuthData {
                     realm_id: realm_id.0.clone(),
-                    user_id: user.id.0.clone(),
                     client_id: client.client_id.to_string(),
                     redirect_uri: redirect_uri_str.clone(),
-                    scope: requested_scopes.clone(),
+                    scope: requested_scopes,
                     state: params.get("state").cloned(),
-                    nonce: params
-                        .get("nonce")
-                        .map(|s| issuerd_core::Nonce::new(s.clone()))
-                        .transpose()
-                        .ok()
-                        .flatten(),
+                    nonce,
+                    response_type: "code".to_string(),
                     code_challenge,
                     code_challenge_method,
-                    session_id: Some(session_id.0.clone()),
-                    auth_time: Some(now),
+                    ip_address: Some(ip),
+                    execution_id: issuerd_core::FlowStageId::new("spnego").unwrap(),
                     acr_values: vec![],
                     claims: None,
+                    _typestate_tag: "action_required".to_string(),
+                    attempt_count: 0,
+                    remember_me: false,
+                    user_id: Some(user.id.0.clone()),
+                    prompt_consent: prompt
+                        .contains(&issuerd_protocol::authorization::Prompt::Consent),
+                    locale: Some(crate::i18n::resolve_locale(
+                        &realm,
+                        &[],
+                        headers
+                            .get(axum::http::header::ACCEPT_LANGUAGE)
+                            .and_then(|value| value.to_str().ok()),
+                    )),
+                    response_mode,
                     authorization_details: None,
                     resource,
                 };
-                if let Err(e) = super::oidc::store_auth_code(
-                    &state.cache,
-                    &code,
-                    &code_data,
-                    state.config.oauth.auth_code_ttl(&realm),
+                let session_id =
+                    issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap();
+                let now = chrono::Utc::now();
+                let actions = match super::required_actions::evaluate_federated_required_actions(
+                    &state,
+                    &realm,
+                    &user,
+                    Some(ip),
                 )
                 .await
                 {
-                    tracing::error!(realm = %realm_id, client_id = %client.client_id, error = %e, "failed to persist authorization code");
-                    let mut details = HashMap::new();
-                    details.insert("error".to_string(), "temporarily_unavailable".to_string());
-                    emit_oidc_event(
+                    Ok(actions) => actions,
+                    Err(_) if prompt_none => {
+                        return super::auth_response::oauth_error_redirect(
+                            &state,
+                            &redirect_uri_str,
+                            &issuerd_core::IssuerdError::TemporarilyUnavailable,
+                            params.get("state").map(String::as_str),
+                            &packaging,
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        let copy = super::required_actions::PageCopy::for_realm(
+                            &state,
+                            &realm,
+                            pending.locale.as_deref(),
+                            None,
+                        );
+                        return super::required_actions::required_action_operational_error(&copy);
+                    }
+                };
+                if !actions.is_empty() {
+                    if prompt_none {
+                        return super::auth_response::oauth_error_redirect(
+                            &state,
+                            &redirect_uri_str,
+                            &issuerd_core::IssuerdError::LoginRequired,
+                            params.get("state").map(String::as_str),
+                            &packaging,
+                        )
+                        .await;
+                    }
+                    let result = issuerd_core::typestate::TypedFlowResult::new_pending(
+                        user.id.clone(),
+                        session_id,
+                        actions,
+                    );
+                    return super::required_actions::begin_actions_continuation_with_method(
                         &state,
-                        &realm_id,
-                        EventType::LoginError,
-                        &ip,
-                        Some(client_id.clone()),
-                        Some(user.id.clone()),
-                        Some(session_id.clone()),
-                        Some("temporarily_unavailable".to_string()),
-                        details,
+                        realm.name.as_str(),
+                        pending,
+                        result,
+                        true,
+                        AuthMethod::Spnego,
+                        "spnego",
                     )
                     .await;
-                    // Same response_mode handling as the success redirect
-                    // below (RFC 6749 §4.1.2.1 — the redirect URI was
-                    // validated above); JARM wraps error responses exactly
-                    // like success responses.
-                    let requested_mode = params.get("response_mode").and_then(|m| {
-                        m.parse::<issuerd_protocol::authorization::ResponseMode>().ok()
-                    });
-                    if let Some(mode) = requested_mode {
-                        if let Ok(Some(realm)) = state.storage.get_realm(&realm_id).await {
-                            let packaging = super::auth_response::ResponsePackaging {
-                                realm: &realm,
-                                client_id: client.client_id.as_str(),
-                                requested_mode: Some(mode),
-                                default_fragment: false,
-                            };
+                }
+                if prompt_none {
+                    match super::consent::consent_needed(
+                        &state,
+                        &realm_id,
+                        &client,
+                        &user.id,
+                        &pending.scope,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return super::auth_response::oauth_error_redirect(
+                                &state,
+                                &redirect_uri_str,
+                                &issuerd_core::IssuerdError::ConsentRequired,
+                                params.get("state").map(String::as_str),
+                                &packaging,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(realm = %realm_id, error = %e, "SPNEGO consent lookup failed");
                             return super::auth_response::oauth_error_redirect(
                                 &state,
                                 &redirect_uri_str,
                                 &issuerd_core::IssuerdError::TemporarilyUnavailable,
-                                params.get("state").map(|s| s.as_str()),
+                                params.get("state").map(String::as_str),
                                 &packaging,
                             )
                             .await;
                         }
                     }
-                    let mut redirect_params: Vec<(&str, &str)> =
-                        vec![("error", "temporarily_unavailable")];
-                    if let Some(s) = params.get("state") {
-                        redirect_params.push(("state", s.as_str()));
-                    }
-                    let url =
-                        super::oidc::build_redirect_url(&redirect_uri_str, &redirect_params, false);
-                    return (StatusCode::FOUND, [("Location", url)]).into_response();
                 }
-
-                let mut redirect_params: Vec<(&str, &str)> = vec![("code", code.as_str())];
-                if let Some(s) = params.get("state") {
-                    redirect_params.push(("state", s.as_str()));
-                }
-
-                let mut details = HashMap::new();
-                details.insert("method".to_string(), "spnego".to_string());
-                details.insert("username".to_string(), user.username.to_string());
-                emit_oidc_event(
+                let mut response = super::login_api::complete_login_with_method(
                     &state,
                     &realm_id,
-                    EventType::Login,
-                    &ip,
-                    Some(client_id.clone()),
-                    Some(user.id.clone()),
-                    Some(session_id),
-                    None,
-                    details,
+                    &pending,
+                    &user.id,
+                    &session_id,
+                    now,
+                    true,
+                    AuthMethod::Spnego,
+                    "spnego",
                 )
                 .await;
-
-                // Honor an explicitly requested response_mode
-                // (form_post / JARM); without one the code delivery stays a
-                // plain query redirect. JARM signing needs the realm — on a
-                // lookup failure fall back to the plain redirect rather than
-                // failing the completed authentication.
-                let requested_mode = params
-                    .get("response_mode")
-                    .and_then(|m| m.parse::<issuerd_protocol::authorization::ResponseMode>().ok());
-                if let Some(mode) = requested_mode {
-                    if let Ok(Some(realm)) = state.storage.get_realm(&realm_id).await {
-                        let packaging = super::auth_response::ResponsePackaging {
-                            realm: &realm,
-                            client_id: client.client_id.as_str(),
-                            requested_mode: Some(mode),
-                            default_fragment: false,
-                        };
-                        return super::auth_response::authorization_response(
-                            &state,
-                            &redirect_uri_str,
-                            &redirect_params,
-                            &packaging,
-                        )
-                        .await;
-                    }
+                if response.status() == StatusCode::SEE_OTHER {
+                    *response.status_mut() = StatusCode::FOUND;
                 }
-
-                let url =
-                    super::oidc::build_redirect_url(&redirect_uri_str, &redirect_params, false);
-
-                return (StatusCode::FOUND, [("Location", url)]).into_response();
+                return response;
             }
             Ok(issuerd_core::SpnegoAuthResult {
                 status: issuerd_core::SpnegoStatus::Continue,
@@ -763,6 +785,113 @@ mod tests {
         state.storage.create_client(&realm_id, &client).await.unwrap();
     }
 
+    async fn seed_user(state: &Arc<ServerState>, required_actions: &[&str]) -> UserId {
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let user = User {
+            id: UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm_id.clone(),
+            username: Username::new("alice").unwrap(),
+            email: None,
+            email_verified: false,
+            first_name: None,
+            last_name: None,
+            enabled: true,
+            federation_link: Some("mock-krb".to_string()),
+            attributes: HashMap::new(),
+            required_actions: required_actions.iter().map(|action| action.to_string()).collect(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let user_id = user.id.clone();
+        state.storage.create_user(&realm_id, &user).await.unwrap();
+        user_id
+    }
+
+    async fn authenticated_request(
+        state: &Arc<ServerState>,
+        params: HashMap<String, String>,
+    ) -> Response {
+        handle_spnego(
+            State(state.clone()),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            axum::extract::Extension(crate::middleware::proxy_ip::ClientIp(
+                "127.0.0.1".parse().unwrap(),
+            )),
+            negotiate_headers("token"),
+            axum::extract::Query(params),
+        )
+        .await
+    }
+
+    async fn assert_no_artifacts(state: &Arc<ServerState>, user_id: &UserId) {
+        let sessions = state
+            .storage
+            .list_sessions(
+                &issuerd_core::RealmId::new("master").unwrap(),
+                Some(user_id.clone()),
+                &issuerd_core::Pagination::default(),
+            )
+            .await
+            .unwrap();
+        assert!(sessions.is_empty(), "authorization gate created a session");
+        let codes = state.cache.scan_keys("auth_code:master:*").await.unwrap();
+        assert!(codes.is_empty(), "authorization gate created a code");
+    }
+
+    #[tokio::test]
+    async fn spnego_consent_required_pauses_before_issuance() {
+        let state = test_state_with_manager(authenticated_manager()).await;
+        seed_test_client(&state).await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let identifier = issuerd_core::ClientIdentifier::new("test-client").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &identifier)
+            .await
+            .unwrap()
+            .unwrap();
+        client.consent_required = true;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+        let user_id = seed_user(&state, &[]).await;
+
+        let response = authenticated_request(&state, query_with_redirect()).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("/login/consent/"), "location: {location}");
+        assert_no_artifacts(&state, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn spnego_required_actions_pause_and_preserve_authentication_method() {
+        let state = test_state_with_manager(authenticated_manager()).await;
+        seed_test_client(&state).await;
+        let user_id = seed_user(&state, &["TERMS_AND_CONDITIONS"]).await;
+
+        let response = authenticated_request(&state, query_with_redirect()).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("/login/required-action/"), "location: {location}");
+        assert_no_artifacts(&state, &user_id).await;
+        let execution = location.rsplit('/').next().unwrap();
+        let entry = state
+            .cache
+            .get(&crate::routes::required_actions::pending_actions_cache_key(
+                &issuerd_core::RealmId::new("master").unwrap(),
+                execution,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let entry: crate::routes::required_actions::PendingActionsData =
+            serde_json::from_slice(&entry).unwrap();
+        assert_eq!(entry.auth_method, Some(AuthMethod::Spnego));
+        assert_eq!(entry.method_label.as_deref(), Some("spnego"));
+    }
+
     #[tokio::test]
     async fn spnego_endpoint_no_header_returns_401() {
         let cfg = crate::config::ServerConfig::default();
@@ -878,8 +1007,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FOUND);
         let location = response.headers().get("Location").unwrap().to_str().unwrap();
-        assert!(location.starts_with("http://localhost/callback?code="));
-        assert!(location.contains("&state=xyz"));
+        let url = url::Url::parse(location).unwrap();
+        assert_eq!(url.path(), "/callback");
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("localhost"));
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert!(params.get("code").is_some_and(|code| !code.is_empty()));
+        assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
     }
 
     #[tokio::test]

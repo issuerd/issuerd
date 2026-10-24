@@ -77,11 +77,17 @@ fn action_required_tag() -> String {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingActionsData {
     /// The original authorization request; replayed by
-    /// [`super::login_api::complete_login`] once the last action clears.
+    /// [`super::login_api::complete_login_with_method`] once the last action clears.
     pub pending: PendingAuthData,
     pub user_id: String,
     pub session_id: String,
     pub auth_time: chrono::DateTime<chrono::Utc>,
+    /// Original method for brokered/SPNEGO logins; legacy password entries
+    /// predate these fields and use the password fallback at completion.
+    #[serde(default)]
+    pub auth_method: Option<issuerd_core::AuthMethod>,
+    #[serde(default)]
+    pub method_label: Option<String>,
     /// Action ids still to complete, in evaluation order.
     pub remaining_actions: Vec<String>,
     /// VERIFY_EMAIL: set once the message has been sent so re-rendering the
@@ -122,18 +128,98 @@ fn continuation_url(realm_name: &str, execution: &str) -> String {
     )
 }
 
-/// Start the required-action continuation: store the paused state and
-/// redirect the browser to the first action page.
-///
-/// Called from both login completion points (password login POST and the
-/// authorize endpoint's SSO/cookie path) when the flow succeeded with
-/// `result.required_actions` non-empty.
+/// Evaluate required actions after a broker or Kerberos authentication.
+/// These users have no local password by design, but an explicit password
+/// update assignment remains enforceable. Any evaluation failure aborts login.
+pub(crate) async fn evaluate_federated_required_actions(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    user: &User,
+    ip_address: Option<std::net::IpAddr>,
+) -> Result<Vec<String>, IssuerdError> {
+    let mut attributes = HashMap::new();
+    if realm.verify_email_enabled {
+        attributes.insert("realm_verify_email_enabled".to_string(), "true".to_string());
+    }
+    let ctx = AuthContext {
+        realm_id: realm.id.clone(),
+        client_id: None,
+        user_id: Some(user.id.clone()),
+        session_id: None,
+        ip_address,
+        parameters: HashMap::new(),
+        attributes,
+        current_challenge: None,
+    };
+    let mut action_ids = state.plugin_registry.list_required_action_ids();
+    for assigned in &user.required_actions {
+        if !action_ids.contains(assigned) {
+            action_ids.push(assigned.clone());
+        }
+    }
+
+    let update_password_assigned =
+        user.required_actions.iter().any(|action| action == "UPDATE_PASSWORD");
+    let mut pending = Vec::new();
+    for action_id in action_ids {
+        if action_id == "UPDATE_PASSWORD" && !update_password_assigned {
+            continue;
+        }
+        let action = match state.plugin_registry.get_required_action(&action_id).await {
+            Ok(Some(action)) => action,
+            Ok(None) => {
+                error!(action = %action_id, "required action is not registered");
+                return Err(IssuerdError::ServerError(format!(
+                    "required action listed or assigned but not registered: {action_id}"
+                )));
+            }
+            Err(e) => {
+                error!(error = %e, action = %action_id, "required action registry lookup failed");
+                return Err(e);
+            }
+        };
+        match action.try_evaluate(&ctx).await {
+            Ok(true) => pending.push(action_id),
+            Ok(false) => {}
+            Err(e) => {
+                error!(error = %e, action = %action_id, "required action evaluation failed");
+                return Err(e);
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// Start the required-action continuation for a password-authenticated flow.
 pub(crate) async fn begin_actions_continuation(
     state: &Arc<ServerState>,
     realm_name: &str,
     pending: PendingAuthData,
     result: TypedFlowResult<ActionsPending>,
     is_browser_form: bool,
+) -> Response {
+    begin_actions_continuation_with_method(
+        state,
+        realm_name,
+        pending,
+        result,
+        is_browser_form,
+        issuerd_core::AuthMethod::Password,
+        "password",
+    )
+    .await
+}
+
+/// Store the paused state and redirect to the first action page, retaining
+/// the original authentication method for session creation and audit events.
+pub(crate) async fn begin_actions_continuation_with_method(
+    state: &Arc<ServerState>,
+    realm_name: &str,
+    pending: PendingAuthData,
+    result: TypedFlowResult<ActionsPending>,
+    is_browser_form: bool,
+    auth_method: issuerd_core::AuthMethod,
+    method_label: &str,
 ) -> Response {
     debug!(
         realm = %pending.realm_id,
@@ -156,6 +242,8 @@ pub(crate) async fn begin_actions_continuation(
         user_id: result.user_id.0.clone(),
         session_id: result.session_id.0.clone(),
         auth_time: result.auth_time,
+        auth_method: Some(auth_method),
+        method_label: Some(method_label.to_string()),
         remaining_actions: result.required_actions.clone(),
         pending,
         email_sent: false,
@@ -1804,6 +1892,8 @@ pub async fn execute_actions_handler(
         user_id: user_id.0.clone(),
         session_id: issuerd_core::SessionId::new(issuerd_core::utils::generate_id()).unwrap().0,
         auth_time: chrono::Utc::now(),
+        auth_method: None,
+        method_label: None,
         remaining_actions: continuation.actions.clone(),
         email_sent: false,
         error: None,
@@ -1873,7 +1963,7 @@ async fn finish_continuation(
         session_id.clone(),
         entry.auth_time,
     );
-    super::login_api::complete_login(
+    super::login_api::complete_login_with_method(
         state,
         realm_id,
         &entry.pending,
@@ -1881,6 +1971,8 @@ async fn finish_continuation(
         &session_id,
         entry.auth_time,
         true,
+        entry.auth_method.clone().unwrap_or(issuerd_core::AuthMethod::Password),
+        entry.method_label.as_deref().unwrap_or("password"),
     )
     .await
 }
@@ -3226,6 +3318,8 @@ mod tests {
             user_id: "user-1".to_string(),
             session_id: issuerd_core::utils::generate_id(),
             auth_time: Utc::now(),
+            auth_method: None,
+            method_label: None,
             remaining_actions: vec![],
             email_sent: false,
             error: None,
@@ -3238,6 +3332,25 @@ mod tests {
         let location =
             resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap().to_string();
         assert_eq!(location, "https://app.example.com/after");
+    }
+
+    #[tokio::test]
+    async fn finish_continuation_preserves_spnego_method() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut entry = bare_entry(&realm_id, &[]);
+        entry.user_id = "admin".to_string();
+        entry.auth_method = Some(issuerd_core::AuthMethod::Spnego);
+        entry.method_label = Some("spnego".to_string());
+
+        let response =
+            finish_continuation(&state, &realm_id, &entry, &PageCopy::builtin("en")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let session_id = issuerd_core::SessionId::new(entry.session_id).unwrap();
+        let session =
+            state.storage.get_user_session(&realm_id, &session_id).await.unwrap().unwrap();
+        assert_eq!(session.auth_method, issuerd_core::AuthMethod::Spnego);
     }
 
     // -----------------------------------------------------------------------
@@ -3261,6 +3374,8 @@ mod tests {
             user_id: UserId::new(issuerd_core::utils::generate_id()).unwrap().0,
             session_id: issuerd_core::utils::generate_id(),
             auth_time: Utc::now(),
+            auth_method: None,
+            method_label: None,
             remaining_actions: actions.iter().map(|s| s.to_string()).collect(),
             email_sent: false,
             error: None,

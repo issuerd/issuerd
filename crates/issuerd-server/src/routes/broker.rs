@@ -942,21 +942,14 @@ async fn finalize_brokered_login(
 
     // Required actions assigned to this user (VERIFY_EMAIL, TERMS, ...) are
     // enforced exactly like after a password login.
-    let mut ctx = issuerd_core::AuthContext {
-        realm_id: realm.id.clone(),
-        client_id: None,
-        user_id: Some(user.id.clone()),
-        session_id: None,
-        ip_address: pending.ip_address,
-        parameters: HashMap::new(),
-        attributes: HashMap::new(),
-        current_challenge: None,
-    };
-    if realm.verify_email_enabled {
-        ctx.attributes
-            .insert("realm_verify_email_enabled".to_string(), "true".to_string());
-    }
-    let actions = match evaluate_broker_required_actions(state, &user, &ctx).await {
+    let actions = match super::required_actions::evaluate_federated_required_actions(
+        state,
+        realm,
+        &user,
+        pending.ip_address,
+    )
+    .await
+    {
         Ok(actions) => actions,
         Err(_) => {
             let copy = PageCopy::for_realm(state, realm, pending.locale.as_deref(), None);
@@ -967,12 +960,14 @@ async fn finalize_brokered_login(
     let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
     if !actions.is_empty() {
         let result = TypedFlowResult::new_pending(user.id.clone(), session_id, actions);
-        return super::required_actions::begin_actions_continuation(
+        return super::required_actions::begin_actions_continuation_with_method(
             state,
             realm.name.as_ref(),
             pending,
             result,
             true,
+            AuthMethod::IdentityProvider,
+            "identity_provider",
         )
         .await;
     }
@@ -988,57 +983,6 @@ async fn finalize_brokered_login(
         "identity_provider",
     )
     .await
-}
-
-async fn evaluate_broker_required_actions(
-    state: &Arc<ServerState>,
-    user: &User,
-    ctx: &issuerd_core::AuthContext,
-) -> Result<Vec<String>, IssuerdError> {
-    // Listed actions drive automatic evaluation. Explicit assignments are
-    // resolved as well so a legacy registry may omit optional actions from its
-    // listing without making an assigned action invisible.
-    let mut action_ids = state.plugin_registry.list_required_action_ids();
-    for assigned in &user.required_actions {
-        if !action_ids.contains(assigned) {
-            action_ids.push(assigned.clone());
-        }
-    }
-
-    let update_password_assigned =
-        user.required_actions.iter().any(|action| action == "UPDATE_PASSWORD");
-    let mut pending = Vec::new();
-    for action_id in action_ids {
-        // A brokered user's sign-in method IS the external IdP, so they
-        // legitimately have no local password: the "no password →
-        // UPDATE_PASSWORD" auto-rule must not fire on broker logins (Keycloak
-        // behaves the same). An explicit admin assignment is still honored.
-        if action_id == "UPDATE_PASSWORD" && !update_password_assigned {
-            continue;
-        }
-        let action = match state.plugin_registry.get_required_action(&action_id).await {
-            Ok(Some(action)) => action,
-            Ok(None) => {
-                tracing::error!(action = %action_id, "required action is not registered");
-                return Err(IssuerdError::ServerError(format!(
-                    "required action listed or assigned but not registered: {action_id}"
-                )));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, action = %action_id, "required action registry lookup failed");
-                return Err(e);
-            }
-        };
-        match action.try_evaluate(ctx).await {
-            Ok(true) => pending.push(action_id),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(error = %e, action = %action_id, "required action evaluation failed");
-                return Err(e);
-            }
-        }
-    }
-    Ok(pending)
 }
 
 /// User attribute recording which realm roles (by name) this provider's role

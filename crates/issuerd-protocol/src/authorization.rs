@@ -333,7 +333,8 @@ pub fn authorization_details_is_subset(
     requested.iter().all(|r| granted.contains(r))
 }
 
-fn parse_prompt(value: Option<&String>) -> Result<Vec<Prompt>, IssuerdError> {
+/// Parse and validate the space-delimited OIDC `prompt` parameter.
+pub fn parse_prompt(value: Option<&String>) -> Result<Vec<Prompt>, IssuerdError> {
     let prompts = parse_space_separated(value);
     if prompts.is_empty() {
         return Ok(Vec::new());
