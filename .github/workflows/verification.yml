@@ -97,7 +97,7 @@ jobs:
       # The driver build (~minutes) lands in ~/.dylint_drivers; the lint
       # library's own target dir lives outside the workspace root's target/.
       - name: Cache dylint driver and lint library
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.dylint_drivers
