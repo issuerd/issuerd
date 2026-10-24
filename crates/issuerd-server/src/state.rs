@@ -71,15 +71,18 @@ impl ServerState {
         )
     }
 
-    /// Resolve the realm's bound top-level flow and an executor that can run
-    /// it: the flow set is loaded from storage per request — one
-    /// indexed query on Postgres, trivial on the in-memory/json backends, and
-    /// deliberately uncached so admin flow edits take effect immediately. The
-    /// realm's binding field (`bound`, `None` → `default_alias`) picks the
-    /// top-level flow; when the read fails (logged) or the alias is not in
-    /// storage, the `fallback` code constructor keeps bootstrapping and legacy
-    /// rigs working. The executor is built over the full loaded list so
-    /// `sub_flow_alias` stages resolve.
+    /// Legacy infallible flow resolution for external embedders. New
+    /// authentication request handlers must use [`Self::try_bound_flow_executor`]
+    /// so a broken explicit binding or storage read cannot select a weaker flow.
+    ///
+    /// The flow set is loaded from storage per call — one indexed query on
+    /// Postgres, trivial on the in-memory/json backends, and deliberately
+    /// uncached so admin flow edits take effect immediately. The realm's binding
+    /// field (`bound`, `None` → `default_alias`) picks the top-level flow; when
+    /// the read fails (logged) or the alias is not in storage, the `fallback`
+    /// code constructor preserves this method's historical behavior. The
+    /// executor is built over the full loaded list so `sub_flow_alias` stages
+    /// resolve.
     ///
     /// Only the browser and registration bindings are consumed at runtime
     /// (here and in the login/registration routes). The direct-grant,
@@ -111,6 +114,34 @@ impl ServerState {
             .cloned()
             .unwrap_or_else(|| fallback(realm.id.clone()));
         (flow, self.typed_executor_with_flows(&flows))
+    }
+
+    /// Resolve a top-level flow without allowing a configuration or storage
+    /// failure to downgrade authentication. An explicitly bound alias must
+    /// exist as a top-level flow in the successfully loaded storage list. Only
+    /// an unbound realm may use `fallback` when `default_alias` is absent.
+    ///
+    /// The executor retains the complete loaded list so sub-flow resolution is
+    /// identical for stored flows and the legacy unbound fallback.
+    pub async fn try_bound_flow_executor(
+        &self,
+        realm: &Realm,
+        bound: Option<&str>,
+        default_alias: &str,
+        fallback: fn(RealmId) -> FlowConfig,
+    ) -> Result<(FlowConfig, issuerd_auth_flow::typestate::TypedFlowExecutor), IssuerdError> {
+        let flows = self.storage.list_flow_configs(&realm.id).await?;
+        let alias = bound.unwrap_or(default_alias);
+        let flow = match flows.iter().find(|f| f.top_level && f.alias.as_str() == alias) {
+            Some(flow) => flow.clone(),
+            None if bound.is_none() => fallback(realm.id.clone()),
+            None => {
+                return Err(IssuerdError::ServerError(format!(
+                    "explicitly bound top-level flow '{alias}' not found"
+                )))
+            }
+        };
+        Ok((flow, self.typed_executor_with_flows(&flows)))
     }
 
     /// Resolve the realm segment from a request URL to a realm.
@@ -1373,16 +1404,20 @@ mod tests {
         assert_eq!(realms.len(), 1);
     }
 
-    #[tokio::test]
-    async fn bound_flow_executor_loads_storage_flows_with_code_fallback() {
-        let cfg = ServerConfig::default();
-        let state = ServerState::from_config(&cfg).await.unwrap();
+    async fn flow_resolution_state() -> (ServerState, Realm) {
+        let state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
         let realm = state
             .storage
             .get_realm(&RealmId::new("master").unwrap())
             .await
             .unwrap()
             .unwrap();
+        (state, realm)
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_loads_storage_flows() {
+        let (state, realm) = flow_resolution_state().await;
 
         // Realm creation seeded the builtin flows into storage.
         let stored = state.storage.list_flow_configs(&realm.id).await.unwrap();
@@ -1394,19 +1429,64 @@ mod tests {
         custom.built_in = false;
         state.storage.create_flow_config(&realm.id, &custom).await.unwrap();
         let (flow, _executor) = state
-            .bound_flow_executor(&realm, Some("custom-top"), "browser", default_browser_flow)
-            .await;
+            .try_bound_flow_executor(&realm, Some("custom-top"), "browser", default_browser_flow)
+            .await
+            .unwrap();
         assert_eq!(flow.alias.as_str(), "custom-top");
         assert_eq!(flow.stages.len(), 1, "stored flow, not the 7-stage code default");
 
-        // An unbound realm (None) resolves the default alias from storage; an
-        // unknown binding falls back to the code constructor.
-        let (flow, _executor) =
-            state.bound_flow_executor(&realm, None, "browser", default_browser_flow).await;
-        assert_eq!(flow.alias.as_str(), "browser");
         let (flow, _executor) = state
-            .bound_flow_executor(&realm, Some("missing"), "browser", default_browser_flow)
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await
+            .unwrap();
+        assert_eq!(flow.alias.as_str(), "browser");
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_missing_explicit_alias_fails_closed() {
+        let (state, realm) = flow_resolution_state().await;
+
+        let result = state
+            .try_bound_flow_executor(&realm, Some("missing"), "browser", default_browser_flow)
             .await;
+        let Err(error) = result else {
+            panic!("a missing explicitly bound alias must not use the password-capable default");
+        };
+        assert!(matches!(&error, IssuerdError::ServerError(_)));
+        assert!(error.to_string().contains("'missing'"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_list_error_fails_closed() {
+        let (mut state, realm) = flow_resolution_state().await;
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_list_flow_configs()
+            .once()
+            .returning(|_| Err(IssuerdError::ServerError("flow list unavailable".to_string())));
+        state.storage = Arc::new(storage);
+
+        let result = state
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await;
+        let Err(error) = result else {
+            panic!("a storage read failure must not use the code default");
+        };
+        assert_eq!(error, IssuerdError::ServerError("flow list unavailable".to_string()));
+    }
+
+    #[tokio::test]
+    async fn try_bound_flow_executor_unbound_missing_default_uses_code_fallback() {
+        let (state, realm) = flow_resolution_state().await;
+        state.storage.delete_flow_config(&realm.id, "browser").await.unwrap();
+        let stored = state.storage.list_flow_configs(&realm.id).await.unwrap();
+        assert!(!stored.is_empty(), "the flow list still loads successfully");
+        assert!(!stored.iter().any(|f| f.top_level && f.alias.as_str() == "browser"));
+
+        let (flow, _executor) = state
+            .try_bound_flow_executor(&realm, None, "browser", default_browser_flow)
+            .await
+            .unwrap();
         assert_eq!(flow.alias.as_str(), "browser");
         assert_eq!(flow.stages.len(), 7, "code default browser flow as fallback");
     }

@@ -371,13 +371,36 @@ pub async fn login_handler(
     }
 
     // Run flow. The resume position is the flow stage id stored inside the
-    // pending entry — not the browser-facing random flow id. The
-    // realm's browser-flow binding selects the top-level flow from storage
-    // (code default as fallback); the executor sees the full stored flow set
-    // so sub-flow stages resolve.
-    let (flow, executor) = state
-        .bound_flow_executor(&realm, realm.browser_flow.as_deref(), "browser", default_browser_flow)
-        .await;
+    // pending entry — not the browser-facing random flow id. Explicit bindings
+    // and storage reads must succeed; only an unbound legacy realm may use the
+    // code default when its default alias is absent. The executor sees the
+    // full stored flow set so sub-flow stages resolve.
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
+            &realm,
+            realm.browser_flow.as_deref(),
+            "browser",
+            default_browser_flow,
+        )
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "browser flow resolution failed");
+            if is_browser_form {
+                let mut redirect = url::form_urlencoded::Serializer::new(String::new());
+                redirect.append_pair("execution_id", &body.execution_id.0);
+                redirect.append_pair("realm", &realm_name);
+                redirect.append_pair("error", "server_error");
+                return Redirect::to(&format!("/login.html?{}", redirect.finish())).into_response();
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+                .into_response();
+        }
+    };
 
     let outcome = match executor.continue_flow(&flow, &pending.execution_id, ctx).await {
         Ok(o) => o,
@@ -2057,6 +2080,83 @@ pub(crate) mod tests {
         assert!(json["code"].as_str().unwrap().len() > 5);
         assert!(json["id_token"].is_null());
         assert_eq!(json["redirect_uri"], "http://localhost:8080/cb");
+    }
+
+    #[tokio::test]
+    async fn login_missing_explicit_browser_flow_fails_closed() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.browser_flow = Some("missing-strict-mfa".to_string());
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let execution_id = FlowStageId::new("username-password").unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: Some("xyz".to_string()),
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: execution_id.clone(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+            resource: None,
+        };
+        let cache_key = crate::routes::oidc::pending_auth_cache_key(&realm_id, &execution_id.0);
+        state
+            .cache
+            .set(
+                &cache_key,
+                serde_json::to_vec(&pending).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let response = login_handler(
+            State(state),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            Query(std::collections::HashMap::new()),
+            headers_with_flow_cookie(&execution_id.0),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&LoginRequest {
+                    execution_id,
+                    username: "admin".to_string(),
+                    password: "admin".to_string(),
+                    otp: None,
+                    remember_me: None,
+                    webauthn_assertion: None,
+                    resend: None,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = extract_json(response).await;
+        assert_eq!(json["error"], "server_error");
+        assert!(json.get("code").is_none(), "no code may be issued: {json}");
     }
 
     #[tokio::test]
@@ -4096,7 +4196,8 @@ pub(crate) mod tests {
         });
         mock_storage.expect_create_user_session().returning(|_, _| Ok(()));
         mock_storage.expect_get_user().returning(|_, _| Ok(None));
-        // No stored flows: the runtime falls back to the code default flow.
+        // The unbound mock realm successfully loads an empty flow list, so the
+        // legacy default-alias fallback applies.
         mock_storage.expect_list_flow_configs().returning(|_| Ok(vec![]));
 
         let mut reg = crate::state::SimplePluginRegistry::new();
@@ -4264,7 +4365,8 @@ pub(crate) mod tests {
             }))
         });
         mock_storage.expect_get_realm().returning(|_| Ok(None));
-        // No stored flows: the runtime falls back to the code default flow.
+        // The unbound mock realm successfully loads an empty flow list, so the
+        // legacy default-alias fallback applies.
         mock_storage.expect_list_flow_configs().returning(|_| Ok(vec![]));
 
         let mut reg = crate::state::SimplePluginRegistry::new();

@@ -291,19 +291,33 @@ pub async fn register_page(
     };
 
     // With no form parameters the authenticator challenges; the challenge's
-    // stage id is the resume position stored for the POST. The
-    // realm's registration-flow binding selects the flow from storage (code
-    // default as fallback).
+    // stage id is the resume position stored for the POST. Explicit bindings
+    // and storage reads must succeed; only an unbound legacy realm may use the
+    // code default when its default alias is absent.
     let mut ctx = TypedAuthContext::new_anonymous(realm_id.clone());
     ctx.ip_address = Some(ip);
-    let (flow, executor) = state
-        .bound_flow_executor(
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
             &realm,
             realm.registration_flow.as_deref(),
             "registration",
             registration_flow,
         )
-        .await;
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "registration flow resolution failed");
+            return error_response(
+                &copy,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &copy.msg(
+                    "register.internalError",
+                    "Registration failed due to an internal error. Please try again later.",
+                ),
+            );
+        }
+    };
     let outcome = match executor.execute(&flow, ctx).await {
         Ok(o) => o,
         Err(e) => {
@@ -441,14 +455,28 @@ pub async fn register_submit(
         }
     }
 
-    let (flow, executor) = state
-        .bound_flow_executor(
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
             &realm,
             realm.registration_flow.as_deref(),
             "registration",
             registration_flow,
         )
-        .await;
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "registration flow resolution failed");
+            return error_response(
+                &copy,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &copy.msg(
+                    "register.internalError",
+                    "Registration failed due to an internal error. Please try again later.",
+                ),
+            );
+        }
+    };
     let outcome = match executor.continue_flow(&flow, &pending.execution_id, ctx).await {
         Ok(o) => o,
         Err(e) => {
@@ -696,9 +724,23 @@ async fn try_resume_login_flow(
         ctx.parameters.insert("nonce".to_string(), vec![n.to_string()]);
     }
 
-    let (flow, executor) = state
-        .bound_flow_executor(realm, realm.browser_flow.as_deref(), "browser", default_browser_flow)
-        .await;
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
+            realm,
+            realm.browser_flow.as_deref(),
+            "browser",
+            default_browser_flow,
+        )
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "browser flow resolution failed during registration login resume");
+            let bytes = serde_json::to_vec(&pending).unwrap();
+            let _ = state.cache.set(&cache_key, bytes, Some(Duration::from_secs(600))).await;
+            return None;
+        }
+    };
     let outcome = match executor.continue_flow(&flow, &pending.execution_id, ctx).await {
         Ok(o) => o,
         Err(_) => {
@@ -1235,7 +1277,68 @@ mod tests {
         assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn page_missing_explicit_registration_flow_fails_closed() {
+        let (state, _storage, _cache) = test_state().await;
+        let mut realm = enable_registration(&state).await;
+        realm.registration_flow = Some("missing-registration".to_string());
+        state.storage.update_realm(&realm).await.unwrap();
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let resp = register_page(
+            State(state),
+            Path("master".to_string()),
+            axum::extract::Query(RegisterPageQuery { execution_id: None }),
+            client_ip(),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_string(resp).await.contains("internal error"));
+    }
+
     // -- login-flow resume ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn submit_with_missing_browser_binding_restores_login_without_default_resume() {
+        let (state, storage, cache) = test_state().await;
+        enable_registration(&state).await;
+        let realm_id = master_realm_id();
+        seed_pending_login(&cache, &realm_id, "login-exec-missing").await;
+        let (flow_id, resp) = start_registration(&state, Some("login-exec-missing")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut realm = storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.browser_flow = Some("missing-strict-mfa".to_string());
+        storage.update_realm(&realm).await.unwrap();
+        cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let resp = submit_registration(
+            &state,
+            &flow_id,
+            &[flow_cookie(&flow_id), flow_cookie("login-exec-missing")],
+            &valid_form(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("Registration successful"));
+        assert!(storage.get_user_by_username(&realm_id, "newbie").await.unwrap().is_some());
+        assert!(
+            cache
+                .get(&pending_auth_cache_key(&realm_id, "login-exec-missing"))
+                .await
+                .unwrap()
+                .is_some(),
+            "a declined resume must restore the paused login entry"
+        );
+    }
 
     #[tokio::test]
     async fn submit_resumes_originating_login_flow() {

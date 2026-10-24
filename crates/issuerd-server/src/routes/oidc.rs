@@ -1414,14 +1414,31 @@ async fn handle_auth_request(
         ctx.attributes.insert("identity_provider_hint".to_string(), hint.clone());
     }
 
-    // Run flow. The realm's browser-flow binding selects the
-    // top-level flow from storage (code default as fallback); the executor is
-    // built over the realm's full stored flow set so sub-flow stages resolve.
-    // The direct-grant / reset-credentials / first-broker-login bindings are
-    // intentionally not consumed at runtime — see `ServerState::bound_flow_executor`.
-    let (flow, executor) = state
-        .bound_flow_executor(&realm, realm.browser_flow.as_deref(), "browser", default_browser_flow)
-        .await;
+    // Run flow. The realm's browser-flow binding selects the top-level flow
+    // from storage; only an unbound legacy realm may use the code default when
+    // that default alias is absent. The executor retains the full stored flow
+    // set so sub-flow stages resolve. The direct-grant / reset-credentials /
+    // first-broker-login bindings are intentionally not consumed at runtime —
+    // see `ServerState::bound_flow_executor`.
+    let (flow, executor) = match state
+        .try_bound_flow_executor(
+            &realm,
+            realm.browser_flow.as_deref(),
+            "browser",
+            default_browser_flow,
+        )
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(realm = %realm_id, error = %e, "browser flow resolution failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+                .into_response();
+        }
+    };
 
     match executor.execute(&flow, ctx).await {
         Ok(FlowOutput::Success { ctx, result }) => {
@@ -15710,6 +15727,22 @@ mod tests {
             location.contains("code="),
             "remember-me cookie should silently re-authenticate, location: {location}"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_missing_explicit_browser_flow_does_not_fall_back_to_default() {
+        let state = setup_state().await;
+        update_master_realm(&state, |realm| {
+            realm.browser_flow = Some("missing-strict-mfa".to_string());
+        })
+        .await;
+
+        let response =
+            auth_get_with_headers(&state, axum::http::HeaderMap::new(), valid_code_auth_params())
+                .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(axum::http::header::LOCATION).is_none());
+        assert_eq!(extract_json(response).await["error"], "server_error");
     }
 
     // -- Challenge-arm registration gate -----------------------------------
