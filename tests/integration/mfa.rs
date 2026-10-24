@@ -571,10 +571,9 @@ async fn delete_auth(harness: &TestHarness, path: &str, token: &str) -> axum::re
 async fn account_totp_enrollment_e2e() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("mfa-acct").await;
-    let client = harness.create_client("mfa-acct", false).await;
     let _user = harness.create_user("mfa-acct", "liam", "Password123!").await;
     let token = harness
-        .authenticate_user("mfa-acct", client.client_id.as_ref(), "liam", "Password123!")
+        .authenticate_account_console_user("mfa-acct", "liam", "Password123!")
         .await
         .access_token;
 
@@ -654,10 +653,9 @@ async fn account_totp_enrollment_e2e() {
 async fn account_totp_verify_without_start_is_rejected() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("mfa-nostart").await;
-    let client = harness.create_client("mfa-nostart", false).await;
     let _user = harness.create_user("mfa-nostart", "olivia", "Password123!").await;
     let token = harness
-        .authenticate_user("mfa-nostart", client.client_id.as_ref(), "olivia", "Password123!")
+        .authenticate_account_console_user("mfa-nostart", "olivia", "Password123!")
         .await
         .access_token;
 

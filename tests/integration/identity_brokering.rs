@@ -192,16 +192,18 @@ fn query_param(url: &str, key: &str) -> String {
     TestHarness::extract_query_param(url, key).unwrap_or_else(|| panic!("missing {key} in {url}"))
 }
 
-/// Extract `issuerd_session=<token>` from a login response's Set-Cookie header.
+/// Extract the per-realm SSO cookie from a login response.
 fn session_cookie(resp: &Response) -> String {
-    let raw = resp
-        .headers()
-        .get(axum::http::header::SET_COOKIE)
-        .unwrap_or_else(|| panic!("login response carries no Set-Cookie: {:?}", resp.status()))
-        .to_str()
+    resp.headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("issuerd_session_") && !c.starts_with("issuerd_session_state_"))
+        .unwrap_or_else(|| panic!("login response carries no SSO cookie: {:?}", resp.status()))
+        .split(';')
+        .next()
         .unwrap()
-        .to_string();
-    raw.split(';').next().unwrap().to_string()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -659,48 +661,14 @@ async fn account_linking_ceremony() {
     let rig = broker_rig(&[]).await;
     let alice = rig.internal.create_user(INTERNAL, "alice", "alice-pass-1").await;
 
-    // Log alice in through the browser flow to obtain a bearer token AND the
-    // issuerd_session cookie (the linking callback requires both to match).
-    let app_client_id = rig.app_client.client_id.to_string();
-    let auth_path = format!(
-        "/realms/{INTERNAL}/protocol/openid-connect/auth?response_type=code&client_id={app_client_id}&redirect_uri={APP_REDIRECT}&scope=openid"
-    );
-    let resp = rig.internal.get(&auth_path).await;
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let execution = query_param(&location(&resp), "execution_id");
-    let resp = rig
-        .internal
-        .post_json_with_cookie(
-            &format!("/api/v1/auth/login?realm={INTERNAL}"),
-            serde_json::json!({
-                "execution_id": execution,
-                "username": "alice",
-                "password": "alice-pass-1",
-            }),
-            &TestHarness::flow_cookie(&execution),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let alice_session = session_cookie(&resp);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let login_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let code = login_json["code"].as_str().unwrap().to_string();
+    // Log alice in through account-console to obtain a first-party bearer token
+    // AND the issuerd_session cookie (the linking callback requires both to match).
     let tokens = rig
         .internal
-        .post_form(
-            &format!("/realms/{INTERNAL}/protocol/openid-connect/token"),
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
-                ("redirect_uri", APP_REDIRECT),
-                ("client_id", rig.app_client.client_id.as_ref()),
-                ("client_secret", rig.app_client.secret.as_deref().unwrap()),
-            ],
-        )
+        .authenticate_account_console_user(INTERNAL, "alice", "alice-pass-1")
         .await;
-    let body = axum::body::to_bytes(tokens.into_body(), usize::MAX).await.unwrap();
-    let token_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let bearer = token_json["access_token"].as_str().unwrap().to_string();
+    let alice_session = format!("issuerd_session_{}={}", internal_realm_id(), tokens.sso_token);
+    let bearer = tokens.access_token;
 
     // The account API lists no links yet, then starts the ceremony.
     let resp = rig
@@ -806,11 +774,40 @@ async fn account_linking_ceremony() {
 async fn unlink_last_sign_in_method_guarded() {
     let rig = broker_rig(&[("trustEmail", "true")]).await;
 
-    // Broker-created user: no password credential, exactly one link.
+    // Broker-created user: no password credential, exactly one link. Its SSO
+    // cookie silently authenticates a first-party account-console flow.
     let resp = drive_to_callback(&rig, EXT_USER, EXT_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let app_loc = location(&resp);
-    let tokens = redeem_app_code(&rig, &app_loc).await;
+    assert!(location(&resp).starts_with(&format!("{APP_REDIRECT}?")));
+    let sso_session = session_cookie(&resp);
+    let account_client = rig.internal.account_console_client(INTERNAL).await;
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(verifier);
+    let auth_path = format!(
+        "/realms/{INTERNAL}/protocol/openid-connect/auth?response_type=code&client_id=account-console&redirect_uri={APP_REDIRECT}&scope=openid&code_challenge={challenge}&code_challenge_method=S256"
+    );
+    let resp = get_with_cookie(&rig.internal, &auth_path, &sso_session).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let account_redirect = location(&resp);
+    assert!(account_redirect.starts_with(&format!("{APP_REDIRECT}?")));
+    let code = query_param(&account_redirect, "code");
+    let resp = rig
+        .internal
+        .post_form(
+            &format!("/realms/{INTERNAL}/protocol/openid-connect/token"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", APP_REDIRECT),
+                ("client_id", account_client.client_id.as_ref()),
+                ("client_secret", ""),
+                ("code_verifier", verifier),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let bearer = tokens["access_token"].as_str().unwrap().to_string();
 
     let resp = rig
