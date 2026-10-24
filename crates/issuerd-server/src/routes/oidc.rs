@@ -6084,21 +6084,20 @@ async fn userinfo_handler_inner(
             // expired token never reaches it.
             let cache_ctx = if signed_userinfo_alg.is_some() {
                 None
+            } else if let Some(realm) = issuer_realm.as_ref() {
+                let user_id = session
+                    .as_ref()
+                    .map(|s| s.user_id.clone())
+                    .unwrap_or_else(|| claims.sub.clone());
+                let client_id = claims.aud.as_str().to_string();
+                let fp = crate::userinfo_cache::fingerprint(&claims);
+                let generation =
+                    crate::userinfo_cache::counters(&state, &realm.id, &user_id, &client_id).await;
+                Some((realm.id.clone(), user_id, client_id, fp, generation))
             } else {
-                issuer_realm.as_ref().map(|realm| {
-                    let user_id = session
-                        .as_ref()
-                        .map(|s| s.user_id.clone())
-                        .unwrap_or_else(|| claims.sub.clone());
-                    (
-                        realm.id.clone(),
-                        user_id,
-                        claims.aud.as_str().to_string(),
-                        crate::userinfo_cache::fingerprint(&claims),
-                    )
-                })
+                None
             };
-            if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
+            if let Some((realm_id, user_id, client_id, fp, _)) = &cache_ctx {
                 if let Some(body) =
                     crate::userinfo_cache::read(&state, realm_id, user_id, client_id, fp).await
                 {
@@ -6222,10 +6221,16 @@ async fn userinfo_handler_inner(
             }
 
             if cacheable {
-                if let Some((realm_id, user_id, client_id, fp)) = &cache_ctx {
+                if let Some((realm_id, user_id, client_id, fp, generation)) = &cache_ctx {
                     if let Ok(body) = serde_json::to_vec(&value) {
                         crate::userinfo_cache::write(
-                            &state, realm_id, user_id, client_id, fp, &body,
+                            &state,
+                            realm_id,
+                            user_id,
+                            client_id,
+                            fp,
+                            *generation,
+                            &body,
                         )
                         .await;
                         return crate::dpop::with_nonce_header(

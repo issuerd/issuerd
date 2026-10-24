@@ -85,15 +85,17 @@ fn content_hash<T: serde::Serialize>(value: &T) -> String {
     out
 }
 
+pub type CacheGeneration = (u64, u64, u64);
+
 /// The current (epoch, usergen, clientgen) counters, read concurrently.
 /// `None` on any cache error — callers treat it as a cache outage and
 /// bypass the layer (recompute, skip the write).
-async fn counters(
+pub async fn counters(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     user_id: &UserId,
     client_id: &str,
-) -> Option<(u64, u64, u64)> {
+) -> Option<CacheGeneration> {
     let read = |key: String| async move {
         match state.cache.get(&key).await {
             Ok(Some(bytes)) => std::str::from_utf8(&bytes).ok()?.parse::<u64>().ok(),
@@ -163,14 +165,17 @@ pub async fn write(
     user_id: &UserId,
     client_id: &str,
     fingerprint: &str,
+    generation: Option<CacheGeneration>,
     body: &[u8],
 ) {
     let ttl = state.config.cache.read_cache_ttl_secs;
     if ttl == 0 {
         return;
     }
-    let Some((epoch, usergen, clientgen)) = counters(state, realm_id, user_id, client_id).await
-    else {
+    let Some((epoch, usergen, clientgen)) = (match generation {
+        Some(generation) => Some(generation),
+        None => counters(state, realm_id, user_id, client_id).await,
+    }) else {
         return;
     };
     let key = cache_keys::userinfo_response(realm_id.as_ref(), user_id.as_ref(), fingerprint);
@@ -218,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrip() {
         let (state, realm, user) = setup().await;
-        write(&state, &realm, &user, "app", "app|openid", b"{\"sub\":\"alice\"}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{\"sub\":\"alice\"}").await;
         let body = read(&state, &realm, &user, "app", "app|openid").await.expect("hit");
         assert_eq!(body, b"{\"sub\":\"alice\"}");
         // A different fingerprint misses.
@@ -228,8 +233,17 @@ mod tests {
     #[tokio::test]
     async fn epoch_bump_invalidates() {
         let (state, realm, user) = setup().await;
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_some());
+        issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), &realm).await;
+        assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_generation_invalidates_after_counter_advances() {
+        let (state, realm, user) = setup().await;
+        let generation = counters(&state, &realm, &user, "app").await.unwrap();
+        write(&state, &realm, &user, "app", "app|openid", Some(generation), b"{}").await;
         issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), &realm).await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
     }
@@ -237,7 +251,7 @@ mod tests {
     #[tokio::test]
     async fn user_invalidation_invalidates() {
         let (state, realm, user) = setup().await;
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_some());
         issuerd_cluster::invalidate::invalidate_user_claims(state.cache.as_ref(), &realm, &user)
             .await;
@@ -247,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn client_invalidation_invalidates() {
         let (state, realm, user) = setup().await;
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_some());
         issuerd_cluster::invalidate::invalidate_client_claims(
             state.cache.as_ref(),
@@ -258,7 +272,7 @@ mod tests {
         .await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
         // An unrelated client's bump leaves the entry alone.
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await;
         issuerd_cluster::invalidate::invalidate_client_claims(
             state.cache.as_ref(),
             &realm,
@@ -293,7 +307,7 @@ mod tests {
         let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
         let realm = RealmId::new("master").unwrap();
         let user = UserId::new("alice").unwrap();
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await;
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await;
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
     }
 
@@ -345,7 +359,7 @@ mod tests {
         let realm = RealmId::new("master").unwrap();
         let user = UserId::new("alice").unwrap();
         assert!(read(&state, &realm, &user, "app", "app|openid").await.is_none());
-        write(&state, &realm, &user, "app", "app|openid", b"{}").await; // must not panic
+        write(&state, &realm, &user, "app", "app|openid", None, b"{}").await; // must not panic
     }
 
     #[test]
