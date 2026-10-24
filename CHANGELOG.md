@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Composite role expansion no longer picks arbitrary same-named client roles.** A realm-role fallback to a client role now requires that role name to be unique across clients; ambiguous legacy references grant nothing rather than privileges from an arbitrary client. Valid realm, same-client, and unique cross-client composites remain supported.
 - **Passwordless login rejects ambiguous email identifiers.** When multiple accounts share an email address, email-code login no longer selects the backend’s first match; it sends no code and binds no account, preserving uniform anti-enumeration challenges and the unique-username fallback.
 - **The account API is restricted to first-party interactive sessions.** Only `account-console` and `admin-cli` access tokens with a live stored user session are accepted; arbitrary relying-party and sessionless client-credentials tokens receive 401. This closes the path from an ordinary RP token to email, password, MFA, and linked-account changes. Custom callers must migrate to the first-party flow.
 - **TOTP replay protection is atomic on every verification path.** Browser, password-grant, admin-token, and device verification now claim a matched step through `consume_totp_step` before succeeding, so concurrent submissions of the same code have exactly one winner instead of all passing the old read-modify-write check. Losing the race rejects the login/grant; storage errors remain fatal.
