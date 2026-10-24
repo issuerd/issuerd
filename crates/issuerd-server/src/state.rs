@@ -354,7 +354,7 @@ impl ServerState {
     ) -> Result<Self, IssuerdError> {
         // Crypto: load the shared signing-key set from storage so every node
         // signs with the same active key and validates its peers' tokens.
-        let crypto = bootstrap_crypto_provider(storage.as_ref()).await?;
+        let (crypto, initial_keys) = bootstrap_crypto_provider(storage.as_ref()).await?;
         let jwks = crypto.get_public_keys().await?;
 
         // TokenService. The default signing algorithm matches the bootstrapped
@@ -377,12 +377,15 @@ impl ServerState {
         // Propagate keys added (or rotated) by peer nodes into this node's
         // keystore and JWKS snapshot. Only PostgreSQL storage is shared
         // between nodes, so polling is pointless for the other backends.
+        let signing_key_fingerprint =
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&initial_keys)));
         let keyset_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         if matches!(config.storage, crate::config::StorageConfig::Postgres { .. }) {
             spawn_jwks_refresh_task(
                 storage.clone(),
                 crypto.clone(),
                 token_manager.clone(),
+                signing_key_fingerprint.clone(),
                 config.cluster.jwks_refresh_interval_secs,
                 keyset_generation.clone(),
             );
@@ -513,13 +516,16 @@ impl ServerState {
             let storage = storage.clone();
             let crypto = crypto.clone();
             let token_manager = token_manager.clone();
+            let signing_key_fingerprint = signing_key_fingerprint.clone();
             let keyset_generation = keyset_generation.clone();
             Arc::new(move || {
                 let storage = storage.clone();
                 let crypto = crypto.clone();
                 let token_manager = token_manager.clone();
+                let signing_key_fingerprint = signing_key_fingerprint.clone();
                 let keyset_generation = keyset_generation.clone();
                 tokio::spawn(async move {
+                    let mut current_fingerprint = signing_key_fingerprint.lock().await;
                     let keys = match storage.list_signing_keys().await {
                         Ok(keys) => keys,
                         Err(e) => {
@@ -535,6 +541,7 @@ impl ServerState {
                         tracing::warn!(error = %e, "signing-key reload: JWKS snapshot reload failed");
                         return;
                     }
+                    *current_fingerprint = signing_keys_fingerprint(&keys);
                     keyset_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 });
             })
@@ -636,7 +643,10 @@ impl ServerState {
 /// untouched.
 async fn bootstrap_crypto_provider(
     storage: &dyn Storage,
-) -> Result<Arc<issuerd_token::RingCryptoProvider>, IssuerdError> {
+) -> Result<
+    (Arc<issuerd_token::RingCryptoProvider>, Vec<issuerd_core::StoredSigningKey>),
+    IssuerdError,
+> {
     let crypto_config = issuerd_token::CryptoConfig::default();
     let mut keys = storage.list_signing_keys().await?;
     if keys.is_empty() {
@@ -652,16 +662,43 @@ async fn bootstrap_crypto_provider(
         keys = storage.list_signing_keys().await?;
     }
     let provider = issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys)?;
-    Ok(Arc::new(provider))
+    Ok((Arc::new(provider), keys))
 }
 
-/// Periodically re-read the shared signing-key set from storage and, when it
-/// changed, reload the keystore and the JWKS snapshot so keys added or rotated
-/// by peer nodes propagate to this node without a restart.
+type SharedSigningKeyFingerprint = Arc<tokio::sync::Mutex<[u8; 32]>>;
+
+/// Fingerprint every field consumed by a keystore reload without retaining a
+/// second long-lived copy of private material. Per-key hashes are sorted so
+/// storage ordering cannot affect the result.
+fn signing_keys_fingerprint(keys: &[issuerd_core::StoredSigningKey]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut key_hashes: Vec<[u8; 32]> = keys
+        .iter()
+        .map(|key| {
+            let encoded =
+                serde_json::to_vec(key).expect("serializing a stored signing key cannot fail");
+            Sha256::digest(encoded).into()
+        })
+        .collect();
+    key_hashes.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update((keys.len() as u64).to_be_bytes());
+    for hash in key_hashes {
+        hasher.update(hash);
+    }
+    hasher.finalize().into()
+}
+
+/// Periodically re-read the shared signing-key set from storage and, when its
+/// canonical fingerprint changed, reload the keystore and the JWKS snapshot so
+/// key and active-status changes by peer nodes propagate without a restart.
 fn spawn_jwks_refresh_task(
     storage: Arc<dyn Storage>,
     crypto: Arc<issuerd_token::RingCryptoProvider>,
     token_manager: Arc<TokenManager<issuerd_token::RingCryptoProvider>>,
+    signing_key_fingerprint: SharedSigningKeyFingerprint,
     interval_secs: u64,
     keyset_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -672,6 +709,7 @@ fn spawn_jwks_refresh_task(
         interval.tick().await;
         loop {
             interval.tick().await;
+            let mut current_fingerprint = signing_key_fingerprint.lock().await;
             let keys = match storage.list_signing_keys().await {
                 Ok(keys) => keys,
                 Err(e) => {
@@ -679,21 +717,8 @@ fn spawn_jwks_refresh_task(
                     continue;
                 }
             };
-            let current_kids: Vec<String> = match crypto.get_public_keys().await {
-                Ok(set) => {
-                    let mut kids: Vec<String> =
-                        set.keys.iter().map(|k| k.kid.to_string()).collect();
-                    kids.sort();
-                    kids
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "JWKS refresh: cannot read current JWKS");
-                    continue;
-                }
-            };
-            let mut stored_kids: Vec<String> = keys.iter().map(|k| k.kid.to_string()).collect();
-            stored_kids.sort();
-            if stored_kids == current_kids {
+            let stored_fingerprint = signing_keys_fingerprint(&keys);
+            if stored_fingerprint == *current_fingerprint {
                 continue;
             }
             if let Err(e) = crypto.reload_keys(&keys) {
@@ -704,6 +729,7 @@ fn spawn_jwks_refresh_task(
                 tracing::warn!(error = %e, "JWKS refresh: JWKS snapshot reload failed");
                 continue;
             }
+            *current_fingerprint = stored_fingerprint;
             keyset_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(keys = keys.len(), "reloaded signing keys from shared storage");
         }
@@ -1440,6 +1466,152 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signing_key_fingerprint_covers_all_reload_inputs() {
+        let first = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(true);
+        let second = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(false);
+        let keys = vec![first, second];
+        let baseline = signing_keys_fingerprint(&keys);
+
+        let mut changed = keys.clone();
+        changed[0].kid = keys[1].kid.clone();
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "kid");
+
+        let mut changed = keys.clone();
+        changed[0].alg = issuerd_core::Algorithm::Rs384;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "algorithm");
+
+        let mut changed = keys.clone();
+        changed[0].created_at += chrono::Duration::seconds(1);
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "created_at");
+
+        let mut changed = keys.clone();
+        changed[0].active = false;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "active");
+
+        let mut changed = keys.clone();
+        changed[0].public_jwk.x = keys[1].public_jwk.x.clone();
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "public JWK");
+
+        let mut changed = keys.clone();
+        changed[0].private_der[0] ^= 1;
+        assert_ne!(signing_keys_fingerprint(&changed), baseline, "private material");
+
+        assert_ne!(signing_keys_fingerprint(&keys[..1]), baseline, "adding or removing a key");
+    }
+
+    #[tokio::test]
+    async fn jwks_refresh_task_does_not_reload_for_reordering() {
+        use std::sync::atomic::Ordering;
+
+        let keys = vec![
+            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+                .unwrap()
+                .to_stored(true),
+            issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+                .unwrap()
+                .to_stored(true),
+        ];
+        let crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::from_signing_keys(
+                issuerd_token::CryptoConfig::default(),
+                &keys,
+            )
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let token_manager = Arc::new(TokenManager::with_default_alg(
+            crypto.clone(),
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            jwks,
+            issuerd_token::CryptoConfig::default().default_alg,
+        ));
+
+        let mut reordered = keys.clone();
+        reordered.reverse();
+        let mut mock_storage = issuerd_core::MockStorage::new();
+        mock_storage.expect_list_signing_keys().returning(move || Ok(reordered.clone()));
+        let storage: Arc<dyn issuerd_core::Storage> = Arc::new(mock_storage);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_jwks_refresh_task(
+            storage,
+            crypto,
+            token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&keys))),
+            1,
+            generation.clone(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            0,
+            "reordering an otherwise identical key set must not trigger a reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwks_refresh_task_reloads_active_only_changes() {
+        use std::sync::atomic::Ordering;
+
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let key = issuerd_token::KeyStore::generate_key(issuerd_core::Algorithm::EdDsa, 2048)
+            .unwrap()
+            .to_stored(true);
+        storage.create_signing_key(&key).await.unwrap();
+        let crypto = Arc::new(
+            issuerd_token::RingCryptoProvider::from_signing_keys(
+                issuerd_token::CryptoConfig::default(),
+                std::slice::from_ref(&key),
+            )
+            .unwrap(),
+        );
+        let jwks = crypto.get_public_keys().await.unwrap();
+        let token_manager = Arc::new(TokenManager::with_default_alg(
+            crypto.clone(),
+            "http://localhost:8080".to_string(),
+            std::time::Duration::from_secs(60),
+            jwks,
+            issuerd_token::CryptoConfig::default().default_alg,
+        ));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_jwks_refresh_task(
+            storage.clone(),
+            crypto.clone(),
+            token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(std::slice::from_ref(&key)))),
+            1,
+            generation.clone(),
+        );
+
+        let mut disabled = key.clone();
+        disabled.active = false;
+        storage.update_signing_key(&disabled).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while generation.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            generation.load(Ordering::Relaxed) >= 1,
+            "an active-only storage change must trigger a reload"
+        );
+        let err = crypto
+            .sign(r#"{"sub":"user-1"}"#, disabled.alg, &disabled.kid)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("disabled"),
+            "the reloaded keystore must reject signing with the disabled key: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn jwks_refresh_task_reloads_only_on_key_set_changes() {
         use std::sync::atomic::Ordering;
@@ -1474,6 +1646,7 @@ mod tests {
             storage.clone(),
             crypto.clone(),
             token_manager,
+            Arc::new(tokio::sync::Mutex::new(signing_keys_fingerprint(&keys))),
             1,
             generation.clone(),
         );
