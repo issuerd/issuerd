@@ -10,6 +10,9 @@
 //! receives a signed logout token (`logout_token=<jwt>`,
 //! `application/x-www-form-urlencoded`). Delivery is fire-and-forget with a
 //! short timeout and one retry; it never blocks or fails the user's logout.
+//! Calls require HTTPS and publicly routable addresses, with redirects disabled
+//! and DNS validation pinned to the connection. The operator can explicitly
+//! allow private callbacks with `[outbound_http] allow_private_addresses`.
 //! Each delivery (success or failure) is recorded as an admin event.
 //!
 //! **Front-channel:** the RP-initiated logout endpoint renders an
@@ -48,23 +51,33 @@ const BACKCHANNEL_TIMEOUT_SECS: u64 = 5;
 pub struct BackchannelLogoutDispatcher {
     storage: Arc<dyn Storage>,
     token_manager: Arc<dyn TokenIssuer>,
-    http: reqwest::Client,
+    http: crate::broker::SsrfGuardedClient,
 }
 
 impl BackchannelLogoutDispatcher {
-    /// `extra_roots` are the additional root CAs from `[outbound_http]
-    /// extra_ca_bundle` (empty = public webpki roots only).
     pub fn new(
         storage: Arc<dyn Storage>,
         token_manager: Arc<dyn TokenIssuer>,
         extra_roots: &[reqwest::Certificate],
     ) -> Result<Self, IssuerdError> {
-        let http = crate::outbound_http::client_builder(extra_roots)
-            .timeout(Duration::from_secs(BACKCHANNEL_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| {
-                IssuerdError::ServerError(format!("backchannel logout http client: {e}"))
-            })?;
+        Self::new_with_policy(storage, token_manager, extra_roots, false)
+    }
+
+    /// Build the dispatcher with an explicit guarded-address policy. HTTPS and
+    /// redirect rejection always apply; non-public addresses require the
+    /// explicit `[outbound_http] allow_private_addresses` opt-in.
+    pub fn new_with_policy(
+        storage: Arc<dyn Storage>,
+        token_manager: Arc<dyn TokenIssuer>,
+        extra_roots: &[reqwest::Certificate],
+        allow_private_addresses: bool,
+    ) -> Result<Self, IssuerdError> {
+        let http = crate::broker::SsrfGuardedClient::new(
+            extra_roots,
+            allow_private_addresses,
+            Duration::from_secs(BACKCHANNEL_TIMEOUT_SECS),
+        )
+        .map_err(|e| IssuerdError::ServerError(format!("backchannel logout http client: {e}")))?;
         Ok(Self {
             storage,
             token_manager,
@@ -75,16 +88,16 @@ impl BackchannelLogoutDispatcher {
     /// POST the logout token with one retry; returns the final error, if any.
     async fn post_logout_token(&self, uri: &str, token: &str) -> Result<(), String> {
         for attempt in 1..=2 {
-            match self.http.post(uri).form(&[("logout_token", token)]).send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => {
+            match self.http.post_form(uri, &[("logout_token", token)]).await {
+                Ok(status) if status.is_success() => return Ok(()),
+                Ok(status) => {
                     debug!(
                         attempt,
-                        status = %resp.status(),
+                        %status,
                         uri, "backchannel logout delivery rejected"
                     );
                     if attempt == 2 {
-                        return Err(format!("http status {}", resp.status()));
+                        return Err(format!("http status {status}"));
                     }
                 }
                 Err(e) => {
@@ -761,5 +774,201 @@ mod tests {
             bare, "https://client.example.com/fc-plain",
             "opted-out client is called with the bare URI"
         );
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedLogoutRequest {
+        method: String,
+        path: String,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct LogoutRecorder {
+        requests: Arc<std::sync::Mutex<Vec<RecordedLogoutRequest>>>,
+    }
+
+    impl LogoutRecorder {
+        fn snapshot(&self) -> Vec<RecordedLogoutRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    async fn record_logout_request(
+        axum::extract::State(recorder): axum::extract::State<LogoutRecorder>,
+        request: axum::extract::Request,
+    ) -> Response {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_string();
+        let content_type = request
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(request.into_body(), 64 * 1024).await.unwrap().to_vec();
+        recorder.requests.lock().unwrap().push(RecordedLogoutRequest {
+            method,
+            path: path.clone(),
+            content_type,
+            body,
+        });
+        if path == "/redirect" {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, "/target")],
+            )
+                .into_response()
+        } else {
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        }
+    }
+
+    async fn start_loopback_tls_logout() -> (String, reqwest::Certificate, LogoutRecorder) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "issuerd logout test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .unwrap()
+                .signed_by(&server_key, &ca_cert, &ca_key)
+                .unwrap();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            server_cert.pem().into_bytes(),
+            server_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let recorder = LogoutRecorder::default();
+        let app = axum::Router::new().fallback(record_logout_request).with_state(recorder.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
+        (format!("https://127.0.0.1:{port}"), root, recorder)
+    }
+
+    fn delivery_dispatcher(
+        roots: Vec<reqwest::Certificate>,
+        allow_private_addresses: bool,
+    ) -> BackchannelLogoutDispatcher {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        BackchannelLogoutDispatcher::new_with_policy(
+            storage,
+            Arc::new(FailingTokenIssuer),
+            &roots,
+            allow_private_addresses,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn backchannel_rejects_plain_http_even_with_private_opt_in() {
+        let (base, root, recorder) = start_loopback_tls_logout().await;
+        let uri = format!("{}/logout", base.replacen("https:", "http:", 1));
+        let dispatcher = delivery_dispatcher(vec![root], true);
+
+        let err = dispatcher.post_logout_token(&uri, "token").await.unwrap_err();
+
+        assert!(err.contains("untrusted URL"), "{err}");
+        assert!(recorder.snapshot().is_empty(), "plain HTTP must not be dialed");
+    }
+
+    #[tokio::test]
+    async fn backchannel_rejects_loopback_before_connecting_by_default() {
+        let (base, root, recorder) = start_loopback_tls_logout().await;
+        let dispatcher = delivery_dispatcher(vec![root], false);
+
+        let err = dispatcher
+            .post_logout_token(&format!("{base}/logout"), "token")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("untrusted URL"), "{err}");
+        assert!(recorder.snapshot().is_empty(), "loopback must not be dialed");
+    }
+
+    #[tokio::test]
+    async fn backchannel_rejects_loopback_hostnames_before_connecting() {
+        let (base, root, recorder) = start_loopback_tls_logout().await;
+        let dispatcher = delivery_dispatcher(vec![root], false);
+        let uri = format!("{}/logout", base.replace("127.0.0.1", "localhost"));
+
+        let err = dispatcher.post_logout_token(&uri, "token").await.unwrap_err();
+
+        assert!(err.contains("untrusted URL"), "{err}");
+        assert!(
+            recorder.snapshot().is_empty(),
+            "a hostname resolving to loopback must not be dialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn backchannel_rejects_private_and_link_local_literals() {
+        let dispatcher = delivery_dispatcher(Vec::new(), false);
+        for uri in [
+            "https://10.0.0.5/logout",
+            "https://192.168.1.10/logout",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/logout",
+        ] {
+            let err = dispatcher.post_logout_token(uri, "token").await.unwrap_err();
+            assert!(err.contains("untrusted URL"), "{uri}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backchannel_does_not_follow_redirects() {
+        let (base, root, recorder) = start_loopback_tls_logout().await;
+        let dispatcher = delivery_dispatcher(vec![root], true);
+
+        let err = dispatcher
+            .post_logout_token(&format!("{base}/redirect"), "token")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("untrusted URL"), "{err}");
+        let requests = recorder.snapshot();
+        assert_eq!(requests.len(), 2, "the original request keeps its one retry");
+        assert!(requests.iter().all(|request| request.path == "/redirect"));
+    }
+
+    #[tokio::test]
+    async fn backchannel_private_opt_in_delivers_form_over_https() {
+        let (base, root, recorder) = start_loopback_tls_logout().await;
+        let dispatcher = delivery_dispatcher(vec![root], true);
+        let token = "header.payload+/=&";
+
+        dispatcher.post_logout_token(&format!("{base}/logout"), token).await.unwrap();
+
+        let requests = recorder.snapshot();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/logout");
+        assert_eq!(request.content_type.as_deref(), Some("application/x-www-form-urlencoded"));
+        let form: HashMap<String, String> = serde_urlencoded::from_bytes(&request.body).unwrap();
+        assert_eq!(form.get("logout_token").map(String::as_str), Some(token));
     }
 }

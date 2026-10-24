@@ -501,10 +501,11 @@ impl ServerState {
         };
 
         let logout_notifier: Arc<dyn issuerd_core::SessionLogoutNotifier> =
-            Arc::new(crate::routes::logout::BackchannelLogoutDispatcher::new(
+            Arc::new(crate::routes::logout::BackchannelLogoutDispatcher::new_with_policy(
                 storage.clone(),
                 token_manager.clone(),
                 &extra_roots,
+                config.outbound_http.allow_private_addresses,
             )?);
 
         // Same-node signing-key reload hook: re-read the shared

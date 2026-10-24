@@ -44,20 +44,23 @@ const EXTERNAL_TOKEN_LEEWAY_SECS: u64 = 60;
 // ReqwestBrokerClient
 // ---------------------------------------------------------------------------
 
+/// HTTPS-only client for configured URLs that must not reach non-public
+/// addresses. The resolver validates and supplies the exact addresses the
+/// connector dials; redirects are disabled.
+#[derive(Clone)]
+pub(crate) struct SsrfGuardedClient {
+    client: reqwest::Client,
+    allow_private_addresses: bool,
+}
+
 /// Production [`BrokerClient`] over `reqwest` (rustls). Timeouts are short:
 /// a hung IdP must not stall login requests.
 pub struct ReqwestBrokerClient {
     /// IdP-facing client (discovery, JWKS, token, userinfo), built for
     /// `idp_egress`.
     client: reqwest::Client,
-    /// Separate client for attacker-influenced URLs (`get_json_ssrf_guarded`):
-    /// redirect following is disabled so a public URL cannot bounce the
-    /// fetch into the internal network (SSRF hardening).
-    untrusted_client: reqwest::Client,
-    /// `[outbound_http] allow_private_addresses`: skip the public-IP check on
-    /// resolved addresses in the guarded fetch (test rigs only — see the
-    /// config key's warning).
-    allow_private_addresses: bool,
+    /// Separate client for attacker-influenced URLs (`get_json_ssrf_guarded`).
+    untrusted_client: SsrfGuardedClient,
     /// How the IdP-facing calls are SSRF-gated.
     idp_egress: IdpEgress,
 }
@@ -130,15 +133,15 @@ impl ReqwestBrokerClient {
         let client = idp_client_builder(extra_roots, idp_egress)
             .build()
             .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
-        let untrusted_client = crate::outbound_http::client_builder(extra_roots)
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
+        let untrusted_client = SsrfGuardedClient::new(
+            extra_roots,
+            allow_private_addresses,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|e| IssuerdError::ServerError(format!("broker HTTP client init: {e}")))?;
         Ok(Self {
             client,
             untrusted_client,
-            allow_private_addresses,
             idp_egress,
         })
     }
@@ -210,7 +213,7 @@ fn is_non_public_ip_literal(url: &url::Url) -> bool {
 /// DNS resolver of the gated IdP client. It refuses a host unless every
 /// address it resolves to is publicly routable, and hands the connector
 /// exactly those checked addresses — so the check and the connection use
-/// the same answer, on the first request and on every redirect hop.
+/// the same answer on every request.
 struct PublicOnlyResolver;
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
@@ -219,7 +222,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
         Box::pin(async move {
             // Port 0: the connector substitutes the URL's port.
             let addrs = resolve_public(&host, 0).await.map_err(|why| {
-                warn!(why, host, "IdP host refused by the SSRF resolver");
+                warn!(why, host, "outbound host refused by the SSRF resolver");
                 why
             })?;
             let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
@@ -467,89 +470,126 @@ impl BrokerClient for ReqwestBrokerClient {
     /// logged only, so this endpoint cannot serve as a blind host/port
     /// oracle into the internal network.
     ///
-    /// Residual risk: DNS-rebinding TOCTOU — the answer checked here can
-    /// differ from the one the connector re-resolves when dialing. The full
-    /// mitigation would be a pinning connector that dials the validated IP
-    /// directly.
+    /// Hostname resolution and connection share one validated answer through
+    /// [`PublicOnlyResolver`], so a DNS change cannot substitute an internal
+    /// address between the check and the connection.
     async fn get_json_ssrf_guarded(&self, url: &str) -> Result<serde_json::Value, IssuerdError> {
-        let body = self.guarded_get_bytes(url).await?;
-        serde_json::from_slice(&body).map_err(|e| guarded_fetch_fail(&format!("json parse: {e}")))
+        let body = self.untrusted_client.get_bytes(url).await?;
+        serde_json::from_slice(&body).map_err(|e| guarded_request_fail(&format!("json parse: {e}")))
     }
 
     /// The text variant of [`Self::get_json_ssrf_guarded`] (a pre-registered
     /// `request_uri` serves a JWT, not JSON).
     async fn get_text_ssrf_guarded(&self, url: &str) -> Result<String, IssuerdError> {
-        let body = self.guarded_get_bytes(url).await?;
-        String::from_utf8(body).map_err(|e| guarded_fetch_fail(&format!("utf8: {e}")))
+        let body = self.untrusted_client.get_bytes(url).await?;
+        String::from_utf8(body).map_err(|e| guarded_request_fail(&format!("utf8: {e}")))
     }
 }
 
-/// One generic, leak-free error for every failure mode of the SSRF-guarded
-/// fetch: the real cause is logged only, so callers cannot serve as a blind
+/// One generic, leak-free error for every failure mode of an SSRF-guarded
+/// request: the real cause is logged only, so callers cannot serve as a blind
 /// host/port oracle into the internal network.
-fn guarded_fetch_fail(why: &str) -> IssuerdError {
-    warn!(why, "SSRF-guarded fetch rejected/failed");
+fn guarded_request_fail(why: &str) -> IssuerdError {
+    warn!(why, "SSRF-guarded request rejected/failed");
     IssuerdError::InvalidRequest("untrusted URL could not be fetched".to_string())
 }
 
-impl ReqwestBrokerClient {
-    /// The shared guarded GET: https-only, publicly routable resolved IPs
-    /// (unless the server's `[outbound_http] allow_private_addresses` test
-    /// escape hatch is on), no redirects, body capped at
-    /// [`MAX_UNTRUSTED_BODY_BYTES`]. Both the JSON and the text surface parse
-    /// from this.
-    async fn guarded_get_bytes(&self, url: &str) -> Result<Vec<u8>, IssuerdError> {
-        let fail = guarded_fetch_fail;
+impl SsrfGuardedClient {
+    pub(crate) fn new(
+        extra_roots: &[reqwest::Certificate],
+        allow_private_addresses: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Self, reqwest::Error> {
+        let builder = crate::outbound_http::client_builder(extra_roots)
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        let builder = if allow_private_addresses {
+            builder
+        } else {
+            builder.dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
+        };
+        Ok(Self {
+            client: builder.build()?,
+            allow_private_addresses,
+        })
+    }
 
-        // Never fetch untrusted URLs over plain http. (For
-        // `sector_identifier_uri` the pairwise validator enforces https too,
-        // OIDC Core §8.1 — this gate protects every caller.)
-        let parsed = url::Url::parse(url).map_err(|e| fail(&format!("url parse: {e}")))?;
+    fn check_url(&self, url: &str) -> Result<(), IssuerdError> {
+        let parsed =
+            url::Url::parse(url).map_err(|e| guarded_request_fail(&format!("url parse: {e}")))?;
         if parsed.scheme() != "https" {
-            return Err(fail("non-https scheme"));
+            return Err(guarded_request_fail("non-https scheme"));
         }
-        let host = parsed.host_str().ok_or_else(|| fail("no host component"))?;
-        let port = parsed.port_or_known_default().ok_or_else(|| fail("no port"))?;
-
-        // Resolve the host and refuse the request if ANY resolved address is
-        // not publicly routable. `[outbound_http] allow_private_addresses`
-        // skips this check wholesale (test rigs only; the scheme, redirect,
-        // size-cap and timeout rules still apply).
-        if !self.allow_private_addresses {
-            resolve_public(host, port).await.map_err(|why| fail(&why))?;
+        if parsed.host_str().is_none() {
+            return Err(guarded_request_fail("no host component"));
         }
+        if parsed.port_or_known_default().is_none() {
+            return Err(guarded_request_fail("no port"));
+        }
+        // The connector does not invoke its DNS resolver for IP literals.
+        // Hostnames are checked by PublicOnlyResolver, which returns exactly
+        // the validated addresses that the connector then dials.
+        if !self.allow_private_addresses && is_non_public_ip_literal(&parsed) {
+            return Err(guarded_request_fail("non-public address literal"));
+        }
+        Ok(())
+    }
 
-        // Redirects are disabled on this client, so a 3xx surfaces as the
-        // response status and is treated as a fetch failure.
+    /// GET a small document with the shared URL and transport guards.
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, IssuerdError> {
+        self.check_url(url)?;
         let resp = self
-            .untrusted_client
+            .client
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|e| fail(&format!("connect: {e}")))?;
+            .map_err(|e| guarded_request_fail(&format!("connect: {e}")))?;
         let status = resp.status();
         if status.is_redirection() {
-            return Err(fail(&format!("redirect: {status}")));
+            return Err(guarded_request_fail(&format!("redirect: {status}")));
         }
         if !status.is_success() {
-            return Err(fail(&format!("status: {status}")));
+            return Err(guarded_request_fail(&format!("status: {status}")));
         }
 
-        // Cap the body at 64 KiB: refuse early via Content-Length when the
-        // server advertises one, then enforce while streaming the body.
         if resp.content_length().is_some_and(|n| n > MAX_UNTRUSTED_BODY_BYTES as u64) {
-            return Err(fail("content-length exceeds cap"));
+            return Err(guarded_request_fail("content-length exceeds cap"));
         }
         let mut body = Vec::new();
         let mut resp = resp;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| fail(&format!("body: {e}")))? {
+        while let Some(chunk) =
+            resp.chunk().await.map_err(|e| guarded_request_fail(&format!("body: {e}")))?
+        {
             if body.len() + chunk.len() > MAX_UNTRUSTED_BODY_BYTES {
-                return Err(fail("body exceeds cap"));
+                return Err(guarded_request_fail("body exceeds cap"));
             }
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+
+    /// POST a form without following redirects. The response body is not
+    /// consumed; the caller decides whether the returned HTTP status succeeds.
+    pub(crate) async fn post_form(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+    ) -> Result<reqwest::StatusCode, IssuerdError> {
+        self.check_url(url)?;
+        let resp = self
+            .client
+            .post(url)
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| guarded_request_fail(&format!("connect: {e}")))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(guarded_request_fail(&format!("redirect: {status}")));
+        }
+        Ok(status)
     }
 }
 
@@ -1046,8 +1086,12 @@ mod tests {
     fn gated_client(egress: IdpEgress, builder: reqwest::ClientBuilder) -> ReqwestBrokerClient {
         ReqwestBrokerClient {
             client: builder.build().unwrap(),
-            untrusted_client: reqwest::Client::new(),
-            allow_private_addresses: false,
+            untrusted_client: SsrfGuardedClient::new(
+                &[],
+                false,
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap(),
             idp_egress: egress,
         }
     }
