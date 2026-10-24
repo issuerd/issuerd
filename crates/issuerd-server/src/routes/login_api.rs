@@ -3917,6 +3917,37 @@ pub(crate) mod tests {
         }
     }
 
+    struct AttemptedAuthenticator(&'static str);
+
+    #[async_trait::async_trait]
+    impl issuerd_core::Authenticator for AttemptedAuthenticator {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn display_name(&self) -> &str {
+            self.0
+        }
+        fn requires_user(&self) -> bool {
+            true
+        }
+        fn configured_for(&self, _context: &AuthContext) -> bool {
+            true
+        }
+        async fn authenticate(&self, _context: &mut AuthContext) -> issuerd_core::AuthStepResult {
+            issuerd_core::AuthStepResult::Attempted
+        }
+    }
+
+    fn register_attempted_defaults(registry: &mut crate::state::SimplePluginRegistry) {
+        for id in [
+            "conditional-user-configured",
+            "auth-otp-form",
+            "auth-webauthn",
+        ] {
+            registry.register_authenticator(Arc::new(AttemptedAuthenticator(id)));
+        }
+    }
+
     // Authenticator that returns Challenge so the flow executor yields FlowOutcome::Challenge.
     struct ChallengeAuthenticator;
 
@@ -4072,6 +4103,7 @@ pub(crate) mod tests {
         reg.register_authenticator(Arc::new(HardcodedUserAuthenticator {
             user_id: issuerd_core::UserId::new("ghost").unwrap(),
         }));
+        register_attempted_defaults(&mut reg);
 
         let state = Arc::new(ServerState {
             config: ServerConfig::default(),
@@ -4239,6 +4271,7 @@ pub(crate) mod tests {
         reg.register_authenticator(Arc::new(HardcodedUserAuthenticator {
             user_id: issuerd_core::UserId::new("u1").unwrap(),
         }));
+        register_attempted_defaults(&mut reg);
 
         let state = Arc::new(ServerState {
             config: ServerConfig::default(),
