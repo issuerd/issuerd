@@ -17090,11 +17090,14 @@
           "Internal"
         ],
         "summary": "Log out the first-party SPA session",
-        "description": "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout) and clears those plus the `issuerd_remember_{realm}` cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
+        "description": "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout), revokes remember-me tokens, and clears those cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
         "operationId": "auth_logout",
         "responses": {
           "204": {
             "description": "Logged out; session cookies cleared"
+          },
+          "503": {
+            "description": "Revocation state unavailable; retry logout"
           }
         }
       }

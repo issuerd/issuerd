@@ -658,10 +658,11 @@ pub async fn login_handler(
     path = "/api/v1/auth/logout",
     tag = "Internal",
     summary = "Log out the first-party SPA session",
-    description = "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout) and clears those plus the `issuerd_remember_{realm}` cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
+    description = "Destroys every SSO session referenced by the browser's per-realm `issuerd_session_{realm}` cookies (with back-channel logout), revokes remember-me tokens, and clears those cookies; the pre-realm-scoping `issuerd_session`/`issuerd_remember` names are honored and cleared as well.",
     operation_id = "auth_logout",
     responses(
         (status = 204, description = "Logged out; session cookies cleared"),
+        (status = 503, description = "Revocation state unavailable; retry logout"),
     ),
 )]
 #[instrument(skip(state, headers))]
@@ -724,6 +725,10 @@ pub async fn logout_api_handler(
             }
         } else if name == "issuerd_remember" || name.starts_with("issuerd_remember_") {
             clear_names.push(name.to_string());
+            let result = crate::session_cache::revoke_remember_cookie(&state, value).await;
+            if let Some(response) = super::oidc::cache_operation_result(result) {
+                return response;
+            }
         }
     }
 
@@ -3701,6 +3706,40 @@ pub(crate) mod tests {
                 "missing clear for {expected}; got: {cleared:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn logout_api_revokes_remember_cookie() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let claims = issuerd_token::action_tokens::action_token_claims(
+            &issuerd_core::UserId::new("admin").unwrap(),
+            &realm_id,
+            issuerd_core::ACTION_TOKEN_PURPOSE_REMEMBER_ME,
+            3600,
+        );
+        let cookie =
+            issuerd_token::action_tokens::issue_action_token(state.crypto.as_ref(), &claims)
+                .await
+                .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("issuerd_remember_master={cookie}").parse().unwrap(),
+        );
+
+        let response = logout_api_handler(State(state.clone()), headers).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .cache
+                .get(&issuerd_cluster::cache_keys::remember_token_revoked("master", &claims.jti))
+                .await
+                .unwrap()
+                .is_some(),
+            "logout must revoke the signed token, not only clear its browser cookie"
+        );
     }
 
     #[tokio::test]

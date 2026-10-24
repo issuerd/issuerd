@@ -368,6 +368,25 @@ pub(crate) fn find_realm_cookie(
     legacy
 }
 
+/// Collect both cookie generations for revocation, rather than selecting only
+/// the preferred one for authentication.
+fn realm_cookie_values(
+    headers: &axum::http::HeaderMap,
+    realm_id: &RealmId,
+    legacy_name: &str,
+) -> Vec<String> {
+    let per_realm = format!("{legacy_name}_{realm_id}");
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|h| h.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter(|(name, _)| *name == legacy_name || *name == per_realm)
+        .map(|(_, value)| value.to_string())
+        .collect()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingAuthData {
     pub realm_id: String,
@@ -1345,8 +1364,9 @@ async fn handle_auth_request(
 
     // Remember-me re-authentication: no live SSO session, but a valid
     // long-lived `issuerd_remember` cookie re-establishes the user silently. Any
-    // failure (missing/invalid/expired token, unknown or disabled user) is
-    // silent — the flow simply falls through to the login form.
+    // failure (missing/invalid/expired/revoked token, revocation-store outage,
+    // unknown or disabled user) is silent — the flow falls through to the login
+    // form rather than restoring an identity without proof of current state.
     if !force_reauth && existing_session.is_none() && realm.remember_me_enabled {
         if let Some(value) = find_realm_cookie(&headers, &realm_id, "issuerd_remember") {
             let verified = issuerd_token::action_tokens::verify_action_token(
@@ -1357,9 +1377,16 @@ async fn handle_auth_request(
             )
             .await;
             if let Ok(claims) = verified {
-                let user = match issuerd_core::UserId::new(claims.sub.clone()) {
-                    Ok(id) => state.storage.get_user(&realm_id, &id).await.ok().flatten(),
-                    Err(_) => None,
+                let revoked =
+                    crate::session_cache::remember_token_revoked(&state, &realm_id, &claims.jti)
+                        .await;
+                let user = if revoked {
+                    None
+                } else {
+                    match issuerd_core::UserId::new(claims.sub.clone()) {
+                        Ok(id) => state.storage.get_user(&realm_id, &id).await.ok().flatten(),
+                        Err(_) => None,
+                    }
                 };
                 if let Some(user) = user.filter(|u| u.enabled) {
                     debug!(realm = %realm_id, user_id = %user.id, "re-authenticating via remember-me cookie");
@@ -6323,6 +6350,12 @@ async fn logout_inner(
         }
     };
     let realm_id = realm.id.clone();
+    for token in realm_cookie_values(&headers, &realm_id, "issuerd_remember") {
+        let result = crate::session_cache::revoke_remember_token(&state, &realm_id, &token).await;
+        if let Some(response) = cache_operation_result(result) {
+            return response;
+        }
+    }
 
     let mut session_id: Option<issuerd_core::SessionId> = None;
     let mut user_id: Option<issuerd_core::UserId> = None;
@@ -15774,6 +15807,34 @@ mod tests {
             location.contains("code="),
             "remember-me cookie should silently re-authenticate, location: {location}"
         );
+    }
+
+    #[tokio::test]
+    async fn rp_logout_revokes_copied_remember_me_cookies() {
+        let state = setup_state().await;
+        update_master_realm(&state, |realm| realm.remember_me_enabled = true).await;
+        let scoped = remember_me_cookie(&state).await;
+        let legacy = remember_me_cookie(&state).await;
+        let headers =
+            cookie_headers(&format!("issuerd_remember_master={scoped}; issuerd_remember={legacy}"));
+
+        let response = logout_inner(
+            state.clone(),
+            Some("master".to_string()),
+            "127.0.0.1".parse().unwrap(),
+            headers,
+            HashMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for cookie in [scoped, legacy] {
+            let headers = cookie_headers(&format!("issuerd_remember={cookie}"));
+            let response = auth_get_with_headers(&state, headers, valid_code_auth_params()).await;
+            let location = response.headers().get("location").unwrap().to_str().unwrap();
+            assert!(location.contains("execution_id="), "location: {location}");
+            assert!(!location.contains("code="), "revoked cookie re-authenticated: {location}");
+        }
     }
 
     #[tokio::test]

@@ -37,8 +37,9 @@
 //!   invalidation latency. Realm deletes are additionally covered because
 //!   `resolve_issuer_realm` invalidation makes the issuer unresolvable.
 //!
-//! Cache outages degrade, never fail: every cache error falls back to the
-//! storage path with a WARN, so a Redis hiccup costs latency, not answers.
+//! Session-snapshot cache outages degrade to storage with a WARN. Remember-me
+//! revocation reads instead fail closed, and logout revocation writes surface
+//! an error so the caller can retry without reporting a false success.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,6 +268,81 @@ pub async fn invalidate_session_entry(
     }
 }
 
+/// Whether a remember-me token was revoked at logout. Cache failures reject
+/// the token instead of silently restoring a remembered identity.
+pub async fn remember_token_revoked(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    token_id: &str,
+) -> bool {
+    match state
+        .cache
+        .get(&cache_keys::remember_token_revoked(realm_id.as_ref(), token_id))
+        .await
+    {
+        Ok(value) => value.is_some(),
+        Err(e) => {
+            warn!(realm = %realm_id, error = %e, "remember-me revocation read failed; rejecting token");
+            true
+        }
+    }
+}
+
+/// Revoke a presented remember-me cookie for the rest of its validity window.
+/// Malformed or expired cookies need no state; valid ones are revoked by their
+/// unique token id, so deleting the browser cookie is not the only protection.
+pub async fn revoke_remember_token(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    token: &str,
+) -> Result<(), issuerd_core::IssuerdError> {
+    let claims = match issuerd_token::action_tokens::verify_action_token(
+        state.crypto.as_ref(),
+        token,
+        issuerd_core::ACTION_TOKEN_PURPOSE_REMEMBER_ME,
+        realm_id,
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(issuerd_core::IssuerdError::InvalidRequest(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let remaining = claims.exp.saturating_add(60).saturating_sub(chrono::Utc::now().timestamp());
+    if remaining <= 0 {
+        return Ok(());
+    }
+    state
+        .cache
+        .set(
+            &cache_keys::remember_token_revoked(realm_id.as_ref(), &claims.jti),
+            vec![1],
+            Some(Duration::from_secs(remaining as u64)),
+        )
+        .await
+}
+
+/// Revoke a remember-me cookie without trusting its cookie name for tenancy.
+/// The realm decoded here is only a candidate: signature, purpose, and the
+/// same realm claim are verified before the revocation write.
+pub async fn revoke_remember_cookie(
+    state: &Arc<ServerState>,
+    token: &str,
+) -> Result<(), issuerd_core::IssuerdError> {
+    use base64::Engine as _;
+
+    let realm = token
+        .split('.')
+        .nth(1)
+        .and_then(|payload| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok())
+        .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+        .and_then(|claims| claims.get("realm")?.as_str().map(str::to_owned));
+    let Some(realm) = realm.and_then(|realm| RealmId::new(realm).ok()) else {
+        return Ok(());
+    };
+    revoke_remember_token(state, &realm, token).await
+}
+
 /// Bump the per-user session-validity version counter (bulk revocation:
 /// user delete / logout-all). Every cached snapshot of this user's sessions
 /// misses on its next read. No TTL: the counter must outlive any cached
@@ -444,46 +520,47 @@ mod tests {
         assert!(state.cache.get(&cache_key(&realm_id, &sid)).await.unwrap().is_none());
     }
 
+    #[derive(Debug)]
+    struct DeadCache;
+
+    #[async_trait::async_trait]
+    impl DistributedCache for DeadCache {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+        async fn set(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: Option<Duration>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+        async fn compare_and_swap(
+            &self,
+            _: &str,
+            _: Option<Vec<u8>>,
+            _: Vec<u8>,
+        ) -> Result<bool, issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+        async fn publish(&self, _: &str, _: Vec<u8>) -> Result<(), issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+        async fn subscribe(
+            &self,
+            _: &str,
+            _: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        ) -> Result<(), issuerd_core::IssuerdError> {
+            Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
+        }
+    }
+
     #[tokio::test]
     async fn cache_outage_falls_back_to_storage() {
-        #[derive(Debug)]
-        struct DeadCache;
-        #[async_trait::async_trait]
-        impl DistributedCache for DeadCache {
-            async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-            async fn set(
-                &self,
-                _: &str,
-                _: Vec<u8>,
-                _: Option<Duration>,
-            ) -> Result<(), issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-            async fn delete(&self, _: &str) -> Result<(), issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-            async fn compare_and_swap(
-                &self,
-                _: &str,
-                _: Option<Vec<u8>>,
-                _: Vec<u8>,
-            ) -> Result<bool, issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-            async fn publish(&self, _: &str, _: Vec<u8>) -> Result<(), issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-            async fn subscribe(
-                &self,
-                _: &str,
-                _: Box<dyn Fn(Vec<u8>) + Send + Sync>,
-            ) -> Result<(), issuerd_core::IssuerdError> {
-                Err(issuerd_core::IssuerdError::ServerError("cache down".into()))
-            }
-        }
-
         let cfg = crate::config::ServerConfig::default();
         let storage: Arc<dyn issuerd_core::Storage> =
             Arc::new(issuerd_storage::InMemoryStorage::new());
@@ -503,6 +580,18 @@ mod tests {
         assert!(session_snapshot(&state, &realm_id, &sid).await.is_some());
         state.storage.delete_user_session(&realm_id, &sid).await.unwrap();
         assert!(session_snapshot(&state, &realm_id, &sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remember_revocation_read_outage_rejects() {
+        let cfg = crate::config::ServerConfig::default();
+        let storage: Arc<dyn issuerd_core::Storage> =
+            Arc::new(issuerd_storage::InMemoryStorage::new());
+        let state = Arc::new(
+            ServerState::from_components(&cfg, storage, Arc::new(DeadCache)).await.unwrap(),
+        );
+        let realm_id = RealmId::new("master").unwrap();
+        assert!(remember_token_revoked(&state, &realm_id, "token-id").await);
     }
 
     struct RacingCache {
