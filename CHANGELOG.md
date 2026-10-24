@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Aggregate Admin API reads enforce their specific capabilities.** Full realm export now requires `manage-realm`, and group-member listings require `view-users` or `manage-users`; `view-realm` alone can no longer retrieve every user/client or full member profiles. Authorized responses and credential redaction are unchanged.
 - **Explicit authentication-flow bindings fail closed.** Internal authorization, login, and registration paths now use strict flow resolution: storage errors and missing explicitly bound aliases abort with generic server errors instead of silently selecting a password-capable default. Only unbound legacy realms may use the code fallback after a successful flow-list load. The legacy public wrapper remains for embedder compatibility.
 - **SPNEGO enforces PKCE instead of discarding malformed challenges.** Public clients must present a valid S256 challenge, and non-S256 or malformed values are rejected before session/code creation. This closes the previous `.ok().flatten()` path that could silently turn malformed PKCE into a code without a verifier.
 - **Password brute-force configuration and federated first import fail closed.** A realm lookup error can no longer silently disable lockout checks and failure recording. Invalid federated usernames now return an authentication error instead of panicking during first-login import, matching the per-record sync behavior.

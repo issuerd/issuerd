@@ -413,7 +413,7 @@ fn mask_idp_secrets(
     path = "/admin/realms/{realm}/export",
     tag = "Realms",
     summary = "Export the full realm",
-    description = "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********` (`bindCredential` too for callers without `manage-realm`). Groups are a flat list with hierarchy carried by `parent_id`. Requires `view-realm` or `manage-realm` role.",
+    description = "Returns the realm as a single JSON document: realm fields at the top level (Keycloak-compatible where fields overlap) plus users, clients, groups, roles, identity providers, and client scopes. The document carries no secret material: users never include credentials, client secrets are omitted, and identity-provider `clientSecret` values are masked as `**********`. Groups are a flat list with hierarchy carried by `parent_id`. Requires `manage-realm` role.",
     params(("realm" = String, Path, description = "Realm name")),
     responses(
         (status = 200, description = "Realm export document", body = RealmExportRepresentation),
@@ -428,7 +428,7 @@ pub async fn export_realm(
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path(realm): axum::extract::Path<String>,
 ) -> Result<Json<RealmExportRepresentation>, AdminApiError> {
-    require_roles(&auth, &["view-realm", "manage-realm"])?;
+    require_roles(&auth, &["manage-realm"])?;
     let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let realm_id = realm.id.clone();
     let all = Pagination {
@@ -1187,34 +1187,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_masks_bind_credential_for_callers_without_manage_realm() {
-        for (role, bind_credential) in [
-            ("view-realm", "**********"),
-            ("manage-realm", "bind-secret-value"),
-        ] {
-            let state = crate::test_utils::tests::test_state(vec![RoleName::new(role).unwrap()]);
-            let app = test_app(state.clone());
-            let realm_id = master_realm_id();
-            let mut idp = seed_idp(&state, &realm_id, "idp1", Some("idp-secret-value")).await;
-            idp.config.insert("bindCredential".to_string(), "bind-secret-value".to_string());
-            state.storage.update_identity_provider(&realm_id, &idp).await.unwrap();
+    async fn export_returns_bind_credential_to_manage_realm() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let mut idp = seed_idp(&state, &realm_id, "idp1", Some("idp-secret-value")).await;
+        idp.config.insert("bindCredential".to_string(), "bind-secret-value".to_string());
+        state.storage.update_identity_provider(&realm_id, &idp).await.unwrap();
 
-            let (status, body) = post_json(&app, "/admin/realms/master/export", None).await;
-            assert_eq!(status, StatusCode::OK, "body: {body}");
-            let config = &body["identityProviders"][0]["config"];
-            assert_eq!(config["clientSecret"], "**********", "role {role}");
-            assert_eq!(config["bindCredential"], bind_credential, "role {role}");
-            assert_eq!(config["clientId"], "idp-client", "role {role}");
-        }
+        let (status, body) = post_json(&app, "/admin/realms/master/export", None).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let config = &body["identityProviders"][0]["config"];
+        assert_eq!(config["clientSecret"], "**********");
+        assert_eq!(config["bindCredential"], "bind-secret-value");
+        assert_eq!(config["clientId"], "idp-client");
     }
 
     #[tokio::test]
-    async fn export_allows_view_role() {
+    async fn export_requires_manage_realm() {
         let state =
             crate::test_utils::tests::test_state(vec![RoleName::new("view-realm").unwrap()]);
         let app = test_app(state);
         let (status, _) = post_json(&app, "/admin/realms/master/export", None).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -245,7 +245,7 @@ pub async fn get_group(
     path = "/admin/realms/{realm}/groups/{id}/members",
     tag = "Groups",
     summary = "List group members",
-    description = "Returns the users that are members of the group, paginated. Requires `view-realm` or `manage-realm` role.",
+    description = "Returns the users that are members of the group, paginated. Requires `view-users` or `manage-users` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("id" = String, Path, description = "Group ID"),
@@ -265,7 +265,7 @@ pub async fn get_group_members(
     axum::extract::Path((realm, id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<Vec<UserRepresentation>>, AdminApiError> {
-    require_roles(&auth, &["view-realm", "manage-realm"])?;
+    require_roles(&auth, &["view-users", "manage-users"])?;
     let (realm_id, group) = load_group(&state, &realm, &id).await?;
     let members = state
         .storage
@@ -1814,7 +1814,7 @@ mod tests {
     async fn group_members_paginate() {
         let state =
             crate::test_utils::tests::test_state(vec![
-                issuerd_core::RoleName::new("view-realm").unwrap()
+                issuerd_core::RoleName::new("view-users").unwrap()
             ]);
         let app = group_routes(state.clone());
         let realm = realm_fixture();
@@ -1882,6 +1882,36 @@ mod tests {
         let (status, _) =
             member_names(&app, "/admin/realms/test/groups/no-such-group/members".to_string()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn group_members_require_user_read_role() {
+        for (role, expected) in [
+            ("view-realm", StatusCode::FORBIDDEN),
+            ("manage-users", StatusCode::OK),
+        ] {
+            let state =
+                crate::test_utils::tests::test_state(vec![
+                    issuerd_core::RoleName::new(role).unwrap()
+                ]);
+            let app = group_routes(state.clone());
+            let realm = realm_fixture();
+            state.storage.create_realm(&realm).await.unwrap();
+            let group = group_fixture(&realm.id, "group-1", "team", "/team", None);
+            state.storage.create_group(&realm.id, &group).await.unwrap();
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/realms/test/groups/group-1/members")
+                        .header("Authorization", "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "role {role}");
+        }
     }
 
     #[tokio::test]
