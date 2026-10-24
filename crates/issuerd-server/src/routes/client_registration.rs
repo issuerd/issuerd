@@ -835,7 +835,10 @@ const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 8] = [
 ///   partial filtering that would silently register a different client than
 ///   the caller sent;
 /// - `web_origins` REJECTS the literal `"*"` (CORS wildcard) with
-///   `invalid_client_metadata`.
+///   `invalid_client_metadata`;
+/// - when MCP is enabled, reserved `mcp:*` scopes are REJECTED in either scope
+///   list: agent clients require explicit administrator onboarding, never
+///   anonymous self-assignment.
 ///
 /// Runs on open-endpoint creates AND on RFC 7592 updates of clients carrying
 /// the `dcr.policy=open` marker ([`client_metadata::ATTR_DCR_POLICY`]), so a
@@ -844,7 +847,22 @@ const OPEN_REGISTRATION_STRIPPED_ATTRIBUTES: [&str; 8] = [
 fn enforce_open_registration_policy(
     realm_id: &RealmId,
     rep: &mut ClientRepresentation,
+    mcp_enabled: bool,
 ) -> Result<(), Response> {
+    if mcp_enabled
+        && rep
+            .default_scopes
+            .iter()
+            .chain(rep.optional_scopes.iter())
+            .flatten()
+            .any(|scope| issuerd_core::is_mcp_scope_name(scope))
+    {
+        return Err(registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "MCP scopes require explicit administrator assignment and are not allowed on open registration",
+        ));
+    }
     if let Some(attributes) = &mut rep.attributes {
         // The logout URIs arrive free-form through the Keycloak-shaped
         // `attributes` map (the RFC-spelled top-level fields are
@@ -1005,7 +1023,9 @@ async fn register_client(
     // fields an unauthenticated registrant must not control. The
     // token-gated path is Trusted and skips it entirely.
     if policy == RegistrationPolicy::Open {
-        if let Err(resp) = enforce_open_registration_policy(&realm.id, &mut rep) {
+        if let Err(resp) =
+            enforce_open_registration_policy(&realm.id, &mut rep, state.config.mcp.enabled)
+        {
             return resp;
         }
     }
@@ -1052,6 +1072,16 @@ async fn register_client(
             );
         }
     };
+    if let Err(e) = issuerd_core::validate_no_default_mcp_scopes(
+        client.default_scopes.as_slice(),
+        state.config.mcp.enabled,
+    ) {
+        return registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            &e.to_string(),
+        );
+    }
     match ensure_client_id_available(&state.storage, &realm.id, &client.client_id, None).await {
         Ok(()) => {}
         Err(IssuerdError::Conflict) => {
@@ -1500,7 +1530,9 @@ pub async fn update_registered_client_handler(
         existing.attributes.get(client_metadata::ATTR_DCR_POLICY).map(String::as_str)
             == Some(client_metadata::DCR_POLICY_OPEN);
     if open_registered {
-        if let Err(resp) = enforce_open_registration_policy(&realm.id, &mut rep) {
+        if let Err(resp) =
+            enforce_open_registration_policy(&realm.id, &mut rep, state.config.mcp.enabled)
+        {
             return resp;
         }
     }
@@ -1531,6 +1563,16 @@ pub async fn update_registered_client_handler(
             );
         }
     };
+    if let Err(e) = issuerd_core::validate_no_default_mcp_scopes(
+        updated.default_scopes.as_slice(),
+        state.config.mcp.enabled,
+    ) {
+        return registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            &e.to_string(),
+        );
+    }
     updated.id = existing.id.clone();
     updated.realm_id = existing.realm_id.clone();
     // Enablement is admin-only: a registration access token must never
@@ -2079,7 +2121,7 @@ mod tests {
             }
         }))
         .unwrap();
-        enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+        enforce_open_registration_policy(&realm_id, &mut rep, false).unwrap();
         let attributes = rep.attributes.unwrap();
         assert_eq!(
             attributes.len(),
@@ -2098,14 +2140,14 @@ mod tests {
             "web_origins": ["https://app.example.com", "*"]
         }))
         .unwrap();
-        assert!(enforce_open_registration_policy(&realm_id, &mut rep).is_err());
+        assert!(enforce_open_registration_policy(&realm_id, &mut rep, false).is_err());
         // Non-wildcard origins pass untouched.
         let mut rep: ClientRepresentation = serde_json::from_value(serde_json::json!({
             "client_id": "policy-test",
             "web_origins": ["https://app.example.com"]
         }))
         .unwrap();
-        enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+        enforce_open_registration_policy(&realm_id, &mut rep, false).unwrap();
         assert_eq!(rep.web_origins.unwrap(), vec!["https://app.example.com".to_string()]);
     }
 
@@ -2302,7 +2344,7 @@ mod tests {
                 "attributes": {"backchannel_logout_uri": uri}
             }))
             .unwrap();
-            assert!(enforce_open_registration_policy(&realm_id, &mut rep).is_err(), "{uri}");
+            assert!(enforce_open_registration_policy(&realm_id, &mut rep, false).is_err(), "{uri}");
         }
         // https, loopback http and custom schemes validate (and are still
         // stripped — the open endpoint never stores logout URIs).
@@ -2317,7 +2359,7 @@ mod tests {
                 "attributes": {"backchannel_logout_uri": uri}
             }))
             .unwrap();
-            enforce_open_registration_policy(&realm_id, &mut rep).unwrap();
+            enforce_open_registration_policy(&realm_id, &mut rep, false).unwrap();
             assert!(!rep.attributes.unwrap().contains_key("backchannel_logout_uri"), "{uri}");
         }
     }

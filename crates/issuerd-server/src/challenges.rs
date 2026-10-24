@@ -212,7 +212,7 @@ mod tests {
 
     /// An RFC 9728 resource-metadata URL as the `/mcp` middleware derives it.
     const META: &str =
-        "https://idp.example.com/realms/master/.well-known/oauth-protected-resource/mcp";
+        "https://idp.example.com/.well-known/oauth-protected-resource/realms/master/mcp";
 
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();

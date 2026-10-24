@@ -129,7 +129,16 @@ impl TokenRequest {
         })
     }
 
-    pub fn validate(&self, _realm: &Realm, client: &Client) -> Result<(), IssuerdError> {
+    pub fn validate(&self, realm: &Realm, client: &Client) -> Result<(), IssuerdError> {
+        self.validate_with_mcp(realm, client, false)
+    }
+
+    pub fn validate_with_mcp(
+        &self,
+        _realm: &Realm,
+        client: &Client,
+        mcp_enabled: bool,
+    ) -> Result<(), IssuerdError> {
         match self.grant_type {
             GrantType::AuthorizationCode => {
                 if self.code.is_none() {
@@ -214,16 +223,17 @@ impl TokenRequest {
         // `openid` is the OIDC protocol marker, not a client scope: exempt
         // (same rule as the authorization endpoint) so DCR-registered
         // clients without an explicit `scope` list can refresh OIDC grants.
-        if !self.scope.is_empty() {
-            let available: std::collections::HashSet<&str> = client
-                .default_scopes
-                .iter()
-                .chain(client.optional_scopes.iter())
-                .map(String::as_str)
-                .collect();
-            if self.scope.iter().any(|s| s != "openid" && !available.contains(s.as_str())) {
-                return Err(IssuerdError::InvalidScope);
-            }
+        if !self.scope.is_empty()
+            && self.scope.iter().any(|scope| {
+                scope != "openid"
+                    && !issuerd_core::client_scope_request_permitted_with_mcp(
+                        client,
+                        scope,
+                        mcp_enabled,
+                    )
+            })
+        {
+            return Err(IssuerdError::InvalidScope);
         }
         Ok(())
     }

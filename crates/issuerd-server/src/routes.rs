@@ -145,6 +145,7 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         available_locales: theme::available_locales(&state.config.themes.dir),
         token_issuer: state.token_manager.clone(),
         signing_key_reload: state.signing_key_reload.clone(),
+        mcp_enabled: state.config.mcp.enabled,
         base_url: state.config.issuer_url.trim_end_matches('/').to_string(),
         // Per-recipient locale bundle for outbound admin email copy: the
         // recipient's `locale` attribute (then the realm default) selects the
@@ -191,13 +192,14 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
             get(protected_resource::protected_resource_metadata_handler),
         )
         .route(
-            "/.well-known/oauth-protected-resource/realms/{realm}/mcp",
+            "/.well-known/oauth-protected-resource/{*path}",
             get(protected_resource::protected_resource_metadata_realm_handler),
         )
         .route("/realms/{realm}/protocol/openid-connect/certs", get(oidc::certs_handler))
         .route(
             "/realms/{realm}/protocol/openid-connect/auth",
-            get(oidc::auth_handler).post(oidc::auth_handler_post),
+            get(oidc::auth_handler_with_resource_count)
+                .post(oidc::auth_handler_post_with_resource_count),
         )
         .route(
             "/realms/{realm}/protocol/openid-connect/auth/device",
@@ -249,7 +251,7 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
             "/realms/{realm}/protocol/openid-connect/token/introspect",
             post(oidc::introspect_handler),
         )
-        .route("/realms/{realm}/kerberos", get(kerberos::handle_spnego))
+        .route("/realms/{realm}/kerberos", get(kerberos::handle_spnego_with_resource_count))
         .route("/realms/{realm}/broker/{alias}/login", get(broker::broker_login_handler))
         .route(
             "/realms/{realm}/broker/{alias}/endpoint",

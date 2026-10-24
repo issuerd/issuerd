@@ -730,6 +730,90 @@ async fn registration_lifecycle_writes_admin_events() {
     }
 }
 
+#[tokio::test]
+async fn open_registration_disabled_allows_legacy_mcp_scope_names() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("dcr-mcp-disabled").await;
+    enable_registration(&harness, &realm).await;
+    let resp = harness
+        .post_json(
+            &registrations_path(realm.name.as_ref(), "default"),
+            serde_json::json!({
+                "client_id": "legacy-mcp-client",
+                "redirect_uris": ["https://app.example.com/cb"],
+                "scope": "openid mcp:write"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let client = stored_client(&harness, &realm, "legacy-mcp-client").await.unwrap();
+    assert!(client.default_scopes.contains("mcp:write"));
+}
+
+#[tokio::test]
+async fn open_registration_rejects_mcp_scopes_on_create_and_update() {
+    let mut config = crate::harness::test_config();
+    config.mcp.enabled = true;
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+    );
+    let harness = TestHarness::with_state(state);
+    let realm = harness.create_realm("dcr-mcp-policy").await;
+    enable_registration(&harness, &realm).await;
+
+    for (idx, body) in [
+        serde_json::json!({
+            "client_id": "mcp-rfc-scope",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "scope": "openid mcp:write"
+        }),
+        serde_json::json!({
+            "client_id": "mcp-default-list",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "default_scopes": ["openid", "mcp:read"]
+        }),
+        serde_json::json!({
+            "client_id": "mcp-optional-list",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "optional_scopes": ["mcp:write"]
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = harness
+            .post_json(&registrations_path(realm.name.as_ref(), "default"), body.clone())
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "case {idx}: {body}");
+        assert_eq!(json_body(resp).await["error"], "invalid_client_metadata");
+        let client_id = body["client_id"].as_str().unwrap();
+        assert!(stored_client(&harness, &realm, client_id).await.is_none());
+    }
+
+    let created = register_open_ok(&harness, realm.name.as_ref()).await;
+    let client_id = created["client_id"].as_str().unwrap();
+    let registration_token = created["registration_access_token"].as_str().unwrap();
+    let resp = put_json_auth(
+        &harness,
+        &registration_client_path(realm.name.as_ref(), client_id),
+        serde_json::json!({
+            "client_id": client_id,
+            "redirect_uris": ["http://localhost:8080/cb"],
+            "scope": "openid mcp:read"
+        }),
+        registration_token,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["error"], "invalid_client_metadata");
+    let stored = stored_client(&harness, &realm, client_id).await.unwrap();
+    assert!(!stored
+        .default_scopes
+        .iter()
+        .chain(stored.optional_scopes.iter())
+        .any(|scope| issuerd_core::is_mcp_scope_name(scope)));
+}
+
 // ---------------------------------------------------------------------------
 // Open-endpoint payload policy (2026-10 security review)
 // ---------------------------------------------------------------------------

@@ -3827,6 +3827,46 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn concurrent_builtin_scope_backfill_is_idempotent() {
+        let (url, _container) = start_pg_container().await;
+        let first = PostgresStorage::connect(&url).await.unwrap();
+        first.run_migrations().await.unwrap();
+        let second = PostgresStorage::connect(&url).await.unwrap();
+        let realm = test_realm();
+        first.create_realm(&realm).await.unwrap();
+        for name in [MCP_SCOPE_READ, MCP_SCOPE_WRITE] {
+            let scope = first.get_client_scope_by_name(&realm.id, name).await.unwrap().unwrap();
+            first.delete_client_scope(&realm.id, &scope.id).await.unwrap();
+        }
+
+        let (a, b) = tokio::join!(
+            crate::seed::seed_builtin_client_scopes(&first, &realm.id),
+            crate::seed::seed_builtin_client_scopes(&second, &realm.id),
+        );
+        a.unwrap();
+        b.unwrap();
+        let scopes = first
+            .list_client_scopes(&realm.id, &Pagination::new(0, i32::MAX))
+            .await
+            .unwrap();
+        assert_eq!(scopes.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn postgres_mcp_backfill_rejects_legacy_default_assignment() {
+        let (storage, _container) = setup_pg().await;
+        let realm = test_realm();
+        storage.create_realm(&realm).await.unwrap();
+        let mut client = test_client(&realm.id);
+        client.default_scopes = Scope::parse("openid mcp:write");
+        storage.create_client(&realm.id, &client).await.unwrap();
+        storage.run_migrations().await.unwrap();
+
+        let err = crate::seed::validate_mcp_scope_policy(&storage).await.unwrap_err();
+        assert!(err.to_string().contains("default list"));
+    }
+
     #[test]
     fn sqlx_err_pool_timed_out() {
         let err = sqlx_err(sqlx::Error::PoolTimedOut);

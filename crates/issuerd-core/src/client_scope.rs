@@ -25,8 +25,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::IssuerdError;
 use crate::ids::{ClientId, ClientScopeId, MapperId, RealmId, RoleId};
-use crate::models::ClientProtocol;
+use crate::models::{Client, ClientProtocol};
 
 // ---------------------------------------------------------------------------
 // Mapper config keys (Keycloak wire spellings)
@@ -231,6 +232,11 @@ pub const MCP_SCOPE_READ: &str = "mcp:read";
 /// as [`MCP_SCOPE_READ`].
 pub const MCP_SCOPE_WRITE: &str = "mcp:write";
 
+/// Client attribute marking an anonymously registered client.
+pub const ATTR_DCR_POLICY: &str = "dcr.policy";
+/// The [`ATTR_DCR_POLICY`] value stamped on open-endpoint registrations.
+pub const DCR_POLICY_OPEN: &str = "open";
+
 /// Names of the built-in client scopes seeded into every realm.
 pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "profile",
@@ -256,6 +262,47 @@ pub const DEFAULT_OPTIONAL_SCOPES: &[&str] =
 /// Whether `name` is one of the built-in client scope names.
 pub fn is_builtin_scope_name(name: &str) -> bool {
     BUILTIN_SCOPE_NAMES.contains(&name)
+}
+
+/// Whether `name` is a reserved MCP authorization scope.
+pub fn is_mcp_scope_name(name: &str) -> bool {
+    matches!(name, MCP_SCOPE_READ | MCP_SCOPE_WRITE)
+}
+
+/// Reject MCP scopes in a client's default-scope list when MCP is enabled.
+/// Legacy scope names keep their previous behavior while the surface is off.
+pub fn validate_no_default_mcp_scopes(
+    default_scopes: &[String],
+    mcp_enabled: bool,
+) -> Result<(), IssuerdError> {
+    if mcp_enabled {
+        if let Some(scope) = default_scopes.iter().find(|scope| is_mcp_scope_name(scope)) {
+            return Err(IssuerdError::InvalidRequest(format!(
+                "MCP scope {scope} must be assigned explicitly as an optional scope"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a client may request `scope` under its assigned scope policy.
+/// This preserves the legacy default∪optional rule with MCP disabled.
+pub fn client_scope_request_permitted(client: &Client, scope: &str) -> bool {
+    client_scope_request_permitted_with_mcp(client, scope, false)
+}
+
+/// Apply the MCP-aware scope policy. When enabled, MCP scopes are valid only
+/// as optional-only assignments; legacy/direct storage cannot make them
+/// default or available through both lists.
+pub fn client_scope_request_permitted_with_mcp(
+    client: &Client,
+    scope: &str,
+    mcp_enabled: bool,
+) -> bool {
+    if mcp_enabled && is_mcp_scope_name(scope) {
+        return client.optional_scopes.contains(scope) && !client.default_scopes.contains(scope);
+    }
+    client.default_scopes.contains(scope) || client.optional_scopes.contains(scope)
 }
 
 fn targets(access: bool, id: bool, userinfo: bool) -> HashMap<String, String> {
@@ -628,6 +675,48 @@ mod tests {
             assert!(!DEFAULT_DEFAULT_SCOPES.contains(&name));
             assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&name));
         }
+    }
+
+    #[test]
+    fn mcp_scope_requests_require_optional_only_assignment() {
+        let client = Client {
+            id: ClientId::new("client-1").unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            client_id: crate::ClientIdentifier::new("agent").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: crate::ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: crate::Scope::parse("openid"),
+            optional_scopes: crate::Scope::parse("mcp:read"),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: vec![],
+            scope_mappings: ScopeMappings::default(),
+            attributes: HashMap::new(),
+        };
+        assert!(client_scope_request_permitted(&client, "openid"));
+        assert!(client_scope_request_permitted_with_mcp(&client, MCP_SCOPE_READ, true));
+        assert!(!client_scope_request_permitted_with_mcp(&client, MCP_SCOPE_WRITE, true));
+
+        let mut legacy_default = client.clone();
+        legacy_default.default_scopes = crate::Scope::parse("mcp:read");
+        assert!(!client_scope_request_permitted_with_mcp(&legacy_default, MCP_SCOPE_READ, true));
+        assert!(client_scope_request_permitted_with_mcp(&legacy_default, MCP_SCOPE_READ, false));
+        assert!(
+            validate_no_default_mcp_scopes(legacy_default.default_scopes.as_slice(), true).is_err()
+        );
+        assert!(
+            validate_no_default_mcp_scopes(legacy_default.default_scopes.as_slice(), false).is_ok()
+        );
+        assert!(validate_no_default_mcp_scopes(client.default_scopes.as_slice(), true).is_ok());
     }
 
     #[test]

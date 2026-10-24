@@ -754,7 +754,32 @@ pub async fn auth_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    handle_auth_request(state, realm, ip, headers, params).await
+    handle_auth_request(state, realm, ip, headers, params, 1).await
+}
+
+/// Production GET wrapper that retains raw-query multiplicity before `Query`
+/// collapses repeated keys. The original handler remains for direct callers.
+pub async fn auth_handler_with_resource_count(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let resource_count =
+        issuerd_protocol::resource::resource_parameter_count(uri.query().unwrap_or(""));
+    if resource_count <= 1 {
+        return auth_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(realm)),
+            axum::extract::Extension(ClientIp(ip)),
+            headers,
+            Query(params),
+        )
+        .await;
+    }
+    handle_auth_request(state, realm, ip, headers, params, resource_count).await
 }
 
 pub async fn auth_handler_post(
@@ -779,7 +804,47 @@ pub async fn auth_handler_post(
     for (k, v) in query_params {
         params.entry(k).or_insert(v);
     }
-    handle_auth_request(state, realm, ip, headers, params).await
+    handle_auth_request(state, realm, ip, headers, params, 1).await
+}
+
+/// Production POST wrapper covering duplicates across both query and body.
+pub async fn auth_handler_post_with_resource_count(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    Query(query_params): Query<HashMap<String, String>>,
+    body: String,
+) -> Response {
+    let resource_count =
+        issuerd_protocol::resource::resource_parameter_count(uri.query().unwrap_or(""))
+            + issuerd_protocol::resource::resource_parameter_count(&body);
+    if resource_count <= 1 {
+        return auth_handler_post(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(realm)),
+            axum::extract::Extension(ClientIp(ip)),
+            headers,
+            Query(query_params),
+            body,
+        )
+        .await;
+    }
+    let mut params: HashMap<String, String> = match serde_urlencoded::from_str(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_form_data"})),
+            )
+                .into_response();
+        }
+    };
+    for (k, v) in query_params {
+        params.entry(k).or_insert(v);
+    }
+    handle_auth_request(state, realm, ip, headers, params, resource_count).await
 }
 
 #[instrument(skip(state, headers, params, ip), fields(realm = ?realm))]
@@ -789,6 +854,7 @@ async fn handle_auth_request(
     ip: std::net::IpAddr,
     headers: axum::http::HeaderMap,
     params: HashMap<String, String>,
+    resource_count: usize,
 ) -> Response {
     let realm_name = match realm {
         Some(r) => r,
@@ -914,38 +980,43 @@ async fn handle_auth_request(
         params
     };
 
-    let auth_req = match AuthorizationRequest::parse(&params) {
-        Ok(r) => r,
-        Err(e) => {
-            if let Some(resp) = try_auth_error_redirect(&state, &realm_name, &params, &e).await {
-                let mut details = std::collections::HashMap::new();
-                details.insert("error".to_string(), e.to_string());
-                emit_oidc_event(
-                    &state,
-                    &realm_id,
-                    EventType::LoginError,
-                    &ip,
-                    params.get("client_id").and_then(|s| issuerd_core::ClientId::new(s).ok()),
-                    None,
-                    None,
-                    Some(e.to_string()),
-                    details,
-                )
-                .await;
-                return resp;
-            }
-            if wants_html(&headers) {
-                let mut redirect = url::form_urlencoded::Serializer::new(String::new());
-                redirect.append_pair("error", e.oauth_error_code().as_ref());
-                redirect.append_pair("realm", &realm_name);
-                if let Some(desc) = params.get("error_description") {
-                    redirect.append_pair("error_description", desc);
+    let auth_req =
+        match issuerd_protocol::resource::validate_resource_parameter_count(resource_count)
+            .and_then(|()| AuthorizationRequest::parse(&params))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(resp) = try_auth_error_redirect(&state, &realm_name, &params, &e).await
+                {
+                    let mut details = std::collections::HashMap::new();
+                    details.insert("error".to_string(), e.to_string());
+                    emit_oidc_event(
+                        &state,
+                        &realm_id,
+                        EventType::LoginError,
+                        &ip,
+                        params.get("client_id").and_then(|s| issuerd_core::ClientId::new(s).ok()),
+                        None,
+                        None,
+                        Some(e.to_string()),
+                        details,
+                    )
+                    .await;
+                    return resp;
                 }
-                return Redirect::to(&format!("/login.html?{}", redirect.finish())).into_response();
+                if wants_html(&headers) {
+                    let mut redirect = url::form_urlencoded::Serializer::new(String::new());
+                    redirect.append_pair("error", e.oauth_error_code().as_ref());
+                    redirect.append_pair("realm", &realm_name);
+                    if let Some(desc) = params.get("error_description") {
+                        redirect.append_pair("error_description", desc);
+                    }
+                    return Redirect::to(&format!("/login.html?{}", redirect.finish()))
+                        .into_response();
+                }
+                return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
             }
-            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
-        }
-    };
+        };
 
     // Resolve the UI locale once per flow (`ui_locales` beats
     // `Accept-Language` beats the realm default) and pin it on every pending
@@ -974,15 +1045,19 @@ async fn handle_auth_request(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
     };
 
-    if let Err(e) = auth_req.validate(&realm, &client).and_then(|()| {
-        // RFC 8707 §2.1: a present `resource` must be on the server's
-        // allowlist (fail-closed; gated on `[mcp] enabled`).
-        crate::routes::protected_resource::validate_resource_param(
-            &state.config,
-            &realm_name,
-            auth_req.resource.as_deref(),
-        )
-    }) {
+    if let Err(e) =
+        auth_req
+            .validate_with_mcp(&realm, &client, state.config.mcp.enabled)
+            .and_then(|()| {
+                // RFC 8707 §2.1: a present `resource` must be on the server's
+                // allowlist (fail-closed; gated on `[mcp] enabled`).
+                crate::routes::protected_resource::validate_resource_param(
+                    &state.config,
+                    realm.name.as_str(),
+                    auth_req.resource.as_deref(),
+                )
+            })
+    {
         warn!(realm = %realm_id, client_id = %auth_req.client_id, error = %e, "authorization request validation failed");
         let mut details = std::collections::HashMap::new();
         details.insert("error".to_string(), e.to_string());
@@ -2107,7 +2182,7 @@ pub async fn device_auth_handler(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response(),
     };
 
-    if let Err(e) = device_req.validate(&client) {
+    if let Err(e) = device_req.validate_with_mcp(&client, state.config.mcp.enabled) {
         return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
 
@@ -2586,7 +2661,7 @@ pub async fn ciba_auth_handler(
     // The requested scope must be assigned to the client — otherwise CIBA
     // would be a side channel around the authorize-endpoint scope check
     // (e.g. picking up an unassigned `offline_access`).
-    if let Err(e) = ciba_req.validate_scope(&client) {
+    if let Err(e) = ciba_req.validate_scope_with_mcp(&client, state.config.mcp.enabled) {
         emit_oidc_event(
             &state,
             &realm_id,
@@ -3111,6 +3186,22 @@ async fn token_handler_inner(
         }
     };
 
+    // Token exchange accepted and ignored `resource` before RFC 8707 support.
+    // Preserve that behavior only while the new MCP surface is disabled;
+    // every other request enforces the single-resource profile before the
+    // form map can collapse repeated keys.
+    let legacy_token_exchange_resource = !state.config.mcp.enabled
+        && body_params
+            .get("grant_type")
+            .is_some_and(|value| value == GrantType::TokenExchange.as_str());
+    if legacy_token_exchange_resource {
+        body_params.remove("resource");
+    } else if let Err(e) = issuerd_protocol::resource::validate_resource_parameter_count(
+        issuerd_protocol::resource::resource_parameter_count(&body),
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+    }
+
     // Extract client credentials from the Basic Auth header, folding them
     // into the form params. A body `client_id` next to Basic auth is legal
     // and common; contradictions are rejected as `invalid_client`.
@@ -3215,7 +3306,7 @@ async fn token_handler_inner(
     let dpop_jkt: Option<String> = dpop.proof.map(|p| p.jkt);
     let dpop_response_nonce = dpop.response_nonce;
 
-    if let Err(e) = token_req.validate(&realm, &client) {
+    if let Err(e) = token_req.validate_with_mcp(&realm, &client, state.config.mcp.enabled) {
         warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "token request validation failed");
         return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
@@ -3251,7 +3342,7 @@ async fn token_handler_inner(
         }
         if let Err(e) = crate::routes::protected_resource::validate_resource_param(
             &state.config,
-            &realm_name,
+            realm.name.as_str(),
             Some(resource),
         ) {
             warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "token request resource validation failed");
@@ -3455,6 +3546,13 @@ async fn token_handler_inner(
                 (Some(requested), _) => Some(requested.clone()),
                 (None, granted) => granted.clone(),
             };
+            if let Err(e) = crate::routes::protected_resource::validate_resource_param(
+                &state.config,
+                realm.name.as_str(),
+                resource.as_deref(),
+            ) {
+                return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+            }
 
             // Create and store session for auth code grant
             let redirect_uri = match issuerd_core::RedirectUri::new(code_data.redirect_uri.clone())
@@ -3616,7 +3714,7 @@ async fn token_handler_inner(
 
             let refresh_token = match state
                 .token_manager
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &user,
                     &client,
                     &realm,
@@ -4003,7 +4101,7 @@ async fn token_handler_inner(
 
             let refresh_token = match state
                 .token_manager
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &user,
                     &client,
                     &realm,
@@ -4310,6 +4408,13 @@ async fn token_handler_inner(
                 }
             }
             let resource = validated.claims.resource.clone();
+            if let Err(e) = crate::routes::protected_resource::validate_resource_param(
+                &state.config,
+                realm.name.as_str(),
+                resource.as_deref(),
+            ) {
+                return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+            }
 
             // Rotate only after the old token is durably revoked; otherwise
             // issue no replacement that could leave both tokens usable.
@@ -4396,7 +4501,7 @@ async fn token_handler_inner(
             // does not accumulate across rotations).
             let new_refresh_token = match state
                 .token_manager
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &user,
                     &client,
                     &realm,
@@ -4845,7 +4950,7 @@ async fn token_handler_inner(
 
             let refresh_token = match state
                 .token_manager
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &user,
                     &device_client,
                     &realm,
@@ -5211,7 +5316,7 @@ async fn token_handler_inner(
 
             let refresh_token = match state
                 .token_manager
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &user,
                     &ciba_client,
                     &realm,
@@ -13601,7 +13706,7 @@ mod tests {
         state.storage.create_user_session(&realm_id, &session).await.unwrap();
         let refresh = state
             .token_manager
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &user,
                 &client,
                 &realm,
@@ -13771,7 +13876,7 @@ mod tests {
         state.storage.create_user_session(&realm_id, &session).await.unwrap();
         let refresh = state
             .token_manager
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &user,
                 &client,
                 &realm,
@@ -14134,7 +14239,7 @@ mod tests {
         state.storage.create_user_session(&realm_id, &session).await.unwrap();
         let refresh = state
             .token_manager
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &user,
                 &client,
                 &realm,
@@ -17529,7 +17634,7 @@ mod tests {
         let (realm, client, user) = sso_login_fixtures(&state).await;
         let refresh = state
             .token_manager
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &user,
                 &client,
                 &realm,

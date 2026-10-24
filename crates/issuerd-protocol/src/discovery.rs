@@ -354,12 +354,11 @@ impl DiscoveryResponse {
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728 §3.2) for a realm's MCP
 /// resource (`{issuer_url}/realms/{realm}/mcp`).
 ///
-/// Served from `/.well-known/oauth-protected-resource` (bare form: the master
-/// realm's resource) and `/.well-known/oauth-protected-resource/realms/{realm}/mcp`
-/// (the RFC 9728 §3.1 path-inserted form) when `[mcp] enabled = true`; MCP
-/// clients read this document to locate the authorization server before
-/// starting OAuth. Groundwork for the MCP endpoint (GitHub issue #39) — the
-/// resource itself follows.
+/// The path-suffixed RFC 9728 §3.1 form preserves any issuer base path:
+/// `/.well-known/oauth-protected-resource/{issuer-path}/realms/{realm}/mcp`.
+/// The bare `/.well-known/oauth-protected-resource` route is also available
+/// as an explicit `resource_metadata` alias for the master realm, not as
+/// origin-level metadata. Groundwork for the MCP endpoint (GitHub issue #39).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtectedResourceMetadata {
     /// The protected resource identifier (RFC 9728 §3.2 `resource`).
@@ -398,6 +397,18 @@ impl ProtectedResourceMetadata {
                 issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED.to_vec(),
             bearer_methods_supported: vec!["header".to_string()],
         }
+    }
+
+    /// Derive the RFC 9728 §3.1 metadata URL for the realm's MCP resource,
+    /// preserving any path prefix in the configured issuer URL.
+    pub fn metadata_url_for_realm(base_url: &str, realm: &str) -> Url {
+        let base = Url::parse(base_url).unwrap();
+        let resource_path = format!("{}/realms/{}/mcp", base.path().trim_end_matches('/'), realm);
+        let mut metadata = base;
+        metadata.set_query(None);
+        metadata.set_fragment(None);
+        metadata.set_path(&format!("/.well-known/oauth-protected-resource{resource_path}"));
+        metadata
     }
 }
 
@@ -584,6 +595,24 @@ mod tests {
         let doc = ProtectedResourceMetadata::for_realm("https://auth.example.com/", "demo");
         assert_eq!(doc.resource.as_str(), "https://auth.example.com/realms/demo/mcp");
         assert_eq!(doc.authorization_servers[0].as_str(), "https://auth.example.com/realms/demo");
+    }
+
+    #[test]
+    fn protected_resource_metadata_url_preserves_issuer_path_prefix() {
+        let url = ProtectedResourceMetadata::metadata_url_for_realm(
+            "https://auth.example.com/iam",
+            "demo",
+        );
+        assert_eq!(
+            url.as_str(),
+            "https://auth.example.com/.well-known/oauth-protected-resource/iam/realms/demo/mcp"
+        );
+        let url =
+            ProtectedResourceMetadata::metadata_url_for_realm("https://auth.example.com/", "demo");
+        assert_eq!(
+            url.as_str(),
+            "https://auth.example.com/.well-known/oauth-protected-resource/realms/demo/mcp"
+        );
     }
 
     #[test]

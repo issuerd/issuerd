@@ -187,6 +187,7 @@ pub mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales,
@@ -384,7 +385,6 @@ pub mod tests {
             _offline: bool,
             _dpop_jkt: Option<&str>,
             authorization_details: Option<&[serde_json::Value]>,
-            resource: Option<&str>,
         ) -> Result<issuerd_token::RefreshToken, issuerd_core::IssuerdError> {
             Ok(issuerd_token::RefreshToken {
                 token: "stub-refresh-token".to_string(),
@@ -400,7 +400,7 @@ pub mod tests {
                     scope: issuerd_core::Scope::parse("openid"),
                     cnf: None,
                     authorization_details: authorization_details.map(<[serde_json::Value]>::to_vec),
-                    resource: resource.map(str::to_string),
+                    resource: None,
                 },
             })
         }

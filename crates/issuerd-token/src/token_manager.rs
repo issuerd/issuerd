@@ -327,7 +327,34 @@ impl<C: CryptoProvider> TokenManager<C> {
         Ok(AccessToken { token, claims })
     }
 
-    /// Issue a refresh token.
+    /// Issue a refresh token without an RFC 8707 resource grant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue_refresh_token(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        session_id: &SessionId,
+        scope: &[String],
+        offline: bool,
+        dpop_jkt: Option<&str>,
+        authorization_details: Option<&[serde_json::Value]>,
+    ) -> Result<RefreshToken, IssuerdError> {
+        self.issue_refresh_token_with_resource(
+            user,
+            client,
+            realm,
+            session_id,
+            scope,
+            offline,
+            dpop_jkt,
+            authorization_details,
+            None,
+        )
+        .await
+    }
+
+    /// Issue a refresh token carrying an optional RFC 8707 resource grant.
     ///
     /// `offline` marks the token as an offline refresh token
     /// (`typ: Offline`, Keycloak `TokenUtil.TOKEN_TYPE_OFFLINE`): it is bound
@@ -350,7 +377,7 @@ impl<C: CryptoProvider> TokenManager<C> {
     /// the refresh token — like `authorization_details`, the refresh grant
     /// re-issues it onto the rotated token and the access token's `aud`.
     #[allow(clippy::too_many_arguments)]
-    pub async fn issue_refresh_token(
+    pub async fn issue_refresh_token_with_resource(
         &self,
         user: &User,
         client: &Client,
@@ -1109,8 +1136,42 @@ pub trait TokenIssuer: Send + Sync {
         offline: bool,
         dpop_jkt: Option<&str>,
         authorization_details: Option<&[serde_json::Value]>,
-        resource: Option<&str>,
     ) -> Result<RefreshToken, IssuerdError>;
+
+    /// Issue a refresh token carrying an optional RFC 8707 resource grant.
+    ///
+    /// Existing issuers keep their original required method. Implementations
+    /// that do not support resource indicators fail closed only when a caller
+    /// actually supplies a resource.
+    async fn issue_refresh_token_with_resource(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        session_id: &SessionId,
+        scope: &[String],
+        offline: bool,
+        dpop_jkt: Option<&str>,
+        authorization_details: Option<&[serde_json::Value]>,
+        resource: Option<&str>,
+    ) -> Result<RefreshToken, IssuerdError> {
+        if resource.is_some() {
+            return Err(IssuerdError::InvalidRequest(
+                "resource indicators are not supported by this token issuer".into(),
+            ));
+        }
+        self.issue_refresh_token(
+            user,
+            client,
+            realm,
+            session_id,
+            scope,
+            offline,
+            dpop_jkt,
+            authorization_details,
+        )
+        .await
+    }
 
     async fn issue_id_token(
         &self,
@@ -1220,9 +1281,33 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
         offline: bool,
         dpop_jkt: Option<&str>,
         authorization_details: Option<&[serde_json::Value]>,
-        resource: Option<&str>,
     ) -> Result<RefreshToken, IssuerdError> {
         self.issue_refresh_token(
+            user,
+            client,
+            realm,
+            session_id,
+            scope,
+            offline,
+            dpop_jkt,
+            authorization_details,
+        )
+        .await
+    }
+
+    async fn issue_refresh_token_with_resource(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        session_id: &SessionId,
+        scope: &[String],
+        offline: bool,
+        dpop_jkt: Option<&str>,
+        authorization_details: Option<&[serde_json::Value]>,
+        resource: Option<&str>,
+    ) -> Result<RefreshToken, IssuerdError> {
+        self.issue_refresh_token_with_resource(
             user,
             client,
             realm,
@@ -1646,7 +1731,7 @@ mod tests {
             },
         );
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &test_realm(),
@@ -1686,7 +1771,7 @@ mod tests {
             },
         );
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &test_realm(),
@@ -3285,10 +3370,15 @@ mod tests {
         let payload = decode_payload(&token.token);
         assert_eq!(payload["aud"], serde_json::json!(["my-app", "other"]));
 
-        // Validation still works: Audience deserialization tolerates the
-        // multi-audience array form and takes the first entry.
+        // Validation preserves the complete audience set while the first-entry
+        // convenience accessor remains available for client binding.
         let validated = tm.validate_access_token(&token.token).unwrap();
-        assert_eq!(validated.claims.aud, Audience::new("my-app").unwrap());
+        assert_eq!(
+            validated.claims.aud,
+            Audience::from_values(vec!["my-app".to_string(), "other".to_string()]).unwrap()
+        );
+        assert_eq!(validated.claims.aud.as_str(), "my-app");
+        assert!(validated.claims.aud.contains("other"));
     }
 
     #[tokio::test]
@@ -3309,7 +3399,7 @@ mod tests {
         );
 
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &test_realm(),
@@ -3349,7 +3439,7 @@ mod tests {
         // as online ones; access tokens still do not (covered by
         // access_token_rejected_as_refresh_token).
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &test_realm(),
@@ -3472,7 +3562,7 @@ mod tests {
         realm.refresh_token_lifespan = SecondsNonZero::new(1);
 
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &realm,
@@ -4011,7 +4101,7 @@ mod tests {
             assert!(attempt < 99, "issue+validate did not fit into one wall-clock second");
             let started = Utc::now().timestamp();
             let token = tm
-                .issue_refresh_token(
+                .issue_refresh_token_with_resource(
                     &test_user(),
                     &test_client(),
                     &test_realm(),
@@ -4453,7 +4543,7 @@ mod tests {
         assert!(!at.token.is_empty());
 
         let rt = ti
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &test_realm(),
@@ -5199,7 +5289,7 @@ mod tests {
     async fn es512_refresh_token_roundtrip() {
         let (tm, _) = multi_alg_tm().await;
         let token = tm
-            .issue_refresh_token(
+            .issue_refresh_token_with_resource(
                 &test_user(),
                 &test_client(),
                 &realm_with_alg("ES512"),

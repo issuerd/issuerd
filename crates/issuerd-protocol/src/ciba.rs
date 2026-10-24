@@ -79,13 +79,17 @@ impl CibaRequest {
     /// deliberately left unassigned. Separate from `validate` because the
     /// client is only known to the handler, not to `parse`.
     pub fn validate_scope(&self, client: &issuerd_core::Client) -> Result<(), IssuerdError> {
-        let available: std::collections::HashSet<&str> = client
-            .default_scopes
-            .iter()
-            .chain(client.optional_scopes.iter())
-            .map(String::as_str)
-            .collect();
-        if self.scope.iter().any(|s| !available.contains(s.as_str())) {
+        self.validate_scope_with_mcp(client, false)
+    }
+
+    pub fn validate_scope_with_mcp(
+        &self,
+        client: &issuerd_core::Client,
+        mcp_enabled: bool,
+    ) -> Result<(), IssuerdError> {
+        if self.scope.iter().any(|scope| {
+            !issuerd_core::client_scope_request_permitted_with_mcp(client, scope, mcp_enabled)
+        }) {
             return Err(IssuerdError::InvalidScope);
         }
         Ok(())

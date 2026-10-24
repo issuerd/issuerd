@@ -156,6 +156,15 @@ impl AuthorizationRequest {
     }
 
     pub fn validate(&self, realm: &Realm, client: &Client) -> Result<(), IssuerdError> {
+        self.validate_with_mcp(realm, client, false)
+    }
+
+    pub fn validate_with_mcp(
+        &self,
+        realm: &Realm,
+        client: &Client,
+        mcp_enabled: bool,
+    ) -> Result<(), IssuerdError> {
         // Redirect URI: Keycloak-compatible match (exact, or trailing-`*`
         // wildcard prefix) and no fragment
         if !client.redirect_uris.iter().any(|r| r.matches(self.redirect_uri.as_str())) {
@@ -189,20 +198,19 @@ impl AuthorizationRequest {
             ));
         }
 
-        // Scope: intersect with client's available scopes
-        let available_scopes: std::collections::HashSet<String> = client
-            .default_scopes
-            .iter()
-            .chain(client.optional_scopes.iter())
-            .cloned()
-            .collect();
-
         for scope in &self.scope {
             // `openid` is the OIDC protocol marker, not a client scope:
             // every client may request it (Keycloak parity — otherwise a
             // client registered via DCR without a `scope` field could never
-            // run an OIDC flow).
-            if scope != "openid" && !available_scopes.contains(scope) {
+            // run an OIDC flow). MCP scopes additionally require an
+            // optional-only assignment.
+            if scope != "openid"
+                && !issuerd_core::client_scope_request_permitted_with_mcp(
+                    client,
+                    scope,
+                    mcp_enabled,
+                )
+            {
                 return Err(IssuerdError::InvalidScope);
             }
         }

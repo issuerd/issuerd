@@ -172,6 +172,10 @@ async fn import_client(
             // the realm default-scope tables: import stores the document
             // verbatim.
             let mut client: issuerd_core::Client = rep.try_into()?;
+            issuerd_core::validate_no_default_mcp_scopes(
+                client.default_scopes.as_slice(),
+                state.mcp_enabled,
+            )?;
             client.realm_id = realm_id.clone();
             state.storage.create_client(realm_id, &client).await?;
             record(summary, ResourceType::Client, name, ImportAction::Added);
@@ -184,6 +188,10 @@ async fn import_client(
             // Same preserve rules as `PUT /clients/{id}`: an omitted secret
             // and the scope mappings survive the overwrite.
             let mut updated: issuerd_core::Client = rep.try_into()?;
+            issuerd_core::validate_no_default_mcp_scopes(
+                updated.default_scopes.as_slice(),
+                state.mcp_enabled,
+            )?;
             updated.id = existing.id;
             updated.realm_id = existing.realm_id;
             if updated.secret.is_none() {
@@ -1212,6 +1220,30 @@ mod tests {
         assert_eq!(events[0].operation_type, OperationType::Action);
         assert_eq!(events[0].resource_type, ResourceType::Realm);
         assert_eq!(events[0].resource_path, "realms/master/export");
+    }
+
+    #[tokio::test]
+    async fn partial_import_applies_mcp_scope_policy_to_clients() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let body = serde_json::json!({
+            "clients": [{
+                "client_id": "legacy-agent",
+                "redirect_uris": [],
+                "default_scopes": ["openid", "mcp:write"]
+            }]
+        });
+
+        // The shared test state defaults to MCP-disabled: legacy import works.
+        let (status, result) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "disabled import failed: {result}");
+
+        let mut enabled = manage_realm_state();
+        std::sync::Arc::get_mut(&mut enabled).unwrap().mcp_enabled = true;
+        let app = test_app(enabled);
+        let (status, _) = post_json(&app, "/admin/realms/master/partialImport", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     // -- push-revocation ------------------------------------------------------

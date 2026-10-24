@@ -4752,9 +4752,19 @@ pub(crate) mod tests {
         tm.issue_sso_session_token(&user, &client, &realm, &[], &session_id, None, None)
             .await
             .unwrap();
-        tm.issue_refresh_token(&user, &client, &realm, &session_id, &[], false, None, None, None)
-            .await
-            .unwrap();
+        tm.issue_refresh_token_with_resource(
+            &user,
+            &client,
+            &realm,
+            &session_id,
+            &[],
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         tm.issue_id_token(
             &user,
             &client,
@@ -4840,7 +4850,6 @@ pub(crate) mod tests {
             _offline: bool,
             _dpop_jkt: Option<&str>,
             _authorization_details: Option<&[serde_json::Value]>,
-            _resource: Option<&str>,
         ) -> Result<issuerd_token::RefreshToken, issuerd_core::IssuerdError> {
             self.refresh_token_result
                 .clone()

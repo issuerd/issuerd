@@ -1019,3 +1019,141 @@ async fn admin_mapper_types_enum_and_realm_defaults() {
     .await;
     assert_eq!(optionals.as_array().unwrap().len(), 5);
 }
+
+#[tokio::test]
+async fn mcp_scopes_are_optional_only_across_admin_paths() {
+    let mut config = crate::harness::test_config();
+    config.mcp.enabled = true;
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+    );
+    let harness = TestHarness::with_state(state);
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let realm = harness.create_realm("cs-mcp-policy").await;
+    let client = harness.create_client("cs-mcp-policy", false).await;
+    harness.create_user("cs-mcp-policy", "alice", "password123").await;
+    let scope = harness
+        .storage
+        .get_client_scope_by_name(&realm.id, "mcp:read")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let resp = put_json_auth(
+        &harness,
+        &format!(
+            "/admin/realms/cs-mcp-policy/clients/{}/default-client-scopes/{}",
+            client.id, scope.id
+        ),
+        &admin,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    for endpoint in [
+        "default-default-client-scopes",
+        "default-optional-client-scopes",
+    ] {
+        let resp = put_json_auth(
+            &harness,
+            &format!("/admin/realms/cs-mcp-policy/{endpoint}/{}", scope.id),
+            &admin,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "endpoint: {endpoint}");
+    }
+
+    let resp = harness
+        .post_json_auth(
+            "/admin/realms/cs-mcp-policy/clients",
+            &admin,
+            serde_json::json!({
+                "client_id": "default-agent",
+                "redirect_uris": ["http://localhost:8080/cb"],
+                "default_scopes": ["openid", "mcp:write"]
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = harness
+        .post_json_auth(
+            "/admin/realms/cs-mcp-policy/clients",
+            &admin,
+            serde_json::json!({
+                "client_id": "optional-agent",
+                "redirect_uris": ["http://localhost:8080/cb"],
+                "optional_scopes": ["mcp:read"]
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = put_json_auth(
+        &harness,
+        &format!(
+            "/admin/realms/cs-mcp-policy/clients/{}/optional-client-scopes/{}",
+            client.id, scope.id
+        ),
+        &admin,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    password_grant(&harness, "cs-mcp-policy", &client, "alice", "password123", "openid mcp:read")
+        .await;
+}
+
+#[tokio::test]
+async fn disabled_admin_paths_preserve_legacy_mcp_assignments() {
+    let harness = TestHarness::new().await;
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let realm = harness.create_realm("cs-mcp-disabled").await;
+    let client = harness.create_client("cs-mcp-disabled", false).await;
+    let scope = harness
+        .storage
+        .get_client_scope_by_name(&realm.id, "mcp:read")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let resp = harness
+        .post_json_auth(
+            "/admin/realms/cs-mcp-disabled/clients",
+            &admin,
+            serde_json::json!({
+                "client_id": "legacy-agent",
+                "redirect_uris": ["http://localhost:8080/cb"],
+                "default_scopes": ["openid", "mcp:write"]
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = put_json_auth(
+        &harness,
+        &format!(
+            "/admin/realms/cs-mcp-disabled/clients/{}/default-client-scopes/{}",
+            client.id, scope.id
+        ),
+        &admin,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    for endpoint in [
+        "default-default-client-scopes",
+        "default-optional-client-scopes",
+    ] {
+        let resp = put_json_auth(
+            &harness,
+            &format!("/admin/realms/cs-mcp-disabled/{endpoint}/{}", scope.id),
+            &admin,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "endpoint: {endpoint}");
+    }
+}

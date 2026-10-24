@@ -92,9 +92,7 @@ pub const ATTR_DCR_CLIENT_ID_ISSUED_AT: &str = "dcr.client_id_issued_at";
 /// payload policy; the marker itself is re-stamped on every update so the
 /// registrant cannot shed it. Stamped after the payload is converted, so a
 /// caller-supplied value never survives.
-pub const ATTR_DCR_POLICY: &str = "dcr.policy";
-/// The [`ATTR_DCR_POLICY`] value stamped on open-endpoint registrations.
-pub const DCR_POLICY_OPEN: &str = "open";
+pub use issuerd_core::{ATTR_DCR_POLICY, DCR_POLICY_OPEN};
 
 /// A non-empty attribute value, borrowed.
 fn attribute<'a>(client: &'a Client, key: &str) -> Option<&'a str> {

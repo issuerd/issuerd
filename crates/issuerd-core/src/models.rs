@@ -2948,17 +2948,28 @@ impl AsRef<str> for Issuer {
 // Audience
 // ---------------------------------------------------------------------------
 
-/// An audience identifier, validated as non-empty.
+/// A non-empty set of audience identifiers.
 ///
-/// Serialization is always a plain string. Deserialization additionally
-/// tolerates the JWT multi-audience form (`"aud": ["a", "b"]`), taking the
-/// first entry: tokens whose `aud` was extended by an Audience protocol
-/// mapper must still deserialize into the claims structs for
-/// stateless validation. Audience *checks* never rely on this field alone —
-/// `decode_token` enforces a pinned audience via the library, and callers
-/// otherwise verify audience themselves.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct Audience(String);
+/// The single-audience JWT form serializes as a plain string and the
+/// multi-audience form as an array. Deserialization preserves every entry so
+/// resource indicators and other audience extensions survive stateless
+/// validation and introspection. [`Audience::as_str`] retains the historical
+/// first-entry convenience accessor for client-binding call sites.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Audience(Vec<String>);
+
+impl Serialize for Audience {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.len() == 1 {
+            serializer.serialize_str(self.as_str())
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for Audience {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -2971,30 +2982,41 @@ impl<'de> Deserialize<'de> for Audience {
             Single(String),
             Many(Vec<String>),
         }
-        let first = match Repr::deserialize(deserializer)? {
-            Repr::Single(s) => s,
-            Repr::Many(mut v) if !v.is_empty() => v.remove(0),
-            Repr::Many(_) => {
-                return Err(serde::de::Error::custom("audience must not be empty"));
-            }
+        let values = match Repr::deserialize(deserializer)? {
+            Repr::Single(s) => vec![s],
+            Repr::Many(v) => v,
         };
-        Audience::new(first).map_err(serde::de::Error::custom)
+        Audience::from_values(values).map_err(serde::de::Error::custom)
     }
 }
 
 impl Audience {
-    /// Create a new `Audience`, validating the input.
+    /// Create a single-entry `Audience`, validating the input.
     pub fn new(audience: impl Into<String>) -> Result<Self, IssuerdError> {
-        let s = audience.into();
-        if s.is_empty() {
-            return Err(IssuerdError::InvalidRequest("audience must not be empty".into()));
-        }
-        Ok(Self(s))
+        Self::from_values(vec![audience.into()])
     }
 
-    /// Return the audience as a string slice.
+    /// Create an `Audience` from one or more non-empty identifiers.
+    pub fn from_values(values: Vec<String>) -> Result<Self, IssuerdError> {
+        if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+            return Err(IssuerdError::InvalidRequest("audience must not be empty".into()));
+        }
+        Ok(Self(values))
+    }
+
+    /// Return the first audience as a string slice.
     pub fn as_str(&self) -> &str {
+        &self.0[0]
+    }
+
+    /// Return every audience in wire order.
+    pub fn values(&self) -> &[String] {
         &self.0
+    }
+
+    /// Whether the audience set contains `audience`.
+    pub fn contains(&self, audience: &str) -> bool {
+        self.0.iter().any(|value| value == audience)
     }
 }
 
@@ -3008,7 +3030,7 @@ impl TryFrom<String> for Audience {
 
 impl AsRef<str> for Audience {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
@@ -5327,18 +5349,24 @@ mod tests {
     }
 
     #[test]
-    fn audience_deserialize_single_and_multi_audience_forms() {
-        // Plain string form.
-        let a: Audience = serde_json::from_str(r#""client-1""#).unwrap();
-        assert_eq!(a.as_str(), "client-1");
-        // JWT multi-audience array form: the first entry wins.
-        let a: Audience = serde_json::from_str(r#"["client-1","client-2"]"#).unwrap();
-        assert_eq!(a.as_str(), "client-1");
-        // An empty array is rejected (and must not panic).
+    fn audience_single_and_multi_audience_forms_round_trip_losslessly() {
+        let single: Audience = serde_json::from_str(r#""client-1""#).unwrap();
+        assert_eq!(single.as_str(), "client-1");
+        assert_eq!(single.values(), ["client-1"]);
+        assert_eq!(serde_json::to_string(&single).unwrap(), r#""client-1""#);
+
+        let multiple: Audience = serde_json::from_str(r#"["client-1","client-2"]"#).unwrap();
+        assert_eq!(multiple.as_str(), "client-1");
+        assert_eq!(multiple.values(), ["client-1", "client-2"]);
+        assert!(multiple.contains("client-2"));
+        assert!(!multiple.contains("client-3"));
+        assert_eq!(serde_json::to_string(&multiple).unwrap(), r#"["client-1","client-2"]"#);
+
         let err = serde_json::from_str::<Audience>(r#"[]"#).unwrap_err();
         assert!(err.to_string().contains("audience must not be empty"));
-        // An array whose first entry is empty still fails validation.
         assert!(serde_json::from_str::<Audience>(r#"["","client-2"]"#).is_err());
+        assert!(serde_json::from_str::<Audience>(r#"["client-1",""]"#).is_err());
+        assert!(Audience::from_values(Vec::new()).is_err());
     }
 
     // ------------------------------------------------------------------

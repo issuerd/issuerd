@@ -597,7 +597,11 @@ impl ServerState {
             match crate::provisioner::Provisioner::from_file(provision_path) {
                 Ok(provisioner) => {
                     if let Err(e) = provisioner
-                        .apply_once(state.storage.as_ref(), &state.config.issuer_url)
+                        .apply_once_with_mcp(
+                            state.storage.as_ref(),
+                            &state.config.issuer_url,
+                            config.mcp.enabled,
+                        )
                         .await
                     {
                         tracing::error!(error = %e, "provision failed");
@@ -607,6 +611,10 @@ impl ServerState {
                     tracing::error!(error = %e, "failed to load provision config");
                 }
             }
+        }
+
+        if config.mcp.enabled {
+            issuerd_storage::seed::validate_mcp_scope_policy(state.storage.as_ref()).await?;
         }
 
         Ok(state)

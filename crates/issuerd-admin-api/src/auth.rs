@@ -611,6 +611,7 @@ mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales: issuerd_core::i18n::SHIPPED_LOCALES
@@ -1036,6 +1037,7 @@ mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales: issuerd_core::i18n::SHIPPED_LOCALES
@@ -1122,6 +1124,7 @@ mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales: issuerd_core::i18n::SHIPPED_LOCALES

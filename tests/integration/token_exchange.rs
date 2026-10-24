@@ -400,6 +400,56 @@ async fn internal_exchange_scope_narrowing_rules() {
     assert_eq!(claims["scope"].as_str().unwrap(), "openid profile");
 }
 
+#[tokio::test]
+async fn resource_parameter_compatibility_follows_the_mcp_gate() {
+    for enabled in [false, true] {
+        let mut config = crate::harness::test_config();
+        config.mcp.enabled = enabled;
+        let state = std::sync::Arc::new(
+            issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+        );
+        let harness = TestHarness::with_state(state);
+        let realm = if enabled {
+            "ex-resource-on"
+        } else {
+            "ex-resource-off"
+        };
+        harness.create_realm(realm).await;
+        let requesting = harness.create_client(realm, false).await;
+        let target = harness.create_client(realm, false).await;
+        set_exchange_flag(&harness, realm, &target, true).await;
+        harness.create_user(realm, "alice", "Password123!").await;
+        let subject =
+            password_grant_token(&harness, realm, &requesting, "alice", "Password123!", "openid")
+                .await;
+        let resource = if enabled {
+            format!("{}/realms/{realm}/mcp", harness.base_url)
+        } else {
+            "not an absolute URI and legacy token exchange ignored it".to_string()
+        };
+        let mut params = vec![
+            ("grant_type", EXCHANGE_GRANT),
+            ("client_id", requesting.client_id.as_ref()),
+            ("client_secret", requesting.secret.as_deref().unwrap()),
+            ("subject_token", subject.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("audience", target.client_id.as_ref()),
+            ("resource", resource.as_str()),
+        ];
+        if !enabled {
+            params.push(("resource", "a repeated legacy value is ignored too"));
+        }
+        let resp = harness.post_form(&token_path(realm), &params).await;
+        if enabled {
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(resp).await["error"], "invalid_target");
+        } else {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(body_json(resp).await["access_token"].is_string());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subject-token rejection matrix
 // ---------------------------------------------------------------------------

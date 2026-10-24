@@ -484,27 +484,30 @@ is advertised — clients discover the requirement from the
 MCP (Model Context Protocol) surface — groundwork for the MCP resource
 endpoint. The flag currently gates two pieces of the MCP surface:
 
-- the RFC 9728 protected-resource metadata document that MCP clients read to
-  discover the authorization server before starting OAuth:
-  `GET /.well-known/oauth-protected-resource` serves the **master** realm's
-  MCP resource metadata (resource identifier
-  `{issuer_url}/realms/master/mcp`), and
-  `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` serves the
-  named realm's (the RFC 9728 §3.1 path-inserted form);
-- RFC 8707 resource indicators: the `resource` parameter at the
-  authorization endpoint (plain, PAR-pushed, and JAR request-object
-  requests) and on the token endpoint's `authorization_code` /
-  `refresh_token` grants. The allowlist holds exactly one value per realm —
-  the MCP resource URI `{issuer_url}/realms/{realm}/mcp`, compared
-  byte-for-byte. A granted resource becomes the access token's `aud`
-  (`[client_id, resource]`, client id first) and rides the refresh token as
-  a `resource` claim; redemption may restate it, omit it (inherit), or
-  introduce it when the code carried none, while a refresh request may only
-  restate or omit. Every other grant refuses `resource` outright.
+- RFC 9728 protected-resource metadata. The bare
+  `GET /.well-known/oauth-protected-resource` is an explicit
+  `resource_metadata` alias for the **master** realm, not origin-level
+  metadata. The canonical per-realm URL is
+  `GET /.well-known/oauth-protected-resource/{issuer-path}/realms/{realm}/mcp`
+  (the issuer path is empty when `issuer_url` has no path prefix). Metadata is
+  served only for canonical realm names; legacy UUID aliases and mismatched
+  paths answer 404.
+- RFC 8707 resource indicators at the authorization endpoint (plain,
+  PAR-pushed, and JAR request-object requests) and the token endpoint's
+  `authorization_code` / `refresh_token` grants. The allowlist holds exactly
+  one canonical realm-name value per realm — `{issuer_url}/realms/{realm}/mcp`,
+  compared byte-for-byte. Each request may carry at most one `resource`;
+  repeated values are rejected with `invalid_target` before query/form maps
+  can collapse them. A granted resource becomes the access token's `aud`
+  (`[client_id, resource]`, client id first), preserved through validation and
+  introspection, and rides the refresh token as a `resource` claim. Code
+  redemption may restate it, omit it (inherit), or introduce it when the code
+  carried none; refresh may only restate or omit. Every other grant refuses
+  `resource` when MCP is enabled.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm) and any request carrying a `resource` parameter is refused with `invalid_target` — fail-closed, never silently ignored. |
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
 
 ```toml
 [mcp]
@@ -514,10 +517,21 @@ enabled = false
 Environment equivalent: `ISSUERD_MCP__ENABLED`.
 
 The document advertises the realm issuer URL as the authorization server, the
-built-in `mcp:read` / `mcp:write` scopes (never default-assigned — an
-administrator grants them to specific agent clients), and the DPoP
-proof-signing algorithms, identical to `dpop_signing_alg_values_supported` in
-the OIDC discovery document.
+built-in `mcp:read` / `mcp:write` scopes, and the DPoP proof-signing
+algorithms, identical to `dpop_signing_alg_values_supported` in the OIDC
+discovery document. When MCP is enabled, its scopes require an
+administrator's explicit optional assignment: anonymous DCR rejects them in
+either scope list, and Admin API, provisioning, and realm-default paths
+reject default assignments. With MCP disabled, legacy custom scope names keep
+the previous default∪optional behavior.
+
+Before enabling MCP, every cluster node must run the resource-aware version
+(older nodes drop `resource` when rotating refresh tokens), and legacy custom
+MCP scope definitions must be reconciled. Startup validates existing scopes
+and assignments and aborts on mapper/role-bearing custom scopes, default
+assignments, or open-registered clients carrying MCP scopes. MCP-disabled
+legacy deployments do not run this validation and keep booting unchanged. See
+[backup-and-upgrade.md](backup-and-upgrade.md).
 
 ## [crypto.key_encryption]
 
@@ -880,7 +894,8 @@ lifetime_secs = 30              # single-use nonce TTL; 5-300
 # metadata routes (/.well-known/oauth-protected-resource — MCP clients read it
 # to discover the authorization server) and RFC 8707 resource indicators (the
 # `resource` parameter; the only allowlisted value is the realm's MCP resource
-# URI). The routes 404 and any `resource` is refused while disabled.
+# URI). The routes 404 and supported flows reject `resource` while disabled;
+# legacy token exchange keeps its historical ignore behavior.
 [mcp]
 enabled = false
 

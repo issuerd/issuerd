@@ -213,6 +213,10 @@ pub async fn create_client(
     let mut rep = body;
     seed_client_scopes_from_realm_defaults(&state.storage, &realm_id, &mut rep).await?;
     let mut client: issuerd_core::Client = rep.clone().try_into()?;
+    issuerd_core::validate_no_default_mcp_scopes(
+        client.default_scopes.as_slice(),
+        state.mcp_enabled,
+    )?;
     if client
         .attributes
         .get(issuerd_core::Client::ADMIN_API_ACCESS_ATTRIBUTE)
@@ -319,6 +323,10 @@ pub async fn update_client(
         .await?
         .ok_or(AdminApiError::NotFound)?;
     let mut updated: issuerd_core::Client = body.clone().try_into()?;
+    issuerd_core::validate_no_default_mcp_scopes(
+        updated.default_scopes.as_slice(),
+        state.mcp_enabled,
+    )?;
     updated.id = existing.id;
     updated.realm_id = existing.realm_id;
     // A secret-less update body means "leave the secret unchanged", not

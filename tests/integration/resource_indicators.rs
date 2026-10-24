@@ -333,8 +333,37 @@ async fn code_flow_binds_resource_as_access_token_audience() {
 
     // RFC 8707 §2.1: the access token's audience is the client plus the
     // granted resource, client id first.
-    let access_claims = jwt_claims(json["access_token"].as_str().unwrap());
+    let access_token = json["access_token"].as_str().unwrap();
+    let access_claims = jwt_claims(access_token);
     assert_eq!(access_claims["aud"], serde_json::json!([client.client_id.as_ref(), resource]));
+
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_components(
+            &issuerd_server::config::ServerConfig::default(),
+            harness.storage.clone(),
+            harness.cache.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let validated = state.token_service.validate_access_token(access_token).unwrap();
+    assert!(validated.claims.aud.contains(&resource));
+    assert_eq!(validated.claims.aud.values(), &[client.client_id.to_string(), resource.clone()]);
+
+    let introspection = harness
+        .post_form(
+            "/realms/ri-flow/protocol/openid-connect/token/introspect",
+            &[
+                ("token", access_token),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(introspection.status(), StatusCode::OK);
+    let introspection = json_body(introspection).await;
+    assert_eq!(introspection["active"], true);
+    assert_eq!(introspection["aud"], serde_json::json!([client.client_id.as_ref(), resource]));
 
     // The refresh token is the durable artifact of the grant: it carries
     // the resource claim.
@@ -458,6 +487,188 @@ async fn refresh_restate_omit_and_reject() {
 }
 
 #[tokio::test]
+async fn disabling_mcp_rejects_persisted_resource_grants_without_rotating_refresh() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-toggle").await;
+    let client = harness.create_client("ri-toggle", false).await;
+    harness.create_user("ri-toggle", "mia", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-toggle");
+
+    let code = run_code_flow(
+        &harness,
+        "ri-toggle",
+        &client,
+        "mia",
+        &format!("&resource={}", enc(&resource)),
+    )
+    .await;
+    let refresh_code = run_code_flow(
+        &harness,
+        "ri-toggle",
+        &client,
+        "mia",
+        &format!("&resource={}", enc(&resource)),
+    )
+    .await;
+    let (status, issued) = redeem_code(&harness, "ri-toggle", &client, &refresh_code, &[]).await;
+    assert_eq!(status, StatusCode::OK, "initial redemption failed: {issued}");
+    let refresh_token = issued["refresh_token"].as_str().unwrap().to_string();
+
+    let disabled_state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_components(
+            &crate::harness::test_config(),
+            harness.storage.clone(),
+            harness.cache.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let disabled = TestHarness::with_state(disabled_state);
+    let (status, json) = redeem_code(&disabled, "ri-toggle", &client, &code, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_invalid_target(&json);
+    let (status, json) = refresh(&disabled, "ri-toggle", &client, &refresh_token, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_invalid_target(&json);
+
+    let reenabled_state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_components(
+            &{
+                let mut config = crate::harness::test_config();
+                config.mcp.enabled = true;
+                config
+            },
+            harness.storage.clone(),
+            harness.cache.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let reenabled = TestHarness::with_state(reenabled_state);
+    let (status, json) = refresh(&reenabled, "ri-toggle", &client, &refresh_token, &[]).await;
+    assert_eq!(status, StatusCode::OK, "refresh was revoked during disabled rejection: {json}");
+    assert_eq!(
+        jwt_claims(json["access_token"].as_str().unwrap())["aud"],
+        serde_json::json!([client.client_id.as_ref(), resource])
+    );
+}
+
+#[tokio::test]
+async fn disabled_mcp_preserves_legacy_default_scope_behavior() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("ri-legacy-scope").await;
+    let mut client = harness.create_client("ri-legacy-scope", false).await;
+    client.default_scopes = issuerd_core::Scope::parse("openid mcp:read");
+    harness.storage.update_client(&realm.id, &client).await.unwrap();
+    harness.create_user("ri-legacy-scope", "nina", "Password123!").await;
+
+    let resp = harness
+        .post_form(
+            &token_path("ri-legacy-scope"),
+            &[
+                ("grant_type", "password"),
+                ("username", "nina"),
+                ("password", "Password123!"),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+                ("scope", "openid mcp:read"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["scope"].as_str().unwrap().contains("mcp:read"));
+
+    let query = code_flow_query(&client, "").replace("scope=openid", "scope=openid+mcp:read");
+    let resp = authorize(&harness, "ri-legacy-scope", &query).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let code = browser_login(&harness, "ri-legacy-scope", &location, "nina").await;
+    let (status, json) = redeem_code(&harness, "ri-legacy-scope", &client, &code, &[]).await;
+    assert_eq!(status, StatusCode::OK, "legacy code flow failed: {json}");
+    assert!(jwt_claims(json["access_token"].as_str().unwrap())["scope"]
+        .as_str()
+        .unwrap()
+        .contains("mcp:read"));
+}
+
+#[tokio::test]
+async fn device_and_ciba_enforce_optional_only_scopes_when_enabled() {
+    let harness = harness_with_mcp_enabled().await;
+    let realm = harness.create_realm("ri-device-scope").await;
+    harness.create_user("ri-device-scope", "olga", "Password123!").await;
+
+    for optional in ["", "mcp:write"] {
+        let mut device_client = harness.create_client("ri-device-scope", true).await;
+        device_client.default_scopes = issuerd_core::Scope::parse("openid mcp:write");
+        device_client.optional_scopes = issuerd_core::Scope::parse(optional);
+        harness.storage.update_client(&realm.id, &device_client).await.unwrap();
+        let resp = harness
+            .post_form(
+                "/realms/ri-device-scope/protocol/openid-connect/auth/device",
+                &[
+                    ("client_id", device_client.client_id.as_ref()),
+                    ("scope", "mcp:write"),
+                ],
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_scope");
+
+        let mut ciba_client = harness.create_client("ri-device-scope", false).await;
+        ciba_client.default_scopes = issuerd_core::Scope::parse("openid mcp:write");
+        ciba_client.optional_scopes = issuerd_core::Scope::parse(optional);
+        harness.storage.update_client(&realm.id, &ciba_client).await.unwrap();
+        let resp = harness
+            .post_form(
+                "/realms/ri-device-scope/protocol/openid-connect/ext/ciba/auth",
+                &[
+                    ("client_id", ciba_client.client_id.as_ref()),
+                    ("client_secret", ciba_client.secret.as_deref().unwrap()),
+                    ("scope", "mcp:write"),
+                    ("login_hint", "olga"),
+                ],
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_scope");
+    }
+
+    let mut device_client = harness.create_client("ri-device-scope", true).await;
+    device_client.default_scopes = issuerd_core::Scope::parse("openid");
+    device_client.optional_scopes = issuerd_core::Scope::parse("mcp:read");
+    harness.storage.update_client(&realm.id, &device_client).await.unwrap();
+    let resp = harness
+        .post_form(
+            "/realms/ri-device-scope/protocol/openid-connect/auth/device",
+            &[
+                ("client_id", device_client.client_id.as_ref()),
+                ("scope", "mcp:read"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["device_code"].is_string());
+
+    let mut ciba_client = harness.create_client("ri-device-scope", false).await;
+    ciba_client.default_scopes = issuerd_core::Scope::parse("openid");
+    ciba_client.optional_scopes = issuerd_core::Scope::parse("mcp:read");
+    harness.storage.update_client(&realm.id, &ciba_client).await.unwrap();
+    let resp = harness
+        .post_form(
+            "/realms/ri-device-scope/protocol/openid-connect/ext/ciba/auth",
+            &[
+                ("client_id", ciba_client.client_id.as_ref()),
+                ("client_secret", ciba_client.secret.as_deref().unwrap()),
+                ("scope", "mcp:read"),
+                ("login_hint", "olga"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["auth_req_id"].is_string());
+}
+
+#[tokio::test]
 async fn resource_rejected_for_other_grants() {
     let harness = harness_with_mcp_enabled().await;
     harness.create_realm("ri-grants").await;
@@ -495,6 +706,133 @@ async fn resource_rejected_for_other_grants() {
             ],
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_invalid_target(&json_body(resp).await);
+}
+
+#[tokio::test]
+async fn legacy_realm_id_urls_use_only_the_canonical_resource_name() {
+    let harness = harness_with_mcp_enabled().await;
+    let realm = issuerd_core::Realm {
+        id: issuerd_core::RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+        name: issuerd_core::RealmName::new("ri-alias").unwrap(),
+        ..Default::default()
+    };
+    harness.storage.create_realm(&realm).await.unwrap();
+    let realm_id = realm.id.to_string();
+    let client = harness.create_client(&realm_id, false).await;
+    harness.create_user(&realm_id, "henry", "Password123!").await;
+    let canonical = mcp_resource(&harness, "ri-alias");
+    let alias = mcp_resource(&harness, &realm_id);
+
+    let resp = authorize(
+        &harness,
+        &realm_id,
+        &code_flow_query(&client, &format!("&resource={}", enc(&alias))),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(resp.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+
+    let code = run_code_flow(
+        &harness,
+        &realm_id,
+        &client,
+        "henry",
+        &format!("&resource={}", enc(&canonical)),
+    )
+    .await;
+    let (status, json) = redeem_code(&harness, &realm_id, &client, &code, &[]).await;
+    assert_eq!(status, StatusCode::OK, "ID-alias redemption failed: {json}");
+    assert_eq!(
+        jwt_claims(json["access_token"].as_str().unwrap())["aud"],
+        serde_json::json!([client.client_id.as_ref(), canonical])
+    );
+}
+
+#[tokio::test]
+async fn repeated_resource_parameters_are_rejected_before_map_collapse() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-repeat").await;
+    let client = harness.create_client("ri-repeat", false).await;
+    harness.create_user("ri-repeat", "irene", "Password123!").await;
+    let good = mcp_resource(&harness, "ri-repeat");
+    let good_enc = enc(&good);
+    let bad_enc = enc("https://api.example.com/other");
+
+    for pair in [
+        format!("&resource={bad_enc}&resource={good_enc}"),
+        format!("&resource={good_enc}&resource={bad_enc}"),
+        format!("&resource={good_enc}&resource={good_enc}"),
+    ] {
+        let resp = authorize(&harness, "ri-repeat", &code_flow_query(&client, &pair)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(resp.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+    }
+
+    let resp = harness
+        .post_form(
+            &format!("{}?resource={bad_enc}", auth_path("ri-repeat")),
+            &[
+                ("response_type", "code"),
+                ("client_id", client.client_id.as_ref()),
+                ("redirect_uri", REDIRECT_URI),
+                ("scope", "openid"),
+                ("state", "ri-state"),
+                ("resource", &good),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(resp.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+
+    for resources in [
+        ["https://api.example.com/other", good.as_str()],
+        [good.as_str(), "https://api.example.com/other"],
+    ] {
+        let resp = harness
+            .post_form(
+                &token_path("ri-repeat"),
+                &[
+                    ("grant_type", "password"),
+                    ("username", "irene"),
+                    ("password", "Password123!"),
+                    ("client_id", client.client_id.as_ref()),
+                    ("client_secret", client.secret.as_deref().unwrap()),
+                    ("resource", resources[0]),
+                    ("resource", resources[1]),
+                ],
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_invalid_target(&json_body(resp).await);
+    }
+
+    let resp = harness
+        .post_form(
+            &par_path("ri-repeat"),
+            &[
+                ("response_type", "code"),
+                ("client_id", client.client_id.as_ref()),
+                ("redirect_uri", REDIRECT_URI),
+                ("scope", "openid"),
+                ("client_secret", client.secret.as_deref().unwrap()),
+                ("resource", &good),
+                ("resource", &good),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_invalid_target(&json_body(resp).await);
+
+    let req = axum::http::Request::builder()
+        .uri(format!("/realms/ri-repeat/kerberos?resource={good_enc}&resource={good_enc}"))
+        .header(axum::http::header::AUTHORIZATION, "Negotiate dGVzdA==")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(harness.app.clone(), harness.add_connect_info(req))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_invalid_target(&json_body(resp).await);
 }

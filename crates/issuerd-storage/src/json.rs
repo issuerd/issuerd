@@ -2780,4 +2780,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[tokio::test]
+    async fn json_snapshot_custom_mcp_definition_is_rejected_after_reload() {
+        let path =
+            std::env::temp_dir().join(format!("issuerd-json-test-{}.json", uuid::Uuid::new_v4()));
+        let realm_id = RealmId::new("realm-1").unwrap();
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&test_realm()).await.unwrap();
+            let mut scope = storage
+                .get_client_scope_by_name(&realm_id, MCP_SCOPE_WRITE)
+                .await
+                .unwrap()
+                .unwrap();
+            let mapper = builtin_client_scopes(&realm_id)
+                .into_iter()
+                .find(|scope| scope.name == "profile")
+                .unwrap()
+                .protocol_mappers
+                .into_iter()
+                .next()
+                .unwrap();
+            scope.protocol_mappers.push(mapper);
+            storage.update_client_scope(&realm_id, &scope).await.unwrap();
+        }
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let err = crate::seed::validate_mcp_scope_policy(&storage).await.unwrap_err();
+            assert!(err.to_string().contains("protocol mappers or role mappings"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn json_snapshot_default_mcp_assignment_is_rejected_after_reload() {
+        let path =
+            std::env::temp_dir().join(format!("issuerd-json-test-{}.json", uuid::Uuid::new_v4()));
+        let realm_id = RealmId::new("realm-1").unwrap();
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            storage.create_realm(&test_realm()).await.unwrap();
+            let mut client = full_client(&realm_id);
+            client.default_scopes = Scope::parse("openid mcp:write");
+            storage.create_client(&realm_id, &client).await.unwrap();
+        }
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let err = crate::seed::validate_mcp_scope_policy(&storage).await.unwrap_err();
+            assert!(err.to_string().contains("default list"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

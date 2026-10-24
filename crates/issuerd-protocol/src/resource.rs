@@ -31,6 +31,22 @@ pub fn parse_resource_indicator(raw: Option<&String>) -> Result<Option<String>, 
     Ok(Some(raw.clone()))
 }
 
+/// Count `resource` occurrences in an URL-encoded query or form body before
+/// deserialization can collapse repeated keys.
+pub fn resource_parameter_count(encoded: &str) -> usize {
+    url::form_urlencoded::parse(encoded.as_bytes())
+        .filter(|(name, _)| name == "resource")
+        .count()
+}
+
+/// Enforce this server's single-resource profile (RFC 8707 §2).
+pub fn validate_resource_parameter_count(count: usize) -> Result<(), IssuerdError> {
+    if count > 1 {
+        return Err(IssuerdError::InvalidTarget("resource must appear at most once".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +66,23 @@ mod tests {
     #[test]
     fn absent_resource_is_none() {
         assert_eq!(parse_resource_indicator(None).unwrap(), None);
+    }
+
+    #[test]
+    fn repeated_resource_parameters_are_counted_and_rejected() {
+        for encoded in [
+            "resource=https%3A%2F%2Fa.example&resource=https%3A%2F%2Fb.example",
+            "resource=https%3A%2F%2Fa.example&x=1&resource=https%3A%2F%2Fa.example",
+        ] {
+            assert_eq!(resource_parameter_count(encoded), 2);
+            assert!(matches!(
+                validate_resource_parameter_count(resource_parameter_count(encoded)),
+                Err(IssuerdError::InvalidTarget(_))
+            ));
+        }
+        assert_eq!(resource_parameter_count("resource=https%3A%2F%2Fa.example"), 1);
+        assert!(validate_resource_parameter_count(0).is_ok());
+        assert!(validate_resource_parameter_count(1).is_ok());
     }
 
     #[rstest]

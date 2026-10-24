@@ -114,6 +114,122 @@ async fn path_suffixed_route_serves_the_named_realm() {
 }
 
 #[tokio::test]
+async fn issuer_path_prefix_uses_the_rfc_derived_metadata_url() {
+    let mut config = crate::harness::test_config();
+    config.issuer_url = "http://localhost:8080/iam".to_string();
+    config.mcp.enabled = true;
+    let state = std::sync::Arc::new(
+        issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
+    );
+    let harness = TestHarness::with_state(state);
+    harness.create_realm("demo").await;
+
+    let metadata_url =
+        issuerd_protocol::discovery::ProtectedResourceMetadata::metadata_url_for_realm(
+            &harness.base_url,
+            "demo",
+        );
+    assert_eq!(metadata_url.path(), "/.well-known/oauth-protected-resource/iam/realms/demo/mcp");
+    let resp = get(&harness, metadata_url.path()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["resource"], "http://localhost:8080/iam/realms/demo/mcp");
+    assert_eq!(
+        json["authorization_servers"],
+        serde_json::json!(["http://localhost:8080/iam/realms/demo"])
+    );
+}
+
+#[tokio::test]
+async fn percent_encoded_realm_name_resolves_to_canonical_metadata() {
+    let harness = harness_with_mcp_enabled().await;
+    let realm = issuerd_core::Realm {
+        id: issuerd_core::RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+        name: issuerd_core::RealmName::new("tenant{one}").unwrap(),
+        ..Default::default()
+    };
+    harness.storage.create_realm(&realm).await.unwrap();
+    let metadata_url =
+        issuerd_protocol::discovery::ProtectedResourceMetadata::metadata_url_for_realm(
+            &harness.base_url,
+            "tenant{one}",
+        );
+    assert!(metadata_url.path().contains("tenant%7Bone%7D"));
+    let resp = get(&harness, metadata_url.path()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await["resource"],
+        format!("{}/realms/tenant%7Bone%7D/mcp", harness.base_url)
+    );
+}
+
+#[tokio::test]
+async fn realm_id_alias_is_not_a_second_metadata_resource() {
+    let harness = harness_with_mcp_enabled().await;
+    let realm = issuerd_core::Realm {
+        id: issuerd_core::RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+        name: issuerd_core::RealmName::new("demo").unwrap(),
+        ..Default::default()
+    };
+    harness.storage.create_realm(&realm).await.unwrap();
+    let resp = get(&harness, &realm_path(realm.id.as_ref())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_enabled_boot_rejects_legacy_default_scope_but_disabled_boots() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("demo").await;
+    let mut client = harness.create_client("demo", false).await;
+    client.default_scopes = issuerd_core::Scope::parse("openid mcp:write");
+    harness.storage.update_client(&realm.id, &client).await.unwrap();
+
+    let disabled = crate::harness::test_config();
+    issuerd_server::state::ServerState::from_components(
+        &disabled,
+        harness.storage.clone(),
+        harness.cache.clone(),
+    )
+    .await
+    .unwrap();
+
+    let mut enabled = crate::harness::test_config();
+    enabled.mcp.enabled = true;
+    let err = issuerd_server::state::ServerState::from_components(
+        &enabled,
+        harness.storage.clone(),
+        harness.cache.clone(),
+    )
+    .await
+    .err()
+    .expect("MCP-enabled boot must reject the legacy default assignment");
+    assert!(err.to_string().contains("MCP scope collision"));
+}
+
+#[tokio::test]
+async fn challenge_metadata_url_roundtrips_to_the_same_resource() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("demo").await;
+    let resource = format!("{}/realms/demo/mcp", harness.base_url);
+    let metadata_url =
+        issuerd_protocol::discovery::ProtectedResourceMetadata::metadata_url_for_realm(
+            &harness.base_url,
+            "demo",
+        );
+    let challenge =
+        issuerd_server::challenges::invalid_token_challenge(metadata_url.as_str(), None);
+    assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        challenge.headers()[axum::http::header::WWW_AUTHENTICATE].to_str().unwrap(),
+        format!("Bearer resource_metadata=\"{metadata_url}\"")
+    );
+
+    let resp = get(&harness, metadata_url.path()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["resource"], resource);
+}
+
+#[tokio::test]
 async fn unknown_realm_answers_404() {
     let harness = harness_with_mcp_enabled().await;
     let resp = get(&harness, &realm_path("no-such-realm")).await;

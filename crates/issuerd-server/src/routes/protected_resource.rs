@@ -8,13 +8,12 @@
 //! by `[mcp] enabled`, default off — a disabled gate answers 404 exactly like
 //! an unknown realm, revealing nothing):
 //!
-//! - `GET /.well-known/oauth-protected-resource` — the bare form, serving the
-//!   **master** realm's MCP resource (mirrors how bare
-//!   `/.well-known/openid-configuration` falls back to `master` in
-//!   [`super::oidc::discovery_handler`]);
-//! - `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` — the
-//!   RFC 9728 §3.1 path-inserted form for the resource
-//!   `{issuer_url}/realms/{realm}/mcp`.
+//! - `GET /.well-known/oauth-protected-resource` — an explicit
+//!   `resource_metadata` alias for the **master** realm's MCP resource, not
+//!   origin-level metadata;
+//! - `GET /.well-known/oauth-protected-resource/{issuer-path}/realms/{realm}/mcp`
+//!   — the RFC 9728 §3.1 path-inserted form for the canonical resource
+//!   `{issuer_url}/realms/{realm}/mcp`, including any issuer base path.
 //!
 //! The RealmResolution middleware only extracts realms from `/realms/` and
 //! `/admin/realms/` prefixes, so these requests arrive unresolved and the
@@ -27,7 +26,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -47,6 +46,11 @@ pub(crate) fn realm_mcp_resource(issuer_url: &str, realm_name: &str) -> String {
     ProtectedResourceMetadata::for_realm(issuer_url, realm_name)
         .resource
         .to_string()
+}
+
+/// The canonical RFC 9728 metadata URL advertised in Bearer challenges.
+pub(crate) fn realm_mcp_metadata_url(issuer_url: &str, realm_name: &str) -> String {
+    ProtectedResourceMetadata::metadata_url_for_realm(issuer_url, realm_name).to_string()
 }
 
 /// Validate an RFC 8707 `resource` parameter against the realm's allowlist.
@@ -74,22 +78,45 @@ pub(crate) fn validate_resource_param(
     Ok(())
 }
 
-/// `GET /.well-known/oauth-protected-resource` — bare form: the master
-/// realm's MCP resource metadata.
+/// `GET /.well-known/oauth-protected-resource` — explicit master-realm alias.
 pub async fn protected_resource_metadata_handler(
     State(state): State<Arc<ServerState>>,
 ) -> Response {
     serve(&state, "master").await
 }
 
-/// `GET /.well-known/oauth-protected-resource/realms/{realm}/mcp` — the
-/// RFC 9728 §3.1 path-suffixed form for the resource
-/// `{issuer_url}/realms/{realm}/mcp`.
+/// Serve only the exact RFC 9728 path derived from the configured issuer and
+/// a realm name. Unknown paths and legacy UUID aliases answer 404.
 pub async fn protected_resource_metadata_realm_handler(
     State(state): State<Arc<ServerState>>,
-    Path(realm): Path<String>,
+    uri: axum::http::Uri,
 ) -> Response {
-    serve(&state, &realm).await
+    let request_path = uri.path().to_string();
+    let Some((_, realm_and_suffix)) = request_path.rsplit_once("/realms/") else {
+        return not_found();
+    };
+    let Some(realm_segment) = realm_and_suffix.strip_suffix("/mcp") else {
+        return not_found();
+    };
+    if realm_segment.is_empty() || realm_segment.contains('/') {
+        return not_found();
+    }
+    let Some(realm_segment) =
+        url::form_urlencoded::parse(format!("realm={realm_segment}").as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+    else {
+        return not_found();
+    };
+    if issuerd_core::RealmName::new(&realm_segment).is_err() {
+        return not_found();
+    }
+    let expected = realm_mcp_metadata_url(&state.config.issuer_url, &realm_segment);
+    let expected = url::Url::parse(&expected).expect("realm metadata URL is valid");
+    if request_path != expected.path() {
+        return not_found();
+    }
+    serve(&state, &realm_segment).await
 }
 
 /// Uniform 404 for a disabled feature gate and an unknown realm alike — a
@@ -103,7 +130,7 @@ async fn serve(state: &Arc<ServerState>, realm_segment: &str) -> Response {
         return not_found();
     }
     match state.resolve_realm(realm_segment).await {
-        Ok(Some(realm)) => {
+        Ok(Some(realm)) if realm_segment == realm.name.as_str() => {
             let metadata =
                 ProtectedResourceMetadata::for_realm(&state.config.issuer_url, realm.name.as_str());
             match serde_json::to_vec(&metadata) {
@@ -122,7 +149,7 @@ async fn serve(state: &Arc<ServerState>, realm_segment: &str) -> Response {
                 }
             }
         }
-        Ok(None) => not_found(),
+        Ok(_) => not_found(),
         Err(e) => {
             warn!(error = %e, "protected-resource metadata: realm resolution failed");
             not_found()
@@ -144,6 +171,10 @@ mod tests {
         assert_eq!(
             realm_mcp_resource("http://localhost:8080/", "demo"),
             "http://localhost:8080/realms/demo/mcp"
+        );
+        assert_eq!(
+            realm_mcp_metadata_url("http://localhost:8080/iam", "demo"),
+            "http://localhost:8080/.well-known/oauth-protected-resource/iam/realms/demo/mcp"
         );
     }
 

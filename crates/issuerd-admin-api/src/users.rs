@@ -1545,6 +1545,7 @@ mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(crate::test_utils::tests::StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales: issuerd_core::i18n::SHIPPED_LOCALES
@@ -2802,6 +2803,7 @@ mod tests {
             available_themes: base.available_themes.clone(),
             token_issuer: base.token_issuer.clone(),
             signing_key_reload: base.signing_key_reload.clone(),
+            mcp_enabled: false,
             base_url: base.base_url.clone(),
             email_bundle: base.email_bundle.clone(),
             available_locales: base.available_locales.clone(),

@@ -128,9 +128,8 @@ pub(crate) async fn token_exchange_grant(
     // Mandatory audience check (Keycloak's semantics; security review
     // remediation): the requesting client must be an audience of the subject
     // token. Without it, a client that was handed a token addressed to
-    // someone else could re-scope it. The raw `aud` claim is inspected
-    // because the typed claims keep only its first entry.
-    if !subject_token_audience_contains(subject_token, client.client_id.as_ref()) {
+    // someone else could re-scope it.
+    if !subject_claims.aud.contains(client.client_id.as_ref()) {
         warn!(realm = %realm_id, client_id = %client.client_id, "token exchange: requesting client not in the subject token's audience");
         return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
     }
@@ -231,7 +230,7 @@ async fn internal_exchange(
     // protocol mappers / role filters) into the target's audience. RFC 6749
     // §3.3 permits issuing a narrower scope than requested; the response
     // carries the issued set.
-    let scope = intersect_client_scopes(scope, &target_client);
+    let scope = intersect_client_scopes(scope, &target_client, state.config.mcp.enabled);
 
     // The exchanged token stays bound to the subject's session; subject
     // tokens without a user session (client credentials) get a fresh,
@@ -423,7 +422,7 @@ async fn impersonation_exchange(
     } else {
         token_req.scope.clone()
     };
-    let scope = intersect_client_scopes(scope, &target_client);
+    let scope = intersect_client_scopes(scope, &target_client, state.config.mcp.enabled);
 
     let mut overlay = crate::claims::build_claims_overlay(
         state,
@@ -535,43 +534,22 @@ async fn impersonation_exchange(
     })
 }
 
-/// Whether the subject token's raw `aud` claim lists `client_id`, tolerating
-/// both JWT forms (`"aud": "a"` and `"aud": ["a", "b"]`). The payload is
-/// decoded WITHOUT re-verifying the signature — trust comes from
-/// `validate_access_token`, which ran on the same bytes just before
-/// (same pattern as `dpop::unverified_nonce_claim`). The typed
-/// `AccessTokenClaims.aud` cannot answer this: it keeps only the first entry
-/// of a multi-audience claim. Every decode failure fails closed (`false`).
-fn subject_token_audience_contains(subject_token: &str, client_id: &str) -> bool {
-    use base64::Engine as _;
-    let Some(payload) = subject_token.split('.').nth(1) else {
-        return false;
-    };
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return false;
-    };
-    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    match claims.get("aud") {
-        Some(serde_json::Value::String(aud)) => aud == client_id,
-        Some(serde_json::Value::Array(auds)) => {
-            auds.iter().any(|aud| aud.as_str() == Some(client_id))
-        }
-        _ => false,
-    }
-}
-
 /// Intersect a scope with the target client's assigned scope names
 /// (`default_scopes ∪ optional_scopes`). The claims pipeline resolves scope
 /// names realm-wide, so without this an exchanged token could carry scopes —
 /// and their mappers and scope-derived role filters — that the target client
 /// was never assigned.
-fn intersect_client_scopes(scope: issuerd_core::Scope, client: &Client) -> issuerd_core::Scope {
+fn intersect_client_scopes(
+    scope: issuerd_core::Scope,
+    client: &Client,
+    mcp_enabled: bool,
+) -> issuerd_core::Scope {
     issuerd_core::Scope::from(
         scope
             .iter()
-            .filter(|s| client.default_scopes.contains(s) || client.optional_scopes.contains(s))
+            .filter(|scope| {
+                issuerd_core::client_scope_request_permitted_with_mcp(client, scope, mcp_enabled)
+            })
             .cloned()
             .collect::<Vec<_>>(),
     )
@@ -803,50 +781,33 @@ mod tests {
         assert_eq!(json_body(resp).await["error"], "invalid_grant");
     }
 
-    /// Mint an unsigned-shaped JWT carrying `aud` for the audience helper
-    /// (the helper never verifies the signature — the exchange validated the
-    /// token before consulting it).
-    fn token_with_aud(aud: serde_json::Value) -> String {
-        use base64::Engine as _;
-        let b64 = |v: serde_json::Value| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap())
-        };
-        format!(
-            "{}.{}.sig",
-            b64(serde_json::json!({"alg": "none"})),
-            b64(serde_json::json!({"sub": "user-1", "aud": aud}))
-        )
-    }
-
     #[test]
     fn audience_string_form_matches_exactly() {
-        let token = token_with_aud(serde_json::json!("requester"));
-        assert!(subject_token_audience_contains(&token, "requester"));
-        assert!(!subject_token_audience_contains(&token, "other-client"));
-        // No substring or case folding.
-        assert!(!subject_token_audience_contains(&token, "request"));
-        assert!(!subject_token_audience_contains(&token, "Requester"));
+        let aud: issuerd_core::Audience =
+            serde_json::from_value(serde_json::json!("requester")).unwrap();
+        assert!(aud.contains("requester"));
+        assert!(!aud.contains("other-client"));
+        assert!(!aud.contains("request"));
+        assert!(!aud.contains("Requester"));
     }
 
     #[test]
     fn audience_array_form_matches_any_entry() {
-        let token = token_with_aud(serde_json::json!(["frontend", "requester"]));
-        assert!(subject_token_audience_contains(&token, "requester"));
-        assert!(subject_token_audience_contains(&token, "frontend"));
-        assert!(!subject_token_audience_contains(&token, "absent"));
+        let aud: issuerd_core::Audience =
+            serde_json::from_value(serde_json::json!(["frontend", "requester"])).unwrap();
+        assert!(aud.contains("requester"));
+        assert!(aud.contains("frontend"));
+        assert!(!aud.contains("absent"));
     }
 
     #[test]
     fn audience_missing_or_malformed_fails_closed() {
-        // No `aud` claim at all.
-        let token = token_with_aud(serde_json::Value::Null);
-        assert!(!subject_token_audience_contains(&token, "requester"));
-        // Non-string/array `aud`.
-        let token = token_with_aud(serde_json::json!(42));
-        assert!(!subject_token_audience_contains(&token, "requester"));
-        // Not a JWT.
-        assert!(!subject_token_audience_contains("not-a-jwt", "requester"));
-        // Garbage payload segment.
-        assert!(!subject_token_audience_contains("a.!!!.b", "requester"));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            assert!(serde_json::from_value::<issuerd_core::Audience>(value).is_err());
+        }
     }
 }
