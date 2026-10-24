@@ -1762,6 +1762,7 @@ pub async fn execute_actions_handler(
         locale: None,
         response_mode: None,
         authorization_details: None,
+        resource: None,
     };
     let entry = PendingActionsData {
         pending,
@@ -1921,6 +1922,7 @@ mod tests {
             locale: None,
             response_mode: None,
             authorization_details: None,
+            resource: None,
         }
     }
 

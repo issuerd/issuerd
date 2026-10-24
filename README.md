@@ -126,11 +126,13 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 | Token Introspection (RFC 7662) | Implemented |
 | Device Authorization Grant (RFC 8628) | Implemented |
 | Token Exchange (RFC 8693) | Implemented, incl. impersonation |
+| Resource Indicators (RFC 8707) | Implemented; exact-allowlist, gated by `[mcp] enabled` (default off) |
 | Pushed Authorization Requests (RFC 9126) | Implemented |
 | JWT-Secured Authorization Requests — JAR (RFC 9101) | Implemented |
 | JWT-Secured Authorization Response Mode — JARM | Implemented |
 | Rich Authorization Requests (RFC 9396) | Implemented |
 | DPoP (RFC 9449) | Implemented (mTLS sender-constraining deferred) |
+| OAuth 2.0 Protected Resource Metadata (RFC 9728) | Implemented; gated by `[mcp] enabled` (default off) |
 | Dynamic Client Registration (RFC 7591/7592) | Implemented, incl. read/update/delete |
 | CIBA (OpenID Connect Client-Initiated Backchannel Authentication) | Poll mode |
 | TOTP (RFC 6238), WebAuthn / FIDO2 | Implemented |

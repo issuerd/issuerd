@@ -15,14 +15,19 @@
 //! Built-in scopes ([`builtin_client_scopes`]) are seeded per realm and
 //! reproduce the claim behavior that was hardcoded before client scopes were
 //! introduced: `profile`, `email`, `address`, `phone`, `roles`,
-//! `offline_access`, `web-origins`, and `acr`.
+//! `offline_access`, `web-origins`, and `acr`. Two more built-ins,
+//! `mcp:read` and `mcp:write`, are coarse agent-facing authorization gates
+//! for the MCP (Model Context Protocol) endpoint: they carry no protocol
+//! mappers, are never part of the realm default sets, and are assigned to
+//! specific agent clients by an administrator.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::IssuerdError;
 use crate::ids::{ClientId, ClientScopeId, MapperId, RealmId, RoleId};
-use crate::models::ClientProtocol;
+use crate::models::{Client, ClientProtocol};
 
 // ---------------------------------------------------------------------------
 // Mapper config keys (Keycloak wire spellings)
@@ -217,6 +222,21 @@ pub struct ClientScope {
     pub scope_mappings: ScopeMappings,
 }
 
+/// Scope name gating read operations for MCP (Model Context Protocol) agent
+/// clients. A pure authorization gate: no protocol mappers, never
+/// default-assigned — see [`builtin_client_scopes`].
+pub const MCP_SCOPE_READ: &str = "mcp:read";
+
+/// Scope name gating write operations for MCP agent clients (destructive
+/// operations additionally require step-up approval). Same assignment rules
+/// as [`MCP_SCOPE_READ`].
+pub const MCP_SCOPE_WRITE: &str = "mcp:write";
+
+/// Client attribute marking an anonymously registered client.
+pub const ATTR_DCR_POLICY: &str = "dcr.policy";
+/// The [`ATTR_DCR_POLICY`] value stamped on open-endpoint registrations.
+pub const DCR_POLICY_OPEN: &str = "open";
+
 /// Names of the built-in client scopes seeded into every realm.
 pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "profile",
@@ -227,6 +247,8 @@ pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "offline_access",
     "web-origins",
     "acr",
+    MCP_SCOPE_READ,
+    MCP_SCOPE_WRITE,
 ];
 
 /// Built-in scopes assigned as *default* scopes to every realm (and mirrored
@@ -240,6 +262,47 @@ pub const DEFAULT_OPTIONAL_SCOPES: &[&str] =
 /// Whether `name` is one of the built-in client scope names.
 pub fn is_builtin_scope_name(name: &str) -> bool {
     BUILTIN_SCOPE_NAMES.contains(&name)
+}
+
+/// Whether `name` is a reserved MCP authorization scope.
+pub fn is_mcp_scope_name(name: &str) -> bool {
+    matches!(name, MCP_SCOPE_READ | MCP_SCOPE_WRITE)
+}
+
+/// Reject MCP scopes in a client's default-scope list when MCP is enabled.
+/// Legacy scope names keep their previous behavior while the surface is off.
+pub fn validate_no_default_mcp_scopes(
+    default_scopes: &[String],
+    mcp_enabled: bool,
+) -> Result<(), IssuerdError> {
+    if mcp_enabled {
+        if let Some(scope) = default_scopes.iter().find(|scope| is_mcp_scope_name(scope)) {
+            return Err(IssuerdError::InvalidRequest(format!(
+                "MCP scope {scope} must be assigned explicitly as an optional scope"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a client may request `scope` under its assigned scope policy.
+/// This preserves the legacy default∪optional rule with MCP disabled.
+pub fn client_scope_request_permitted(client: &Client, scope: &str) -> bool {
+    client_scope_request_permitted_with_mcp(client, scope, false)
+}
+
+/// Apply the MCP-aware scope policy. When enabled, MCP scopes are valid only
+/// as optional-only assignments; legacy/direct storage cannot make them
+/// default or available through both lists.
+pub fn client_scope_request_permitted_with_mcp(
+    client: &Client,
+    scope: &str,
+    mcp_enabled: bool,
+) -> bool {
+    if mcp_enabled && is_mcp_scope_name(scope) {
+        return client.optional_scopes.contains(scope) && !client.default_scopes.contains(scope);
+    }
+    client.default_scopes.contains(scope) || client.optional_scopes.contains(scope)
 }
 
 fn targets(access: bool, id: bool, userinfo: bool) -> HashMap<String, String> {
@@ -316,7 +379,7 @@ fn scope(realm_id: &RealmId, name: &str, mappers: Vec<ProtocolMapper>) -> Client
     }
 }
 
-/// Build the eight built-in client scopes for a realm, with fresh random ids.
+/// Build the ten built-in client scopes for a realm, with fresh random ids.
 ///
 /// The mapper set reproduces the claim behavior that was hardcoded before
 /// client scopes were introduced: `profile`/`email`/`address`/`phone`
@@ -325,6 +388,12 @@ fn scope(realm_id: &RealmId, name: &str, mappers: Vec<ProtocolMapper>) -> Client
 /// tokens only. One Keycloak-parity exception: the `username` mapper also
 /// targets access tokens, so `preferred_username` is available to access-
 /// token consumers (e.g. the admin console's user menu).
+///
+/// `mcp:read` and `mcp:write` are agent-facing authorization gates for the
+/// MCP (Model Context Protocol) endpoint: they carry no protocol mappers and
+/// are deliberately absent from [`DEFAULT_DEFAULT_SCOPES`] and
+/// [`DEFAULT_OPTIONAL_SCOPES`] — an administrator assigns them to specific
+/// agent clients explicitly.
 pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
     let profile = scope(
         realm_id,
@@ -454,6 +523,24 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
 
     let acr = scope(realm_id, "acr", vec![]);
 
+    // Coarse agent-facing authorization gates for the MCP endpoint: pure
+    // gates with no protocol mappers (they emit no claims), seeded per realm
+    // but never default-assigned — see the function-level docs.
+    let mcp_read = ClientScope {
+        description: Some("Read access for MCP (Model Context Protocol) agents".to_string()),
+        ..scope(realm_id, MCP_SCOPE_READ, vec![])
+    };
+    let mcp_write = ClientScope {
+        description: Some(
+            concat!(
+                "Write access for MCP (Model Context Protocol) agents; ",
+                "destructive operations additionally require step-up approval"
+            )
+            .to_string(),
+        ),
+        ..scope(realm_id, MCP_SCOPE_WRITE, vec![])
+    };
+
     vec![
         profile,
         email,
@@ -463,6 +550,8 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
         offline_access,
         web_origins,
         acr,
+        mcp_read,
+        mcp_write,
     ]
 }
 
@@ -557,13 +646,77 @@ mod tests {
                 "roles",
                 "offline_access",
                 "web-origins",
-                "acr"
+                "acr",
+                "mcp:read",
+                "mcp:write"
             ]
         );
         for s in &scopes {
             assert_eq!(s.realm_id, realm);
             assert_eq!(s.protocol, ClientProtocol::OpenIdConnect);
         }
+    }
+
+    #[test]
+    fn mcp_scopes_are_mapperless_and_never_default_assigned() {
+        let realm = RealmId::new("r1").unwrap();
+        let scopes = builtin_client_scopes(&realm);
+        for name in ["mcp:read", "mcp:write"] {
+            let scope = scopes.iter().find(|s| s.name == name).unwrap();
+            // Pure authorization gates: they emit no claims and carry no role
+            // subsetting.
+            assert!(scope.protocol_mappers.is_empty());
+            assert!(scope.scope_mappings.realm_roles.is_empty());
+            assert!(scope.scope_mappings.client_roles.is_empty());
+            assert!(scope.description.is_some());
+            assert!(is_builtin_scope_name(name));
+            // Optional-assignment only: an administrator assigns them to
+            // specific agent clients; they never join the realm default sets.
+            assert!(!DEFAULT_DEFAULT_SCOPES.contains(&name));
+            assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&name));
+        }
+    }
+
+    #[test]
+    fn mcp_scope_requests_require_optional_only_assignment() {
+        let client = Client {
+            id: ClientId::new("client-1").unwrap(),
+            realm_id: RealmId::new("r1").unwrap(),
+            client_id: crate::ClientIdentifier::new("agent").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: crate::ClientAuthenticatorType::ClientSecret,
+            secret: None,
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: crate::Scope::parse("openid"),
+            optional_scopes: crate::Scope::parse("mcp:read"),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: vec![],
+            scope_mappings: ScopeMappings::default(),
+            attributes: HashMap::new(),
+        };
+        assert!(client_scope_request_permitted(&client, "openid"));
+        assert!(client_scope_request_permitted_with_mcp(&client, MCP_SCOPE_READ, true));
+        assert!(!client_scope_request_permitted_with_mcp(&client, MCP_SCOPE_WRITE, true));
+
+        let mut legacy_default = client.clone();
+        legacy_default.default_scopes = crate::Scope::parse("mcp:read");
+        assert!(!client_scope_request_permitted_with_mcp(&legacy_default, MCP_SCOPE_READ, true));
+        assert!(client_scope_request_permitted_with_mcp(&legacy_default, MCP_SCOPE_READ, false));
+        assert!(
+            validate_no_default_mcp_scopes(legacy_default.default_scopes.as_slice(), true).is_err()
+        );
+        assert!(
+            validate_no_default_mcp_scopes(legacy_default.default_scopes.as_slice(), false).is_ok()
+        );
+        assert!(validate_no_default_mcp_scopes(client.default_scopes.as_slice(), true).is_ok());
     }
 
     #[test]

@@ -58,6 +58,10 @@ pub struct TokenRequest {
     /// `authorization_code` and `refresh_token` grants honor it — the server
     /// rejects it for the others.
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// Resource indicator (RFC 8707 §2.2): structurally validated (absolute
+    /// URI, no fragment); only the `authorization_code` and `refresh_token`
+    /// grants honor it — the server rejects it for the others.
+    pub resource: Option<String>,
 }
 
 impl TokenRequest {
@@ -121,10 +125,20 @@ impl TokenRequest {
             authorization_details: crate::authorization::parse_authorization_details(
                 body.get("authorization_details"),
             )?,
+            resource: crate::resource::parse_resource_indicator(body.get("resource"))?,
         })
     }
 
-    pub fn validate(&self, _realm: &Realm, client: &Client) -> Result<(), IssuerdError> {
+    pub fn validate(&self, realm: &Realm, client: &Client) -> Result<(), IssuerdError> {
+        self.validate_with_mcp(realm, client, false)
+    }
+
+    pub fn validate_with_mcp(
+        &self,
+        _realm: &Realm,
+        client: &Client,
+        mcp_enabled: bool,
+    ) -> Result<(), IssuerdError> {
         match self.grant_type {
             GrantType::AuthorizationCode => {
                 if self.code.is_none() {
@@ -209,16 +223,17 @@ impl TokenRequest {
         // `openid` is the OIDC protocol marker, not a client scope: exempt
         // (same rule as the authorization endpoint) so DCR-registered
         // clients without an explicit `scope` list can refresh OIDC grants.
-        if !self.scope.is_empty() {
-            let available: std::collections::HashSet<&str> = client
-                .default_scopes
-                .iter()
-                .chain(client.optional_scopes.iter())
-                .map(String::as_str)
-                .collect();
-            if self.scope.iter().any(|s| s != "openid" && !available.contains(s.as_str())) {
-                return Err(IssuerdError::InvalidScope);
-            }
+        if !self.scope.is_empty()
+            && self.scope.iter().any(|scope| {
+                scope != "openid"
+                    && !issuerd_core::client_scope_request_permitted_with_mcp(
+                        client,
+                        scope,
+                        mcp_enabled,
+                    )
+            })
+        {
+            return Err(IssuerdError::InvalidScope);
         }
         Ok(())
     }
@@ -448,6 +463,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         let client = make_test_client(false);
         assert!(req.validate(&Realm::default(), &client).is_err());
@@ -478,6 +494,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         let client = make_test_client(true);
         assert!(req.validate(&Realm::default(), &client).is_err());
@@ -508,6 +525,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_err());
     }
@@ -537,6 +555,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_err());
     }
@@ -566,6 +585,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         };
         assert!(req.validate(&Realm::default(), &make_test_client(false)).is_ok());
     }
@@ -623,6 +643,31 @@ mod tests {
         assert!(matches!(err, IssuerdError::InvalidAuthorizationDetails(_)));
     }
 
+    #[test]
+    fn token_request_parses_resource() {
+        let mut body = HashMap::new();
+        body.insert("grant_type".to_string(), "authorization_code".to_string());
+        body.insert("code".to_string(), "code-1".to_string());
+        body.insert("redirect_uri".to_string(), "https://example.com/cb".to_string());
+        body.insert(
+            "resource".to_string(),
+            "https://issuer.example.com/realms/demo/mcp".to_string(),
+        );
+        let req = TokenRequest::parse(&body).unwrap();
+        assert_eq!(req.resource.as_deref(), Some("https://issuer.example.com/realms/demo/mcp"));
+
+        // Malformed values are rejected with the RFC 8707 error code.
+        for raw in ["/relative", "https://example.com/mcp#frag", ""] {
+            body.insert("resource".to_string(), raw.to_string());
+            let err = TokenRequest::parse(&body).unwrap_err();
+            assert!(
+                matches!(err, IssuerdError::InvalidTarget(_)),
+                "expected invalid_target for {raw:?}, got {err}"
+            );
+            assert_eq!(err.oauth_error_code().as_ref(), "invalid_target");
+        }
+    }
+
     fn make_token_exchange_request(
         subject_token: Option<&str>,
         subject_token_type: Option<&str>,
@@ -650,6 +695,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         }
     }
 
@@ -748,6 +794,7 @@ mod tests {
             requested_subject: None,
             actor_token: None,
             authorization_details: None,
+            resource: None,
         }
     }
 

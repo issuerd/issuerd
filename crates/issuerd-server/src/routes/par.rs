@@ -115,6 +115,12 @@ pub async fn par_handler(
         }
     };
 
+    if let Err(e) = issuerd_protocol::resource::validate_resource_parameter_count(
+        issuerd_protocol::resource::resource_parameter_count(&body),
+    ) {
+        return par_endpoint_error(&e);
+    }
+
     // Client credentials may arrive via Basic auth instead of the form body
     // (same rules as the token endpoint, RFC 9126 §2). A body `client_id`
     // next to the Basic header is legal (RFC 9126 §1.1's example); a
@@ -165,7 +171,20 @@ pub async fn par_handler(
         Ok(r) => r,
         Err(e) => return par_endpoint_error(&e),
     };
-    if let Err(e) = auth_req.validate(&realm, &client) {
+    if let Err(e) =
+        auth_req
+            .validate_with_mcp(&realm, &client, state.config.mcp.enabled)
+            .and_then(|()| {
+                // RFC 8707 §2.1: a pushed `resource` faces the same fail-closed
+                // allowlist as at the authorization endpoint (gated on
+                // `[mcp] enabled`); it is re-checked when the request is consumed.
+                crate::routes::protected_resource::validate_resource_param(
+                    &state.config,
+                    realm.name.as_str(),
+                    auth_req.resource.as_deref(),
+                )
+            })
+    {
         return par_endpoint_error(&e);
     }
     // Reject unimplemented response types at push time, mirroring the

@@ -26,13 +26,49 @@ use super::oidc::emit_oidc_event;
 /// - `401` + `WWW-Authenticate: Negotiate` when no `Authorization` header is present.
 /// - `401` + `WWW-Authenticate: Negotiate {token}` when SPNEGO requires another round-trip.
 /// - Redirect with auth code on successful authentication.
-#[tracing::instrument(skip(state, ip, headers, params))]
 pub async fn handle_spnego(
     State(state): State<Arc<ServerState>>,
     axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    handle_spnego_with_count(state, realm, ip, headers, params, 1).await
+}
+
+/// Production wrapper that rejects duplicate `resource` values before `Query`
+/// collapses them. The original handler remains available for direct callers.
+pub async fn handle_spnego_with_resource_count(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Extension(ResolvedRealm(realm)): axum::extract::Extension<ResolvedRealm>,
+    axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let resource_count =
+        issuerd_protocol::resource::resource_parameter_count(uri.query().unwrap_or(""));
+    if resource_count <= 1 {
+        return handle_spnego(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(realm)),
+            axum::extract::Extension(ClientIp(ip)),
+            headers,
+            axum::extract::Query(params),
+        )
+        .await;
+    }
+    handle_spnego_with_count(state, realm, ip, headers, params, resource_count).await
+}
+
+#[tracing::instrument(skip(state, ip, headers, params))]
+async fn handle_spnego_with_count(
+    state: Arc<ServerState>,
+    realm: Option<String>,
+    ip: std::net::IpAddr,
+    headers: axum::http::HeaderMap,
+    params: HashMap<String, String>,
+    resource_count: usize,
 ) -> Response {
     let realm_name = match realm.as_deref() {
         Some(r) => r,
@@ -65,6 +101,11 @@ pub async fn handle_spnego(
         }
     };
     let realm_id = realm.id.clone();
+
+    if let Err(e) = issuerd_protocol::resource::validate_resource_parameter_count(resource_count) {
+        return (StatusCode::BAD_REQUEST, axum::Json(super::oidc::error_response(&e)))
+            .into_response();
+    }
 
     let token = match headers
         .get(axum::http::header::AUTHORIZATION)
@@ -223,9 +264,13 @@ pub async fn handle_spnego(
                 let scope = params.get("scope").cloned().unwrap_or_else(|| "openid".to_string());
                 let requested_scopes: Vec<String> =
                     scope.split_whitespace().map(str::to_string).collect();
-                let available_scopes: std::collections::HashSet<&String> =
-                    client.default_scopes.iter().chain(client.optional_scopes.iter()).collect();
-                if requested_scopes.iter().any(|s| !available_scopes.contains(s)) {
+                if requested_scopes.iter().any(|scope| {
+                    !issuerd_core::client_scope_request_permitted_with_mcp(
+                        &client,
+                        scope,
+                        state.config.mcp.enabled,
+                    )
+                }) {
                     return (
                         StatusCode::BAD_REQUEST,
                         axum::Json(serde_json::json!({
@@ -246,6 +291,35 @@ pub async fn handle_spnego(
                     )
                         .into_response();
                 }
+
+                // RFC 8707 §2.1: a present `resource` must parse (absolute
+                // URI, no fragment) and be on the server's allowlist
+                // (fail-closed, `[mcp] enabled`-gated) — the same rule the
+                // authorization endpoint applies, so this interaction-free
+                // entry point cannot bypass it.
+                let resource = match issuerd_protocol::resource::parse_resource_indicator(
+                    params.get("resource"),
+                )
+                .and_then(|r| {
+                    super::protected_resource::validate_resource_param(
+                        &state.config,
+                        realm.name.as_str(),
+                        r.as_deref(),
+                    )
+                    .map(|()| r)
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": e.oauth_error_code().as_ref(),
+                                "error_description": e.to_string()
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
 
                 // Find or create user
                 let user = match state
@@ -371,6 +445,7 @@ pub async fn handle_spnego(
                     acr_values: vec![],
                     claims: None,
                     authorization_details: None,
+                    resource,
                 };
                 if let Err(e) = super::oidc::store_auth_code(
                     &state.cache,

@@ -77,10 +77,14 @@ mod oidc_discovery;
 mod pairwise_subjects;
 #[path = "integration/par.rs"]
 mod par;
+#[path = "integration/protected_resource.rs"]
+mod protected_resource;
 #[path = "integration/rar.rs"]
 mod rar;
 #[path = "integration/request_uri.rs"]
 mod request_uri;
+#[path = "integration/resource_indicators.rs"]
+mod resource_indicators;
 #[path = "integration/session_management.rs"]
 mod session_management;
 #[path = "integration/spec_conformance.rs"]

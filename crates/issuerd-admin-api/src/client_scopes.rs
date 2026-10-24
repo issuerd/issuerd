@@ -828,6 +828,12 @@ async fn assign_scope_to_client(
         .get_client_scope(&realm_id, &scope_id)
         .await?
         .ok_or(AdminApiError::NotFound)?;
+    if state.mcp_enabled && is_default && issuerd_core::is_mcp_scope_name(&scope.name) {
+        return Err(AdminApiError::BadRequest(format!(
+            "MCP scope {} must be assigned explicitly as an optional scope",
+            scope.name
+        )));
+    }
     state
         .storage
         .assign_client_scope(&realm_id, &client.id, &scope_id, is_default)
@@ -1138,11 +1144,17 @@ async fn add_realm_default_scope(
     let realm_id = state.storage.get_realm_by_name(realm).await?.ok_or(AdminApiError::NotFound)?.id;
     let scope_id =
         ClientScopeId::new(scope_id).map_err(|e| AdminApiError::BadRequest(e.to_string()))?;
-    state
+    let scope = state
         .storage
         .get_client_scope(&realm_id, &scope_id)
         .await?
         .ok_or(AdminApiError::NotFound)?;
+    if state.mcp_enabled && issuerd_core::is_mcp_scope_name(&scope.name) {
+        return Err(AdminApiError::BadRequest(format!(
+            "MCP scope {} cannot be assigned as a realm default",
+            scope.name
+        )));
+    }
     state
         .storage
         .add_realm_default_client_scope(&realm_id, &scope_id, is_default)

@@ -30,6 +30,14 @@ impl DeviceAuthorizationRequest {
     }
 
     pub fn validate(&self, client: &Client) -> Result<(), IssuerdError> {
+        self.validate_with_mcp(client, false)
+    }
+
+    pub fn validate_with_mcp(
+        &self,
+        client: &Client,
+        mcp_enabled: bool,
+    ) -> Result<(), IssuerdError> {
         if self.client_id != client.client_id {
             return Err(IssuerdError::InvalidRequest("client_id mismatch".into()));
         }
@@ -40,13 +48,9 @@ impl DeviceAuthorizationRequest {
         // (same rule as the authorization and token endpoints) — otherwise a
         // client could pick up scopes such as `offline_access` that the admin
         // deliberately left unassigned.
-        let available: std::collections::HashSet<&str> = client
-            .default_scopes
-            .iter()
-            .chain(client.optional_scopes.iter())
-            .map(String::as_str)
-            .collect();
-        if self.scope.iter().any(|s| !available.contains(s.as_str())) {
+        if self.scope.iter().any(|scope| {
+            !issuerd_core::client_scope_request_permitted_with_mcp(client, scope, mcp_enabled)
+        }) {
             return Err(IssuerdError::InvalidScope);
         }
         Ok(())

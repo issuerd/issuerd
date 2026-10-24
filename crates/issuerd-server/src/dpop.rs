@@ -9,10 +9,11 @@
 //!
 //! Proof validation itself is pure and lives in [`issuerd_token::dpop`]; this
 //! module adds the stateful parts:
-//! - `DPoP` header extraction and the expected `htm`/`htu` derivation from
-//!   the configured issuer (the discovery-advertised realm-name spelling is
-//!   primary; the realm-id spelling is accepted as tolerance —
-//!   `resolve_realm` serves both),
+//! - `DPoP` header extraction and the `htm`/`htu` check against the
+//!   caller-declared accepted paths (realm-relative, e.g.
+//!   `protocol/openid-connect/token`), derived from the configured issuer
+//!   (the discovery-advertised realm-name spelling is primary; the realm-id
+//!   spelling is accepted as tolerance — `resolve_realm` serves both),
 //! - `jti` single-use enforcement in the distributed cache
 //!   (`dpop_jti:{realm_id}:{jti}`, TTL = the proof's remaining acceptance
 //!   window) via the atomic cache `increment` — the
@@ -82,28 +83,34 @@ pub(crate) enum DpopRejection {
     UseDpopNonce(String),
 }
 
-/// Accepted `htu` values for `endpoint` (the path tail after
-/// `/protocol/openid-connect/`, e.g. `"token"`): the discovery-advertised
-/// realm-NAME URL, plus the realm-id spelling as tolerance when the two
-/// differ (realm resolution accepts both).
+/// Accepted `htu` values for `accepted_paths` (realm-relative request paths,
+/// e.g. `protocol/openid-connect/token` or `mcp`): for each path, the
+/// discovery-advertised realm-NAME URL, plus the realm-id spelling as
+/// tolerance when the two differ (realm resolution accepts both).
 fn accepted_htus(
     state: &ServerState,
     realm_id: &RealmId,
     realm_name: Option<&str>,
-    endpoint: &str,
+    accepted_paths: &[&str],
 ) -> Vec<String> {
     let base = state.config.issuer_url.trim_end_matches('/');
     let primary = realm_name.unwrap_or(realm_id.0.as_str());
-    let mut urls = vec![format!(
-        "{base}/realms/{primary}/protocol/openid-connect/{endpoint}"
-    )];
-    if realm_name.is_some_and(|name| name != realm_id.0) {
-        urls.push(format!("{base}/realms/{}/protocol/openid-connect/{endpoint}", realm_id.0));
+    let mut urls = Vec::with_capacity(accepted_paths.len() * 2);
+    for path in accepted_paths {
+        urls.push(format!("{base}/realms/{primary}/{path}"));
+        if realm_name.is_some_and(|name| name != realm_id.0) {
+            urls.push(format!("{base}/realms/{}/{path}", realm_id.0));
+        }
     }
     urls
 }
 
 /// Extract and verify the `DPoP` proof header of a request, if present.
+///
+/// `accepted_paths` declares the realm-relative request paths the proof's
+/// `htu` may spell (e.g. `&["protocol/openid-connect/token"]` for the token
+/// endpoint; the future MCP route passes `&["mcp"]`) — each is accepted in
+/// the realm-name and realm-id spellings; any other URL fails the check.
 ///
 /// Returns a [`DpopVerification`] with `proof: None` when no `DPoP` header
 /// was sent (plain Bearer flow). On success the proof's `jti` is burned in
@@ -117,7 +124,7 @@ pub(crate) async fn verify_proof_header(
     realm_name: Option<&str>,
     headers: &axum::http::HeaderMap,
     htm: &str,
-    endpoint: &str,
+    accepted_paths: &[&str],
     access_token: Option<&str>,
 ) -> Result<DpopVerification, DpopRejection> {
     let Some(value) = headers.get("dpop") else {
@@ -174,7 +181,7 @@ pub(crate) async fn verify_proof_header(
 
     let requirements = issuerd_token::DpopProofRequirements {
         expected_htm: htm,
-        accepted_htu: &accepted_htus(state, realm_id, realm_name, endpoint),
+        accepted_htu: &accepted_htus(state, realm_id, realm_name, accepted_paths),
         expected_ath: access_token,
         max_age_secs: DPOP_PROOF_MAX_AGE_SECS,
         leeway_secs: DPOP_PROOF_LEEWAY_SECS,
@@ -492,7 +499,7 @@ mod tests {
             Some(MASTER),
             &headers_with(None),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -513,7 +520,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -537,14 +544,22 @@ mod tests {
             Some(MASTER),
             &headers,
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None
         )
         .await
         .is_ok());
         assert!(matches!(
-            verify_proof_header(&state, &realm_id, Some(MASTER), &headers, "POST", "token", None)
-                .await,
+            verify_proof_header(
+                &state,
+                &realm_id,
+                Some(MASTER),
+                &headers,
+                "POST",
+                &["protocol/openid-connect/token"],
+                None,
+            )
+            .await,
             Err(DpopRejection::InvalidProof)
         ));
     }
@@ -562,7 +577,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -577,7 +592,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -598,7 +613,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             Some("the-access-token"),
         )
         .await
@@ -611,7 +626,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             Some("the-access-token"),
         )
         .await
@@ -646,7 +661,12 @@ mod tests {
         let realm_id = RealmId::new("uuid-id").unwrap();
 
         // Name == id: a single accepted URL.
-        let htus = accepted_htus(&state, &RealmId::new(MASTER).unwrap(), Some(MASTER), "token");
+        let htus = accepted_htus(
+            &state,
+            &RealmId::new(MASTER).unwrap(),
+            Some(MASTER),
+            &["protocol/openid-connect/token"],
+        );
         assert_eq!(
             htus,
             vec![format!(
@@ -657,12 +677,92 @@ mod tests {
         // UUID-id realm addressed by name (e.g. PostgresStorage): the name
         // spelling (discovery-advertised) is primary; the id spelling is
         // accepted as tolerance.
-        let htus = accepted_htus(&state, &realm_id, Some("human-name"), "token");
+        let htus = accepted_htus(
+            &state,
+            &realm_id,
+            Some("human-name"),
+            &["protocol/openid-connect/token"],
+        );
         assert_eq!(
             htus,
             vec![
                 format!("{base}/realms/human-name/protocol/openid-connect/token"),
                 format!("{base}/realms/uuid-id/protocol/openid-connect/token"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_relative_path_proof_accepted() {
+        // The future MCP route is `POST /realms/{realm}/mcp` — outside the
+        // /protocol/openid-connect/ namespace. A proof minted for that exact
+        // URL must validate when the caller declares the realm-relative path.
+        let state = test_state().await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let htu = format!("{}/realms/{MASTER}/mcp", state.config.issuer_url);
+        let proof = key.proof("POST", &htu, "jti-mcp-path", None);
+        let result = verify_proof_header(
+            &state,
+            &realm_id,
+            Some(MASTER),
+            &headers_with(Some(&proof)),
+            "POST",
+            &["mcp"],
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "proof for the caller-declared path must verify");
+        assert_eq!(result.unwrap().proof.unwrap().jkt, key.jkt());
+    }
+
+    #[tokio::test]
+    async fn undeclared_path_proof_rejected() {
+        // Widening is explicit: with the caller accepting `mcp`, a proof
+        // minted for any other path (here a sibling `/realms/{realm}/admin`)
+        // still fails — the check stays an exact URL match.
+        let state = test_state().await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let htu = format!("{}/realms/{MASTER}/admin", state.config.issuer_url);
+        let proof = key.proof("POST", &htu, "jti-undeclared", None);
+        assert!(matches!(
+            verify_proof_header(
+                &state,
+                &realm_id,
+                Some(MASTER),
+                &headers_with(Some(&proof)),
+                "POST",
+                &["mcp"],
+                None,
+            )
+            .await,
+            Err(DpopRejection::InvalidProof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_htus_derive_each_path_in_both_spellings() {
+        let state = test_state().await;
+        let base = state.config.issuer_url.clone();
+        let realm_id = RealmId::new("uuid-id").unwrap();
+
+        // Multiple realm-relative paths (the OIDC endpoint spelling and a
+        // non-OIDC route): each is derived in the name spelling followed by
+        // the id spelling.
+        let htus = accepted_htus(
+            &state,
+            &realm_id,
+            Some("human-name"),
+            &["protocol/openid-connect/token", "mcp"],
+        );
+        assert_eq!(
+            htus,
+            vec![
+                format!("{base}/realms/human-name/protocol/openid-connect/token"),
+                format!("{base}/realms/uuid-id/protocol/openid-connect/token"),
+                format!("{base}/realms/human-name/mcp"),
+                format!("{base}/realms/uuid-id/mcp"),
             ]
         );
     }
@@ -684,7 +784,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -724,7 +824,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -776,7 +876,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -793,7 +893,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await
@@ -828,7 +928,7 @@ mod tests {
             Some(MASTER),
             &headers_with(Some(&proof)),
             "POST",
-            "token",
+            &["protocol/openid-connect/token"],
             None,
         )
         .await

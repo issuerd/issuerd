@@ -187,6 +187,7 @@ pub mod tests {
             available_themes: vec!["issuerd".to_string()],
             token_issuer: Arc::new(StubTokenIssuer::new()),
             signing_key_reload: Arc::new(|| {}),
+            mcp_enabled: false,
             base_url: "http://localhost:8080".to_string(),
             email_bundle: None,
             available_locales,
@@ -399,6 +400,7 @@ pub mod tests {
                     scope: issuerd_core::Scope::parse("openid"),
                     cnf: None,
                     authorization_details: authorization_details.map(<[serde_json::Value]>::to_vec),
+                    resource: None,
                 },
             })
         }

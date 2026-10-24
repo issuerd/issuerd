@@ -722,6 +722,26 @@ impl Algorithm {
         Algorithm::EdDsa,
     ];
 
+    /// JWS signing algorithms accepted for DPoP proof JWTs (RFC 9449 §4.2) —
+    /// the asymmetric-only accept set of the proof validator
+    /// (`issuerd_token::dpop::validate_dpop_proof`, via the external-token alg
+    /// allowlist it shares with brokered ID tokens and `private_key_jwt`
+    /// client assertions). Served verbatim as
+    /// `dpop_signing_alg_values_supported` in OIDC discovery (RFC 9449 §5.1)
+    /// and in protected-resource metadata (RFC 9728 §3.2). Symmetric `HS*`
+    /// algorithms are meaningless for proofs (the verification key rides in
+    /// the proof itself) and `none` is never accepted; `ES512` is omitted
+    /// because the `jsonwebtoken` backend does not implement it. The set is a
+    /// protocol constant — no configuration knob widens or narrows it.
+    pub const DPOP_SIGNING_ALG_VALUES_SUPPORTED: &[Algorithm] = &[
+        Algorithm::Rs256,
+        Algorithm::Rs384,
+        Algorithm::Rs512,
+        Algorithm::Es256,
+        Algorithm::Es384,
+        Algorithm::EdDsa,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Algorithm::Rs256 => "RS256",

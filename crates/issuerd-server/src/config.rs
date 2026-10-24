@@ -56,6 +56,9 @@ pub struct ServerConfig {
     /// DPoP (RFC 9449) settings (`[dpop]` section).
     #[serde(default)]
     pub dpop: DpopConfig,
+    /// MCP endpoint settings (`[mcp]` section). Disabled by default.
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// Crypto settings (`[crypto]` section).
     #[serde(default)]
     pub crypto: CryptoSettings,
@@ -93,6 +96,7 @@ impl Default for ServerConfig {
             cache: CacheConfig::default(),
             oauth: OAuthConfig::default(),
             dpop: DpopConfig::default(),
+            mcp: McpConfig::default(),
             crypto: CryptoSettings::default(),
             outbound_http: OutboundHttpConfig::default(),
             themes: ThemesConfig::default(),
@@ -192,6 +196,7 @@ impl ServerConfig {
             cache: CacheConfig::default(),
             oauth: OAuthConfig::default(),
             dpop: DpopConfig::default(),
+            mcp: McpConfig::default(),
             crypto: CryptoSettings::default(),
             outbound_http: OutboundHttpConfig::default(),
             provision: Some(PathBuf::from("provision.yaml")),
@@ -521,6 +526,24 @@ impl Default for DpopNonceConfig {
             lifetime_secs: DPOP_NONCE_LIFETIME_DEFAULT_SECS,
         }
     }
+}
+
+/// MCP (Model Context Protocol) settings (`[mcp]` section).
+///
+/// Groundwork for the MCP resource endpoint (GitHub issue #39): the flag
+/// currently gates the RFC 9728 protected-resource metadata routes
+/// (`/.well-known/oauth-protected-resource` and the path-suffixed form) and
+/// RFC 8707 resource indicators (the `resource` parameter — while disabled,
+/// any request carrying one is refused with `invalid_target`); the
+/// MCP endpoint itself follows. The whole section is optional and defaults to
+/// disabled, so existing configuration files boot unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Master switch for the MCP surface. Default `false`: the
+    /// protected-resource metadata routes answer 404 and any `resource`
+    /// parameter is refused with `invalid_target`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Crypto settings (`[crypto]` section).
@@ -1571,6 +1594,37 @@ key_base64 = "{}"
         for bad in [0, 4, 301, 6000] {
             assert!(nonce(bad).validate().is_err(), "{bad}s must fail validation");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // [mcp]
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mcp_disabled_by_default() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.mcp.enabled);
+        // The generated example carries the same default.
+        assert!(!ServerConfig::generate_example().mcp.enabled);
+    }
+
+    #[test]
+    fn mcp_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("mcp_toml", "toml");
+        fs::write(&path, "[mcp]\nenabled = true\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(cfg.mcp.enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_MCP__ENABLED", "true");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_MCP__ENABLED");
+        assert!(cfg.mcp.enabled);
     }
 
     #[test]

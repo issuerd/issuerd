@@ -61,6 +61,15 @@ impl Provisioner {
         storage: &dyn Storage,
         base_url: &str,
     ) -> Result<(), issuerd_core::IssuerdError> {
+        self.apply_once_with_mcp(storage, base_url, false).await
+    }
+
+    pub async fn apply_once_with_mcp(
+        &self,
+        storage: &dyn Storage,
+        base_url: &str,
+        mcp_enabled: bool,
+    ) -> Result<(), issuerd_core::IssuerdError> {
         let marker = self.config.marker_name();
 
         // Claim the marker atomically *before* applying: a concurrent first
@@ -73,7 +82,7 @@ impl Provisioner {
         info!(marker = %marker, "applying provision config");
         self.apply_realms(storage, base_url).await?;
         self.apply_roles(storage).await?;
-        self.apply_clients(storage).await?;
+        self.apply_clients(storage, mcp_enabled).await?;
         // Groups after clients: group client-role mappings resolve clients.
         self.apply_groups(storage).await?;
         self.apply_users(storage).await?;
@@ -333,7 +342,11 @@ impl Provisioner {
     // Clients
     // ------------------------------------------------------------------
 
-    async fn apply_clients(&self, storage: &dyn Storage) -> Result<(), issuerd_core::IssuerdError> {
+    async fn apply_clients(
+        &self,
+        storage: &dyn Storage,
+        mcp_enabled: bool,
+    ) -> Result<(), issuerd_core::IssuerdError> {
         for p in &self.config.clients {
             let realm_id = self.resolve_realm_id(storage, &p.realm).await?;
             let client_id = ClientIdentifier::new(&p.client_id).map_err(|e| {
@@ -344,6 +357,7 @@ impl Provisioner {
                 warn!(realm = %p.realm, client = %p.client_id, "client already exists; skipping");
                 continue;
             }
+            issuerd_core::validate_no_default_mcp_scopes(&p.default_scopes, mcp_enabled)?;
 
             let secret = p.secret.clone().or_else(|| {
                 if p.public_client {
@@ -1010,6 +1024,49 @@ mod tests {
         // Realm should still exist (and not be recreated / duplicated).
         let realms = storage.list_realms(&Pagination::default()).await.unwrap();
         assert_eq!(realms.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_scope_policy_follows_the_feature_gate_during_provisioning() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.clients[0].default_scopes = vec!["mcp:write".to_string()];
+        Provisioner { config }
+            .apply_once(&storage, "http://localhost:8080")
+            .await
+            .unwrap();
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let client = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("my-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.default_scopes.contains("mcp:write"));
+
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.clients[0].default_scopes = vec!["mcp:write".to_string()];
+        let err = Provisioner { config }
+            .apply_once_with_mcp(&storage, "http://localhost:8080", true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("optional scope"));
+
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.clients[0].optional_scopes = vec!["mcp:read".to_string()];
+        Provisioner { config }
+            .apply_once_with_mcp(&storage, "http://localhost:8080", true)
+            .await
+            .unwrap();
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let client = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("my-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.optional_scopes.contains("mcp:read"));
+        assert!(!client.default_scopes.contains("mcp:read"));
     }
 
     #[tokio::test]

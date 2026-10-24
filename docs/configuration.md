@@ -23,6 +23,7 @@ implemented in `crates/issuerd-server/src/config.rs` and the daemon startup path
 - [[cache]](#cache)
 - [[oauth]](#oauth)
 - [[dpop]](#dpop)
+- [[mcp]](#mcp)
 - [[crypto.key_encryption]](#cryptokey_encryption)
 - [[outbound_http]](#outbound_http)
 - [[themes]](#themes)
@@ -478,6 +479,60 @@ or expired. RFC 9449 defines no discovery metadata for nonce support, so none
 is advertised — clients discover the requirement from the
 `use_dpop_nonce`/`DPoP-Nonce` signals.
 
+## [mcp]
+
+MCP (Model Context Protocol) surface — groundwork for the MCP resource
+endpoint. The flag currently gates two pieces of the MCP surface:
+
+- RFC 9728 protected-resource metadata. The bare
+  `GET /.well-known/oauth-protected-resource` is an explicit
+  `resource_metadata` alias for the **master** realm, not origin-level
+  metadata. The canonical per-realm URL is
+  `GET /.well-known/oauth-protected-resource/{issuer-path}/realms/{realm}/mcp`
+  (the issuer path is empty when `issuer_url` has no path prefix). Metadata is
+  served only for canonical realm names; legacy UUID aliases and mismatched
+  paths answer 404.
+- RFC 8707 resource indicators at the authorization endpoint (plain,
+  PAR-pushed, and JAR request-object requests) and the token endpoint's
+  `authorization_code` / `refresh_token` grants. The allowlist holds exactly
+  one canonical realm-name value per realm — `{issuer_url}/realms/{realm}/mcp`,
+  compared byte-for-byte. Each request may carry at most one `resource`;
+  repeated values are rejected with `invalid_target` before query/form maps
+  can collapse them. A granted resource becomes the access token's `aud`
+  (`[client_id, resource]`, client id first), preserved through validation and
+  introspection, and rides the refresh token as a `resource` claim. Code
+  redemption may restate it, omit it (inherit), or introduce it when the code
+  carried none; refresh may only restate or omit. Every other grant refuses
+  `resource` when MCP is enabled.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
+
+```toml
+[mcp]
+enabled = false
+```
+
+Environment equivalent: `ISSUERD_MCP__ENABLED`.
+
+The document advertises the realm issuer URL as the authorization server, the
+built-in `mcp:read` / `mcp:write` scopes, and the DPoP proof-signing
+algorithms, identical to `dpop_signing_alg_values_supported` in the OIDC
+discovery document. When MCP is enabled, its scopes require an
+administrator's explicit optional assignment: anonymous DCR rejects them in
+either scope list, and Admin API, provisioning, and realm-default paths
+reject default assignments. With MCP disabled, legacy custom scope names keep
+the previous default∪optional behavior.
+
+Before enabling MCP, every cluster node must run the resource-aware version
+(older nodes drop `resource` when rotating refresh tokens), and legacy custom
+MCP scope definitions must be reconciled. Startup validates existing scopes
+and assignments and aborts on mapper/role-bearing custom scopes, default
+assignments, or open-registered clients carrying MCP scopes. MCP-disabled
+legacy deployments do not run this validation and keep booting unchanged. See
+[backup-and-upgrade.md](backup-and-upgrade.md).
+
 ## [crypto.key_encryption]
 
 Envelope encryption for the cluster-wide JWT **signing keys at rest**
@@ -833,6 +888,16 @@ auth_code_ttl_secs = 600        # authorization-code redemption window; 10-600, 
 [dpop.nonce]
 mode = "disabled"               # server-provided proof nonces: "disabled" | "supported" | "required"
 lifetime_secs = 30              # single-use nonce TTL; 5-300
+
+# ---- MCP ----------------------------------------------------------------------
+# Groundwork for the MCP endpoint: gates the RFC 9728 protected-resource
+# metadata routes (/.well-known/oauth-protected-resource — MCP clients read it
+# to discover the authorization server) and RFC 8707 resource indicators (the
+# `resource` parameter; the only allowlisted value is the realm's MCP resource
+# URI). The routes 404 and supported flows reject `resource` while disabled;
+# legacy token exchange keeps its historical ignore behavior.
+[mcp]
+enabled = false
 
 # ---- Signing-key encryption at rest ------------------------------------------
 # Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).

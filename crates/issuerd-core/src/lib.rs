@@ -32,9 +32,11 @@ pub use broker::{
     IdpPreset, MapperEffects, MockBrokerClient,
 };
 pub use client_scope::{
-    builtin_client_scopes, is_builtin_scope_name, mapper_config, ClaimTarget, ClientScope,
-    MapperType, ProtocolMapper, ScopeMappings, BUILTIN_SCOPE_NAMES, DEFAULT_DEFAULT_SCOPES,
-    DEFAULT_OPTIONAL_SCOPES,
+    builtin_client_scopes, client_scope_request_permitted, client_scope_request_permitted_with_mcp,
+    is_builtin_scope_name, is_mcp_scope_name, mapper_config, validate_no_default_mcp_scopes,
+    ClaimTarget, ClientScope, MapperType, ProtocolMapper, ScopeMappings, ATTR_DCR_POLICY,
+    BUILTIN_SCOPE_NAMES, DCR_POLICY_OPEN, DEFAULT_DEFAULT_SCOPES, DEFAULT_OPTIONAL_SCOPES,
+    MCP_SCOPE_READ, MCP_SCOPE_WRITE,
 };
 pub use error::{IssuerdError, OAuth2Error, OAuth2ErrorCode};
 pub use events::{AdminEvent, Event, EventType, OperationType, ResourceType};

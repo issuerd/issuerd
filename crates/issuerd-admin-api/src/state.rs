@@ -59,6 +59,8 @@ pub struct AdminApiState {
     /// up the storage mutation immediately. Peer cluster nodes converge via
     /// the JWKS polling task. No-op in tests.
     pub signing_key_reload: Arc<dyn Fn() + Send + Sync>,
+    /// Whether the MCP surface and its optional-only scope policy are enabled.
+    pub mcp_enabled: bool,
     /// Public base URL of the server (the configured issuer URL without a
     /// trailing slash); used to build absolute links in outbound email.
     pub base_url: String,

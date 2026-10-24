@@ -472,6 +472,27 @@ mod tests {
         assert!(!alg_matches_kty("unknown", A::RS256));
     }
 
+    /// The string-level allowlist behind the DPoP proof validator (and the
+    /// external ID-token path) must accept exactly the algorithms advertised
+    /// as `dpop_signing_alg_values_supported` — no more, no less.
+    #[test]
+    fn map_alg_accepts_exactly_the_dpop_advertised_set() {
+        for alg in Algorithm::ALL {
+            let advertised = Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED.contains(&alg);
+            assert_eq!(
+                map_alg(alg.as_str()).is_ok(),
+                advertised,
+                "alg {} acceptance drifted from the advertised DPoP set",
+                alg.as_str()
+            );
+        }
+        // Names outside the core vocabulary are rejected outright (and the
+        // match is case-sensitive, per RFC 7518 §3.1).
+        for name in ["none", "PS256", "ES256K", "rs256"] {
+            assert!(map_alg(name).is_err(), "{name} must be rejected");
+        }
+    }
+
     #[tokio::test]
     async fn single_element_aud_array_does_not_require_azp() {
         let fx = fixture().await;

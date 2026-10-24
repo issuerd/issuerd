@@ -22,7 +22,7 @@ const ALL: Pagination = Pagination {
     max: i32::MAX,
 };
 
-/// Seed the eight built-in client scopes into `realm_id` and wire the realm
+/// Seed the ten built-in client scopes into `realm_id` and wire the realm
 /// default scope sets ([`DEFAULT_DEFAULT_SCOPES`] / [`DEFAULT_OPTIONAL_SCOPES`]).
 ///
 /// Scopes that already exist (matched by name) are left untouched; realm
@@ -35,7 +35,10 @@ pub async fn seed_builtin_client_scopes(
     let existing = storage.list_client_scopes(realm_id, &ALL).await?;
     for scope in builtin_client_scopes(realm_id) {
         if !existing.iter().any(|s| s.name == scope.name) {
-            storage.create_client_scope(realm_id, &scope).await?;
+            match storage.create_client_scope(realm_id, &scope).await {
+                Ok(()) | Err(IssuerdError::Conflict) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -58,7 +61,8 @@ pub async fn seed_builtin_client_scopes(
 /// Assign realm client scopes to a freshly created client, mirroring its
 /// legacy string lists: scopes named in `client.default_scopes` become
 /// *default* assignments, scopes named in `client.optional_scopes` become
-/// *optional* assignments.
+/// *optional* assignments. This preserves legacy behavior; the MCP-enabled
+/// startup validator rejects unsafe MCP configurations separately.
 ///
 /// Carve-out: a scope named `roles` is always assigned as *default* when the
 /// client has no assignment for it. Before client scopes were introduced the
@@ -84,6 +88,90 @@ pub async fn seed_client_scope_assignments(
     if let Some(roles) = scopes.iter().find(|s| s.name == "roles") {
         if !assigned.iter().any(|(id, _)| id == &roles.id) {
             storage.assign_client_scope(realm_id, &client.id, &roles.id, true).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate legacy MCP scope definitions and assignments before the MCP
+/// surface is enabled. MCP-disabled deployments deliberately skip this check
+/// so previously valid custom scopes keep booting unchanged.
+pub async fn validate_mcp_scope_policy(
+    storage: &(impl Storage + ?Sized),
+) -> Result<(), IssuerdError> {
+    fn collision(realm: &Realm, detail: String) -> IssuerdError {
+        IssuerdError::InvalidRequest(format!(
+            "MCP scope collision in realm '{}': {detail}; reconcile it before enabling MCP",
+            realm.name
+        ))
+    }
+
+    let realms = storage.list_realms(&ALL).await?;
+    for realm in realms {
+        let scopes = storage.list_client_scopes(&realm.id, &ALL).await?;
+        let mcp_scopes: Vec<&ClientScope> =
+            scopes.iter().filter(|scope| is_mcp_scope_name(&scope.name)).collect();
+        for scope in &mcp_scopes {
+            if !scope.protocol_mappers.is_empty()
+                || !scope.scope_mappings.realm_roles.is_empty()
+                || !scope.scope_mappings.client_roles.is_empty()
+            {
+                return Err(collision(
+                    &realm,
+                    format!(
+                        "custom scope '{}' carries protocol mappers or role mappings",
+                        scope.name
+                    ),
+                ));
+            }
+        }
+
+        let realm_defaults = storage.list_realm_default_client_scopes(&realm.id).await?;
+        if realm_defaults
+            .iter()
+            .any(|(scope_id, _)| mcp_scopes.iter().any(|scope| scope.id == *scope_id))
+        {
+            return Err(collision(
+                &realm,
+                "an MCP scope is assigned as a realm default".to_string(),
+            ));
+        }
+
+        let clients = storage.list_clients(&realm.id, &ALL).await?;
+        for client in clients {
+            if let Some(scope) = client.default_scopes.iter().find(|scope| is_mcp_scope_name(scope))
+            {
+                return Err(collision(
+                    &realm,
+                    format!(
+                        "client '{}' has MCP scope '{scope}' in its default list",
+                        client.client_id
+                    ),
+                ));
+            }
+            let open_registered =
+                client.attributes.get(ATTR_DCR_POLICY).map(String::as_str) == Some(DCR_POLICY_OPEN);
+            if open_registered
+                && client
+                    .default_scopes
+                    .iter()
+                    .chain(client.optional_scopes.iter())
+                    .any(|scope| is_mcp_scope_name(scope))
+            {
+                return Err(collision(
+                    &realm,
+                    format!("open-registered client '{}' carries an MCP scope", client.client_id),
+                ));
+            }
+            let assignments = storage.list_client_scope_assignments(&realm.id, &client.id).await?;
+            if assignments.iter().any(|(scope_id, is_default)| {
+                *is_default && mcp_scopes.iter().any(|scope| scope.id == *scope_id)
+            }) {
+                return Err(collision(
+                    &realm,
+                    format!("client '{}' has a default MCP assignment", client.client_id),
+                ));
+            }
         }
     }
     Ok(())
@@ -190,13 +278,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_builtin_client_scopes_creates_all_eight_with_realm_defaults() {
+    async fn seed_builtin_client_scopes_creates_all_ten_with_realm_defaults() {
         let storage = InMemoryStorage::new();
         let realm = realm_id();
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 8);
+        assert_eq!(scopes.len(), 10);
         for expected in builtin_client_scopes(&realm) {
             assert!(
                 scopes.iter().any(|s| s.name == expected.name),
@@ -219,6 +307,13 @@ mod tests {
                 );
             }
         }
+        // The MCP authorization gates are seeded but never join the realm
+        // default sets — administrators assign them to agent clients
+        // explicitly.
+        for name in ["mcp:read", "mcp:write"] {
+            let scope = scopes.iter().find(|s| s.name == name).unwrap();
+            assert!(!defaults.iter().any(|(id, _)| id == &scope.id));
+        }
     }
 
     #[tokio::test]
@@ -237,10 +332,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_builtin_client_scopes_tolerates_concurrent_creation() {
+        let storage = std::sync::Arc::new(InMemoryStorage::new());
+        let realm = realm_id();
+        let (first, second) = tokio::join!(
+            seed_builtin_client_scopes(storage.as_ref(), &realm),
+            seed_builtin_client_scopes(storage.as_ref(), &realm),
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(storage.list_client_scopes(&realm, &ALL).await.unwrap().len(), 10);
+    }
+
+    #[tokio::test]
     async fn seed_builtin_client_scopes_preserves_preexisting_scope() {
         // A realm that already carries one of the built-in scopes (created
         // before seeding existed): the pre-existing row must be preserved
-        // (not recreated) and the remaining seven scopes filled in.
+        // (not recreated) and the remaining nine scopes filled in.
         let storage = InMemoryStorage::new();
         let realm = realm_id();
         let preexisting = ClientScope {
@@ -258,7 +366,7 @@ mod tests {
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 8);
+        assert_eq!(scopes.len(), 10);
         let profile = scopes.iter().find(|s| s.name == "profile").unwrap();
         assert_eq!(profile.id, preexisting.id);
         assert_eq!(profile.description, preexisting.description);
@@ -295,6 +403,93 @@ mod tests {
             storage.list_client_scope_assignments(&realm, &client.id).await.unwrap(),
             before
         );
+    }
+
+    async fn seeded_storage() -> (InMemoryStorage, RealmId) {
+        let storage = InMemoryStorage::new();
+        let realm = realm_id();
+        storage
+            .create_realm(&Realm {
+                id: realm.clone(),
+                name: RealmName::new("seed-realm").unwrap(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (storage, realm)
+    }
+
+    #[tokio::test]
+    async fn seed_client_scope_assignments_preserves_legacy_mcp_assignments() {
+        let (storage, realm) = seeded_storage().await;
+        let client = test_client("client-1", "my-app", "openid mcp:write", "mcp:read");
+        seed_client_scope_assignments(&storage, &realm, &client).await.unwrap();
+
+        let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
+        let read = scopes.iter().find(|scope| scope.name == MCP_SCOPE_READ).unwrap();
+        let write = scopes.iter().find(|scope| scope.name == MCP_SCOPE_WRITE).unwrap();
+        let assignments = storage.list_client_scope_assignments(&realm, &client.id).await.unwrap();
+        assert!(assignments.contains(&(read.id.clone(), false)));
+        assert!(assignments.contains(&(write.id.clone(), true)));
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_accepts_valid_legacy_optional_assignment() {
+        let (storage, realm) = seeded_storage().await;
+        let client = test_client("client-1", "my-app", "openid", "mcp:write");
+        storage.create_client(&realm, &client).await.unwrap();
+        validate_mcp_scope_policy(&storage).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_rejects_unsafe_legacy_client_assignments() {
+        let (storage, realm) = seeded_storage().await;
+        let client = test_client("client-1", "my-app", "openid mcp:write", "");
+        storage.create_client(&realm, &client).await.unwrap();
+        assert!(validate_mcp_scope_policy(&storage).await.is_err());
+
+        let (storage, realm) = seeded_storage().await;
+        let mut client = test_client("client-1", "my-app", "openid", "mcp:read");
+        client
+            .attributes
+            .insert(ATTR_DCR_POLICY.to_string(), DCR_POLICY_OPEN.to_string());
+        storage.create_client(&realm, &client).await.unwrap();
+        assert!(validate_mcp_scope_policy(&storage).await.is_err());
+
+        let (storage, realm) = seeded_storage().await;
+        let client = test_client("client-1", "my-app", "openid", "");
+        storage.create_client(&realm, &client).await.unwrap();
+        let scope =
+            storage.get_client_scope_by_name(&realm, MCP_SCOPE_READ).await.unwrap().unwrap();
+        storage.assign_client_scope(&realm, &client.id, &scope.id, true).await.unwrap();
+        assert!(validate_mcp_scope_policy(&storage).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_rejects_realm_defaults_and_custom_definitions() {
+        let (storage, realm) = seeded_storage().await;
+        let scope =
+            storage.get_client_scope_by_name(&realm, MCP_SCOPE_READ).await.unwrap().unwrap();
+        storage.add_realm_default_client_scope(&realm, &scope.id, false).await.unwrap();
+        assert!(validate_mcp_scope_policy(&storage).await.is_err());
+
+        let (storage, realm) = seeded_storage().await;
+        let mut scope = storage
+            .get_client_scope_by_name(&realm, MCP_SCOPE_WRITE)
+            .await
+            .unwrap()
+            .unwrap();
+        let profile_mapper = builtin_client_scopes(&realm)
+            .into_iter()
+            .find(|scope| scope.name == "profile")
+            .unwrap()
+            .protocol_mappers
+            .into_iter()
+            .next()
+            .unwrap();
+        scope.protocol_mappers.push(profile_mapper);
+        storage.update_client_scope(&realm, &scope).await.unwrap();
+        assert!(validate_mcp_scope_policy(&storage).await.is_err());
     }
 
     #[tokio::test]

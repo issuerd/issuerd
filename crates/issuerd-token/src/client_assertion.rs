@@ -127,6 +127,10 @@ pub fn validate_client_secret_assertion(
     decode_and_check(assertion, &key, &validation, requirements)
 }
 
+fn private_key_jwt_alg_supported(alg: jsonwebtoken::Algorithm) -> bool {
+    crate::external::map_alg(&format!("{alg:?}")).is_ok()
+}
+
 /// Verify a `private_key_jwt` assertion against the client's JWKS document.
 /// Only asymmetric algorithms are accepted; candidate keys are filtered by
 /// `kid` (when the assertion carries one) and algorithm family.
@@ -135,16 +139,13 @@ pub fn validate_private_key_assertion(
     jwks: &serde_json::Value,
     requirements: &ClientAssertionRequirements<'_>,
 ) -> Result<ClientAssertionClaims, IssuerdError> {
-    use jsonwebtoken::Algorithm as A;
     let header =
         jsonwebtoken::decode_header(assertion).map_err(|e| invalid_caused("malformed JWT", e))?;
-    match header.alg {
-        A::RS256 | A::RS384 | A::RS512 | A::ES256 | A::ES384 | A::EdDSA => {}
-        other => {
-            return Err(IssuerdError::InvalidRequest(format!(
-                "unsupported client assertion algorithm for private_key_jwt: {other:?}"
-            )))
-        }
+    if !private_key_jwt_alg_supported(header.alg) {
+        return Err(IssuerdError::InvalidRequest(format!(
+            "unsupported client assertion algorithm for private_key_jwt: {:?}",
+            header.alg
+        )));
     }
     let jwks: ExternalJwks = serde_json::from_value(jwks.clone())
         .map_err(|e| invalid_caused("malformed client JWKS", e))?;
@@ -613,6 +614,17 @@ mod tests {
             }
             assert!(result.is_ok(), "exp exactly at the lifetime cap must be accepted");
             return;
+        }
+    }
+
+    #[test]
+    fn private_key_jwt_alg_set_matches_dpop_accept_set() {
+        use jsonwebtoken::Algorithm as A;
+        for alg in [A::RS256, A::RS384, A::RS512, A::ES256, A::ES384, A::EdDSA] {
+            assert!(private_key_jwt_alg_supported(alg), "rejected {alg:?}");
+        }
+        for alg in [A::HS256, A::HS384, A::HS512, A::PS256, A::PS384, A::PS512] {
+            assert!(!private_key_jwt_alg_supported(alg), "accepted {alg:?}");
         }
     }
 

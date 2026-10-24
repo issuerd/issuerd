@@ -12,5 +12,6 @@ pub mod discovery;
 pub mod error;
 pub mod introspection;
 pub mod pkce;
+pub mod resource;
 pub mod token;
 pub mod utils;

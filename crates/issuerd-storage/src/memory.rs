@@ -3659,14 +3659,14 @@ mod tests {
         let storage = InMemoryStorage::new();
         let realm = test_realm();
         storage.create_realm(&realm).await.unwrap();
-        // Realm creation seeded the 8 built-ins.
+        // Realm creation seeded the 10 built-ins.
         assert_eq!(
             storage
                 .list_client_scopes(&realm.id, &Pagination::default())
                 .await
                 .unwrap()
                 .len(),
-            8
+            10
         );
 
         let scope = test_client_scope("realm-1", "custom");
@@ -3755,6 +3755,8 @@ mod tests {
                 "acr",
                 "address",
                 "email",
+                "mcp:read",
+                "mcp:write",
                 "offline_access",
                 "phone",
                 "profile",
@@ -4141,7 +4143,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            8
+            10
         );
         assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);
         // email (optional) + roles (default) from the creation seeding.
@@ -4202,7 +4204,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            8
+            10
         );
         assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);
         assert_eq!(
@@ -4213,6 +4215,44 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_without_mcp_scopes_gains_them_via_backfill() {
+        let storage = InMemoryStorage::new();
+        let realm = test_realm();
+        storage.create_realm(&realm).await.unwrap();
+
+        // Simulate a snapshot written before the MCP scopes existed: every
+        // built-in except `mcp:read`/`mcp:write` is present.
+        let scopes = storage.list_client_scopes(&realm.id, &Pagination::default()).await.unwrap();
+        assert_eq!(scopes.len(), 10);
+        for name in ["mcp:read", "mcp:write"] {
+            let scope = scopes.iter().find(|s| s.name == name).unwrap();
+            storage.delete_client_scope(&realm.id, &scope.id).await.unwrap();
+        }
+        let snapshot = storage.to_snapshot();
+
+        let storage2 = InMemoryStorage::new();
+        storage2.load_snapshot(snapshot);
+        assert_eq!(
+            storage2
+                .list_client_scopes(&realm.id, &Pagination::default())
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+
+        // The seeding backfill adds the two missing built-ins; the realm
+        // default sets are untouched (the MCP scopes never join them).
+        crate::seed::seed_builtin_client_scopes(&storage2, &realm.id).await.unwrap();
+        let scopes = storage2.list_client_scopes(&realm.id, &Pagination::default()).await.unwrap();
+        assert_eq!(scopes.len(), 10);
+        for name in ["mcp:read", "mcp:write"] {
+            assert!(scopes.iter().any(|s| s.name == name));
+        }
+        assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);
     }
 
     // ------------------------------------------------------------------
