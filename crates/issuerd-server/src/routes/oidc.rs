@@ -1551,7 +1551,7 @@ async fn handle_auth_request(
                 authorization_details: auth_req.authorization_details.clone(),
                 resource: auth_req.resource.clone(),
             };
-            if super::consent::consent_needed(
+            let needs_consent = match super::consent::consent_needed(
                 &state,
                 &realm_id,
                 &client,
@@ -1561,6 +1561,24 @@ async fn handle_auth_request(
             )
             .await
             {
+                Ok(needed) => needed,
+                Err(e) => {
+                    warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "consent lookup failed");
+                    return crate::routes::auth_response::oauth_error_redirect(
+                        &state,
+                        auth_req.redirect_uri.as_ref(),
+                        &IssuerdError::TemporarilyUnavailable,
+                        auth_req.state.as_deref(),
+                        &crate::routes::auth_response::ResponsePackaging::from_request(
+                            &realm,
+                            client.client_id.as_str(),
+                            &auth_req,
+                        ),
+                    )
+                    .await;
+                }
+            };
+            if needs_consent {
                 // prompt=none must never render an interactive page (OIDC Core
                 // 3.1.2.6): report consent_required to the client instead.
                 if auth_req.prompt.contains(&Prompt::None) {

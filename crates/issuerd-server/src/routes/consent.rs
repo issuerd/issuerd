@@ -27,9 +27,9 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use issuerd_core::{AuthMethod, Client, Realm, RealmId, SessionId, User, UserId};
+use issuerd_core::{AuthMethod, Client, IssuerdError, Realm, RealmId, SessionId, User, UserId};
 
 use crate::email::html_escape;
 use crate::state::ServerState;
@@ -87,9 +87,9 @@ fn continuation_url(realm_name: &str, execution: &str) -> String {
 ///
 /// The page is shown when `prompt=consent` was requested (regardless of
 /// stored grants), or when the client requires consent and no stored grant
-/// covers the full requested scope set. A consent-store failure fails open
-/// (log + skip) so a backend hiccup cannot take down logins — the same
-/// policy the claims overlay uses.
+/// covers the full requested scope set. A consent-store failure is an
+/// operational error: inability to determine the grant is not permission to
+/// skip the consent page.
 pub(crate) async fn consent_needed(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
@@ -97,23 +97,18 @@ pub(crate) async fn consent_needed(
     user_id: &UserId,
     granted_scopes: &[String],
     prompt_consent: bool,
-) -> bool {
+) -> Result<bool, IssuerdError> {
     if !client.consent_required && !prompt_consent {
-        return false;
+        return Ok(false);
     }
     if prompt_consent {
-        return true;
+        return Ok(true);
     }
-    match state.storage.get_consents(realm_id, user_id).await {
-        Ok(consents) => match consents.iter().find(|c| c.client_id == client.id) {
-            Some(grant) => !granted_scopes.iter().all(|s| grant.granted_scopes.contains(s)),
-            None => true,
-        },
-        Err(e) => {
-            warn!(realm = %realm_id, error = %e, "consent lookup failed; skipping consent screen");
-            false
-        }
-    }
+    let consents = state.storage.get_consents(realm_id, user_id).await?;
+    Ok(match consents.iter().find(|c| c.client_id == client.id) {
+        Some(grant) => !granted_scopes.iter().all(|s| grant.granted_scopes.contains(s)),
+        None => true,
+    })
 }
 
 /// Store the paused login and route the user agent to the consent page.
@@ -638,7 +633,8 @@ mod tests {
         let client = admin_cli(&state, &realm_id).await;
         assert!(
             !consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
-                .await,
+                .await
+                .unwrap(),
             "a client without consent_required must never pause for consent"
         );
     }
@@ -649,7 +645,8 @@ mod tests {
         let client = admin_cli(&state, &realm_id).await;
         assert!(
             consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], true)
-                .await,
+                .await
+                .unwrap(),
             "prompt=consent forces the page regardless of client settings or stored grants"
         );
     }
@@ -660,7 +657,8 @@ mod tests {
         let client = consenting_client(&state, &realm_id).await;
         assert!(
             consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
-                .await,
+                .await
+                .unwrap(),
             "no stored grant -> consent page"
         );
     }
@@ -683,7 +681,8 @@ mod tests {
         // Covered set -> skip the page.
         assert!(
             !consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
-                .await,
+                .await
+                .unwrap(),
             "a stored grant covering the requested scopes skips the page"
         );
         // Anything beyond the grant -> page again.
@@ -696,9 +695,29 @@ mod tests {
                 &["openid".to_string(), "email".to_string()],
                 false
             )
-            .await,
+            .await
+            .unwrap(),
             "a scope outside the stored grant re-triggers the page"
         );
+    }
+
+    #[tokio::test]
+    async fn consent_lookup_failure_is_not_treated_as_granted() {
+        let (state, realm_id, user_id) = setup().await;
+        let client = consenting_client(&state, &realm_id).await;
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_consents()
+            .returning(|_, _| Err(IssuerdError::ServerError("consent store down".into())));
+        let state = Arc::new(ServerState {
+            storage: Arc::new(storage),
+            ..state.as_ref().clone()
+        });
+
+        let result =
+            consent_needed(&state, &realm_id, &client, &user_id, &["openid".to_string()], false)
+                .await;
+        assert!(matches!(result, Err(IssuerdError::ServerError(_))));
     }
 
     // -----------------------------------------------------------------------

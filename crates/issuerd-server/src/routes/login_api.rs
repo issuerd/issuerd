@@ -953,7 +953,7 @@ pub(crate) async fn complete_login_with_method(
     // Consent gate: a consent-required client (or prompt=consent
     // carried in the pending entry) pauses here — after authentication,
     // before session/code issuance — until the user grants the scopes.
-    if super::consent::consent_needed(
+    let needs_consent = match super::consent::consent_needed(
         state,
         &realm_id,
         &client,
@@ -963,6 +963,13 @@ pub(crate) async fn complete_login_with_method(
     )
     .await
     {
+        Ok(needed) => needed,
+        Err(e) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(super::oidc::error_response(&e)))
+                .into_response();
+        }
+    };
+    if needs_consent {
         let entry = super::consent::PendingConsentData {
             user_id: user_id.0.clone(),
             session_id: session_id.0.clone(),
