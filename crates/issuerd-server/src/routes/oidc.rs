@@ -5669,7 +5669,7 @@ async fn verify_user_password(
 }
 
 /// Why a non-browser password grant was rejected at the second-factor gate.
-enum OobSecondFactorReject {
+pub(crate) enum OobSecondFactorReject {
     /// OTP credentials are enrolled but no `totp` code was presented.
     MissingOtp,
     /// The presented `totp` code matched no OTP credential.
@@ -5689,7 +5689,7 @@ enum OobSecondFactorReject {
 /// returning, so the same code cannot be reused for a later grant. Every
 /// presented code spends an attempt from the user's one-time-code budget,
 /// shared with the browser OTP stage.
-async fn enforce_oob_second_factor(
+pub(crate) async fn enforce_oob_second_factor(
     state: &Arc<ServerState>,
     realm: &Realm,
     user: &issuerd_core::User,

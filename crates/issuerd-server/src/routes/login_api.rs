@@ -165,6 +165,8 @@ pub struct AdminTokenRequest {
     pub realm: String,
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1277,6 +1279,28 @@ pub async fn admin_token_handler(
             .into_response();
     }
 
+    if !user.required_actions.is_empty() {
+        warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request rejected: required actions pending");
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
+            .into_response();
+    }
+
+    if let Err(reject) =
+        super::oidc::enforce_oob_second_factor(&state, &realm, &user, body.totp.as_deref()).await
+    {
+        return match reject {
+            super::oidc::OobSecondFactorReject::Internal(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(super::oidc::error_response(&e)))
+                    .into_response()
+            }
+            _ => {
+                warn!(realm = %body.realm, username = %issuerd_core::utils::sanitize_log_str(&body.username), "admin token request rejected: second factor required or invalid");
+                (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_grant"})))
+                    .into_response()
+            }
+        };
+    }
+
     // Successful authentication clears the failure counter.
     if brute_force.is_some() {
         let _ = state
@@ -1291,7 +1315,14 @@ pub async fn admin_token_handler(
         .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
         .await
     {
-        Ok(Some(c)) => c,
+        Ok(Some(c)) if c.enabled => c,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized_client"})),
+            )
+                .into_response();
+        }
         Ok(None) => {
             error!(realm = %realm_id, "admin-cli client not found");
             return (
@@ -1773,6 +1804,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1798,6 +1830,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "wrong".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1823,6 +1856,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -1838,6 +1872,102 @@ pub(crate) mod tests {
 
     async fn setup_state() -> Arc<ServerState> {
         Arc::new(ServerState::from_config(&ServerConfig::with_test_admin()).await.unwrap())
+    }
+
+    async fn seed_admin_totp(state: &Arc<ServerState>) -> issuerd_core::OtpPolicy {
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_vec(),
+            credential_data: serde_json::json!({}),
+            priority: 0,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &credential).await.unwrap();
+        realm.otp_policy
+    }
+
+    fn admin_token_request(totp: Option<String>) -> AdminTokenRequest {
+        AdminTokenRequest {
+            realm: "master".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            totp,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_token_enforces_totp() {
+        let state = setup_state().await;
+        let policy = seed_admin_totp(&state).await;
+
+        let response = admin_token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let step = issuerd_core::utils::now_secs() / u64::from(policy.period_secs);
+        let code = issuerd_auth_flow::totp::totp_at(
+            b"12345678901234567890",
+            step,
+            policy.digits,
+            &policy.algorithm,
+        );
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(Some(code))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_token_rejects_pending_required_actions() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut user =
+            state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        user.required_actions = vec!["UPDATE_PASSWORD".to_string()];
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_token_rejects_disabled_admin_client() {
+        let state = setup_state().await;
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        client.enabled = false;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+
+        let response = admin_token_handler(
+            State(state),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            Json(admin_token_request(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(response).await["error"], "unauthorized_client");
     }
 
     /// Request headers carrying the flow correlation cookie that the authorize
@@ -2623,6 +2753,7 @@ pub(crate) mod tests {
                 realm: "nonexistent".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2640,6 +2771,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "nobody".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2675,6 +2807,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "nocreds".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -2700,6 +2833,7 @@ pub(crate) mod tests {
                     realm: "master".to_string(),
                     username: "admin".to_string(),
                     password: password.to_string(),
+                    totp: None,
                 }),
             )
         };
@@ -2762,6 +2896,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3163,6 +3298,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "badutf8".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3208,6 +3344,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "badhash".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -3680,6 +3817,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -4570,6 +4708,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "norole".to_string(),
                 password: "secret".to_string(),
+                totp: None,
             }),
         )
         .await;
@@ -4640,6 +4779,7 @@ pub(crate) mod tests {
                 realm: "master".to_string(),
                 username: "admin".to_string(),
                 password: "admin".to_string(),
+                totp: None,
             }),
         )
         .await;
