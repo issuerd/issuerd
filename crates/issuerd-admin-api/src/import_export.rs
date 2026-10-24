@@ -1118,6 +1118,13 @@ mod tests {
         let state = manage_realm_state();
         let app = test_app(state.clone());
         let realm_id = master_realm_id();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.attributes.insert(
+            issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE.to_string(),
+            "export-sector-key".to_string(),
+        );
+        realm.attributes.insert("visible".to_string(), "unchanged".to_string());
+        state.storage.update_realm(&realm).await.unwrap();
 
         let user = seed_user(&state, &realm_id, "alice", Some("alice@example.com")).await;
         // A stored password credential: must never appear in the export.
@@ -1142,6 +1149,10 @@ mod tests {
 
         // Realm fields are flattened at the top level.
         assert_eq!(body["realm"], "master");
+        assert_eq!(body["attributes"]["visible"], "unchanged");
+        assert!(body["attributes"]
+            .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+            .is_none());
         assert!(body["users"].as_array().unwrap().iter().any(|u| u["username"] == "alice"));
         let exported_client = body["clients"]
             .as_array()
@@ -1161,6 +1172,7 @@ mod tests {
 
         // No known secret value appears anywhere in the serialized document.
         let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains("export-sector-key"));
         assert!(!serialized.contains("topsecret-client-value"));
         assert!(!serialized.contains("idp-secret-value"));
         assert!(!serialized.contains("argon2id-user-hash"));

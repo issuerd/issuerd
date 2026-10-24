@@ -181,7 +181,9 @@ pub struct RealmRepresentation {
     pub default_locale: Option<String>,
     /// Name of the default realm role assigned to new users.
     pub default_role: Option<String>,
-    /// Arbitrary realm-level attributes.
+    /// Arbitrary realm-level attributes. The server-held
+    /// `pairwise_sector_key` is accepted on writes but omitted from responses
+    /// and admin-event representations.
     pub attributes: Option<HashMap<String, String>>,
     /// Whether brute-force detection (login-failure tracking + lockout) is enabled.
     #[serde(rename = "bruteForceProtected")]
@@ -271,6 +273,26 @@ pub struct RealmRepresentation {
     /// Alias of the registration flow (default `"registration"`).
     #[serde(rename = "registrationFlow")]
     pub registration_flow: Option<String>,
+}
+
+impl RealmRepresentation {
+    /// Remove server-held secrets from a realm representation.
+    ///
+    /// The pairwise sector key remains accepted on writes for deliberate
+    /// rotation, but is omitted rather than masked on reads so a
+    /// read-modify-write round trip cannot replace it with a placeholder.
+    pub fn with_secrets_redacted(mut self) -> Self {
+        if let Some(attributes) = self.attributes.as_mut() {
+            attributes.remove(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE);
+        }
+        self
+    }
+
+    /// Clone without realm secrets, suitable for persisting in the immutable
+    /// admin-event audit log.
+    pub fn redacted_for_audit(&self) -> Self {
+        self.clone().with_secrets_redacted()
+    }
 }
 
 #[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
@@ -1463,6 +1485,7 @@ impl From<Realm> for RealmRepresentation {
             first_broker_login_flow: r.first_broker_login_flow,
             registration_flow: r.registration_flow,
         }
+        .with_secrets_redacted()
     }
 }
 
@@ -1881,8 +1904,31 @@ impl From<Event> for EventRepresentation {
     }
 }
 
+/// Redact realm audit JSON read back from storage, including rows written
+/// before realm create/update emission started sanitizing representations.
+/// Other resource types and unrelated realm events retain their original JSON.
+fn redact_realm_audit_representation(
+    resource_type: ResourceType,
+    representation: Option<String>,
+) -> Option<String> {
+    if resource_type != ResourceType::Realm {
+        return representation;
+    }
+    let raw = representation?;
+    if !raw.contains(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE) {
+        return Some(raw);
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if let Some(attributes) = value.get_mut("attributes").and_then(serde_json::Value::as_object_mut)
+    {
+        attributes.remove(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE);
+    }
+    serde_json::to_string(&value).ok()
+}
+
 impl From<AdminEvent> for AdminEventRepresentation {
     fn from(e: AdminEvent) -> Self {
+        let representation = redact_realm_audit_representation(e.resource_type, e.representation);
         Self {
             id: Some(e.id.to_string()),
             time: e.event_time.timestamp(),
@@ -1895,7 +1941,7 @@ impl From<AdminEvent> for AdminEventRepresentation {
             operation_type: e.operation_type,
             resource_type: e.resource_type,
             resource_path: e.resource_path,
-            representation: e.representation,
+            representation,
             error: e.error,
         }
     }
@@ -3556,6 +3602,42 @@ mod tests {
             first_broker_login_flow: None,
             registration_flow: None,
         }
+    }
+
+    #[test]
+    fn realm_secret_redaction_omits_only_the_pairwise_sector_key() {
+        let realm = Realm {
+            attributes: HashMap::from([
+                (Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE.to_string(), "model-sector-key".to_string()),
+                ("visible".to_string(), "unchanged".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let rep = RealmRepresentation::from(realm);
+        let attributes = rep.attributes.as_ref().unwrap();
+        assert!(!attributes.contains_key(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE));
+        assert_eq!(attributes.get("visible").map(String::as_str), Some("unchanged"));
+
+        let request = RealmRepresentation {
+            attributes: Some(HashMap::from([
+                (Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE.to_string(), "audit-sector-key".to_string()),
+                ("visible".to_string(), "unchanged".to_string()),
+            ])),
+            ..base_realm_rep()
+        };
+        let audit = request.redacted_for_audit();
+        let audit_attributes = audit.attributes.as_ref().unwrap();
+        assert!(!audit_attributes.contains_key(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE));
+        assert_eq!(audit_attributes.get("visible").map(String::as_str), Some("unchanged"));
+        assert_eq!(
+            request.attributes.as_ref().unwrap()[Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE],
+            "audit-sector-key",
+            "audit redaction must not mutate the write representation"
+        );
+
+        let stored = Realm::try_from(request).unwrap();
+        assert_eq!(stored.pairwise_sector_key(), Some("audit-sector-key"));
+        assert_eq!(stored.attributes["visible"], "unchanged");
     }
 
     #[test]

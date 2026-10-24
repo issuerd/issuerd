@@ -190,7 +190,7 @@ pub async fn create_realm(
         OperationType::Create,
         ResourceType::Realm,
         &format!("realms/{}", realm.name),
-        serde_json::to_string(&body).ok(),
+        serde_json::to_string(&body.redacted_for_audit()).ok(),
     )
     .await;
     info!(realm = %realm.name, "realm created");
@@ -296,7 +296,7 @@ pub async fn update_realm(
         OperationType::Update,
         ResourceType::Realm,
         &format!("realms/{}", realm),
-        serde_json::to_string(&body).ok(),
+        serde_json::to_string(&body.redacted_for_audit()).ok(),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -772,6 +772,231 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(realm.pairwise_sector_key(), Some("rotated-key"));
+    }
+
+    async fn realm_body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn realm_read_responses_omit_pairwise_sector_key() {
+        let state = test_state(vec![issuerd_core::RoleName::new("view-realm").unwrap()]);
+        let app = admin_routes(state.clone());
+        let attributes = HashMap::from([
+            (
+                issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE.to_string(),
+                "read-sector-key".to_string(),
+            ),
+            ("visible".to_string(), "unchanged".to_string()),
+        ]);
+        state
+            .storage
+            .create_realm(&issuerd_core::Realm {
+                id: issuerd_core::RealmId::new("realm-1").unwrap(),
+                name: issuerd_core::RealmName::new("test").unwrap(),
+                attributes,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for uri in ["/admin/realms/test", "/admin/realms"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("Authorization", "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "uri: {uri}");
+            let body = realm_body_json(response).await;
+            let realm = if body.is_array() {
+                body.as_array().unwrap().iter().find(|realm| realm["realm"] == "test").unwrap()
+            } else {
+                &body
+            };
+            assert_eq!(realm["attributes"]["visible"], "unchanged", "uri: {uri}");
+            assert!(
+                realm["attributes"]
+                    .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+                    .is_none(),
+                "pairwise sector key disclosed by {uri}: {realm}"
+            );
+            assert!(!body.to_string().contains("read-sector-key"), "uri: {uri}");
+        }
+
+        let stored = state
+            .storage
+            .get_realm(&issuerd_core::RealmId::new("realm-1").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.pairwise_sector_key(), Some("read-sector-key"));
+        assert_eq!(stored.attributes["visible"], "unchanged");
+    }
+
+    #[tokio::test]
+    async fn redacted_realm_roundtrip_preserves_pairwise_sector_key() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        let app = admin_routes(state.clone());
+        let attributes = HashMap::from([
+            (
+                issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE.to_string(),
+                "roundtrip-sector-key".to_string(),
+            ),
+            ("visible".to_string(), "before".to_string()),
+        ]);
+        state
+            .storage
+            .create_realm(&issuerd_core::Realm {
+                id: issuerd_core::RealmId::new("realm-1").unwrap(),
+                name: issuerd_core::RealmName::new("test").unwrap(),
+                attributes,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/realms/test")
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = realm_body_json(response).await;
+        assert!(body["attributes"]
+            .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+            .is_none());
+        body["display_name"] = "Updated".into();
+        body["attributes"]["visible"] = "after".into();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/realms/test?merge=false")
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let stored = state
+            .storage
+            .get_realm(&issuerd_core::RealmId::new("realm-1").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.pairwise_sector_key(), Some("roundtrip-sector-key"));
+        assert_eq!(stored.attributes["visible"], "after");
+        assert_eq!(stored.display_name.unwrap().as_str(), "Updated");
+    }
+
+    #[tokio::test]
+    async fn realm_admin_event_representations_omit_pairwise_sector_key() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        let app = admin_routes(state.clone());
+        let create = serde_json::json!({
+            "realm": "audit-realm",
+            "adminEventsEnabled": true,
+            "adminEventsDetailsEnabled": true,
+            "attributes": {
+                "pairwise_sector_key": "create-sector-key",
+                "visible": "created"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/realms")
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = realm_body_json(response).await;
+        assert_eq!(created["attributes"]["visible"], "created");
+        assert!(created["attributes"]
+            .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+            .is_none());
+        assert!(!created.to_string().contains("create-sector-key"));
+
+        let realm = state.storage.get_realm_by_name("audit-realm").await.unwrap().unwrap();
+        assert_eq!(realm.pairwise_sector_key(), Some("create-sector-key"));
+        let update = serde_json::json!({
+            "realm": "audit-realm",
+            "attributes": {
+                "pairwise_sector_key": "update-sector-key",
+                "visible": "updated"
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/realms/audit-realm")
+                    .header("Authorization", "Bearer valid-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let stored = state.storage.get_realm(&realm.id).await.unwrap().unwrap();
+        assert_eq!(stored.pairwise_sector_key(), Some("update-sector-key"));
+        assert_eq!(stored.attributes["visible"], "updated");
+        let events = state
+            .storage
+            .query_admin_events(
+                &realm.id,
+                &issuerd_core::AdminEventQuery {
+                    operation_type: None,
+                    resource_type: None,
+                    auth_user_id: None,
+                    date_from: None,
+                    date_to: None,
+                    pagination: issuerd_core::Pagination::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let representation = event.representation.as_deref().unwrap();
+            assert!(!representation.contains("create-sector-key"), "{representation}");
+            assert!(!representation.contains("update-sector-key"), "{representation}");
+            let audited: serde_json::Value = serde_json::from_str(representation).unwrap();
+            assert!(audited["attributes"]
+                .get(issuerd_core::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE)
+                .is_none());
+            let expected = match event.operation_type {
+                OperationType::Create => "created",
+                OperationType::Update => "updated",
+                _ => panic!("unexpected realm audit operation"),
+            };
+            assert_eq!(audited["attributes"]["visible"], expected);
+        }
     }
 
     #[tokio::test]
