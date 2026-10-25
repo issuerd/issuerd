@@ -22,14 +22,16 @@ name: Release
 # (crates.io uploads are resumable — scripts/publish.py skips
 # already-uploaded crates, --from CRATE resumes mid-list).
 #
-# Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images
-# (issuerd/issuerd:X.Y.Z-amd64, …-arm64), then docker-manifest assembles the
-# user-facing manifest list (:latest, :X.Y.Z, :X.Y) — one tag serving both
-# architectures (docker pull picks the host arch). Per-arch tags carry no
-# embedded SBOM/provenance attestations on purpose: attested pushes make each
-# tag an OCI index, and nesting indexes breaks manifest-list merging.
-# The arm64 image is packed from the natively built binary (ubuntu-22.04-arm
-# runner — see the linux-arm64 job and Dockerfile.prebuilt).
+# Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images to
+# Docker Hub (issuerd/issuerd) and GHCR (ghcr.io/issuerd/issuerd), then
+# docker-manifest assembles user-facing manifest lists (:latest, :X.Y.Z, :X.Y)
+# on both registries. Both manifests are signed and verified by digest with
+# keyless cosign; detached .sig/.crt files for the downloadable archives are
+# signed separately in the release job. Per-arch tags carry no embedded
+# SBOM/provenance attestations: attested pushes make each tag an OCI index,
+# and nesting indexes breaks manifest-list merging. The arm64 image is packed
+# from the natively built binary (ubuntu-22.04-arm runner — see the linux-arm64
+# job and Dockerfile.prebuilt).
 #
 # Local rehearsal: .act/run-release.sh runs this workflow under nektos/act
 # (plus .act/rehearse-arm64.sh / rehearse-manifest.sh for the arm64 and
@@ -109,11 +111,26 @@ jobs:
           ### Docker (multi-arch: linux/amd64 + linux/arm64)
 
           \`\`\`
-          docker pull issuerd/issuerd:${VERSION}   # pinned — resolves to your host architecture
-          docker pull issuerd/issuerd:latest       # latest release
+          docker pull issuerd/issuerd:${VERSION}   # Docker Hub, pinned by version
+          docker pull ghcr.io/issuerd/issuerd:${VERSION}   # GHCR, same image
+          docker pull issuerd/issuerd:latest       # Docker Hub, latest release
+          docker pull ghcr.io/issuerd/issuerd:latest # GHCR, latest release
           \`\`\`
 
-          Per-architecture tags are also published: \`issuerd/issuerd:${VERSION}-amd64\` and \`issuerd/issuerd:${VERSION}-arm64\`.
+          Per-architecture tags are also published on both registries: \`issuerd/issuerd:${VERSION}-amd64\` / \`issuerd/issuerd:${VERSION}-arm64\` and \`ghcr.io/issuerd/issuerd:${VERSION}-amd64\` / \`ghcr.io/issuerd/issuerd:${VERSION}-arm64\`.
+
+          Both multi-arch manifests are signed by digest with keyless cosign (GitHub OIDC). Verify them with:
+          \`\`\`
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            issuerd/issuerd:${VERSION}
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            ghcr.io/issuerd/issuerd:${VERSION}
+          \`\`\`
+          To pin by digest, inspect either registry tag with \`docker buildx imagetools inspect\` and use the \`@sha256:...\` form. The \`.sig\`/\`.crt\` files attached below are for the downloadable archives; OCI image signatures live beside the manifests in Docker Hub and GHCR.
 
           ### crates.io
 
@@ -138,12 +155,15 @@ jobs:
     uses: ./.github/workflows/heavy.yml
 
   docker:
-    name: docker image (linux/amd64) → Docker Hub
+    name: docker image (linux/amd64) → Docker Hub + GHCR
     # FINAL stage: needs the heavy suites + all platform builds (via the
     # release job's gate) — a tag with failing tests never reaches Docker
     # Hub. Runs side by side with the crates-io publish after the gate.
     needs: [validate, release]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -157,6 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "issuerd/issuerd:$VERSION-amd64" | tee tags.txt
+          echo "ghcr.io/issuerd/issuerd:$VERSION-amd64" | tee -a tags.txt
           {
             echo "tags<<EOF"; cat tags.txt; echo "EOF"
             echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -166,6 +187,12 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       # Under act: build + load locally only (no push).
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
@@ -350,11 +377,14 @@ jobs:
           if-no-files-found: error
 
   docker-arm64:
-    name: docker image (linux/arm64) → Docker Hub
+    name: docker image (linux/arm64) → Docker Hub + GHCR
     # FINAL stage like the amd64 job (same gate), plus the linux-arm64 job
     # for the staged image build context artifact.
     needs: [validate, release, linux-arm64]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -366,16 +396,28 @@ jobs:
       # executes on the x86_64 runner, so no QEMU is needed.
       - name: Stage the Dockerfile into the build context
         run: cp Dockerfile.prebuilt image-arm64/Dockerfile
-      - name: Image tag
+      - name: Image tags
         id: meta
         env:
           VERSION: ${{ needs.validate.outputs.version }}
-        run: echo "tags=issuerd/issuerd:$VERSION-arm64" >> "$GITHUB_OUTPUT"
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "issuerd/issuerd:$VERSION-arm64"
+            echo "ghcr.io/issuerd/issuerd:$VERSION-arm64"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: ${{ env.ACT != 'true' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
           # No .dockerbuild build-record artifact (see the amd64 job).
@@ -401,6 +443,10 @@ jobs:
     name: multi-arch manifest (:latest, :X.Y.Z, :X.Y)
     needs: [validate, docker, docker-arm64]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
@@ -408,24 +454,70 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       # One manifest list per user-facing tag → both architectures under a
       # single tag; the per-arch tags stay published for pinning.
-      - name: Create and push the multi-arch manifest list
+      - name: Create and push the multi-arch manifest lists
+        id: manifest
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          cmd=(docker buildx imagetools create
+          hub_cmd=(docker buildx imagetools create
             -t "issuerd/issuerd:latest"
             -t "issuerd/issuerd:$VERSION"
             -t "issuerd/issuerd:${VERSION%.*}"
             "issuerd/issuerd:$VERSION-amd64" "issuerd/issuerd:$VERSION-arm64")
+          ghcr_cmd=(docker buildx imagetools create
+            -t "ghcr.io/issuerd/issuerd:latest"
+            -t "ghcr.io/issuerd/issuerd:$VERSION"
+            -t "ghcr.io/issuerd/issuerd:${VERSION%.*}"
+            "ghcr.io/issuerd/issuerd:$VERSION-amd64" "ghcr.io/issuerd/issuerd:$VERSION-arm64")
           if [ "${ACT:-}" = true ]; then
-            echo "::notice::act rehearsal — would run: ${cmd[*]}"
+            echo "::notice::act rehearsal — would run: ${hub_cmd[*]}"
+            echo "::notice::act rehearsal — would run: ${ghcr_cmd[*]}"
             exit 0
           fi
-          "${cmd[@]}"
-          docker buildx imagetools inspect "issuerd/issuerd:$VERSION"
+          "${hub_cmd[@]}"
+          "${ghcr_cmd[@]}"
+          hub_digest=$(docker buildx imagetools inspect "issuerd/issuerd:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')
+          ghcr_digest=$(docker buildx imagetools inspect "ghcr.io/issuerd/issuerd:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')
+          for digest in "$hub_digest" "$ghcr_digest"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not determine a registry manifest digest: $digest"
+              exit 1
+            fi
+          done
+          echo "Docker Hub manifest digest: $hub_digest"
+          echo "GHCR manifest digest: $ghcr_digest"
+          echo "hub_digest=$hub_digest" >> "$GITHUB_OUTPUT"
+          echo "ghcr_digest=$ghcr_digest" >> "$GITHUB_OUTPUT"
+      - name: Install cosign
+        if: ${{ env.ACT != 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      # Registry signatures live beside the signed manifests, unlike the
+      # detached .sig/.crt files attached to the GitHub Release archives.
+      - name: Sign and verify the multi-arch manifests (Docker Hub + GHCR)
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "issuerd/issuerd@${{ steps.manifest.outputs.hub_digest }}"
+          cosign sign --yes "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.ghcr_digest }}"
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "issuerd/issuerd@${{ steps.manifest.outputs.hub_digest }}"
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.ghcr_digest }}"
 
   dockerhub-overview:
     name: Docker Hub repo overview
