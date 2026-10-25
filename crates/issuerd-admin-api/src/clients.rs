@@ -8,13 +8,13 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use issuerd_core::{ClientId, OperationType, Pagination, ResourceType};
+use issuerd_core::{ClientId, ClientIdentifier, OperationType, Pagination, ResourceType};
 use std::sync::Arc;
 
 use crate::{
     auth::{require_roles, AdminAuth},
     dto::{
-        ClientRepresentation, ClientSecret, CountRepresentation, PaginationQueryParams,
+        ClientQueryParams, ClientRepresentation, ClientSecret, CountRepresentation,
         UserRepresentation,
     },
     error::AdminApiError,
@@ -60,10 +60,10 @@ pub(crate) async fn ensure_service_account_user(
     path = "/admin/realms/{realm}/clients",
     tag = "Clients",
     summary = "List clients in a realm",
-    description = "Returns a paginated list of OIDC/OAuth2 clients in the realm. Requires `view-clients` or `manage-clients` role.",
+    description = "Returns a paginated list of OIDC/OAuth2 clients in the realm. Supports the Keycloak-parity exact-match `clientId` filter, which takes precedence over pagination. Requires `view-clients` or `manage-clients` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
-        PaginationQueryParams
+        ClientQueryParams
     ),
     responses(
         (status = 200, description = "List of clients", body = Vec<ClientRepresentation>),
@@ -77,7 +77,7 @@ pub async fn list_clients(
     State(state): State<Arc<AdminApiState>>,
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path(realm): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+    axum::extract::Query(params): axum::extract::Query<ClientQueryParams>,
 ) -> Result<Json<Vec<ClientRepresentation>>, AdminApiError> {
     require_roles(&auth, &["view-clients", "manage-clients"])?;
     let realm_id = state
@@ -86,6 +86,12 @@ pub async fn list_clients(
         .await?
         .ok_or(AdminApiError::NotFound)?
         .id;
+    if let Some(client_id) = params.client_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let client_id = ClientIdentifier::new(client_id)
+            .map_err(|e| AdminApiError::BadRequest(e.to_string()))?;
+        let client = state.storage.get_client_by_client_id(&realm_id, &client_id).await?;
+        return Ok(Json(client.into_iter().map(Into::into).collect()));
+    }
     let clients = state
         .storage
         .list_clients(&realm_id, &Pagination::new(params.first, params.max))
@@ -788,6 +794,55 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let reps: Vec<ClientRepresentation> = serde_json::from_slice(&body).unwrap();
         assert_eq!(reps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_clients_exact_client_id_filter() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("view-clients").unwrap()
+            ]);
+        let app = client_routes(state.clone());
+        let (realm_name, _) = create_test_realm_and_client(&state).await;
+
+        // Exact filtering takes precedence over pagination parameters.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/realms/{realm_name}/clients?clientId=my-app&first=100&max=0"
+                    ))
+                    .header("Authorization", "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let reps: Vec<ClientRepresentation> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].client_id.as_str(), "my-app");
+
+        // A substring or an unknown ID returns an empty list, never the paginated scan.
+        for filter in ["my", "unknown"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/admin/realms/{realm_name}/clients?clientId={filter}"))
+                        .header("Authorization", "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let reps: Vec<ClientRepresentation> = serde_json::from_slice(&body).unwrap();
+            assert!(reps.is_empty());
+        }
     }
 
     #[tokio::test]

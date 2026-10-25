@@ -4872,7 +4872,7 @@
           "Clients"
         ],
         "summary": "List clients in a realm",
-        "description": "Returns a paginated list of OIDC/OAuth2 clients in the realm. Requires `view-clients` or `manage-clients` role.",
+        "description": "Returns a paginated list of OIDC/OAuth2 clients in the realm. Supports the Keycloak-parity exact-match `clientId` filter, which takes precedence over pagination. Requires `view-clients` or `manage-clients` role.",
         "operationId": "list_clients",
         "parameters": [
           {
@@ -4882,6 +4882,18 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "in": "query",
+            "description": "Exact-match client ID filter (Keycloak parity): when present, returns at\nmost the one client with exactly this client ID and ignores pagination.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {

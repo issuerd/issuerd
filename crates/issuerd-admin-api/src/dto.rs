@@ -1021,6 +1021,20 @@ pub struct UserQueryParams {
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ClientQueryParams {
+    /// Exact-match client ID filter (Keycloak parity): when present, returns at
+    /// most the one client with exactly this client ID and ignores pagination.
+    #[serde(rename = "clientId")]
+    pub client_id: Option<String>,
+    /// Zero-based index of the first result to return.
+    #[serde(default)]
+    pub first: i32,
+    /// Maximum number of results to return. Defaults to 20.
+    #[serde(default = "default_max")]
+    pub max: i32,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct EventQueryParams {
     /// Filter events by type (e.g. `"login"`, `"logout"`).
     pub event_type: Option<EventType>,
