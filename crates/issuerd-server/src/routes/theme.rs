@@ -263,7 +263,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("acme")).unwrap();
         std::fs::create_dir_all(base.join("empty-theme")).unwrap();
-        std::fs::write(base.join("acme").join("messages_fr.json"), b"{}").unwrap();
+        std::fs::write(base.join("acme").join("messages_es.json"), b"{}").unwrap();
         // A regional (full-tag) bundle is discovered under its full tag.
         std::fs::write(base.join("acme").join("messages_de-AT.json"), b"{}").unwrap();
         // A bundle for a shipped locale changes nothing (deduped).
@@ -272,15 +272,15 @@ mod tests {
         std::fs::write(base.join("acme").join("login.css"), b"x").unwrap();
         std::fs::write(base.join("acme").join("messages_.json"), b"{}").unwrap();
         // Bundles directly under the themes root belong to no theme.
-        std::fs::write(base.join("messages_fr.json"), b"{}").unwrap();
+        std::fs::write(base.join("messages_es.json"), b"{}").unwrap();
 
         let locales = available_locales(&base);
-        assert_eq!(locales, vec!["de", "de-AT", "en", "fr", "zh"]);
+        assert_eq!(locales, vec!["de", "de-AT", "en", "es", "fr", "zh"]);
 
         std::fs::remove_dir_all(&base).unwrap();
 
         // A missing directory still yields the shipped built-ins.
-        assert_eq!(available_locales(&base), vec!["de", "en", "zh"]);
+        assert_eq!(available_locales(&base), vec!["de", "en", "fr", "zh"]);
     }
 
     #[tokio::test]

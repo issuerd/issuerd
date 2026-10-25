@@ -654,8 +654,9 @@ overrides the keys it defines:
 
 1. built-in English (compiled in, always complete — the canonical key list is
    the source-tree `crates/issuerd-server/i18n/messages_en.json`),
-2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`, `zh` — the
-   `zh` bundle is Simplified-script Chinese and serves every `zh-*` region),
+2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`, `fr`, `zh` —
+   the `fr` bundle serves every `fr-*` region, and the `zh` bundle is
+   Simplified-script Chinese and serves every `zh-*` region),
 3. theme English override (`{themes.dir}/{theme}/messages_en.json`),
 4. theme locale override (`{themes.dir}/{theme}/messages_{locale}.json`),
 5. theme full-tag override (`messages_{locale-with-region}.json`, e.g.
@@ -688,7 +689,7 @@ Admin API / provision YAML realm keys `internationalization_enabled`,
 `supported_locales`, `default_locale` (see [provisioning.md](provisioning.md)).
 
 To add a locale, drop a `messages_<locale>.json` into a theme directory —
-e.g. `{themes.dir}/issuerd/messages_fr.json` with `{ "login.title": "Connexion" }` —
+e.g. `{themes.dir}/issuerd/messages_es.json` with `{ "login.title": "Iniciar sesión" }` —
 then enable internationalization on the realm and add the locale to its
 supported locales (it appears in the console checkbox list automatically).
 To refine a locale for one region, add a full-tag bundle next to it —
