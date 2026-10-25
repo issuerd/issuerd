@@ -20,17 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-10-25
+
 ### Added
 
 - **GHCR publication and cosign-signed container images.** Every tag release now also publishes `ghcr.io/issuerd/issuerd` with `latest`, `X.Y.Z`, `X.Y`, and per-architecture tags alongside Docker Hub. Both multi-arch manifests (Docker Hub and GHCR) are signed and verified by digest with keyless cosign (GitHub OIDC). The first GHCR package starts private; an organization owner must make it public once in Package settings, after which it stays public.
 
-### Fixed
-
-- **Idempotent GitHub Release asset uploads.** The release job now uploads only missing assets and publishes only after all 48 are present. Retries no longer delete or rewrite existing assets, so a partial failed release can resume without API races or losing previously uploaded files.
-
-## [0.1.22] - 2026-10-25
-
-### Added
 
 - **Built-in French (`fr`) message bundle.** Login-flow pages and outbound email now ship a complete French translation alongside English, German, and Simplified Chinese; it serves as the generic fallback for every `fr-*` region until a regional theme bundle refines it. `GET /admin/enums/locales` and `GET /admin/serverinfo` list it as a built-in (`French`); enable it per realm via `supported_locales` once internationalization is on. Theme overrides and per-key English fallback are unchanged. ([#1](https://github.com/issuerd/issuerd/issues/1))
 
@@ -58,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cosign v3 keyless release signing.** Cosign is pinned to v3.0.6 and uses its detached-file compatibility mode so the promised `.sig`/`.crt` assets are produced instead of failing on new bundle-format defaults. ([#76](https://github.com/issuerd/issuerd/pull/76))
 
 - **Release jobs on hosts without Docker.** The two PostgreSQL MCP backfill tests now probe Docker availability and skip gracefully instead of panicking on a missing socket. They continue to run against real PostgreSQL testcontainers wherever Docker is available, restoring Windows ARM64, macOS, and glibc 2.28 release coverage. ([#74](https://github.com/issuerd/issuerd/pull/74))
+
+- **Idempotent GitHub Release asset uploads.** The release job now uploads only missing assets and publishes only after all 48 are present. Retries no longer delete or rewrite existing assets, so a partial failed release can resume without API races or losing previously uploaded files. ([#79](https://github.com/issuerd/issuerd/pull/79))
 
 - **Audience and resource-protocol correctness.** Multi-audience JWTs now round-trip every `aud` entry through typed validation and introspection instead of dropping all but the first. Resource metadata and allowlists use canonical realm-name URLs (including issuer path prefixes), and repeated `resource` parameters are rejected before query/form deserialization can make them order-dependent.
 - **MCP scope onboarding and upgrade hardening.** With MCP enabled, anonymous DCR can no longer self-assign `mcp:*`; default assignments are rejected across Admin/provisioning/realm-default paths and optional-only assignment is enforced at issuance. Disabled legacy scopes keep their previous behavior. Legacy custom definitions and open-DCR assignments are validated before MCP starts, and concurrent built-in PostgreSQL backfills no longer abort on duplicate-key conflicts.
