@@ -20,11 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Release artifact checkout order.** `actions/checkout` now runs before artifact downloads, so downloaded release assets are not removed before the idempotent upload step.
-
-## [0.1.23] - 2026-10-25
+## [0.1.24] - 2026-10-25
 
 ### Added
 
@@ -53,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Required-action continuation provenance.** `PendingActionsData` gained optional `auth_method` and `method_label` fields so broker and SPNEGO authentication methods survive continuations. Existing cached entries deserialize with the legacy password fallback. Rust embedders constructing the public struct literally should set both fields to `None` for the old behavior, or the appropriate method/label for a federated flow.
 
 ### Fixed
+
+- **Release artifact checkout order.** `actions/checkout` runs before artifact downloads, so downloaded release assets are not removed before the idempotent upload step. ([#81](https://github.com/issuerd/issuerd/pull/81))
 
 - **Cosign v3 keyless release signing.** Cosign is pinned to v3.0.6 and uses its detached-file compatibility mode so the promised `.sig`/`.crt` assets are produced instead of failing on new bundle-format defaults. ([#76](https://github.com/issuerd/issuerd/pull/76))
 
