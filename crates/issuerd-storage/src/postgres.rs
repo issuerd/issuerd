@@ -2776,6 +2776,16 @@ mod tests {
     use std::collections::HashMap;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
+    fn docker_available() -> bool {
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     async fn start_pg_container() -> (String, testcontainers::ContainerAsync<GenericImage>) {
         let img = GenericImage::new("postgres", "15-alpine")
             .with_wait_for(WaitFor::message_on_stderr(
@@ -3965,6 +3975,12 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_builtin_scope_backfill_is_idempotent() {
+        if !docker_available() {
+            eprintln!(
+                "skipping concurrent_builtin_scope_backfill_is_idempotent: docker unavailable"
+            );
+            return;
+        }
         let (url, _container) = start_pg_container().await;
         let first = PostgresStorage::connect(&url).await.unwrap();
         first.run_migrations().await.unwrap();
@@ -3991,6 +4007,12 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_mcp_backfill_rejects_legacy_default_assignment() {
+        if !docker_available() {
+            eprintln!(
+                "skipping postgres_mcp_backfill_rejects_legacy_default_assignment: docker unavailable"
+            );
+            return;
+        }
         let (storage, _container) = setup_pg().await;
         let realm = test_realm();
         storage.create_realm(&realm).await.unwrap();
