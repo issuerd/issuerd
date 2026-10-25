@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.20] - 2026-10-25
+## [0.1.21] - 2026-10-25
 
 ### Added
 
@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Required-action continuation provenance.** `PendingActionsData` gained optional `auth_method` and `method_label` fields so broker and SPNEGO authentication methods survive continuations. Existing cached entries deserialize with the legacy password fallback. Rust embedders constructing the public struct literally should set both fields to `None` for the old behavior, or the appropriate method/label for a federated flow.
 
 ### Fixed
+
+- **Release jobs on hosts without Docker.** The two PostgreSQL MCP backfill tests now probe Docker availability and skip gracefully instead of panicking on a missing socket. They continue to run against real PostgreSQL testcontainers wherever Docker is available, restoring Windows ARM64, macOS, and glibc 2.28 release coverage. ([#74](https://github.com/issuerd/issuerd/pull/74))
 
 - **Audience and resource-protocol correctness.** Multi-audience JWTs now round-trip every `aud` entry through typed validation and introspection instead of dropping all but the first. Resource metadata and allowlists use canonical realm-name URLs (including issuer path prefixes), and repeated `resource` parameters are rejected before query/form deserialization can make them order-dependent.
 - **MCP scope onboarding and upgrade hardening.** With MCP enabled, anonymous DCR can no longer self-assign `mcp:*`; default assignments are rejected across Admin/provisioning/realm-default paths and optional-only assignment is enforced at issuance. Disabled legacy scopes keep their previous behavior. Legacy custom definitions and open-DCR assignments are validated before MCP starts, and concurrent built-in PostgreSQL backfills no longer abort on duplicate-key conflicts.
