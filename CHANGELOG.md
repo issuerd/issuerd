@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-10-25
+
 ### Added
 
 - **Built-in French (`fr`) message bundle.** Login-flow pages and outbound email now ship a complete French translation alongside English, German, and Simplified Chinese; it serves as the generic fallback for every `fr-*` region until a regional theme bundle refines it. `GET /admin/enums/locales` and `GET /admin/serverinfo` list it as a built-in (`French`); enable it per realm via `supported_locales` once internationalization is on. Theme overrides and per-key English fallback are unchanged. ([#1](https://github.com/issuerd/issuerd/issues/1))
