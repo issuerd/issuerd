@@ -654,9 +654,9 @@ overrides the keys it defines:
 
 1. built-in English (compiled in, always complete — the canonical key list is
    the source-tree `crates/issuerd-server/i18n/messages_en.json`),
-2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`, `fr`, `zh` —
-   the `fr` bundle serves every `fr-*` region, and the `zh` bundle is
-   Simplified-script Chinese and serves every `zh-*` region),
+2. built-in `{locale}` (compiled in; shipped locales: `en`, `de`, `fr`,
+   `pt-BR`, `zh` — `pt-BR` is Brazilian Portuguese, `fr` serves every `fr-*`
+   region, and `zh` is Simplified-script Chinese and serves every `zh-*` region),
 3. theme English override (`{themes.dir}/{theme}/messages_en.json`),
 4. theme locale override (`{themes.dir}/{theme}/messages_{locale}.json`),
 5. theme full-tag override (`messages_{locale-with-region}.json`, e.g.

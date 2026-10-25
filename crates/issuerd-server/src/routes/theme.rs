@@ -275,12 +275,12 @@ mod tests {
         std::fs::write(base.join("messages_es.json"), b"{}").unwrap();
 
         let locales = available_locales(&base);
-        assert_eq!(locales, vec!["de", "de-AT", "en", "es", "fr", "zh"]);
+        assert_eq!(locales, vec!["de", "de-AT", "en", "es", "fr", "pt-BR", "zh"]);
 
         std::fs::remove_dir_all(&base).unwrap();
 
         // A missing directory still yields the shipped built-ins.
-        assert_eq!(available_locales(&base), vec!["de", "en", "fr", "zh"]);
+        assert_eq!(available_locales(&base), vec!["de", "en", "fr", "pt-BR", "zh"]);
     }
 
     #[tokio::test]

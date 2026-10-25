@@ -674,6 +674,7 @@ fn locale_label(tag: &str) -> &str {
         "en" => "English",
         "de" => "German",
         "fr" => "French",
+        "pt-BR" => "Portuguese (Brazil)",
         "zh" => "Chinese",
         _ => tag,
     }
@@ -1056,6 +1057,8 @@ mod tests {
         assert_eq!(de.name, "German");
         let fr = list.iter().find(|v| v.id == "fr").unwrap();
         assert_eq!(fr.name, "French");
+        let pt_br = list.iter().find(|v| v.id == "pt-BR").unwrap();
+        assert_eq!(pt_br.name, "Portuguese (Brazil)");
         let zh = list.iter().find(|v| v.id == "zh").unwrap();
         assert_eq!(zh.name, "Chinese");
         for item in &list {
@@ -1520,7 +1523,7 @@ mod tests {
 
         let Json(list) = list_locales(State(state.clone()), Extension(auth.clone())).await.unwrap();
         // Default test state exposes exactly the shipped built-in locales.
-        assert_enum_list("/admin/enums/locales", &list, &["en", "de", "fr", "zh"]);
+        assert_enum_list("/admin/enums/locales", &list, &["en", "de", "fr", "pt-BR", "zh"]);
 
         let Json(list) = list_authenticators(State(state), Extension(auth)).await.unwrap();
         // Ids come from the state's plugin registry; the stub mirrors the

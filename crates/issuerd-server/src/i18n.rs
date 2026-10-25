@@ -17,8 +17,7 @@
 //!
 //! 1. built-in `en` (embedded, always complete)
 //! 2. built-in primary subtag (`de`; shipped locales: [`SHIPPED_LOCALES`])
-//! 3. built-in full tag (none shipped today — the slot mirrors the theme
-//!    layers, so a future compiled-in regional bundle needs no loader change)
+//! 3. built-in full tag (`pt-BR`; other full tags use the same slot)
 //! 4. theme `en` override (`{themes_dir}/{theme}/messages_en.json`)
 //! 5. theme primary-subtag override (`messages_de.json`)
 //! 6. theme full-tag override (`messages_de-AT.json`)
@@ -59,6 +58,8 @@ mod bundles {
     pub const DE: &str = include_str!("../i18n/messages_de.json");
     /// Built-in French bundle.
     pub const FR: &str = include_str!("../i18n/messages_fr.json");
+    /// Built-in Brazilian Portuguese bundle (full `pt-BR` tag).
+    pub const PT_BR: &str = include_str!("../i18n/messages_pt-BR.json");
     /// Built-in Chinese bundle (Simplified script) — the generic fallback
     /// for every `zh-*` region; regional refinements come from theme layers.
     pub const ZH: &str = include_str!("../i18n/messages_zh.json");
@@ -76,6 +77,7 @@ fn builtin_bundle(locale: &str) -> Option<MessageBundle> {
         "en" => Some(parse_bundle(bundles::EN)),
         "de" => Some(parse_bundle(bundles::DE)),
         "fr" => Some(parse_bundle(bundles::FR)),
+        "pt-BR" => Some(parse_bundle(bundles::PT_BR)),
         "zh" => Some(parse_bundle(bundles::ZH)),
         _ => None,
     }
@@ -223,8 +225,8 @@ pub fn message_bundle(
     }
     // The full tag is its own layer above the primary subtag — but only when
     // it carries more information than the subtag and is safe to embed in a
-    // path. No built-in full-tag bundle ships today; the lookup exists so a
-    // future one needs no loader change.
+    // path. `pt-BR` has a built-in full-tag bundle; other full tags use the
+    // same lookup before falling back to the theme layers.
     let full_tag = if locale != lang {
         safe_layer_name(locale)
     } else {
@@ -508,6 +510,14 @@ mod tests {
         let regional = message_bundle(None, None, "fr-FR");
         assert_eq!(generic.get("login.title").map(String::as_str), Some("Connexion"));
         assert_eq!(regional.get("login.title").map(String::as_str), Some("Connexion"));
+    }
+
+    #[test]
+    fn brazilian_portuguese_builtin_bundle_uses_full_tag() {
+        let regional = message_bundle(None, None, "pt-BR");
+        assert_eq!(regional.get("login.title").map(String::as_str), Some("Entrar"));
+        let primary = message_bundle(None, None, "pt");
+        assert_eq!(primary.get("login.title").map(String::as_str), Some("Sign In"));
     }
 
     #[test]
