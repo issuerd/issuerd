@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **GHCR publication and cosign-signed container images.** Every tag release now also publishes `ghcr.io/issuerd/issuerd` with `latest`, `X.Y.Z`, `X.Y`, and per-architecture tags alongside Docker Hub. Both multi-arch manifests (Docker Hub and GHCR) are signed and verified by digest with keyless cosign (GitHub OIDC). The first GHCR package starts private; an organization owner must make it public once in Package settings, after which it stays public.
 
+### Fixed
+
+- **Idempotent GitHub Release asset uploads.** The release job now uploads only missing assets and publishes only after all 48 are present. Retries no longer delete or rewrite existing assets, so a partial failed release can resume without API races or losing previously uploaded files.
+
 ## [0.1.22] - 2026-10-25
 
 ### Added

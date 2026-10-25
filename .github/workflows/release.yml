@@ -928,29 +928,14 @@ jobs:
           for f in issuerd_*_conformance-evidence.tar.gz SHA256SUMS.txt; do
             cosign sign-blob --yes --use-signing-config=false --new-bundle-format=false --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
           done
-      - name: Create the GitHub Release
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Idempotent, retry-safe upload: existing assets are skipped rather than
+      # deleted/replaced, and publication happens only after all 48 are present.
+      - name: Create or update and publish the GitHub Release
         if: ${{ env.ACT != 'true' }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          body_path: release-notes/release-notes.md
-          make_latest: true
-          fail_on_unmatched_files: true
-          files: |
-            linux-dist/*
-            linux-glibc228-dist/*
-            linux-arm64-dist/*
-            windows-dist/*
-            windows-arm64-dist/*
-            macos-dist/*
-            macos-amd64-dist/*
-            issuerd_*_conformance-evidence.tar.gz
-            SHA256SUMS.txt
-            *-dist/*.sig
-            *-dist/*.crt
-            issuerd_*_conformance-evidence.tar.gz.sig
-            issuerd_*_conformance-evidence.tar.gz.crt
-            SHA256SUMS.txt.sig
-            SHA256SUMS.txt.crt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/upload-release-assets.sh "${GITHUB_REF_NAME}" release-notes/release-notes.md
       - name: Release contents (always logged — this is what rehearsal inspects)
         run: |
           ls -l *-dist/
