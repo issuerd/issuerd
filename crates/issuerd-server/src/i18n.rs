@@ -57,6 +57,8 @@ mod bundles {
     pub const EN: &str = include_str!("../i18n/messages_en.json");
     /// Built-in German bundle.
     pub const DE: &str = include_str!("../i18n/messages_de.json");
+    /// Built-in French bundle.
+    pub const FR: &str = include_str!("../i18n/messages_fr.json");
     /// Built-in Chinese bundle (Simplified script) — the generic fallback
     /// for every `zh-*` region; regional refinements come from theme layers.
     pub const ZH: &str = include_str!("../i18n/messages_zh.json");
@@ -73,6 +75,7 @@ fn builtin_bundle(locale: &str) -> Option<MessageBundle> {
     match locale {
         "en" => Some(parse_bundle(bundles::EN)),
         "de" => Some(parse_bundle(bundles::DE)),
+        "fr" => Some(parse_bundle(bundles::FR)),
         "zh" => Some(parse_bundle(bundles::ZH)),
         _ => None,
     }
@@ -500,25 +503,33 @@ mod tests {
     }
 
     #[test]
+    fn french_builtin_bundle_serves_generic_and_regional_requests() {
+        let generic = message_bundle(None, None, "fr");
+        let regional = message_bundle(None, None, "fr-FR");
+        assert_eq!(generic.get("login.title").map(String::as_str), Some("Connexion"));
+        assert_eq!(regional.get("login.title").map(String::as_str), Some("Connexion"));
+    }
+
+    #[test]
     fn unknown_locale_falls_back_to_english_bundle() {
-        let bundle = message_bundle(None, None, "fr-FR");
+        let bundle = message_bundle(None, None, "es-ES");
         assert_eq!(bundle.get("login.title").map(String::as_str), Some("Sign In"));
     }
 
     #[test]
     fn message_bundle_without_theme_reads_default_theme_dir() {
         // A `None` theme falls back to the default theme directory, matching
-        // the theme asset handler: `themes/issuerd/messages_fr.json` applies
+        // the theme asset handler: `themes/issuerd/messages_es.json` applies
         // without any realm theme setting.
         let dir = std::env::temp_dir()
             .join(format!("issuerd-i18n-test-{}", issuerd_core::utils::generate_id()));
         let theme_dir = dir.join(crate::routes::theme::DEFAULT_THEME);
         std::fs::create_dir_all(&theme_dir).unwrap();
-        std::fs::write(theme_dir.join("messages_fr.json"), r#"{"login.title":"Connexion FR"}"#)
+        std::fs::write(theme_dir.join("messages_es.json"), r#"{"login.title":"Iniciar sesión"}"#)
             .unwrap();
 
-        let bundle = message_bundle(Some(&dir), None, "fr");
-        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Connexion FR"));
+        let bundle = message_bundle(Some(&dir), None, "es");
+        assert_eq!(bundle.get("login.title").map(String::as_str), Some("Iniciar sesión"));
         // Untouched keys still fall back to the built-in English text.
         assert_eq!(bundle.get("consent.allow").map(String::as_str), Some("Allow"));
 

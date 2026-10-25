@@ -12,4 +12,4 @@
 /// server). `zh` is Simplified-script Chinese and serves as the generic
 /// fallback for every `zh-*` region; regional refinements come from theme
 /// bundle layers.
-pub const SHIPPED_LOCALES: &[&str] = &["en", "de", "zh"];
+pub const SHIPPED_LOCALES: &[&str] = &["en", "de", "fr", "zh"];

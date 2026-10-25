@@ -673,6 +673,7 @@ fn locale_label(tag: &str) -> &str {
     match tag {
         "en" => "English",
         "de" => "German",
+        "fr" => "French",
         "zh" => "Chinese",
         _ => tag,
     }
@@ -1053,6 +1054,8 @@ mod tests {
         assert_eq!(en.name, "English");
         let de = list.iter().find(|v| v.id == "de").unwrap();
         assert_eq!(de.name, "German");
+        let fr = list.iter().find(|v| v.id == "fr").unwrap();
+        assert_eq!(fr.name, "French");
         let zh = list.iter().find(|v| v.id == "zh").unwrap();
         assert_eq!(zh.name, "Chinese");
         for item in &list {
@@ -1517,7 +1520,7 @@ mod tests {
 
         let Json(list) = list_locales(State(state.clone()), Extension(auth.clone())).await.unwrap();
         // Default test state exposes exactly the shipped built-in locales.
-        assert_enum_list("/admin/enums/locales", &list, &["en", "de", "zh"]);
+        assert_enum_list("/admin/enums/locales", &list, &["en", "de", "fr", "zh"]);
 
         let Json(list) = list_authenticators(State(state), Extension(auth)).await.unwrap();
         // Ids come from the state's plugin registry; the stub mirrors the
@@ -1537,25 +1540,25 @@ mod tests {
 
     #[tokio::test]
     async fn theme_supplied_locales_appear_in_serverinfo_and_enum_endpoint() {
-        // A state whose boot-time theme scan found a `messages_fr.json`
+        // A state whose boot-time theme scan found a `messages_es.json`
         // bundle: both surfaces must expose the extra locale.
         let state = crate::test_utils::tests::test_state_with_locales(
             vec![issuerd_core::RoleName::new("view-realm").unwrap()],
-            vec!["en".to_string(), "de".to_string(), "fr".to_string()],
+            vec!["en".to_string(), "de".to_string(), "es".to_string()],
         );
         let auth = auth_with_role("view-realm");
 
         let Json(info) =
             get_serverinfo(State(state.clone()), Extension(auth.clone())).await.unwrap();
         let ids: Vec<&str> = info.locales.iter().map(|v| v.id.as_str()).collect();
-        assert_eq!(ids, ["en", "de", "fr"]);
-        let fr = info.locales.iter().find(|v| v.id == "fr").unwrap();
-        assert_eq!(fr.name, "fr", "unknown tags fall back to the raw tag as name");
-        assert!(fr.description.as_ref().is_some_and(|d| !d.is_empty()));
+        assert_eq!(ids, ["en", "de", "es"]);
+        let es = info.locales.iter().find(|v| v.id == "es").unwrap();
+        assert_eq!(es.name, "es", "unknown tags fall back to the raw tag as name");
+        assert!(es.description.as_ref().is_some_and(|d| !d.is_empty()));
 
         let Json(list) = list_locales(State(state), Extension(auth)).await.unwrap();
         let ids: Vec<&str> = list.iter().map(|v| v.id.as_str()).collect();
-        assert_eq!(ids, ["en", "de", "fr"]);
+        assert_eq!(ids, ["en", "de", "es"]);
     }
 
     #[tokio::test]
