@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release artifact checkout order.** `actions/checkout` now runs before artifact downloads, so downloaded release assets are not removed before the idempotent upload step.
+
 ## [0.1.23] - 2026-10-25
 
 ### Added
