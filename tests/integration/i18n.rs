@@ -79,7 +79,7 @@ impl issuerd_core::EmailSender for RecordingSender {
 
 /// Write a scratch themes dir whose default `issuerd` theme carries a minimal
 /// Spanish bundle. `es` is NOT one of the compiled-in locales
-/// (`SHIPPED_LOCALES` is en + de + fr + zh), so every Spanish string in these
+/// (`SHIPPED_LOCALES` is en + de + fr + pt-BR + zh), so every Spanish string in these
 /// tests must come from this theme file. Returns the temp dir (caller cleans up).
 fn write_es_theme() -> std::path::PathBuf {
     let dir = std::env::temp_dir()
@@ -170,6 +170,28 @@ async fn login_context_uses_builtin_french_bundle() {
     assert_eq!(body["messages"]["login.title"], "Connexion");
     assert_eq!(body["messages"]["login.submit"], "Se connecter");
     assert_eq!(body["messages"]["consent.allow"], "Autoriser");
+}
+
+#[tokio::test]
+async fn login_context_uses_builtin_brazilian_portuguese_bundle() {
+    let harness = TestHarness::new().await;
+    let mut realm = harness.create_realm("i18n-pt-br-builtin").await;
+    realm.internationalization_enabled = true;
+    realm.supported_locales = vec!["en".to_string(), "pt-BR".to_string()];
+    realm.default_locale = Some("en".to_string());
+    harness.storage.update_realm(&realm).await.unwrap();
+
+    let resp =
+        get_with_language(&harness, "/realms/i18n-pt-br-builtin/login/context", Some("pt-BR"))
+            .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["locale"], "pt-BR");
+    assert_eq!(body["supported_locales"], serde_json::json!(["en", "pt-BR"]));
+    assert!(body["login_theme"].is_null(), "no login_theme set: {body}");
+    assert_eq!(body["messages"]["login.title"], "Entrar");
+    assert_eq!(body["messages"]["login.submit"], "Entrar");
+    assert_eq!(body["messages"]["consent.allow"], "Permitir");
 }
 
 #[tokio::test]
@@ -295,20 +317,28 @@ async fn reset_password_email_uses_user_locale() {
 
     let mut realm = harness.create_realm("i18n-mail").await;
     realm.internationalization_enabled = true;
-    realm.supported_locales = vec!["en".to_string(), "de".to_string(), "fr".to_string()];
+    realm.supported_locales = vec![
+        "en".to_string(),
+        "de".to_string(),
+        "fr".to_string(),
+        "pt-BR".to_string(),
+    ];
     realm.reset_password_allowed = true;
     harness.storage.update_realm(&realm).await.unwrap();
 
-    // German and French users (locale attributes) and a user without a preference.
+    // German, French, and Brazilian Portuguese users, plus a user without a preference.
     let mut user = harness.create_user("i18n-mail", "nils", "Password123!").await;
     user.attributes.insert("locale".to_string(), vec!["de".to_string()]);
     harness.storage.update_user(&realm.id.clone(), &user).await.unwrap();
     let mut user = harness.create_user("i18n-mail", "pierre", "Password123!").await;
     user.attributes.insert("locale".to_string(), vec!["fr".to_string()]);
     harness.storage.update_user(&realm.id.clone(), &user).await.unwrap();
+    let mut user = harness.create_user("i18n-mail", "joao", "Password123!").await;
+    user.attributes.insert("locale".to_string(), vec!["pt-BR".to_string()]);
+    harness.storage.update_user(&realm.id.clone(), &user).await.unwrap();
     harness.create_user("i18n-mail", "olga", "Password123!").await;
 
-    for username in ["nils", "pierre", "olga"] {
+    for username in ["nils", "pierre", "joao", "olga"] {
         let resp = harness
             .post_form("/realms/i18n-mail/login/reset-credentials", &[("username", username)])
             .await;
@@ -316,13 +346,15 @@ async fn reset_password_email_uses_user_locale() {
     }
 
     // The mails are sent in the background, after the 204s.
-    wait_until(|| recorder.sent.lock().unwrap().len() >= 3).await;
+    wait_until(|| recorder.sent.lock().unwrap().len() >= 4).await;
     let sent = recorder.sent.lock().unwrap().clone();
-    assert_eq!(sent.len(), 3, "all three users get mail: {sent:?}");
+    assert_eq!(sent.len(), 4, "all four users get mail: {sent:?}");
     let german = sent.iter().find(|(to, _)| to == "nils@example.com").expect("nils mail");
     assert_eq!(german.1, "Setzen Sie Ihr Passwort zurück");
     let french = sent.iter().find(|(to, _)| to == "pierre@example.com").expect("pierre mail");
     assert_eq!(french.1, "Réinitialisez votre mot de passe");
+    let brazilian = sent.iter().find(|(to, _)| to == "joao@example.com").expect("joao mail");
+    assert_eq!(brazilian.1, "Redefina sua senha");
     let english = sent.iter().find(|(to, _)| to == "olga@example.com").expect("olga mail");
     assert_eq!(english.1, "Reset your password");
 }
@@ -332,7 +364,7 @@ async fn login_context_supports_theme_supplied_locale() {
     let (harness, dir) = es_theme_harness().await;
     create_es_i18n_realm(&harness, "i18n-es-ctx").await;
 
-    // `es` is not compiled in (SHIPPED_LOCALES is en + de + fr + zh): the
+    // `es` is not compiled in (SHIPPED_LOCALES is en + de + fr + pt-BR + zh): the
     // bundle must come from the theme's messages_es.json via the default-theme
     // fallback — the realm has no login_theme set.
     let resp = get_with_language(&harness, "/realms/i18n-es-ctx/login/context", Some("es")).await;
