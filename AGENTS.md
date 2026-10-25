@@ -262,7 +262,10 @@ As-run status (Kani 0.68 / CBMC 6.11, cargo-flux c460561, WSL):
 - **Kani: 2/2 harnesses verify green** under a 12 GiB memory limit (peak ~9.3
   GiB). `scripts/kani.sh` defaults `CARGO_PROFILE_DEV_OPT_LEVEL` to `3`; the
   unoptimized model needs ~21 GiB and exceeds the CI runner's budget. This does
-  not change harness inputs, loop bounds, or enabled proof checks. Hard-won harness
+  not change harness inputs, loop bounds, or enabled proof checks. CI pins Kani
+  0.68.0, runs on both pull requests and pushes to `main`, and wraps the script
+  in `/usr/bin/time -v` so hosted logs retain peak-memory and exit diagnostics.
+  Hard-won harness
   rules, documented in `pkce.rs`: tiny fixed-array `&str` inputs only (never
   `String::from_utf8(Vec)` — symbolic lengths explode loop unwinding), explicit
   `#[kani::unwind]` on every harness (unbounded unwinding never terminates on
