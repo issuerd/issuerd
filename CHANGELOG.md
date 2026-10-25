@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **GHCR publication and cosign-signed container images.** Every tag release now also publishes `ghcr.io/issuerd/issuerd` with `latest`, `X.Y.Z`, `X.Y`, and per-architecture tags alongside Docker Hub. The multi-arch GHCR manifest is signed and verified by digest with keyless cosign (GitHub OIDC). The first GHCR package starts private; an organization owner must make it public once in Package settings, after which it stays public.
+- **GHCR publication and cosign-signed container images.** Every tag release now also publishes `ghcr.io/issuerd/issuerd` with `latest`, `X.Y.Z`, `X.Y`, and per-architecture tags alongside Docker Hub. Both multi-arch manifests (Docker Hub and GHCR) are signed and verified by digest with keyless cosign (GitHub OIDC). The first GHCR package starts private; an organization owner must make it public once in Package settings, after which it stays public.
 
 ## [0.1.22] - 2026-10-25
 

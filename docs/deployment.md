@@ -70,11 +70,17 @@ docker pull issuerd/issuerd:X.Y.Z
 docker pull ghcr.io/issuerd/issuerd:X.Y.Z
 ```
 
-The release workflow signs the GHCR multi-arch manifest by digest with keyless cosign (GitHub OIDC). Verify the manifest and its certificate identity before running it:
+The release workflow signs both multi-arch manifests by digest with keyless cosign (GitHub OIDC). Verify each manifest and its certificate identity before running it:
 
 ```bash
-# Shows the signed manifest digest, which can also be pinned as @sha256:...
+# Shows the signed manifest digests, which can also be pinned as @sha256:...
+docker buildx imagetools inspect issuerd/issuerd:X.Y.Z
 docker buildx imagetools inspect ghcr.io/issuerd/issuerd:X.Y.Z
+
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  issuerd/issuerd:X.Y.Z
 
 cosign verify \
   --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
@@ -82,7 +88,7 @@ cosign verify \
   ghcr.io/issuerd/issuerd:X.Y.Z
 ```
 
-The `.sig`/`.crt` files attached to the GitHub Release are for the downloadable archives, not for the OCI image. Image signatures live in GHCR next to the signed manifest.
+The `.sig`/`.crt` files attached to the GitHub Release are for the downloadable archives, not for the OCI image. Image signatures live beside the signed manifests in Docker Hub and GHCR.
 
 ### The demo stack (`docker-compose.yml`)
 

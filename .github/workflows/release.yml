@@ -25,7 +25,7 @@ name: Release
 # Multi-arch Docker: the docker / docker-arm64 jobs push per-arch images to
 # Docker Hub (issuerd/issuerd) and GHCR (ghcr.io/issuerd/issuerd), then
 # docker-manifest assembles user-facing manifest lists (:latest, :X.Y.Z, :X.Y)
-# on both registries. The GHCR manifest is signed and verified by digest with
+# on both registries. Both manifests are signed and verified by digest with
 # keyless cosign; detached .sig/.crt files for the downloadable archives are
 # signed separately in the release job. Per-arch tags carry no embedded
 # SBOM/provenance attestations: attested pushes make each tag an OCI index,
@@ -119,14 +119,18 @@ jobs:
 
           Per-architecture tags are also published on both registries: \`issuerd/issuerd:${VERSION}-amd64\` / \`issuerd/issuerd:${VERSION}-arm64\` and \`ghcr.io/issuerd/issuerd:${VERSION}-amd64\` / \`ghcr.io/issuerd/issuerd:${VERSION}-arm64\`.
 
-          The GHCR multi-arch manifest is signed by digest with keyless cosign (GitHub OIDC). Verify it with:
+          Both multi-arch manifests are signed by digest with keyless cosign (GitHub OIDC). Verify them with:
           \`\`\`
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            issuerd/issuerd:${VERSION}
           cosign verify \
             --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             ghcr.io/issuerd/issuerd:${VERSION}
           \`\`\`
-          To pin by digest, inspect \`ghcr.io/issuerd/issuerd:${VERSION}\` with \`docker buildx imagetools inspect\` and use the \`@sha256:...\` form. The \`.sig\`/\`.crt\` files attached below are for the downloadable archives; OCI image signatures live in GHCR.
+          To pin by digest, inspect either registry tag with \`docker buildx imagetools inspect\` and use the \`@sha256:...\` form. The \`.sig\`/\`.crt\` files attached below are for the downloadable archives; OCI image signatures live beside the manifests in Docker Hub and GHCR.
 
           ### crates.io
 
@@ -481,29 +485,39 @@ jobs:
           fi
           "${hub_cmd[@]}"
           "${ghcr_cmd[@]}"
-          docker buildx imagetools inspect "issuerd/issuerd:$VERSION"
-          digest=$(docker buildx imagetools inspect "ghcr.io/issuerd/issuerd:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not determine the GHCR manifest digest"
-            exit 1
-          fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          hub_digest=$(docker buildx imagetools inspect "issuerd/issuerd:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')
+          ghcr_digest=$(docker buildx imagetools inspect "ghcr.io/issuerd/issuerd:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')
+          for digest in "$hub_digest" "$ghcr_digest"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not determine a registry manifest digest: $digest"
+              exit 1
+            fi
+          done
+          echo "Docker Hub manifest digest: $hub_digest"
+          echo "GHCR manifest digest: $ghcr_digest"
+          echo "hub_digest=$hub_digest" >> "$GITHUB_OUTPUT"
+          echo "ghcr_digest=$ghcr_digest" >> "$GITHUB_OUTPUT"
       - name: Install cosign
         if: ${{ env.ACT != 'true' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.0.6
-      # The GHCR signature lives beside the signed manifest, unlike the
+      # Registry signatures live beside the signed manifests, unlike the
       # detached .sig/.crt files attached to the GitHub Release archives.
-      - name: Sign and verify the GHCR multi-arch manifest
+      - name: Sign and verify the multi-arch manifests (Docker Hub + GHCR)
         if: ${{ env.ACT != 'true' }}
         run: |
           set -euo pipefail
-          cosign sign --yes "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.digest }}"
+          cosign sign --yes "issuerd/issuerd@${{ steps.manifest.outputs.hub_digest }}"
+          cosign sign --yes "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.ghcr_digest }}"
           cosign verify \
             --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.digest }}"
+            "issuerd/issuerd@${{ steps.manifest.outputs.hub_digest }}"
+          cosign verify \
+            --certificate-identity-regexp 'https://github.com/issuerd/issuerd/.github/workflows/release.yml.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "ghcr.io/issuerd/issuerd@${{ steps.manifest.outputs.ghcr_digest }}"
 
   dockerhub-overview:
     name: Docker Hub repo overview
