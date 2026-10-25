@@ -817,21 +817,24 @@ jobs:
       - name: Install cosign
         if: ${{ env.ACT != 'true' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
       # Keyless (GitHub OIDC) signatures so the release ships .sig/.crt files
       # next to every asset — the scorecard Signed-Releases check needs
       # signature files attached to the release, the attestation-store entries
-      # from the step above do not count.
+      # from the step above do not count. Cosign v3 defaults to a single new
+      # bundle; keep its detached-file compatibility mode for this contract.
       - name: Sign release artifacts (cosign, keyless)
         if: ${{ env.ACT != 'true' }}
         run: |
           set -euo pipefail
           for d in linux-dist linux-glibc228-dist linux-arm64-dist windows-dist windows-arm64-dist macos-dist macos-amd64-dist; do
             for f in "$d"/*; do
-              cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+              cosign sign-blob --yes --use-signing-config=false --new-bundle-format=false --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
             done
           done
           for f in issuerd_*_conformance-evidence.tar.gz SHA256SUMS.txt; do
-            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+            cosign sign-blob --yes --use-signing-config=false --new-bundle-format=false --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
           done
       - name: Create the GitHub Release
         if: ${{ env.ACT != 'true' }}
