@@ -3,6 +3,7 @@
 //
 // Shared test harness: target abstraction, legacy in-process harness, AD lab connection config.
 
+pub mod dpop;
 pub mod issuerd;
 pub mod keycloak;
 pub mod target;
