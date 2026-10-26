@@ -1,0 +1,17 @@
+bind = "127.0.0.1"
+port = 18089
+issuer_url = "http://127.0.0.1:18089"
+bootstrap_admin_password = "admin"
+
+[web_ui]
+enabled = false
+
+[logging]
+format = "pretty"
+level = "info"
+
+[mcp]
+enabled = true
+
+[dpop.nonce]
+mode = "required"

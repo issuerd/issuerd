@@ -61,7 +61,7 @@ issuerd/
 ├── docker-compose.cluster.yml # Two-node cluster demo (nginx LB + Postgres + Redis)
 ├── cluster/                 # Cluster demo stack config (issuerd.toml, nginx.conf, provision.yaml)
 ├── dns/bind9/               # Bind9 zone config for the integration stack
-├── examples/                # Example server/provision configs (regenerable via `issuerd example`) + local demo stack config (*.demo.*) + runnable examples (agentic-mcp/ — dockerized agentic IAM demo: DPoP + RFC 8693 + CIBA)
+├── examples/                # Example server/provision configs + local demo config (*.demo.*) + runnable examples (agentic-mcp/; mcp-admin/ — external TypeScript DPoP acceptance client and read-only rigs)
 ├── docs/                    # Operations documentation set (index: docs/README.md) + CLUSTERING.md, PERFORMANCE.md, crate graph
 ├── themes/                  # Login theme(s) served at /realms/{realm}/theme/{*path}
 │                            # (the default `issuerd` login.css is also compiled into the
@@ -828,6 +828,7 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 - `src/executor.rs` and `src/tools.rs` implement `realm_get`, `users_search`, `users_get`, `clients_list`, and `clients_get` with strict schemas and curated DTOs (no raw realm/user/client serialization, arbitrary attributes, credentials, secrets, or protocol-mapper dumps).
 - `src/rate_limit.rs` uses atomic distributed fixed-window counters per realm, authorizing client, and internal user; `src/json.rs` rejects duplicate keys recursively.
 - `src/server.rs` and `src/transport.rs` provide the manual `rmcp` handler and stateless Streamable HTTP construction, including issuer-derived authority and shared outer Host/Origin validation. The production dependency is only `issuerd-core`; storage/cluster implementations are dev-only. The production endpoint is `src/routes/mcp.rs` in `issuerd-server`, mounted at `/realms/{realm}/mcp` only when `[mcp].enabled` (a disabled request is a uniform 404): one long-lived adapter wraps `StreamableHttpService` and the shared executor, checks Host/Origin before a bounded 4 MiB body read, enforces dual-era structure before authentication, validates same-realm resource/audience plus DPoP, and injects only request-local auth/preflight permits. GET/DELETE go directly to the SDK's 405 after outer checks; no MCP session IDs or cross-request initialized state are used.
+- `examples/mcp-admin/` contains the external read-only TypeScript acceptance client (exact `@modelcontextprotocol/client` 2.4.0) and its in-memory and PostgreSQL+Redis rigs. Run `npm ci && npm run build && npm run typecheck && npm test` in `examples/mcp-admin/client`, then `examples/mcp-admin/scripts/e2e-local.sh` from the repository root for the real public-native code+PKCE+DPoP, dual-era, all-five-tool acceptance flow. See its README for interactive and Compose commands.
 
 ### `issuerd-server` — Bootstrap
 

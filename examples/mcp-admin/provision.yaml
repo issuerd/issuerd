@@ -1,0 +1,76 @@
+marker: mcp-admin-master-v1
+
+realms:
+  - name: master
+    display_name: Master
+    enabled: true
+    ssl_required: external
+    default_role: user
+
+roles:
+  - realm: master
+    name: admin
+    description: Realm administrator
+  - realm: master
+    name: user
+    description: Standard user
+  - realm: master
+    name: manage-realm
+    description: Manage realm settings
+  - realm: master
+    name: view-realm
+    description: View realm settings
+  - realm: master
+    name: manage-users
+    description: Manage users
+  - realm: master
+    name: view-users
+    description: View users
+  - realm: master
+    name: manage-clients
+    description: Manage clients
+  - realm: master
+    name: view-clients
+    description: View clients
+  - realm: master
+    name: impersonation
+    description: Impersonate users
+
+clients:
+  - realm: master
+    client_id: admin-cli
+    name: Admin CLI
+    description: Setup-only administration for the MCP acceptance lab
+    enabled: true
+    public_client: true
+    bearer_only: false
+    redirect_uris:
+      - http://127.0.0.1:8080/admin/console/callback
+    web_origins: []
+    default_scopes:
+      - openid
+    optional_scopes: []
+    consent_required: false
+    full_scope_allowed: true
+
+users:
+  - realm: master
+    username: admin
+    email: admin@lab.issuerd.invalid
+    email_verified: true
+    first_name: Lab
+    last_name: Administrator
+    enabled: true
+    password: admin
+    realm_roles:
+      - admin
+      - user
+      - manage-realm
+      - view-realm
+      - manage-users
+      - view-users
+      - manage-clients
+      - view-clients
+      - impersonation
+    groups: []
+    attributes: {}

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **External TypeScript MCP acceptance client and read-only rigs.** `examples/mcp-admin` adds a pinned official-SDK public native CLI for authorization-code + PKCE + exact-resource issuance with DPoP, legacy and modern all-tool acceptance runs, idempotent lab setup, a finite in-memory local runner, and a PostgreSQL + Redis Compose rig. The CLI validates RFC 9207 issuer responses on success and error paths and keeps tokens, proofs, keys, cookies, and Authorization headers out of its JSON output.
+
 ## [0.1.24] - 2026-10-25
 
 ### Added
