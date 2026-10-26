@@ -682,7 +682,15 @@ async fn try_auth_error_redirect(
         Ok(Some(c)) => c,
         _ => return None,
     };
-    if !client.redirect_uris.iter().any(|r| r.matches(redirect_uri.as_str())) {
+    let strict_mcp = state.config.mcp.enabled && params.contains_key("resource");
+    let redirect_registered = client.redirect_uris.iter().any(|registered| {
+        if strict_mcp {
+            registered.matches_mcp(redirect_uri.as_str())
+        } else {
+            registered.matches(redirect_uri.as_str())
+        }
+    });
+    if !redirect_registered {
         return None;
     }
     let requested_mode = params.get("response_mode").and_then(|s| s.parse::<ResponseMode>().ok());
@@ -1113,7 +1121,15 @@ async fn handle_auth_request(
         // oidcc-ensure-request-object-with-redirect-uri). Render an error instead.
         // Other validation failures (scope, response_type, ...) still redirect to the
         // requested redirect_uri, which is known to be registered at that point.
-        if !client.redirect_uris.iter().any(|r| r.matches(auth_req.redirect_uri.as_str())) {
+        let strict_mcp = state.config.mcp.enabled && auth_req.resource.is_some();
+        let redirect_registered = client.redirect_uris.iter().any(|registered| {
+            if strict_mcp {
+                registered.matches_mcp(auth_req.redirect_uri.as_str())
+            } else {
+                registered.matches(auth_req.redirect_uri.as_str())
+            }
+        });
+        if !redirect_registered {
             return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
         }
         return crate::routes::auth_response::oauth_error_redirect(
@@ -2570,6 +2586,19 @@ pub async fn ciba_auth_handler(
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
     body: String,
 ) -> Response {
+    // Detect forward-field multiplicity before form deserialization collapses
+    // repeated keys. Single values are parsed below and rejected as
+    // unsupported until the operation-bound CIBA profile exists.
+    for field in ["operation_id", "resource"] {
+        let count = url::form_urlencoded::parse(body.as_bytes())
+            .filter(|(name, _)| name == field)
+            .count();
+        if count > 1 {
+            let e = IssuerdError::InvalidRequest(format!("{field} must appear at most once"));
+            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        }
+    }
+
     let realm_name = match realm {
         Some(r) => r,
         None => {
@@ -3535,6 +3564,18 @@ async fn token_handler_inner(
                 }
             }
 
+            // A resource-bearing code always belongs to the strict MCP code
+            // profile. Legacy cache entries cannot bypass PKCE simply because
+            // they predate that validation rule.
+            if code_data.resource.is_some() && code_data.code_challenge.is_none() {
+                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization code has no PKCE challenge");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
+
             // Verify PKCE if code_challenge was present
             if let Some(ref challenge) = code_data.code_challenge {
                 let verifier = token_req.code_verifier.as_deref().unwrap_or("");
@@ -3594,6 +3635,13 @@ async fn token_handler_inner(
                 .unwrap_or_else(|| SessionId::new(issuerd_core::utils::generate_id()).unwrap());
             let auth_time = code_data.auth_time.unwrap_or_else(chrono::Utc::now);
             let scope = code_data.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
 
             // RFC 9396 §6: the token request may narrow the
             // authorization details granted with the code; without it, the
@@ -4308,6 +4356,14 @@ async fn token_handler_inner(
                     .into_response();
             }
 
+            if validated.claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
+
             // DPoP (RFC 9449 §5.1): a bound refresh token may only
             // be redeemed together with a proof from the same key, and the
             // rotated tokens keep the binding ("slide"). An unbound token
@@ -4971,6 +5027,13 @@ async fn token_handler_inner(
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
             let scope = consumed.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -5337,6 +5400,13 @@ async fn token_handler_inner(
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
             let scope = consumed.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -5866,8 +5936,9 @@ pub(crate) async fn enforce_oob_second_factor(
 
 /// Token-validity gates shared by endpoints that serve bearer-token callers
 /// (userinfo, the account API): explicit revocation (RFC 7009 / auth-code
-/// reuse teardown), issuer-realm resolution, backing-session existence, and
-/// realm `not_before`. Runs AFTER the stateless cryptographic validation;
+/// reuse teardown), reserved step-up scope rejection, issuer-realm resolution,
+/// backing-session existence, and realm `not_before`. Runs AFTER the stateless
+/// cryptographic validation;
 /// invalid tokens answer `401 invalid_token`; cache failures answer
 /// `503 temporarily_unavailable`. Returns the issuer realm (when resolvable)
 /// and the session snapshot (when the token carries a live session) so the
@@ -5886,6 +5957,13 @@ pub(crate) async fn enforce_token_validity(
         (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_token"})))
             .into_response()
     };
+
+    // Operation-bound step-up tokens are not general bearer credentials.
+    // Until their dedicated MCP execution path exists, no non-MCP API may
+    // accept the reserved scope, including from legacy token data.
+    if claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+        return Err(invalid());
+    }
 
     // Check revocation list first; marker-store failures fail closed.
     match state.cache.get(&format!("revoked:{token}")).await {
@@ -8742,6 +8820,36 @@ mod tests {
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
             axum::http::HeaderMap::new(),
             body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(response).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn resource_auth_code_without_pkce_is_rejected_even_without_redirect_uri() {
+        let state = setup_state().await;
+        let code = issuerd_core::utils::generate_id();
+        let mut code_data = sample_auth_code_data();
+        code_data.user_id = "admin".to_string();
+        code_data.client_id = "admin-cli".to_string();
+        code_data.resource = Some("http://localhost:8080/realms/master/mcp".to_string());
+        state
+            .cache
+            .set(
+                &auth_code_cache_key("master", &code),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let response = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!("grant_type=authorization_code&code={code}&client_id=admin-cli"),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -11814,6 +11922,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ciba_auth_handler_forward_fields_and_duplicates_rejected() {
+        let state = setup_state().await;
+        for body in [
+            "login_hint=admin&operation_id=op-1",
+            "login_hint=admin&resource=https://issuer.example.com/realms/master/mcp",
+            "login_hint=admin&operation_id=op-1&operation_id=op-2",
+            "login_hint=admin&resource=https://a.example&resource=https://b.example",
+        ] {
+            let response = ciba_auth_handler(
+                State(state.clone()),
+                axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(extract_json(response).await["error"], "invalid_request", "body: {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn ciba_auth_handler_unknown_user() {
         let state = setup_state().await;
         let client = issuerd_core::Client {
@@ -14336,7 +14465,23 @@ mod tests {
             claims: None,
             cnf: None,
             authorization_details: None,
+            resource: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_token_validity_rejects_only_reserved_step_up_scope() {
+        let state = setup_state().await;
+        let mut claims = access_claims("admin", None, "admin-cli");
+        claims.scope = Scope::parse("openid mcp:step_up");
+        let Err(response) = enforce_token_validity(&state, "token", &claims).await else {
+            panic!("step-up token must not pass shared non-MCP validity");
+        };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(response).await["error"], "invalid_token");
+
+        claims.scope = Scope::parse("openid profile");
+        assert!(enforce_token_validity(&state, "token", &claims).await.is_ok());
     }
 
     /// Regression test: a pairwise subject can never resolve to a

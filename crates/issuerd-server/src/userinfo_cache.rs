@@ -383,6 +383,7 @@ mod tests {
             claims: claims_param,
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
         // Scope order is normalized.
         assert_eq!(

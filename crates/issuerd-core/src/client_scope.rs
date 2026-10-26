@@ -232,6 +232,11 @@ pub const MCP_SCOPE_READ: &str = "mcp:read";
 /// as [`MCP_SCOPE_READ`].
 pub const MCP_SCOPE_WRITE: &str = "mcp:write";
 
+/// Reserved single-purpose scope for the operation-bound CIBA step-up path.
+/// It is deliberately not a built-in seeded scope and is rejected by every
+/// ordinary flow until that separate path is implemented.
+pub const MCP_SCOPE_STEP_UP: &str = "mcp:step_up";
+
 /// Client attribute marking an anonymously registered client.
 pub const ATTR_DCR_POLICY: &str = "dcr.policy";
 /// The [`ATTR_DCR_POLICY`] value stamped on open-endpoint registrations.
@@ -266,15 +271,21 @@ pub fn is_builtin_scope_name(name: &str) -> bool {
 
 /// Whether `name` is a reserved MCP authorization scope.
 pub fn is_mcp_scope_name(name: &str) -> bool {
-    matches!(name, MCP_SCOPE_READ | MCP_SCOPE_WRITE)
+    matches!(name, MCP_SCOPE_READ | MCP_SCOPE_WRITE | MCP_SCOPE_STEP_UP)
 }
 
 /// Reject MCP scopes in a client's default-scope list when MCP is enabled.
-/// Legacy scope names keep their previous behavior while the surface is off.
+/// Legacy scope names keep their previous behavior while the surface is off,
+/// except the reserved step-up scope, which no ordinary client may acquire.
 pub fn validate_no_default_mcp_scopes(
     default_scopes: &[String],
     mcp_enabled: bool,
 ) -> Result<(), IssuerdError> {
+    if default_scopes.iter().any(|scope| scope == MCP_SCOPE_STEP_UP) {
+        return Err(IssuerdError::InvalidRequest(
+            "mcp:step_up is reserved for operation-bound CIBA".into(),
+        ));
+    }
     if mcp_enabled {
         if let Some(scope) = default_scopes.iter().find(|scope| is_mcp_scope_name(scope)) {
             return Err(IssuerdError::InvalidRequest(format!(
@@ -293,12 +304,16 @@ pub fn client_scope_request_permitted(client: &Client, scope: &str) -> bool {
 
 /// Apply the MCP-aware scope policy. When enabled, MCP scopes are valid only
 /// as optional-only assignments; legacy/direct storage cannot make them
-/// default or available through both lists.
+/// default or available through both lists. The reserved step-up scope is
+/// never valid on this ordinary request path, regardless of legacy assignment.
 pub fn client_scope_request_permitted_with_mcp(
     client: &Client,
     scope: &str,
     mcp_enabled: bool,
 ) -> bool {
+    if scope == MCP_SCOPE_STEP_UP {
+        return false;
+    }
     if mcp_enabled && is_mcp_scope_name(scope) {
         return client.optional_scopes.contains(scope) && !client.default_scopes.contains(scope);
     }
@@ -675,6 +690,12 @@ mod tests {
             assert!(!DEFAULT_DEFAULT_SCOPES.contains(&name));
             assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&name));
         }
+
+        assert!(is_mcp_scope_name(MCP_SCOPE_STEP_UP));
+        assert!(!is_builtin_scope_name(MCP_SCOPE_STEP_UP));
+        assert!(!DEFAULT_DEFAULT_SCOPES.contains(&MCP_SCOPE_STEP_UP));
+        assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&MCP_SCOPE_STEP_UP));
+        assert!(!scopes.iter().any(|scope| scope.name == MCP_SCOPE_STEP_UP));
     }
 
     #[test]
@@ -717,6 +738,22 @@ mod tests {
             validate_no_default_mcp_scopes(legacy_default.default_scopes.as_slice(), false).is_ok()
         );
         assert!(validate_no_default_mcp_scopes(client.default_scopes.as_slice(), true).is_ok());
+
+        let mut legacy_step_up = client;
+        legacy_step_up.default_scopes = crate::Scope::parse(MCP_SCOPE_STEP_UP);
+        legacy_step_up.optional_scopes = crate::Scope::parse(MCP_SCOPE_STEP_UP);
+        for mcp_enabled in [false, true] {
+            assert!(!client_scope_request_permitted_with_mcp(
+                &legacy_step_up,
+                MCP_SCOPE_STEP_UP,
+                mcp_enabled,
+            ));
+            assert!(validate_no_default_mcp_scopes(
+                legacy_step_up.default_scopes.as_slice(),
+                mcp_enabled,
+            )
+            .is_err());
+        }
     }
 
     #[test]

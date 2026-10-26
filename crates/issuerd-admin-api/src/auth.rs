@@ -39,6 +39,10 @@ pub async fn admin_auth_middleware(
         warn!(error = %e, "admin API authentication failed");
         AdminApiError::Unauthorized
     })?;
+    if validated.claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+        warn!("admin API authentication failed: operation-bound step-up token presented");
+        return Err(AdminApiError::Unauthorized);
+    }
     // Bearer-only API: a DPoP-bound token (`cnf.jkt`) must be presented with
     // a proof (RFC 9449 §7.1), which this API does not accept — reject the
     // downgrade instead of letting a stolen proof-bound token authenticate
@@ -437,6 +441,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }
@@ -465,6 +470,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }
@@ -557,6 +563,7 @@ mod tests {
                     claims: None,
                     cnf: None,
                     authorization_details: None,
+                    resource: None,
                 },
                 header: issuerd_core::JwsHeader {
                     alg: issuerd_core::Algorithm::Rs256,
@@ -1278,6 +1285,14 @@ mod tests {
         claims.cnf = Some(issuerd_core::ConfirmationClaim {
             jkt: "thumbprint".to_string(),
         });
+        let state = lifecycle_state(claims).await;
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn step_up_token_is_not_an_admin_credential() {
+        let mut claims = tenant_claims();
+        claims.scope = issuerd_core::Scope::parse("openid mcp:step_up");
         let state = lifecycle_state(claims).await;
         assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
     }

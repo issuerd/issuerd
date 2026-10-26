@@ -165,9 +165,19 @@ impl AuthorizationRequest {
         client: &Client,
         mcp_enabled: bool,
     ) -> Result<(), IssuerdError> {
-        // Redirect URI: Keycloak-compatible match (exact, or trailing-`*`
-        // wildcard prefix) and no fragment
-        if !client.redirect_uris.iter().any(|r| r.matches(self.redirect_uri.as_str())) {
+        let strict_mcp = mcp_enabled && self.resource.is_some();
+
+        // Ordinary flows keep the Keycloak-compatible wildcard behavior. MCP
+        // resource requests use exact matching, with only the native loopback
+        // ephemeral-port exception.
+        let redirect_registered = client.redirect_uris.iter().any(|registered| {
+            if strict_mcp {
+                registered.matches_mcp(self.redirect_uri.as_str())
+            } else {
+                registered.matches(self.redirect_uri.as_str())
+            }
+        });
+        if !redirect_registered {
             return Err(IssuerdError::InvalidRequest("redirect_uri not registered".into()));
         }
         if self.redirect_uri.fragment().is_some() {
@@ -195,6 +205,11 @@ impl AuthorizationRequest {
         if !allowed.iter().any(|t| t == self.response_type.as_str()) {
             return Err(IssuerdError::InvalidRequest(
                 "response_type not allowed for client".into(),
+            ));
+        }
+        if strict_mcp && self.response_type != ResponseType::Code {
+            return Err(IssuerdError::InvalidRequest(
+                "MCP resource requests require response_type=code".into(),
             ));
         }
 
@@ -230,19 +245,27 @@ impl AuthorizationRequest {
             ));
         }
 
-        // PKCE: required for public clients when response_type includes code
-        if client.public_client && self.response_type.has_code() && self.code_challenge.is_none() {
-            return Err(IssuerdError::InvalidRequest(
-                "code_challenge required for public clients".into(),
-            ));
+        // PKCE is required for public clients on every code flow and for both
+        // public and confidential clients on an MCP resource request.
+        if self.response_type.has_code() && self.code_challenge.is_none() {
+            if strict_mcp {
+                return Err(IssuerdError::InvalidRequest(
+                    "code_challenge required for MCP resource requests".into(),
+                ));
+            }
+            if client.public_client {
+                return Err(IssuerdError::InvalidRequest(
+                    "code_challenge required for public clients".into(),
+                ));
+            }
         }
 
         // PKCE method: S256 only, matching the `code_challenge_methods_supported`
         // discovery advertisement. RFC 7636 §4.3 defaults a missing
         // code_challenge_method to plain, so a challenge without a method is
         // rejected too — accepting either would be plain through the back
-        // door. Requests without a code_challenge are unaffected: PKCE stays
-        // optional for confidential clients.
+        // door. Outside MCP resource requests, PKCE stays optional for
+        // confidential clients.
         if self.code_challenge.is_some()
             && self.code_challenge_method != Some(PkceCodeChallengeMethod::S256)
         {
@@ -1312,6 +1335,112 @@ mod tests {
         assert!(req.validate(&Realm::default(), &client).is_ok());
     }
 
+    fn mcp_request(redirect_uri: &str) -> AuthorizationRequest {
+        let mut req = auth_req(ResponseType::Code, "openid", vec![]);
+        req.redirect_uri = redirect_uri.parse().unwrap();
+        req.code_challenge = Some(Base64Url::new("challenge_123").unwrap());
+        req.code_challenge_method = Some(PkceCodeChallengeMethod::S256);
+        req.resource = Some("https://issuer.example.com/realms/demo/mcp".to_string());
+        req
+    }
+
+    fn mcp_client(registered: &str, public_client: bool) -> Client {
+        Client {
+            public_client,
+            redirect_uris: vec![RedirectUri::new(registered).unwrap()],
+            ..openid_profile_client()
+        }
+    }
+
+    #[test]
+    fn mcp_resource_requests_require_pure_code_response() {
+        let client = mcp_client("https://client.example.com/cb", false);
+        for response_type in [
+            ResponseType::Token,
+            ResponseType::IdToken,
+            ResponseType::CodeIdToken,
+            ResponseType::CodeToken,
+            ResponseType::IdTokenToken,
+            ResponseType::CodeIdTokenToken,
+        ] {
+            let mut req = mcp_request("https://client.example.com/cb");
+            req.response_type = response_type;
+            assert!(matches!(
+                req.validate_with_mcp(&Realm::default(), &client, true),
+                Err(IssuerdError::InvalidRequest(_))
+            ));
+        }
+        assert!(mcp_request("https://client.example.com/cb")
+            .validate_with_mcp(&Realm::default(), &client, true)
+            .is_ok());
+    }
+
+    #[test]
+    fn mcp_resource_requests_require_s256_for_public_and_confidential_clients() {
+        for public_client in [false, true] {
+            let client = mcp_client("https://client.example.com/cb", public_client);
+            let mut req = mcp_request("https://client.example.com/cb");
+            req.code_challenge = None;
+            req.code_challenge_method = None;
+            assert!(req.validate_with_mcp(&Realm::default(), &client, true).is_err());
+
+            let mut req = mcp_request("https://client.example.com/cb");
+            req.code_challenge_method = Some(PkceCodeChallengeMethod::Plain);
+            assert!(req.validate_with_mcp(&Realm::default(), &client, true).is_err());
+
+            let mut req = mcp_request("https://client.example.com/cb");
+            req.code_challenge_method = None;
+            assert!(req.validate_with_mcp(&Realm::default(), &client, true).is_err());
+
+            assert!(mcp_request("https://client.example.com/cb")
+                .validate_with_mcp(&Realm::default(), &client, true)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn mcp_resource_requests_use_strict_and_native_redirect_matching() {
+        let wildcard = mcp_client("https://client.example.com/*", false);
+        let req = mcp_request("https://client.example.com/cb");
+        assert!(req.validate(&Realm::default(), &wildcard).is_ok());
+        assert!(req.validate_with_mcp(&Realm::default(), &wildcard, true).is_err());
+
+        let exact = mcp_client("https://client.example.com/cb", false);
+        assert!(mcp_request("https://client.example.com/cb")
+            .validate_with_mcp(&Realm::default(), &exact, true)
+            .is_ok());
+        assert!(mcp_request("https://client.example.com:8443/cb")
+            .validate_with_mcp(&Realm::default(), &exact, true)
+            .is_err());
+
+        for (registered, requested) in [
+            ("http://127.0.0.1:8080/cb", "http://127.0.0.1:49152/cb"),
+            ("http://[::1]:8080/cb", "http://[::1]:49152/cb"),
+        ] {
+            let client = mcp_client(registered, true);
+            assert!(mcp_request(requested)
+                .validate_with_mcp(&Realm::default(), &client, true)
+                .is_ok());
+        }
+
+        let client = mcp_client("http://127.0.0.1:8080/cb?x=1", true);
+        for requested in [
+            "http://127.0.0.1:49152/other?x=1",
+            "http://127.0.0.1:49152/cb?x=2",
+            "https://127.0.0.1:49152/cb?x=1",
+            "http://127.0.0.2:49152/cb?x=1",
+        ] {
+            assert!(mcp_request(requested)
+                .validate_with_mcp(&Realm::default(), &client, true)
+                .is_err());
+        }
+
+        let localhost = mcp_client("http://localhost:8080/cb", true);
+        assert!(mcp_request("http://localhost:49152/cb")
+            .validate_with_mcp(&Realm::default(), &localhost, true)
+            .is_err());
+    }
+
     #[test]
     fn validate_max_age_zero() {
         let client = Client {
@@ -1568,6 +1697,20 @@ mod tests {
             request_uri: None,
         };
         assert!(req.validate(&Realm::default(), &client).is_err());
+    }
+
+    #[test]
+    fn validate_step_up_scope_rejected_for_legacy_clients() {
+        let mut client = openid_profile_client();
+        client.default_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        client.optional_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        let req = auth_req(ResponseType::Code, issuerd_core::MCP_SCOPE_STEP_UP, vec![]);
+        for mcp_enabled in [false, true] {
+            assert!(matches!(
+                req.validate_with_mcp(&Realm::default(), &client, mcp_enabled),
+                Err(IssuerdError::InvalidScope)
+            ));
+        }
     }
 
     /// `openid` is the OIDC protocol marker, not a client scope: it is

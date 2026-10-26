@@ -318,6 +318,8 @@ impl<C: CryptoProvider> TokenManager<C> {
             // RAR authorization details likewise arrive through
             // the claims overlay; populated on decode.
             authorization_details: None,
+            // Resource provenance arrives through the trusted overlay too.
+            resource: None,
         };
 
         let token = self
@@ -375,7 +377,8 @@ impl<C: CryptoProvider> TokenManager<C> {
     ///
     /// `resource` (RFC 8707 §2.2) carries the granted resource indicator on
     /// the refresh token — like `authorization_details`, the refresh grant
-    /// re-issues it onto the rotated token and the access token's `aud`.
+    /// re-issues it onto the rotated token and the access token's `aud` and
+    /// trusted resource-provenance claim.
     #[allow(clippy::too_many_arguments)]
     pub async fn issue_refresh_token_with_resource(
         &self,
@@ -548,12 +551,13 @@ impl<C: CryptoProvider> TokenManager<C> {
 
     /// Sign an authorization response as a JARM JWT (JWT Secured
     /// Authorization Response Mode for OAuth 2.0).
-    /// The response parameters (`code`, `state`, `id_token`, `error`, ...)
-    /// become claims alongside the envelope JARM §2.3 requires: `iss` (the
-    /// realm issuer), `aud` (the client_id), `exp`, and `iat`. Envelope
-    /// claims win on collision — response parameters never legitimately
-    /// carry them. The JWT lives only as long as the front-channel redirect
-    /// needs ([`JARM_RESPONSE_LIFETIME_SECS`]); it is signed with the realm's
+    /// The response parameters (`code`, `state`, `id_token`, `error`, `iss`,
+    /// ...) become claims alongside the envelope JARM §2.3 requires: `iss`
+    /// (the realm issuer), `aud` (the client_id), `exp`, and `iat`. Envelope
+    /// claims win on collision, so the RFC 9207 response `iss` must be derived
+    /// from the same realm issuer as the envelope. The JWT lives only as long
+    /// as the front-channel redirect needs ([`JARM_RESPONSE_LIFETIME_SECS`]);
+    /// it is signed with the realm's
     /// token-signing key, so clients verify it against the realm JWKS.
     pub async fn sign_authorization_response(
         &self,
@@ -1833,6 +1837,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         };
 
@@ -2259,6 +2264,7 @@ mod tests {
                         claims: None,
                         cnf: None,
                         authorization_details: None,
+                        resource: None,
                     },
                 }),
                 None,
@@ -2916,6 +2922,7 @@ mod tests {
             claims: None,
             cnf: None,
             authorization_details: None,
+            resource: None,
         }
     }
 
@@ -3379,6 +3386,7 @@ mod tests {
         );
         assert_eq!(validated.claims.aud.as_str(), "my-app");
         assert!(validated.claims.aud.contains("other"));
+        assert_eq!(validated.claims.resource, None);
     }
 
     #[tokio::test]
@@ -3980,6 +3988,7 @@ mod tests {
             claims: None,
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
 
         let (token, _) = tm.sign_claims(&claims, Algorithm::Rs256).await.unwrap();

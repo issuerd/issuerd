@@ -2346,6 +2346,7 @@ mod tests {
                         claims: None,
                         cnf: None,
                         authorization_details: None,
+                        resource: None,
                     },
                     header: issuerd_core::JwsHeader {
                         alg: Algorithm::Hs256,

@@ -144,9 +144,6 @@ impl TokenRequest {
                 if self.code.is_none() {
                     return Err(IssuerdError::InvalidGrant);
                 }
-                if self.redirect_uri.is_none() {
-                    return Err(IssuerdError::InvalidGrant);
-                }
                 if client.public_client && self.code_verifier.is_none() {
                     return Err(IssuerdError::InvalidGrant);
                 }
@@ -810,6 +807,29 @@ mod tests {
 
         req.code_verifier = Some("verifier".to_string());
         assert!(req.validate(&Realm::default(), &make_test_client(true)).is_ok());
+    }
+
+    #[test]
+    fn authorization_code_redirect_uri_is_optional() {
+        let mut req = bare_request(GrantType::AuthorizationCode);
+        req.code = Some(AuthorizationCode::new("code").unwrap());
+        assert!(req.redirect_uri.is_none());
+        assert!(req.validate(&Realm::default(), &make_test_client(false)).is_ok());
+    }
+
+    #[test]
+    fn step_up_scope_is_rejected_even_for_legacy_clients() {
+        let mut client = make_test_client(false);
+        client.default_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        client.optional_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        for mcp_enabled in [false, true] {
+            let mut req = bare_request(GrantType::ClientCredentials);
+            req.scope = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+            assert!(matches!(
+                req.validate_with_mcp(&Realm::default(), &client, mcp_enabled),
+                Err(IssuerdError::InvalidScope)
+            ));
+        }
     }
 
     #[test]

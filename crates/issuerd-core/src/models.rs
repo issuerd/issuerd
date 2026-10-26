@@ -484,6 +484,46 @@ impl RedirectUri {
             None => false,
         }
     }
+
+    /// Match a redirect URI under the strict MCP authorization profile.
+    /// Wildcard registrations are never accepted. Every URI component must
+    /// match exactly, except that an HTTP native loopback redirect may use an
+    /// ephemeral port. Only the literal loopback IP hosts qualify; `localhost`
+    /// and other hostnames do not.
+    pub fn matches_mcp(&self, requested: &str) -> bool {
+        if self.0.ends_with('*') {
+            return false;
+        }
+        if self.0 == requested {
+            return true;
+        }
+        let Ok(registered) = Url::parse(&self.0) else {
+            return false;
+        };
+        let Ok(requested) = Url::parse(requested) else {
+            return false;
+        };
+        if registered.scheme() != "http"
+            || requested.scheme() != "http"
+            || !is_native_loopback(&registered)
+            || registered.host() != requested.host()
+        {
+            return false;
+        }
+        let mut registered_without_port = registered;
+        let mut requested_without_port = requested;
+        registered_without_port.set_port(None).is_ok()
+            && requested_without_port.set_port(None).is_ok()
+            && registered_without_port == requested_without_port
+    }
+}
+
+fn is_native_loopback(uri: &Url) -> bool {
+    match uri.host() {
+        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+        _ => false,
+    }
 }
 
 impl TryFrom<String> for RedirectUri {
@@ -3137,6 +3177,11 @@ pub struct AccessTokenClaims {
     /// userinfo and introspection can reflect the granted details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// RFC 8707 resource grant provenance. Unlike `aud`, which configurable
+    /// mappers may extend, this is injected only by the trusted post-mapper
+    /// resource binder. Missing on tokens issued before this claim existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3568,6 +3613,33 @@ mod tests {
         let registered = RedirectUri::new("https://app.example.com/*/cb").unwrap();
         assert!(!registered.matches("https://app.example.com/a/cb"));
         assert!(registered.matches("https://app.example.com/*/cb"));
+    }
+
+    #[test]
+    fn redirect_uri_mcp_requires_exact_match_except_native_loopback_port() {
+        let exact = RedirectUri::new("https://app.example.com/cb").unwrap();
+        assert!(exact.matches_mcp("https://app.example.com/cb"));
+        assert!(!exact.matches_mcp("https://app.example.com:8443/cb"));
+        assert!(!exact.matches_mcp("https://app.example.com/other"));
+        assert!(!exact.matches_mcp("http://app.example.com/cb"));
+        assert!(!exact.matches_mcp("https://other.example.com/cb"));
+
+        let wildcard = RedirectUri::new("https://app.example.com/*").unwrap();
+        assert!(!wildcard.matches_mcp("https://app.example.com/cb"));
+
+        let ipv4 = RedirectUri::new("http://127.0.0.1:8080/cb?x=1").unwrap();
+        assert!(ipv4.matches_mcp("http://127.0.0.1:49152/cb?x=1"));
+        assert!(!ipv4.matches_mcp("http://127.0.0.1:49152/other?x=1"));
+        assert!(!ipv4.matches_mcp("http://127.0.0.1:49152/cb?x=2"));
+        assert!(!ipv4.matches_mcp("https://127.0.0.1:49152/cb?x=1"));
+        assert!(!ipv4.matches_mcp("http://127.0.0.2:49152/cb?x=1"));
+
+        let ipv6 = RedirectUri::new("http://[::1]:8080/cb").unwrap();
+        assert!(ipv6.matches_mcp("http://[::1]:49152/cb"));
+        assert!(!ipv6.matches_mcp("http://[::2]:49152/cb"));
+
+        let localhost = RedirectUri::new("http://localhost:8080/cb").unwrap();
+        assert!(!localhost.matches_mcp("http://localhost:49152/cb"));
     }
 
     // ------------------------------------------------------------------
@@ -4407,8 +4479,20 @@ mod tests {
                 "type": "account_information",
                 "actions": ["list_accounts"]
             })]),
+            resource: Some("https://issuer.example.com/realms/master/mcp".to_string()),
         };
         roundtrip(&atc);
+
+        let mut legacy = serde_json::to_value(&atc).unwrap();
+        legacy.as_object_mut().unwrap().remove("resource");
+        let decoded: AccessTokenClaims = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded,
+            AccessTokenClaims {
+                resource: None,
+                ..atc
+            }
+        );
     }
 
     // ------------------------------------------------------------------
@@ -5871,8 +5955,11 @@ mod tests {
             claims: None,
             cnf: None,
             authorization_details: None,
+            resource: None,
         };
         roundtrip(&atc);
+        let json = serde_json::to_string(&atc).unwrap();
+        assert!(!json.contains("\"resource\""), "resource must be omitted, not null: {json}");
     }
 
     #[test]

@@ -282,6 +282,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }
@@ -443,6 +444,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }

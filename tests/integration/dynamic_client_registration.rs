@@ -777,6 +777,11 @@ async fn open_registration_rejects_mcp_scopes_on_create_and_update() {
             "redirect_uris": ["https://app.example.com/cb"],
             "optional_scopes": ["mcp:write"]
         }),
+        serde_json::json!({
+            "client_id": "mcp-step-up-reserved",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "optional_scopes": ["mcp:step_up"]
+        }),
     ]
     .into_iter()
     .enumerate()
