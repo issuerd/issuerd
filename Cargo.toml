@@ -8,6 +8,7 @@ members = [
     "crates/issuerd-federation",
     "crates/issuerd-admin-api",
     "crates/issuerd-cluster",
+    "crates/issuerd-mcp",
     "crates/issuerd-server",
 ]
 resolver = "2"
@@ -85,6 +86,8 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 bytes = "1.6"
 issuerd-federation = { workspace = true }
+issuerd-mcp = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 ldap3 = { workspace = true }
 sqlx = { workspace = true }
 ring = { workspace = true }
@@ -119,6 +122,10 @@ serde_urlencoded = "0.7"
 # Pure-Rust YAML (saphyr-lineage parser, `#![deny(unsafe_code)]`) — replaces
 # serde_yaml, whose unsafe-libyaml backend is unmaintained (RUSTSEC-2024-0449).
 serde-saphyr = "2.0"
+schemars = "1.0"
+
+# Model Context Protocol SDK (features are selected by each consumer)
+rmcp = { version = "~3.7.0", default-features = false }
 
 # Crypto
 ring = "0.17"
@@ -260,6 +267,7 @@ issuerd-storage = { path = "crates/issuerd-storage", version = "0.1.24" }
 issuerd-federation = { path = "crates/issuerd-federation", version = "0.1.24" }
 issuerd-admin-api = { path = "crates/issuerd-admin-api", version = "0.1.24" }
 issuerd-cluster = { path = "crates/issuerd-cluster", version = "0.1.24" }
+issuerd-mcp = { path = "crates/issuerd-mcp", version = "0.1.24" }
 issuerd-server = { path = "crates/issuerd-server", version = "0.1.24" }
 
 [profile.release]

@@ -1,0 +1,387 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
+
+use issuerd_core::{Client, ClientAuthenticatorType, ClientProtocol, Realm, SslRequired, User};
+use rmcp::model::{Tool, ToolAnnotations};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::policy::ToolName;
+
+pub const DEFAULT_PAGE_SIZE: u32 = 20;
+pub const MAX_PAGE_SIZE: u32 = 100;
+pub const MAX_INPUT_STRING_BYTES: usize = 255;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsersSearchArgs {
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub search: Option<String>,
+    pub first: Option<u32>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserGetArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientsListArgs {
+    pub client_id: Option<String>,
+    pub first: Option<u32>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientGetArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmOutput {
+    pub id: String,
+    pub realm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub ssl_required: String,
+    pub access_token_lifespan: i64,
+    pub refresh_token_lifespan: i64,
+    pub sso_session_idle_timeout: i64,
+    pub sso_session_max_lifespan: i64,
+    pub offline_session_idle_timeout: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_theme: Option<String>,
+    pub internationalization_enabled: bool,
+    pub supported_locales: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_locale: Option<String>,
+    pub registration_enabled: bool,
+    pub reset_password_allowed: bool,
+    pub remember_me_enabled: bool,
+    pub verify_email_enabled: bool,
+    pub login_with_email_allowed: bool,
+    pub duplicate_emails_allowed: bool,
+    pub edit_username_allowed: bool,
+}
+
+impl From<&Realm> for RealmOutput {
+    fn from(realm: &Realm) -> Self {
+        Self {
+            id: realm.id.to_string(),
+            realm: realm.name.to_string(),
+            display_name: realm.display_name.as_ref().map(ToString::to_string),
+            enabled: realm.enabled,
+            ssl_required: match realm.ssl_required {
+                SslRequired::None => "none",
+                SslRequired::External => "external",
+                SslRequired::All => "all",
+            }
+            .into(),
+            access_token_lifespan: realm.access_token_lifespan.get() as i64,
+            refresh_token_lifespan: realm.refresh_token_lifespan.get() as i64,
+            sso_session_idle_timeout: realm.sso_session_idle_timeout.get() as i64,
+            sso_session_max_lifespan: realm.sso_session_max_lifespan.get() as i64,
+            offline_session_idle_timeout: realm.offline_session_idle_timeout.get() as i64,
+            login_theme: realm.login_theme.as_ref().map(ToString::to_string),
+            email_theme: realm.email_theme.as_ref().map(ToString::to_string),
+            admin_theme: realm.admin_theme.as_ref().map(ToString::to_string),
+            internationalization_enabled: realm.internationalization_enabled,
+            supported_locales: realm.supported_locales.clone(),
+            default_locale: realm.default_locale.clone(),
+            registration_enabled: realm.registration_enabled,
+            reset_password_allowed: realm.reset_password_allowed,
+            remember_me_enabled: realm.remember_me_enabled,
+            verify_email_enabled: realm.verify_email_enabled,
+            login_with_email_allowed: realm.login_with_email_allowed,
+            duplicate_emails_allowed: realm.duplicate_emails_allowed,
+            edit_username_allowed: realm.edit_username_allowed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserOutput {
+    pub id: String,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    pub enabled: bool,
+    pub email_verified: bool,
+    pub created_at: String,
+    pub required_actions: Vec<String>,
+}
+
+impl From<&User> for UserOutput {
+    fn from(user: &User) -> Self {
+        let mut required_actions = user.required_actions.clone();
+        required_actions.sort();
+        Self {
+            id: user.id.to_string(),
+            username: user.username.to_string(),
+            email: user.email.as_ref().map(ToString::to_string),
+            first_name: user.first_name.as_ref().map(ToString::to_string),
+            last_name: user.last_name.as_ref().map(ToString::to_string),
+            enabled: user.enabled,
+            email_verified: user.email_verified,
+            created_at: user.created_at.to_rfc3339(),
+            required_actions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDetailsOutput {
+    #[serde(flatten)]
+    pub user: UserOutput,
+    pub realm_roles: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UsersOutput {
+    pub users: Vec<UserOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientOutput {
+    pub id: String,
+    pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub protocol: String,
+    pub public_client: bool,
+    pub bearer_only: bool,
+    pub client_authenticator_type: String,
+    pub redirect_uris: Vec<String>,
+    pub web_origins: Vec<String>,
+    pub default_scopes: Vec<String>,
+    pub optional_scopes: Vec<String>,
+    pub consent_required: bool,
+    pub full_scope_allowed: bool,
+    pub service_accounts_enabled: bool,
+}
+
+impl From<&Client> for ClientOutput {
+    fn from(client: &Client) -> Self {
+        let mut redirect_uris: Vec<_> =
+            client.redirect_uris.iter().map(ToString::to_string).collect();
+        redirect_uris.sort();
+        let mut web_origins: Vec<_> = client.web_origins.iter().map(ToString::to_string).collect();
+        web_origins.sort();
+        Self {
+            id: client.id.to_string(),
+            client_id: client.client_id.to_string(),
+            name: client.name.as_ref().map(ToString::to_string),
+            description: client.description.clone(),
+            enabled: client.enabled,
+            protocol: match client.protocol {
+                ClientProtocol::OpenIdConnect => "openid-connect",
+                ClientProtocol::Saml => "saml",
+            }
+            .into(),
+            public_client: client.public_client,
+            bearer_only: client.bearer_only,
+            client_authenticator_type: match client.client_authenticator_type {
+                ClientAuthenticatorType::ClientSecret => "client-secret",
+                ClientAuthenticatorType::ClientJwt => "client-jwt",
+                ClientAuthenticatorType::ClientSecretJwt => "client-secret-jwt",
+                ClientAuthenticatorType::ClientX509 => "client-x509",
+            }
+            .into(),
+            redirect_uris,
+            web_origins,
+            default_scopes: client.default_scopes.to_vec(),
+            optional_scopes: client.optional_scopes.to_vec(),
+            consent_required: client.consent_required,
+            full_scope_allowed: client.full_scope_allowed,
+            service_accounts_enabled: client.service_accounts_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientsOutput {
+    pub clients: Vec<ClientOutput>,
+}
+
+fn read_only_annotations() -> ToolAnnotations {
+    ToolAnnotations::from_raw(None, Some(true), Some(false), Some(true), Some(false))
+}
+
+pub fn definition(name: ToolName) -> Tool {
+    let description = match name {
+        ToolName::RealmGet => "Return the current realm's curated, non-secret configuration.",
+        ToolName::UsersSearch => {
+            "Search users by exact username, exact email, or a username/email substring."
+        }
+        ToolName::UsersGet => {
+            "Return a user by internal id, including direct realm roles and groups."
+        }
+        ToolName::ClientsList => "List clients or return one exact public client identifier match.",
+        ToolName::ClientsGet => {
+            "Return a client by its internal UUID without secret or mapper configuration."
+        }
+    };
+    let tool = Tool::new(name.as_str(), description, std::sync::Arc::new(serde_json::Map::new()));
+    let tool = match name {
+        ToolName::RealmGet => {
+            tool.with_input_schema::<NoArgs>().with_output_schema::<RealmOutput>()
+        }
+        ToolName::UsersSearch => {
+            tool.with_input_schema::<UsersSearchArgs>().with_output_schema::<UsersOutput>()
+        }
+        ToolName::UsersGet => tool
+            .with_input_schema::<UserGetArgs>()
+            .with_output_schema::<UserDetailsOutput>(),
+        ToolName::ClientsList => tool
+            .with_input_schema::<ClientsListArgs>()
+            .with_output_schema::<ClientsOutput>(),
+        ToolName::ClientsGet => {
+            tool.with_input_schema::<ClientGetArgs>().with_output_schema::<ClientOutput>()
+        }
+    };
+    tool.with_annotations(read_only_annotations())
+}
+
+pub fn definitions() -> Vec<Tool> {
+    ToolName::ALL.into_iter().map(definition).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn definitions_are_sorted_fully_annotated_and_have_strict_schemas() {
+        let definitions = definitions();
+        let names: Vec<_> = definitions.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            [
+                "clients_get",
+                "clients_list",
+                "realm_get",
+                "users_get",
+                "users_search"
+            ]
+        );
+        for tool in definitions {
+            let annotations = tool.annotations.unwrap();
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
+            assert_eq!(tool.input_schema["type"], "object");
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+            assert_eq!(tool.output_schema.as_ref().unwrap()["type"], "object");
+        }
+        assert!(definition(ToolName::RealmGet).input_schema.get("properties").is_none());
+    }
+
+    #[test]
+    fn strict_inputs_reject_unknown_fields() {
+        for (json, expected) in [
+            (r#"{"unexpected":true}"#, "realm_get"),
+            (r#"{"username":"alice","unexpected":true}"#, "users_search"),
+            (r#"{"id":"alice","unexpected":true}"#, "users_get"),
+            (r#"{"clientId":"agent","unexpected":true}"#, "clients_list"),
+            (r#"{"id":"uuid","unexpected":true}"#, "clients_get"),
+        ] {
+            let error = match expected {
+                "realm_get" => serde_json::from_str::<NoArgs>(json).map(|_| ()).unwrap_err(),
+                "users_search" => {
+                    serde_json::from_str::<UsersSearchArgs>(json).map(|_| ()).unwrap_err()
+                }
+                "users_get" => serde_json::from_str::<UserGetArgs>(json).map(|_| ()).unwrap_err(),
+                "clients_list" => {
+                    serde_json::from_str::<ClientsListArgs>(json).map(|_| ()).unwrap_err()
+                }
+                _ => serde_json::from_str::<ClientGetArgs>(json).map(|_| ()).unwrap_err(),
+            };
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn dto_serialization_has_no_secret_or_arbitrary_extension_channels() {
+        let values = [
+            serde_json::to_value(RealmOutput::from(&realm())).unwrap().to_string(),
+            serde_json::to_value(UserOutput::from(&user(ALICE_ID, "alice", "alice@example.com")))
+                .unwrap()
+                .to_string(),
+            serde_json::to_value(ClientOutput::from(&client(ALPHA_CLIENT_ID, "alpha-client")))
+                .unwrap()
+                .to_string(),
+        ];
+        for value in values {
+            for canary in [
+                REALM_SECRET,
+                PAIRWISE_SECRET,
+                USER_SECRET,
+                CLIENT_SECRET,
+                CLIENT_ATTRIBUTE_SECRET,
+                "attributes",
+                "protocolMappers",
+                "credentials",
+                "federationLink",
+            ] {
+                assert!(!value.contains(canary), "leaked {canary}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_fields_match_admin_names_and_values() {
+        let realm = serde_json::to_value(RealmOutput::from(&realm())).unwrap();
+        assert_eq!(realm["realm"], "demo");
+        assert_eq!(realm["displayName"], "Demo Realm");
+        assert_eq!(realm["sslRequired"], "external");
+        assert_eq!(realm["accessTokenLifespan"], 300);
+        assert_eq!(realm["supportedLocales"], serde_json::json!(["en", "de"]));
+
+        let user =
+            serde_json::to_value(UserOutput::from(&user(ALICE_ID, "alice", "alice@example.com")))
+                .unwrap();
+        assert_eq!(user["id"], ALICE_ID);
+        assert_eq!(user["username"], "alice");
+        assert_eq!(user["emailVerified"], true);
+        assert!(user["createdAt"].as_str().unwrap().starts_with("2023-11-14T"));
+
+        let client =
+            serde_json::to_value(ClientOutput::from(&client(ALPHA_CLIENT_ID, "alpha-client")))
+                .unwrap();
+        assert_eq!(client["clientId"], "alpha-client");
+        assert_eq!(client["protocol"], "openid-connect");
+        assert_eq!(client["clientAuthenticatorType"], "client-secret");
+        assert_eq!(client["redirectUris"][0], "https://a.example/callback");
+        assert_eq!(client["defaultScopes"], serde_json::json!(["profile", "roles"]));
+    }
+}

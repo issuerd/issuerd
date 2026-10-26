@@ -1,0 +1,35 @@
+[package]
+name = "issuerd-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Read-only Model Context Protocol tools, policy, and transport primitives for the Issuerd IAM server"
+keywords = ["oidc", "oauth2", "iam", "mcp"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+issuerd-core = { workspace = true }
+http = "1"
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+issuerd-cluster = { workspace = true }
+issuerd-storage = { workspace = true }
+async-trait = { workspace = true }
+bytes = "1"
+chrono = { workspace = true }
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower-service = "0.3"

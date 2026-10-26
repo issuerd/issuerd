@@ -9,7 +9,7 @@
 
 **Issuerd** is a horizontally scalable, modular Identity and Access Management (IAM) server implementing OIDC/OAuth2 protocols. It is written in Rust and inspired by Keycloak, which is used as a baseline reference implementation throughout the codebase.
 
-The project is organized as a Cargo workspace with 9 library crates plus 1 binary crate. Each crate compiles independently and there are **no circular dependencies**.
+The project is organized as a Cargo workspace with 10 library crates plus 1 binary crate. Each crate compiles independently and there are **no circular dependencies**.
 
 - **Repository**: https://github.com/issuerd/issuerd
 - **License**: Apache-2.0
@@ -38,6 +38,7 @@ issuerd/
 │   ├── issuerd-federation/       # User federation SPI (LDAP, Kerberos, custom)
 │   ├── issuerd-admin-api/        # REST Admin API (Axum + utoipa/OpenAPI)
 │   ├── issuerd-cluster/          # Distributed cache (Redis) & node discovery
+│   ├── issuerd-mcp/              # Read-only MCP tools, policy, safe DTOs, stateless rmcp transport
 │   └── issuerd-server/           # Axum HTTP server bootstrap, middleware, TLS, metrics
 ├── src/main.rs              # CLI binary (daemon + provision + openapi + example + healthcheck commands)
 ├── tests/integration.rs     # Workspace-level integration tests
@@ -77,6 +78,9 @@ issuerd/
 - Beyond `issuerd-core`, the sanctioned non-core edges (see the Mermaid graph in `ARCHITECTURE.md`):
   `issuerd-auth-flow` → `issuerd-token`, `issuerd-cluster`; `issuerd-federation` → `issuerd-storage`;
   `issuerd-admin-api` → `issuerd-auth-flow`, `issuerd-federation`, `issuerd-token`, `issuerd-storage`, `issuerd-cluster`.
+  `issuerd-mcp` has only `issuerd-core` as a production crate dependency;
+  `issuerd-storage` and `issuerd-cluster` are dev-only backends for its tests.
+  The production path is `issuerd-core <- issuerd-mcp <- issuerd-server`.
   New cross-crate edges must follow the same down-layer direction and never create a cycle.
 - `issuerd-server` is the composition root — it depends on all other crates and wires them together.
 
@@ -818,6 +822,13 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 - Admin depth: editable flows/executions + per-execution authenticator config (`flows.rs`; built-in flows read-only, bound/sub-flow-referenced delete guards, whole-set validation-on-save via `issuerd_auth_flow::validation`), user credentials CRUD (`credentials.rs`; redacted, last-credential guard, `moveAfter` renumbers 1..n), execute-actions-email + impersonation (`user_actions.rs`), groups children/members/move + role-composite sub-resources (`groups.rs`, `composites.rs`), partial import/export + push-revocation stub (`import_export.rs`). `GET/PUT /realms/{realm}/events/config` + `DELETE .../events|admin-events` (a fresh admin event records each wipe) + `GET .../events/count` + `GET .../admin-events/count` (filtered totals back the SPA's server-side pagination); event queries clamp `date_from` to `now - events_expiration_secs` when set. Event representations resolve `user_id` → `username` at query time (fallback: the recorded `username` detail) and expose `session_id`; admin events resolve `auth_username` against `auth_realm_id` (master-realm admins). Admin-event writes are gated per realm in `audit.rs` (`emit_admin_event*`): skipped unless `admin_events_enabled`, representation stripped unless `include_representations` (Issuerd defaults: `events_enabled`/`admin_events_enabled` both ON — Keycloak parity break; `include_representations` OFF; when the realm row is missing or cannot be loaded the event is still recorded but the representation is stripped — fail-closed, a realm with unknown preferences has not opted into storing request bodies). `POST /keys/rotate` + `PUT /keys/{kid}/disable` manage the server-global `signing_keys` table (realm segment is namespace parity only) and invoke `AdminApiState.signing_key_reload` so this node's keystore + JWKS snapshot reload without waiting for the polling tick.
 - Uses `AdminApiError` for consistent error responses.
 
+### `issuerd-mcp` — Read-only MCP library
+
+- `src/auth.rs` carries only request-local resolved principals and scope/realm-role helpers; `src/policy.rs` holds the five static read policies shared by listing, preflight, and execution.
+- `src/executor.rs` and `src/tools.rs` implement `realm_get`, `users_search`, `users_get`, `clients_list`, and `clients_get` with strict schemas and curated DTOs (no raw realm/user/client serialization, arbitrary attributes, credentials, secrets, or protocol-mapper dumps).
+- `src/rate_limit.rs` uses atomic distributed fixed-window counters per realm, authorizing client, and internal user; `src/json.rs` rejects duplicate keys recursively.
+- `src/server.rs` and `src/transport.rs` provide the manual `rmcp` handler and stateless Streamable HTTP construction. The production dependency is only `issuerd-core`; storage/cluster implementations are dev-only. No MCP HTTP route is wired yet.
+
 ### `issuerd-server` — Bootstrap
 
 - `ServerState` holds `Arc<dyn Storage>`, `Arc<dyn DistributedCache>`, `Arc<dyn CryptoProvider>`, `Arc<dyn TokenService>`, etc.
@@ -868,11 +879,11 @@ Keycloak uses an embedded H2 database in dev mode, so no PostgreSQL init is requ
 
 ### Publishing to crates.io
 
-All 10 crates share the workspace version and are published in dependency order. The release workflow's `crates-io` job does this automatically on every `v*` tag (real publish; dry-run under act rehearsal); locally:
+All 11 crates share the workspace version and are published in dependency order. The release workflow's `crates-io` job does this automatically on every `v*` tag (real publish; dry-run under act rehearsal); locally:
 
 ```bash
 python scripts/publish.py                    # dry-run rehearsal (default, no upload)
-python scripts/publish.py --real --skip-root # real publish of the 9 library crates
+python scripts/publish.py --real --skip-root # real publish of the 10 library crates
 python scripts/publish.py --real             # real publish incl. the root binary
 ```
 

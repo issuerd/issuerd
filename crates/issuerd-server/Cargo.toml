@@ -20,6 +20,7 @@ issuerd-storage = { workspace = true }
 issuerd-cluster = { workspace = true }
 issuerd-federation = { workspace = true }
 issuerd-admin-api = { workspace = true }
+issuerd-mcp = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 tokio = { workspace = true }
