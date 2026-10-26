@@ -1,7 +1,9 @@
 # Issuerd OIDC Conformance Test Coverage
 
-> Latest full run: **2026-10-11** (suite `release-v5.3.2`) — the full OP certification matrix: Config OP, Basic OP, Implicit OP, Hybrid OP, Form Post OP (basic/implicit/hybrid legs), Dynamic OP (6 response types), 3rd-Party-Init OP (×6), and the four logout profiles (RP-Initiated, Session, Front-Channel, Back-Channel — each ×6 response types); **0 failures and 0 unexpected warnings across all 43 plan invocations (612 executed test modules)** (`run.sh` exit 0). Run in the **hermetic pristine environment**: isolated network (`internal: true`, bind9-only DNS), TLS everywhere from a local root CA, conformance suite JAR and runner scripts byte-pristine (no patching, no intercepting proxies — the only suite deviation is the root CA in the JVM truststore). Per-module tables below reflect this run. Counting convention: module counts are the exact `[1:N]` plan listings; the runner's "Overall totals: ran N" line counts one bookkeeping entry extra (N+1), which is also the OIDF published-count convention.
-> Conformance Suite version: release-v5.3.2
+> Latest full run: **2026-10-27** (suite `release-v5.3.3`) — the full OP certification matrix across 43 plan invocations: **all plans OK, 0 unexpected failures and 0 unexpected warnings**. The 24 failures are the declared Dynamic expected set (the three branding modules per response type plus in-plan key rotation), and the 12 warnings are the declared Back-Channel proxy-header set. Standalone `oidcc-server-rotate-keys` finished **PASSED** with a real admin-API rotation. The run used the hermetic pristine environment: isolated network, local-CA TLS, and an unpatched suite JAR/runner. Current evidence: `results/html-reports-20261026-205311/index.html` (43 plan reports and matching HTML zips); raw logs are in `results/`.
+> Conformance Suite version: release-v5.3.3
+>
+> The detailed per-module tables below preserve the earlier 2026-10-11 baseline analysis. Use the current run's raw logs for exact current condition counts.
 
 ## Test Environment
 
@@ -28,7 +30,7 @@
 
 Validates discovery metadata and JWKS. Requires no browser automation.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 2 test modules, 39 successes, 0 failures, 0 warnings (0.3s)
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 2 test modules, 39 successes, 0 failures, 0 warnings (0.3s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
@@ -40,7 +42,7 @@ Validates discovery metadata and JWKS. Requires no browser automation.
 
 Validates authorization code flow with `response_type=code`.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 1858 successes, 0 failures, 0 warnings (47.3s)
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 1858 successes, 0 failures, 0 warnings (47.3s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
@@ -84,7 +86,7 @@ Validates authorization code flow with `response_type=code`.
 
 Runs the same module set as Basic OP with `response_mode=form_post` — the authorization response is delivered as an auto-submitted HTML form instead of a query redirect.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 2010 successes, 0 failures, 0 warnings (46.2s)
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 36 test modules, 2010 successes, 0 failures, 0 warnings (46.2s)
 
 | Module | Result | Notes |
 |--------|--------|-------|
@@ -133,7 +135,7 @@ The plan pins `client_registration=dynamic_client` and runs once per response
 type (menu-selected, never exercised by the modules); registrations use the
 bootstrap-minted initial access token.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 response-type runs
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 6 response-type runs
 (`code`, `code id_token`, `code id_token token`, `code token`, `id_token`,
 `id_token token`) × 2 test modules, 0 failures, 0 warnings (≤0.1s per run)
 
@@ -148,7 +150,7 @@ bootstrap-minted initial access token.
 
 Validates the implicit flow (`response_type=id_token` and `id_token token` in one run — fragment responses, mandatory nonce, `at_hash`).
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 54 test modules listed (`[1:54]`), 0 failures, 0 warnings (27.9s), static_client. The suite's "Overall totals" line prints 55 (one bookkeeping entry counts as a module); the published profile count 58 assumes the dynamic_client variant — the static run omits `oidcc-id-token-signature` ×2 and `oidcc-idtoken-unsigned` ×2 (both `@VariantNotApplicable(static_client)`); they are covered by the M6 certification-grade dynamic re-runs.
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 54 test modules listed (`[1:54]`), 0 failures, 0 warnings (27.9s), static_client. The suite's "Overall totals" line prints 55 (one bookkeeping entry counts as a module); the published profile count 58 assumes the dynamic_client variant — the static run omits `oidcc-id-token-signature` ×2 and `oidcc-idtoken-unsigned` ×2 (both `@VariantNotApplicable(static_client)`); they are covered by the M6 certification-grade dynamic re-runs.
 
 | Module group | Result | Notes |
 |--------------|--------|-------|
@@ -162,19 +164,19 @@ Validates the implicit flow (`response_type=id_token` and `id_token token` in on
 
 All three hybrid types (`code id_token`, `code token`, `code id_token token`) in one run: `c_hash`/`at_hash`, per-type nonce rules, sub consistency between the authorization- and token-endpoint id_tokens.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 96 test modules listed, 0 failures, 0 warnings (145s), static_client. Same bookkeeping note: the runner prints 97; published 102 = dynamic_client adds `oidcc-id-token-signature` ×3 and `oidcc-idtoken-unsigned` ×3.
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 96 test modules listed, 0 failures, 0 warnings (145s), static_client. Same bookkeeping note: the runner prints 97; published 102 = dynamic_client adds `oidcc-id-token-signature` ×3 and `oidcc-idtoken-unsigned` ×3.
 
 ### 7. Form Post OP — implicit + hybrid legs (`oidcc-formpost-implicit/hybrid-certification-test-plan`)
 
 The implicit/hybrid module sets with `response_mode=form_post` (auto-submitted POST callback, no credentials in the URL query).
 
-**Latest run**: 2026-10-11 — implicit leg: 54 modules listed (runner prints 55), 0 failures, 0 warnings; hybrid leg: 96 listed (prints 97), 0 failures, 0 warnings. Static-vs-published deltas as in §5/§6.
+**Previous detailed run**: 2026-10-11 — implicit leg: 54 modules listed (runner prints 55), 0 failures, 0 warnings; hybrid leg: 96 listed (prints 97), 0 failures, 0 warnings. Static-vs-published deltas as in §5/§6.
 
 ### 8. Dynamic OP (`oidcc-dynamic-certification-test-plan`)
 
 Dynamic registration (RFC 7591/7592) + per-client signing algs + signed userinfo + JAR-by-reference — one run per response type, `client_registration=dynamic_client`, `client_auth_type=private_key_jwt`.
 
-**Latest run**: 2026-10-11 (suite `release-v5.3.2`) — 6 runs (code 23 / code id_token 22 / code id_token token 22 / code token 23 / id_token 18 / id_token token 19 modules = **127 executions**, the published profile total), 0 failures, 0 warnings beyond the expected set below. (The runner's "Overall totals: ran N" line counts one bookkeeping entry extra per run — the `[1:N]` module listings above are the exact counts.)
+**Previous detailed run**: 2026-10-11 (suite `release-v5.3.2`) — 6 runs (code 23 / code id_token 22 / code id_token token 22 / code token 23 / id_token 18 / id_token token 19 modules = **127 executions**, the published profile total), 0 failures, 0 warnings beyond the expected set below. (The runner's "Overall totals: ran N" line counts one bookkeeping entry extra per run — the `[1:N]` module listings above are the exact counts.)
 
 | Module group | Result | Notes |
 |--------------|--------|-------|
@@ -189,19 +191,19 @@ Dynamic registration (RFC 7591/7592) + per-client signing algs + signed userinfo
 
 ### 9. RP-Initiated Logout OP (`oidcc-rp-initiated-logout-certification-test-plan`)
 
-**Latest run**: 2026-10-11 — 6 response-type runs × (1 discovery + 10 logout modules), 0 failures, 0 warnings (≈10s per run). Negative variants (bad/modified/missing `id_token_hint`, unregistered `post_logout_redirect_uri`, missing params/state) land on rendered error/confirmation pages — REVIEW-flagged screenshot modules, as in Basic OP. `post_logout_redirect_uris` validated as the dedicated allowlist (redirect_uris fallback); the SSO session is genuinely destroyed (post-logout `prompt=none` fails).
+**Previous detailed run**: 2026-10-11 — 6 response-type runs × (1 discovery + 10 logout modules), 0 failures, 0 warnings (≈10s per run). Negative variants (bad/modified/missing `id_token_hint`, unregistered `post_logout_redirect_uri`, missing params/state) land on rendered error/confirmation pages — REVIEW-flagged screenshot modules, as in Basic OP. `post_logout_redirect_uris` validated as the dedicated allowlist (redirect_uris fallback); the SSO session is genuinely destroyed (post-logout `prompt=none` fails).
 
 ### 10. Session Management OP (`oidcc-session-management-certification-test-plan`)
 
-**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. `session_state` rides every authorization response; `check_session_iframe` serves the OP-iframe postMessage protocol (`unchanged`/`changed`/`error`); the JS-readable companion cookie is cleared on logout (second check flips to `changed`).
+**Previous detailed run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. `session_state` rides every authorization response; `check_session_iframe` serves the OP-iframe postMessage protocol (`unchanged`/`changed`/`error`); the JS-readable companion cookie is cleared on logout (second check flips to `changed`).
 
 ### 11. Front-Channel Logout OP (`oidcc-frontchannel-rp-initiated-logout-certification-test-plan`)
 
-**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. The logout interstitial renders the client's `frontchannel_logout_uri` iframe with `iss`+`sid` (session-required semantics); the suite validates both against the id_token.
+**Previous detailed run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, 0 warnings. The logout interstitial renders the client's `frontchannel_logout_uri` iframe with `iss`+`sid` (session-required semantics); the suite validates both against the id_token.
 
 ### 12. Back-Channel Logout OP (`oidcc-backchannel-rp-initiated-logout-certification-test-plan`)
 
-**Latest run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, **2 expected warnings** per run: `EnsureIncomingTls13` / `EnsureIncomingTls12WithSecureCipherOrTls13` read the `x-ssl-protocol` request header, which the suite's own fronting nginx sets in its standard deployment — the hermetic stack serves the suite over direct HTTPS (no proxy), so the header cannot exist (`configs/issuerd-expected-warnings-backchannel.json`). The signed `logout_token` (events claim, `sub`/`sid` matching the id_token, no nonce) is delivered over TLS 1.3-capable rustls.
+**Previous detailed run**: 2026-10-11 — 6 response-type runs × 2 modules, 0 failures, **2 expected warnings** per run: `EnsureIncomingTls13` / `EnsureIncomingTls12WithSecureCipherOrTls13` read the `x-ssl-protocol` request header, which the suite's own fronting nginx sets in its standard deployment — the hermetic stack serves the suite over direct HTTPS (no proxy), so the header cannot exist (`configs/issuerd-expected-warnings-backchannel.json`). The signed `logout_token` (events claim, `sub`/`sid` matching the id_token, no nonce) is delivered over TLS 1.3-capable rustls.
 
 ## Known Gaps vs. Conformance Suite Requirements
 
