@@ -148,6 +148,9 @@ pub struct DiscoveryResponse {
     /// responses (`response_mode=jwt` family). The server handler overrides
     /// this per request with the active signing algorithms.
     pub authorization_signing_alg_values_supported: Vec<issuerd_core::Algorithm>,
+    /// RFC 9207 authorization responses carry the exact realm issuer in `iss`.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
     #[serde(with = "scope_vec")]
     pub scopes_supported: Vec<issuerd_core::Scope>,
     pub response_types_supported: Vec<crate::authorization::ResponseType>,
@@ -246,6 +249,7 @@ impl DiscoveryResponse {
                 issuerd_core::Algorithm::Hs512,
             ],
             authorization_signing_alg_values_supported: vec![issuerd_core::Algorithm::Rs256],
+            authorization_response_iss_parameter_supported: true,
             issuer,
             scopes_supported: vec![
                 issuerd_core::Scope::parse("openid"),
@@ -310,6 +314,7 @@ impl DiscoveryResponse {
                 // JWT client assertions are implemented.
                 TokenEndpointAuthMethod::ClientSecretJwt,
                 TokenEndpointAuthMethod::PrivateKeyJwt,
+                TokenEndpointAuthMethod::None,
             ],
             token_endpoint_auth_signing_alg_values_supported: vec![
                 issuerd_core::Algorithm::Rs256,
@@ -366,36 +371,44 @@ pub struct ProtectedResourceMetadata {
     /// Authorization servers issuing tokens for this resource: the realm
     /// issuer URL — identical to the OIDC discovery document's `issuer`.
     pub authorization_servers: Vec<Url>,
-    /// Scopes the resource understands: the built-in agent-facing
-    /// authorization gates (never default-assigned; an administrator grants
-    /// them to specific agent clients).
+    /// The minimal basic scope set advertised for initial MCP authorization.
     pub scopes_supported: Vec<String>,
+    /// Whether access tokens must be DPoP-bound (RFC 9728 §3.2).
+    #[serde(default)]
+    pub dpop_bound_access_tokens_required: bool,
     /// DPoP proof signing algorithms accepted at the resource (RFC 9449
     /// §5.1): the same validator accept set the OIDC discovery document
     /// advertises (`Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED`).
     pub dpop_signing_alg_values_supported: Vec<issuerd_core::Algorithm>,
-    /// RFC 6750 bearer-token presentation methods: the Authorization header
-    /// only — form-body and URI-query methods would leak tokens into logs and
-    /// caches.
+    /// RFC 6750 bearer-token presentation methods. Empty omits the field for
+    /// the strict DPoP profile; explicit Bearer compatibility advertises the
+    /// Authorization header only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bearer_methods_supported: Vec<String>,
 }
 
 impl ProtectedResourceMetadata {
-    /// Build the document for the realm named `realm` under `base_url` (the
-    /// configured issuer URL).
+    /// Build strict DPoP-only metadata for the realm named `realm`.
     pub fn for_realm(base_url: &str, realm: &str) -> Self {
+        Self::for_realm_with_profile(base_url, realm, true)
+    }
+
+    /// Build metadata describing the configured DPoP/Bearer profile.
+    pub fn for_realm_with_profile(base_url: &str, realm: &str, require_dpop: bool) -> Self {
         let issuer =
             Url::parse(&format!("{}/realms/{}", base_url.trim_end_matches('/'), realm)).unwrap();
         Self {
             resource: Url::parse(&format!("{issuer}/mcp")).unwrap(),
             authorization_servers: vec![issuer],
-            scopes_supported: vec![
-                issuerd_core::MCP_SCOPE_READ.to_string(),
-                issuerd_core::MCP_SCOPE_WRITE.to_string(),
-            ],
+            scopes_supported: vec![issuerd_core::MCP_SCOPE_READ.to_string()],
+            dpop_bound_access_tokens_required: require_dpop,
             dpop_signing_alg_values_supported:
                 issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED.to_vec(),
-            bearer_methods_supported: vec!["header".to_string()],
+            bearer_methods_supported: if require_dpop {
+                Vec::new()
+            } else {
+                vec!["header".to_string()]
+            },
         }
     }
 
@@ -561,17 +574,16 @@ mod tests {
     }
 
     #[test]
-    fn protected_resource_metadata_shape() {
+    fn protected_resource_metadata_defaults_to_strict_dpop() {
         let doc = ProtectedResourceMetadata::for_realm("https://auth.example.com", "test-realm");
         let json = serde_json::to_value(&doc).unwrap();
-        // Exactly the five fields, no extras, no nulls (RFC 9728 §3.2).
         let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
             [
                 "authorization_servers",
-                "bearer_methods_supported",
+                "dpop_bound_access_tokens_required",
                 "dpop_signing_alg_values_supported",
                 "resource",
                 "scopes_supported"
@@ -582,12 +594,42 @@ mod tests {
             json["authorization_servers"],
             serde_json::json!(["https://auth.example.com/realms/test-realm"])
         );
-        assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read", "mcp:write"]));
+        assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read"]));
+        assert_eq!(json["dpop_bound_access_tokens_required"], true);
         assert_eq!(
             json["dpop_signing_alg_values_supported"],
             serde_json::json!(["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"])
         );
+        assert!(json.get("bearer_methods_supported").is_none());
+        assert!(doc.bearer_methods_supported.is_empty());
+    }
+
+    #[test]
+    fn protected_resource_metadata_explicit_bearer_compatibility() {
+        let doc = ProtectedResourceMetadata::for_realm_with_profile(
+            "https://auth.example.com",
+            "test-realm",
+            false,
+        );
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["dpop_bound_access_tokens_required"], false);
         assert_eq!(json["bearer_methods_supported"], serde_json::json!(["header"]));
+        assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read"]));
+    }
+
+    #[test]
+    fn discovery_advertises_public_client_auth_and_authorization_issuer() {
+        let doc = DiscoveryResponse::for_realm("https://auth.example.com", "test-realm");
+        assert!(doc
+            .token_endpoint_auth_methods_supported
+            .contains(&TokenEndpointAuthMethod::None));
+        assert!(doc.authorization_response_iss_parameter_supported);
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["authorization_response_iss_parameter_supported"], true);
+        assert!(json["token_endpoint_auth_methods_supported"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("none")));
     }
 
     #[test]

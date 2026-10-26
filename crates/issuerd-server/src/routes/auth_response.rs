@@ -18,7 +18,7 @@
 //! parameters as hidden inputs of an auto-submitting HTML form.
 
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use issuerd_core::{IssuerdError, Realm, RedirectUri};
+use issuerd_core::{Issuer, IssuerdError, Realm, RedirectUri};
 use issuerd_protocol::authorization::ResponseMode;
 
 use crate::{routes::oidc, state::ServerState};
@@ -123,10 +123,29 @@ pub(crate) fn resolve_effective_mode(
     }
 }
 
+fn authorization_parameters(
+    issuer_base_url: &str,
+    realm: &Realm,
+    params: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut owned: Vec<(String, String)> =
+        params.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+    if !params.iter().any(|(name, _)| *name == "iss") {
+        let issuer = Issuer::new(crate::routes::logout::issuer_for_realm(
+            issuer_base_url,
+            realm.name.as_str(),
+        ))
+        .expect("the configured issuer and a valid realm name form a valid issuer URL");
+        owned.push(("iss".to_string(), issuer.as_str().to_string()));
+    }
+    owned
+}
+
 /// Build the final authorization response: a 303 redirect (query/fragment)
-/// or an auto-submitting HTML page (form_post). The JARM modes sign the whole
-/// parameter set into one `response` JWT first (signed with the realm key;
-/// clients verify against the realm JWKS).
+/// or an auto-submitting HTML page (form_post). Every response carries the
+/// RFC 9207 realm issuer. JARM modes sign that complete parameter set into one
+/// `response` JWT first (signed with the realm key; clients verify against the
+/// realm JWKS).
 pub(crate) async fn authorization_response(
     state: &ServerState,
     redirect_uri: &str,
@@ -134,12 +153,11 @@ pub(crate) async fn authorization_response(
     packaging: &ResponsePackaging<'_>,
 ) -> Response {
     let mode = resolve_effective_mode(packaging.requested_mode, packaging.default_fragment);
+    let params = authorization_parameters(&state.config.issuer_url, packaging.realm, params);
     if mode.is_jwt_secured() {
-        let owned: Vec<(String, String)> =
-            params.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
         let jwt = match state
             .token_manager
-            .sign_authorization_response(packaging.realm, packaging.client_id, &owned)
+            .sign_authorization_response(packaging.realm, packaging.client_id, &params)
             .await
         {
             Ok(j) => j,
@@ -153,7 +171,9 @@ pub(crate) async fn authorization_response(
         };
         return deliver(redirect_uri, &[("response", jwt.as_str())], mode);
     }
-    deliver(redirect_uri, params, mode)
+    let params: Vec<(&str, &str)> =
+        params.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+    deliver(redirect_uri, &params, mode)
 }
 
 /// Deliver an (already final) parameter set per the resolved mode.
@@ -305,6 +325,78 @@ mod tests {
         assert!(packaging_for(ResponseType::CodeIdTokenToken));
     }
 
+    #[test]
+    fn parameters_for_jarm_include_exact_issuer_once() {
+        let realm = Realm {
+            name: issuerd_core::RealmName::new("demo").unwrap(),
+            ..Default::default()
+        };
+        let params = authorization_parameters(
+            "https://idp.example.com/",
+            &realm,
+            &[("code", "c-1"), ("state", "s-1")],
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("code".to_string(), "c-1".to_string()),
+                ("state".to_string(), "s-1".to_string()),
+                ("iss".to_string(), "https://idp.example.com/realms/demo".to_string(),),
+            ]
+        );
+
+        let supplied = "https://idp.example.com/realms/demo";
+        let params = authorization_parameters(
+            "https://idp.example.com",
+            &realm,
+            &[("error", "access_denied"), ("iss", supplied)],
+        );
+        assert_eq!(params.iter().filter(|(name, _)| name == "iss").count(), 1);
+        assert_eq!(params[1].1, supplied);
+    }
+
+    #[tokio::test]
+    async fn query_success_and_error_include_exact_realm_issuer() {
+        let state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
+        let realm = state.resolve_realm("master").await.unwrap().unwrap();
+        let expected_issuer = "http://localhost:8080/realms/master";
+        let packaging = ResponsePackaging {
+            realm: &realm,
+            client_id: "admin-cli",
+            requested_mode: Some(ResponseMode::Query),
+            default_fragment: false,
+        };
+        let response = authorization_response(
+            &state,
+            "http://localhost:3000/cb",
+            &[("code", "c-1")],
+            &packaging,
+        )
+        .await;
+        let location = response.headers()[axum::http::header::LOCATION].to_str().unwrap();
+        let url = url::Url::parse(location).unwrap();
+        let iss: Vec<_> = url.query_pairs().filter(|(name, _)| name == "iss").collect();
+        assert_eq!(iss.len(), 1);
+        assert_eq!(iss[0].1, expected_issuer);
+
+        let response = oauth_error_redirect(
+            &state,
+            "http://localhost:3000/cb",
+            &IssuerdError::LoginRequired,
+            Some("s-1"),
+            &packaging,
+        )
+        .await;
+        let location = response.headers()[axum::http::header::LOCATION].to_str().unwrap();
+        let url = url::Url::parse(location).unwrap();
+        let iss: Vec<_> = url.query_pairs().filter(|(name, _)| name == "iss").collect();
+        assert_eq!(iss.len(), 1);
+        assert_eq!(iss[0].1, expected_issuer);
+        assert!(url
+            .query_pairs()
+            .any(|(name, value)| name == "error" && value == "login_required"));
+    }
+
     #[tokio::test]
     async fn form_post_page_shape_and_escaping() {
         let resp = form_post_page(
@@ -404,6 +496,7 @@ mod tests {
             .strip_prefix("http://localhost:3000/cb#response=")
             .expect("JARM error delivered in the fragment");
         let claims = decode_payload(jwt);
+        assert_eq!(claims["iss"], "http://localhost:8080/realms/master");
         assert_eq!(claims["error"], "login_required");
         assert_eq!(claims["state"], "s-1");
     }
@@ -456,6 +549,7 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("name=\"code\" value=\"c-1\""));
         assert!(html.contains("name=\"state\" value=\"s-1\""));
+        assert!(html.contains("name=\"iss\" value=\"http://localhost:8080/realms/master\""));
 
         // fragment default for id_token-bearing response types.
         let packaging = ResponsePackaging {
@@ -473,6 +567,12 @@ mod tests {
         .await;
         let location = resp.headers().get(axum::http::header::LOCATION).unwrap().to_str().unwrap();
         assert!(location.starts_with("http://localhost:3000/cb#id_token=t-1"));
+        let redirect = url::Url::parse(location).unwrap();
+        let iss: Vec<_> = url::form_urlencoded::parse(redirect.fragment().unwrap().as_bytes())
+            .filter(|(name, _)| name == "iss")
+            .collect();
+        assert_eq!(iss.len(), 1);
+        assert_eq!(iss[0].1, "http://localhost:8080/realms/master");
     }
 
     fn decode_payload(jwt: &str) -> serde_json::Value {

@@ -52,6 +52,12 @@ lifetime_secs = 30
 
 [mcp]
 enabled = false
+require_dpop = true
+invocation_rate_limit_per_minute = 60
+allowed_origins = []
+
+[mcp.step_up]
+enabled = false
 
 [crypto]
 

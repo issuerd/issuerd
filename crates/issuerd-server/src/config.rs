@@ -528,20 +528,63 @@ impl Default for DpopNonceConfig {
     }
 }
 
+/// Default distributed invocation allowance for each client and subject.
+pub const MCP_INVOCATION_RATE_LIMIT_DEFAULT_PER_MINUTE: u32 = 60;
+
+fn default_mcp_require_dpop() -> bool {
+    true
+}
+
+fn default_mcp_invocation_rate_limit_per_minute() -> u32 {
+    MCP_INVOCATION_RATE_LIMIT_DEFAULT_PER_MINUTE
+}
+
 /// MCP (Model Context Protocol) settings (`[mcp]` section).
 ///
-/// Groundwork for the MCP resource endpoint (GitHub issue #39): the flag
-/// currently gates the RFC 9728 protected-resource metadata routes
-/// (`/.well-known/oauth-protected-resource` and the path-suffixed form) and
-/// RFC 8707 resource indicators (the `resource` parameter — while disabled,
-/// any request carrying one is refused with `invalid_target`); the
-/// MCP endpoint itself follows. The whole section is optional and defaults to
-/// disabled, so existing configuration files boot unchanged.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// The whole section and every key are optional. Defaults keep existing
+/// configurations booting with the MCP surface disabled and strict DPoP
+/// metadata enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     /// Master switch for the MCP surface. Default `false`: the
     /// protected-resource metadata routes answer 404 and any `resource`
     /// parameter is refused with `invalid_target`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Require DPoP-bound tokens and proofs. `false` is an explicit Bearer
+    /// compatibility choice, not a downgrade of the strict step-up profile.
+    #[serde(default = "default_mcp_require_dpop")]
+    pub require_dpop: bool,
+    /// Distributed tool-invocation allowance per client and subject per minute.
+    #[serde(default = "default_mcp_invocation_rate_limit_per_minute")]
+    pub invocation_rate_limit_per_minute: u32,
+    /// Exact allowed browser origins. Empty rejects every present `Origin`
+    /// when MCP Origin validation is enforced; requests without it remain
+    /// available to non-browser clients.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Independent rollout gate for operation-bound step-up behavior.
+    #[serde(default)]
+    pub step_up: McpStepUpConfig,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_dpop: true,
+            invocation_rate_limit_per_minute: MCP_INVOCATION_RATE_LIMIT_DEFAULT_PER_MINUTE,
+            allowed_origins: Vec::new(),
+            step_up: McpStepUpConfig::default(),
+        }
+    }
+}
+
+/// Operation-bound MCP step-up settings (`[mcp.step_up]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpStepUpConfig {
+    /// Enable only after every cluster node and approval route supports the
+    /// operation-bound flow. Independent of `[mcp].enabled`.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -1604,20 +1647,62 @@ key_base64 = "{}"
     // ------------------------------------------------------------------
 
     #[test]
-    fn mcp_disabled_by_default() {
+    fn mcp_secure_defaults() {
         let cfg = ServerConfig::default();
         assert!(!cfg.mcp.enabled);
-        // The generated example carries the same default.
-        assert!(!ServerConfig::generate_example().mcp.enabled);
+        assert!(cfg.mcp.require_dpop);
+        assert_eq!(cfg.mcp.invocation_rate_limit_per_minute, 60);
+        assert!(cfg.mcp.allowed_origins.is_empty());
+        assert!(!cfg.mcp.step_up.enabled);
+
+        let example = ServerConfig::generate_example();
+        assert!(!example.mcp.enabled);
+        assert!(example.mcp.require_dpop);
+        assert_eq!(example.mcp.invocation_rate_limit_per_minute, 60);
+        assert!(example.mcp.allowed_origins.is_empty());
+        assert!(!example.mcp.step_up.enabled);
     }
 
     #[test]
-    fn mcp_loads_from_toml() {
+    fn mcp_legacy_toml_uses_secure_defaults() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let (path, dir) = temp_path("mcp_toml", "toml");
+        let (path, dir) = temp_path("mcp_legacy_toml", "toml");
         fs::write(&path, "[mcp]\nenabled = true\n").unwrap();
         let cfg = ServerConfig::load(Some(path)).unwrap();
         assert!(cfg.mcp.enabled);
+        assert!(cfg.mcp.require_dpop);
+        assert_eq!(cfg.mcp.invocation_rate_limit_per_minute, 60);
+        assert!(cfg.mcp.allowed_origins.is_empty());
+        assert!(!cfg.mcp.step_up.enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_profile_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("mcp_profile_toml", "toml");
+        fs::write(
+            &path,
+            "[mcp]\nenabled = true\nrequire_dpop = false\ninvocation_rate_limit_per_minute = 120\nallowed_origins = [\"https://inspector.example.com\"]\n[mcp.step_up]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(cfg.mcp.enabled);
+        assert!(!cfg.mcp.require_dpop);
+        assert_eq!(cfg.mcp.invocation_rate_limit_per_minute, 120);
+        assert_eq!(cfg.mcp.allowed_origins, ["https://inspector.example.com"]);
+        assert!(cfg.mcp.step_up.enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_step_up_gate_is_independent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("mcp_step_up_toml", "toml");
+        fs::write(&path, "[mcp.step_up]\nenabled = true\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(!cfg.mcp.enabled);
+        assert!(cfg.mcp.step_up.enabled);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1625,9 +1710,18 @@ key_base64 = "{}"
     fn mcp_env_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ISSUERD_MCP__ENABLED", "true");
+        std::env::set_var("ISSUERD_MCP__REQUIRE_DPOP", "false");
+        std::env::set_var("ISSUERD_MCP__INVOCATION_RATE_LIMIT_PER_MINUTE", "120");
+        std::env::set_var("ISSUERD_MCP__STEP_UP__ENABLED", "true");
         let cfg = ServerConfig::load(None).unwrap();
         std::env::remove_var("ISSUERD_MCP__ENABLED");
+        std::env::remove_var("ISSUERD_MCP__REQUIRE_DPOP");
+        std::env::remove_var("ISSUERD_MCP__INVOCATION_RATE_LIMIT_PER_MINUTE");
+        std::env::remove_var("ISSUERD_MCP__STEP_UP__ENABLED");
         assert!(cfg.mcp.enabled);
+        assert!(!cfg.mcp.require_dpop);
+        assert_eq!(cfg.mcp.invocation_rate_limit_per_minute, 120);
+        assert!(cfg.mcp.step_up.enabled);
     }
 
     #[test]

@@ -131,8 +131,11 @@ async fn serve(state: &Arc<ServerState>, realm_segment: &str) -> Response {
     }
     match state.resolve_realm(realm_segment).await {
         Ok(Some(realm)) if realm_segment == realm.name.as_str() => {
-            let metadata =
-                ProtectedResourceMetadata::for_realm(&state.config.issuer_url, realm.name.as_str());
+            let metadata = ProtectedResourceMetadata::for_realm_with_profile(
+                &state.config.issuer_url,
+                realm.name.as_str(),
+                state.config.mcp.require_dpop,
+            );
             match serde_json::to_vec(&metadata) {
                 Ok(body) => raw_json_response(body),
                 Err(e) => {
