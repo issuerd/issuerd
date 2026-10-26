@@ -37,6 +37,38 @@ impl McpTransportConfig {
         })
     }
 
+    pub fn for_issuer(
+        issuer_url: &str,
+        allowed_origins: Vec<String>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self, McpError> {
+        let url = url::Url::parse(issuer_url)
+            .map_err(|_| McpError::TransportConfig("issuer_url is invalid".into()))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(McpError::TransportConfig(
+                "issuer_url must be an HTTP(S) URL without userinfo".into(),
+            ));
+        }
+        let host = match url.host() {
+            Some(url::Host::Domain(domain)) => domain.to_string(),
+            Some(url::Host::Ipv4(address)) => address.to_string(),
+            Some(url::Host::Ipv6(address)) => format!("[{address}]"),
+            None => {
+                return Err(McpError::TransportConfig(
+                    "issuer_url must have a nonempty authority".into(),
+                ));
+            }
+        };
+        let port = url.port_or_known_default().ok_or_else(|| {
+            McpError::TransportConfig("issuer_url must have a known HTTP(S) port".into())
+        })?;
+        let authority = format!("{host}:{port}");
+        Self::new(vec![authority], allowed_origins, cancellation_token)
+    }
+
     pub fn allowed_hosts(&self) -> &[String] {
         &self.allowed_hosts
     }
@@ -72,6 +104,132 @@ pub fn streamable_http_service(
         Arc::new(NeverSessionManager::default()),
         config,
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportHeaderError {
+    status: http::StatusCode,
+    message: &'static str,
+}
+
+impl TransportHeaderError {
+    fn bad_request(message: &'static str) -> Self {
+        Self {
+            status: http::StatusCode::BAD_REQUEST,
+            message,
+        }
+    }
+
+    fn forbidden(message: &'static str) -> Self {
+        Self {
+            status: http::StatusCode::FORBIDDEN,
+            message,
+        }
+    }
+
+    pub fn status(self) -> http::StatusCode {
+        self.status
+    }
+
+    pub fn message(self) -> &'static str {
+        self.message
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn normalize_authority(host: &str, port: Option<u16>) -> NormalizedAuthority {
+    NormalizedAuthority {
+        host: host.trim_matches('[').trim_matches(']').to_ascii_lowercase(),
+        port,
+    }
+}
+
+fn parse_allowed_authority(allowed: &str) -> Option<NormalizedAuthority> {
+    let allowed = allowed.trim();
+    if allowed.is_empty() {
+        return None;
+    }
+    if let Ok(authority) = http::uri::Authority::try_from(allowed) {
+        return Some(normalize_authority(authority.host(), authority.port_u16()));
+    }
+    Some(normalize_authority(allowed, None))
+}
+
+fn host_is_allowed(host: &NormalizedAuthority, allowed_hosts: &[String]) -> bool {
+    allowed_hosts
+        .iter()
+        .filter_map(|allowed| parse_allowed_authority(allowed))
+        .any(|allowed| {
+            allowed.host == host.host
+                && match allowed.port {
+                    Some(port) => host.port.is_none_or(|host_port| host_port == port),
+                    None => true,
+                }
+        })
+}
+
+fn validate_host(
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    config: &McpTransportConfig,
+) -> Result<(), TransportHeaderError> {
+    let mut values = headers.get_all(http::header::HOST).iter();
+    let host = if let Some(host) = values.next() {
+        if values.next().is_some() {
+            return Err(TransportHeaderError::bad_request("Bad Request: multiple Host headers"));
+        }
+        let host = host.to_str().map_err(|_| {
+            TransportHeaderError::bad_request("Bad Request: Invalid Host header encoding")
+        })?;
+        let authority = http::uri::Authority::try_from(host)
+            .map_err(|_| TransportHeaderError::bad_request("Bad Request: Invalid Host header"))?;
+        normalize_authority(authority.host(), authority.port_u16())
+    } else {
+        let authority = uri
+            .authority()
+            .ok_or_else(|| TransportHeaderError::bad_request("Bad Request: missing Host header"))?;
+        normalize_authority(authority.host(), authority.port_u16())
+    };
+    if !host_is_allowed(&host, &config.allowed_hosts) {
+        return Err(TransportHeaderError::forbidden("Forbidden: Host header is not allowed"));
+    }
+    Ok(())
+}
+
+fn validate_origin(
+    headers: &http::HeaderMap,
+    config: &McpTransportConfig,
+) -> Result<(), TransportHeaderError> {
+    let mut values = headers.get_all(http::header::ORIGIN).iter();
+    let Some(origin) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(TransportHeaderError::forbidden("Forbidden: multiple Origin headers"));
+    }
+    let origin = origin.to_str().map_err(|_| {
+        TransportHeaderError::forbidden("Forbidden: Invalid Origin header encoding")
+    })?;
+    let normalized = normalize_origin(origin)
+        .map_err(|_| TransportHeaderError::forbidden("Forbidden: Invalid Origin header"))?;
+    if !config.allowed_origins.contains(&normalized) {
+        return Err(TransportHeaderError::forbidden("Forbidden: Origin header is not allowed"));
+    }
+    Ok(())
+}
+
+pub fn validate_host_and_origin(
+    config: &McpTransportConfig,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> Result<(), TransportHeaderError> {
+    validate_host(uri, headers, config)?;
+    validate_origin(headers, config)
 }
 
 fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, McpError> {
@@ -225,6 +383,97 @@ mod tests {
                 "accepted {origin}"
             );
         }
+    }
+
+    #[test]
+    fn issuer_authority_and_outer_header_checks_share_exact_normalization() {
+        let config = McpTransportConfig::for_issuer(
+            "http://[::1]:8080/iam",
+            vec!["https://client.example".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(config.allowed_hosts, ["[::1]:8080"]);
+        let uri: http::Uri = "http://[::1]:8080/realms/demo/mcp".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "[::1]:8080".parse().unwrap());
+        validate_host_and_origin(&config, &uri, &headers).unwrap();
+
+        for origin in ["https://client.example", "https://client.example:443"] {
+            headers.insert(http::header::ORIGIN, origin.parse().unwrap());
+            validate_host_and_origin(&config, &uri, &headers).unwrap();
+        }
+        for origin in ["https://client.example:444", "null", "not-an-origin"] {
+            headers.insert(http::header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(
+                validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+                http::StatusCode::FORBIDDEN
+            );
+        }
+        headers.remove(http::header::ORIGIN);
+        headers.insert(http::header::HOST, "[::1]:8081".parse().unwrap());
+        assert_eq!(
+            validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::FORBIDDEN
+        );
+
+        let empty_origins = McpTransportConfig::new(
+            vec!["[::1]:8080".into()],
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        headers.insert(http::header::HOST, "[::1]:8080".parse().unwrap());
+        validate_host_and_origin(&empty_origins, &uri, &headers).unwrap();
+        headers.insert(http::header::ORIGIN, "https://client.example".parse().unwrap());
+        assert_eq!(
+            validate_host_and_origin(&empty_origins, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn issuer_default_port_is_exact_and_missing_host_port_means_that_default() {
+        let config = McpTransportConfig::for_issuer(
+            "https://issuer.example/iam",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(config.allowed_hosts, ["issuer.example:443"]);
+        let uri: http::Uri = "https://issuer.example/realms/demo/mcp".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        for authority in ["issuer.example", "issuer.example:443"] {
+            headers.insert(http::header::HOST, authority.parse().unwrap());
+            validate_host_and_origin(&config, &uri, &headers).unwrap();
+        }
+        headers.insert(http::header::HOST, "issuer.example:444".parse().unwrap());
+        assert_eq!(
+            validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn outer_header_checks_reject_ambiguous_or_missing_host() {
+        let config = McpTransportConfig::new(
+            vec!["issuer.example".into()],
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let uri: http::Uri = "/realms/demo/mcp".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(
+            validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::BAD_REQUEST
+        );
+        headers.append(http::header::HOST, "issuer.example".parse().unwrap());
+        headers.append(http::header::HOST, "issuer.example".parse().unwrap());
+        assert_eq!(
+            validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::BAD_REQUEST
+        );
     }
 
     async fn service(origins: Vec<String>) -> IssuerdStreamableHttpService {

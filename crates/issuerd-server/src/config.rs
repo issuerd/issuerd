@@ -546,7 +546,7 @@ fn default_mcp_invocation_rate_limit_per_minute() -> u32 {
 /// metadata enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
-    /// Master switch for the MCP surface. Default `false`: the
+    /// Master switch for the MCP surface. Default `false`: the MCP and
     /// protected-resource metadata routes answer 404 and any `resource`
     /// parameter is refused with `invalid_target`.
     #[serde(default)]

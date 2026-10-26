@@ -6015,7 +6015,7 @@ pub(crate) async fn enforce_token_validity(
     Ok((issuer_realm, session))
 }
 
-/// Strict MCP authentication failures with their future HTTP mappings.
+/// Strict MCP authentication failures with their HTTP mappings.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum McpTokenError {
@@ -6045,7 +6045,7 @@ pub(crate) struct McpTokenValidity {
 
 /// MCP-only validity gates. Unlike `enforce_token_validity`, this requires an
 /// interactive persisted session and permits the reserved step-up scope only
-/// on this future MCP surface. Backend failures stay retryable.
+/// on the MCP endpoint. Backend failures stay retryable.
 #[allow(dead_code)]
 pub(crate) async fn enforce_mcp_token_validity(
     state: &Arc<ServerState>,
