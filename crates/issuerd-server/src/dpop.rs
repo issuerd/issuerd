@@ -73,8 +73,9 @@ pub(crate) struct DpopVerification {
 #[derive(Debug)]
 pub(crate) enum DpopRejection {
     /// The proof itself failed validation (or the cache backing the
-    /// nonce/jti checks is unavailable) — map to `invalid_dpop_proof`.
-    InvalidProof,
+    /// nonce/jti checks is unavailable) — map to `invalid_dpop_proof`. A fresh
+    /// response nonce is included when nonce mode is enabled and issuance works.
+    InvalidProof(Option<String>),
     /// Nonce gate failure: the proof carried no (or a stale/unknown/used)
     /// nonce under `required`, or a stale/unknown/used one under
     /// `supported`. Carries the fresh nonce the endpoint MUST return in the
@@ -93,31 +94,37 @@ fn accepted_htus(
     realm_name: Option<&str>,
     accepted_paths: &[&str],
 ) -> Vec<String> {
-    let base = state.config.issuer_url.trim_end_matches('/');
-    let primary = realm_name.unwrap_or(realm_id.0.as_str());
+    let primary = match realm_name {
+        Some(segment) => issuerd_core::urls::decode_realm_segment(segment)
+            .ok()
+            .map(|name| name.to_string()),
+        None => Some(realm_id.0.clone()),
+    };
     let mut urls = Vec::with_capacity(accepted_paths.len() * 2);
     for path in accepted_paths {
-        urls.push(format!("{base}/realms/{primary}/{path}"));
-        if realm_name.is_some_and(|name| name != realm_id.0) {
-            urls.push(format!("{base}/realms/{}/{path}", realm_id.0));
+        let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+        if let Some(primary) = primary.as_deref() {
+            if let Ok(builder) =
+                issuerd_core::urls::RealmUrlBuilder::new(&state.config.issuer_url, primary)
+            {
+                urls.push(builder.path(&segments).to_string());
+            }
+        }
+        if realm_name.is_some() && primary.as_deref() != Some(realm_id.0.as_str()) {
+            if let Ok(builder) = issuerd_core::urls::RealmUrlBuilder::new(
+                &state.config.issuer_url,
+                realm_id.0.as_str(),
+            ) {
+                urls.push(builder.path(&segments).to_string());
+            }
         }
     }
     urls
 }
 
 /// Extract and verify the `DPoP` proof header of a request, if present.
-///
-/// `accepted_paths` declares the realm-relative request paths the proof's
-/// `htu` may spell (e.g. `&["protocol/openid-connect/token"]` for the token
-/// endpoint; the future MCP route passes `&["mcp"]`) — each is accepted in
-/// the realm-name and realm-id spellings; any other URL fails the check.
-///
-/// Returns a [`DpopVerification`] with `proof: None` when no `DPoP` header
-/// was sent (plain Bearer flow). On success the proof's `jti` is burned in
-/// the replay cache (fail-closed), the presented nonce (if any) is consumed,
-/// and a fresh nonce is issued for the response when nonce mode is enabled.
-/// Proof failures map to [`DpopRejection::InvalidProof`]; specifics are
-/// logged, not returned.
+/// Legacy endpoints accept the canonical realm-name HTU and the existing UUID
+/// alias for each declared realm-relative path, using the configured nonce mode.
 pub(crate) async fn verify_proof_header(
     state: &ServerState,
     realm_id: &RealmId,
@@ -127,103 +134,165 @@ pub(crate) async fn verify_proof_header(
     accepted_paths: &[&str],
     access_token: Option<&str>,
 ) -> Result<DpopVerification, DpopRejection> {
-    let Some(value) = headers.get("dpop") else {
+    let accepted_htus = accepted_htus(state, realm_id, realm_name, accepted_paths);
+    verify_proof_header_inner(
+        state,
+        realm_id,
+        headers,
+        htm,
+        &accepted_htus,
+        state.config.dpop.nonce.mode,
+        access_token,
+    )
+    .await
+}
+
+/// Strict verification for the MCP resource: only the exact canonical HTU is
+/// accepted, and endpoint policy upgrades `supported` nonces to `required`.
+/// Disabled nonce mode remains disabled.
+#[allow(dead_code)]
+pub(crate) async fn verify_mcp_proof_header(
+    state: &ServerState,
+    realm_id: &RealmId,
+    headers: &axum::http::HeaderMap,
+    htm: &str,
+    canonical_htu: &str,
+    access_token: Option<&str>,
+) -> Result<DpopVerification, DpopRejection> {
+    let nonce_mode = match state.config.dpop.nonce.mode {
+        DpopNonceMode::Disabled => DpopNonceMode::Disabled,
+        DpopNonceMode::Supported | DpopNonceMode::Required => DpopNonceMode::Required,
+    };
+    let accepted_htu = [canonical_htu.to_string()];
+    verify_proof_header_inner(
+        state,
+        realm_id,
+        headers,
+        htm,
+        &accepted_htu,
+        nonce_mode,
+        access_token,
+    )
+    .await
+}
+
+async fn verify_proof_header_inner(
+    state: &ServerState,
+    realm_id: &RealmId,
+    headers: &axum::http::HeaderMap,
+    htm: &str,
+    accepted_htu: &[String],
+    nonce_mode: DpopNonceMode,
+    access_token: Option<&str>,
+) -> Result<DpopVerification, DpopRejection> {
+    let mut values = headers.get_all("dpop").iter();
+    let Some(value) = values.next() else {
         return Ok(DpopVerification {
             proof: None,
             response_nonce: None,
         });
     };
-    let proof = value.to_str().map_err(|_| {
-        tracing::debug!(realm = %realm_id, "DPoP header is not valid ASCII");
-        DpopRejection::InvalidProof
-    })?;
+    if values.next().is_some() {
+        tracing::debug!(realm = %realm_id, "multiple DPoP proof headers");
+        return Err(invalid_proof(state, realm_id, nonce_mode).await);
+    }
+    let proof = match value.to_str() {
+        Ok(proof) => proof,
+        Err(_) => {
+            tracing::debug!(realm = %realm_id, "DPoP header is not valid ASCII");
+            return Err(invalid_proof(state, realm_id, nonce_mode).await);
+        }
+    };
 
-    // Nonce gate (RFC 9449 §8/§9), evaluated before the cryptographic
-    // checks: the claim value selects the cache key to consume; the
-    // signed-claim equality check against the consumed value then happens
-    // under signature in `validate_dpop_proof` (`expected_nonce`).
-    let nonce_mode = state.config.dpop.nonce.mode;
-    let expected_nonce: Option<String> = if nonce_mode == DpopNonceMode::Disabled {
-        None
+    // Read a candidate nonce without consuming it. Signature and expected
+    // claims are verified before the atomic compare-and-delete below, so an
+    // invalid proof cannot burn another party's live nonce.
+    let (expected_nonce, nonce_entry, needs_nonce_challenge) = if nonce_mode
+        == DpopNonceMode::Disabled
+    {
+        (None, None, false)
     } else {
         match unverified_nonce_claim(proof) {
             Some(claim) if claim.len() <= MAX_NONCE_CLAIM_LEN => {
-                // A presented nonce must be one this server issued: consume
-                // it atomically (single-use) — `get_and_delete` makes the
-                // first presenter win and concurrent replays fail.
                 let key = cache_keys::dpop_nonce(&realm_id.0, &claim);
-                match state.cache.get_and_delete(&key).await {
-                    Ok(Some(_)) => Some(claim),
-                    Ok(None) => {
-                        tracing::debug!(
-                            realm = %realm_id,
-                            "DPoP proof carries an unknown, stale, or already-used nonce"
-                        );
-                        return Err(nonce_challenge(state, realm_id).await);
-                    }
+                match state.cache.get(&key).await {
+                    Ok(Some(expected)) => (Some(claim), Some((key, expected)), false),
+                    Ok(None) => (Some(claim), None, true),
                     Err(e) => {
                         tracing::warn!(realm = %realm_id, error = %e, "DPoP nonce cache unavailable");
-                        return Err(DpopRejection::InvalidProof);
+                        return Err(invalid_proof(state, realm_id, nonce_mode).await);
                     }
                 }
             }
-            // Absent, unparsable, or oversized claim. Under `required` the
-            // nonce is mandatory; under `supported` only an oversized claim
-            // (which can never be server-issued) is challenged — absence is
-            // tolerated.
-            claim if nonce_mode == DpopNonceMode::Required || claim.is_some() => {
-                tracing::debug!(realm = %realm_id, "DPoP proof without a usable server nonce");
-                return Err(nonce_challenge(state, realm_id).await);
-            }
-            _ => None,
+            claim => (None, None, nonce_mode == DpopNonceMode::Required || claim.is_some()),
         }
     };
 
     let requirements = issuerd_token::DpopProofRequirements {
         expected_htm: htm,
-        accepted_htu: &accepted_htus(state, realm_id, realm_name, accepted_paths),
+        accepted_htu,
         expected_ath: access_token,
         max_age_secs: DPOP_PROOF_MAX_AGE_SECS,
         leeway_secs: DPOP_PROOF_LEEWAY_SECS,
         now: issuerd_core::utils::now_secs() as i64,
         expected_nonce: expected_nonce.as_deref(),
     };
-    let verified = issuerd_token::validate_dpop_proof(proof, &requirements).map_err(|e| {
-        // An `ath` mismatch on a presented access token means a bound token
-        // was replayed under a different proof key — security-relevant, so
-        // WARN. Every other proof failure is routine client noise (DEBUG).
-        if ath_mismatch(proof, access_token) {
-            tracing::warn!(realm = %realm_id, error = %e, "DPoP proof ath mismatch for presented access token");
-        } else {
-            tracing::debug!(realm = %realm_id, error = %e, "DPoP proof validation failed");
+    let verified = match issuerd_token::validate_dpop_proof(proof, &requirements) {
+        Ok(verified) => verified,
+        Err(e) => {
+            if ath_mismatch(proof, access_token) {
+                tracing::warn!(realm = %realm_id, error = %e, "DPoP proof ath mismatch for presented access token");
+            } else {
+                tracing::debug!(realm = %realm_id, error = %e, "DPoP proof validation failed");
+            }
+            return Err(invalid_proof(state, realm_id, nonce_mode).await);
         }
-        DpopRejection::InvalidProof
-    })?;
+    };
 
-    // jti single-use (RFC 9449 §11.1): the atomic increment creates the key
-    // with the TTL on first use, so exactly one presentation of a `jti`
-    // succeeds and the marker expires with the proof's acceptance window.
+    if needs_nonce_challenge {
+        tracing::debug!(realm = %realm_id, "DPoP proof without a usable server nonce");
+        return Err(nonce_challenge(state, realm_id).await);
+    }
+
+    // jti single-use (RFC 9449 §11.1). The jti marker and nonce are separate
+    // cache resources and cannot be consumed as one transaction: a nonce-CAS
+    // failure after this increment leaves the jti burned, so the client must
+    // retry with a fresh proof and nonce. Every failure remains fail-closed.
     let ttl =
         (verified.iat + DPOP_PROOF_MAX_AGE_SECS).saturating_sub(requirements.now).max(1) as u64;
-    let uses = state
+    let uses = match state
         .cache
         .increment(
             &jti_cache_key(realm_id, &verified.jti),
             Some(std::time::Duration::from_secs(ttl)),
         )
         .await
-        .map_err(|e| {
+    {
+        Ok(uses) => uses,
+        Err(e) => {
             tracing::warn!(realm = %realm_id, error = %e, "DPoP replay cache unavailable");
-            DpopRejection::InvalidProof
-        })?;
+            return Err(invalid_proof(state, realm_id, nonce_mode).await);
+        }
+    };
     if uses != 1 {
         tracing::warn!(realm = %realm_id, "DPoP proof jti replayed");
-        return Err(DpopRejection::InvalidProof);
+        return Err(invalid_proof(state, realm_id, nonce_mode).await);
     }
 
-    // The proof is good: hand the client its next nonce (§8.2 — the server
-    // decides when to supply a new value; single-use nonces mean every
-    // proof-carrying response carries one).
+    if let Some((key, expected)) = nonce_entry {
+        match state.cache.compare_and_delete(&key, expected).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(realm = %realm_id, "DPoP nonce changed or was consumed concurrently");
+                return Err(nonce_challenge(state, realm_id).await);
+            }
+            Err(e) => {
+                tracing::warn!(realm = %realm_id, error = %e, "DPoP nonce consumption failed");
+                return Err(invalid_proof(state, realm_id, nonce_mode).await);
+            }
+        }
+    }
+
     let response_nonce = if nonce_mode == DpopNonceMode::Disabled {
         None
     } else {
@@ -236,7 +305,7 @@ pub(crate) async fn verify_proof_header(
 }
 
 /// Read the `nonce` claim from a proof payload WITHOUT verifying the
-/// signature — the value only selects the cache key to consume; trust comes
+/// signature — the value only selects the cache key to inspect; trust comes
 /// from the signed-claim equality check in `validate_dpop_proof`.
 fn unverified_nonce_claim(proof: &str) -> Option<String> {
     let payload = proof.split('.').nth(1)?;
@@ -279,8 +348,21 @@ async fn issue_nonce(state: &ServerState, realm_id: &RealmId) -> Option<String> 
 async fn nonce_challenge(state: &ServerState, realm_id: &RealmId) -> DpopRejection {
     match issue_nonce(state, realm_id).await {
         Some(nonce) => DpopRejection::UseDpopNonce(nonce),
-        None => DpopRejection::InvalidProof,
+        None => DpopRejection::InvalidProof(None),
     }
+}
+
+async fn invalid_proof(
+    state: &ServerState,
+    realm_id: &RealmId,
+    nonce_mode: DpopNonceMode,
+) -> DpopRejection {
+    let response_nonce = if nonce_mode == DpopNonceMode::Disabled {
+        None
+    } else {
+        issue_nonce(state, realm_id).await
+    };
+    DpopRejection::InvalidProof(response_nonce)
 }
 
 /// Best-effort classification of an already-rejected proof: does its `ath`
@@ -489,6 +571,15 @@ mod tests {
         format!("{}/realms/{MASTER}/protocol/openid-connect/token", state.config.issuer_url)
     }
 
+    fn mcp_htu(state: &ServerState, realm: &str) -> String {
+        issuerd_protocol::discovery::ProtectedResourceMetadata::for_realm(
+            &state.config.issuer_url,
+            realm,
+        )
+        .resource
+        .to_string()
+    }
+
     #[tokio::test]
     async fn absent_header_is_bearer_flow() {
         let state = test_state().await;
@@ -560,7 +651,7 @@ mod tests {
                 None,
             )
             .await,
-            Err(DpopRejection::InvalidProof)
+            Err(DpopRejection::InvalidProof(_))
         ));
     }
 
@@ -737,7 +828,7 @@ mod tests {
                 None,
             )
             .await,
-            Err(DpopRejection::InvalidProof)
+            Err(DpopRejection::InvalidProof(_))
         ));
     }
 
@@ -763,6 +854,20 @@ mod tests {
                 format!("{base}/realms/uuid-id/protocol/openid-connect/token"),
                 format!("{base}/realms/human-name/mcp"),
                 format!("{base}/realms/uuid-id/mcp"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_htus_decode_the_inbound_realm_once() {
+        let state = test_state().await;
+        let realm_id = RealmId::new("uuid-id").unwrap();
+        let htus = accepted_htus(&state, &realm_id, Some("tenant%7Bone%7D"), &["mcp"]);
+        assert_eq!(
+            htus,
+            vec![
+                format!("{}/realms/tenant%7Bone%7D/mcp", state.config.issuer_url),
+                format!("{}/realms/uuid-id/mcp", state.config.issuer_url),
             ]
         );
     }
@@ -797,7 +902,7 @@ mod tests {
     fn outcome_kind(outcome: &Result<DpopVerification, DpopRejection>) -> &'static str {
         match outcome {
             Ok(_) => "Ok",
-            Err(DpopRejection::InvalidProof) => "Err(InvalidProof)",
+            Err(DpopRejection::InvalidProof(_)) => "Err(InvalidProof)",
             Err(DpopRejection::UseDpopNonce(_)) => "Err(UseDpopNonce)",
         }
     }
@@ -943,6 +1048,7 @@ mod tests {
         let response = use_dpop_nonce_response("fresh-nonce");
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(response.headers().get(DPOP_NONCE_HEADER).unwrap(), "fresh-nonce");
+        assert_eq!(response.headers().get_all(DPOP_NONCE_HEADER).iter().count(), 1);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "use_dpop_nonce");
@@ -967,5 +1073,281 @@ mod tests {
         // Non-nonce challenges carry no nonce header.
         let response = challenge_response("invalid_dpop_proof", "the DPoP proof is invalid", None);
         assert!(response.headers().get(DPOP_NONCE_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_proof_headers_are_rejected_by_legacy_and_strict_entry_points() {
+        let state = test_state().await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let htu = token_htu(&state);
+        let proof = key.proof("POST", &htu, "jti-duplicate", None);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("dpop", proof.parse().unwrap());
+        headers.append("dpop", proof.parse().unwrap());
+
+        let legacy = verify_proof_header(
+            &state,
+            &realm_id,
+            Some(MASTER),
+            &headers,
+            "POST",
+            &["protocol/openid-connect/token"],
+            None,
+        )
+        .await;
+        assert!(matches!(legacy, Err(DpopRejection::InvalidProof(_))));
+
+        let strict = verify_mcp_proof_header(&state, &realm_id, &headers, "POST", &htu, None).await;
+        assert!(matches!(strict, Err(DpopRejection::InvalidProof(_))));
+    }
+
+    #[tokio::test]
+    async fn wrong_signature_preserves_live_nonce_and_jti_and_returns_fresh_nonce() {
+        let state = test_state_with_mode(DpopNonceMode::Required).await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let initial = key.proof("POST", &token_htu(&state), "jti-nonce-init", None);
+        let nonce = expect_nonce_challenge(&state, &realm_id, &initial).await;
+        let valid =
+            key.proof_with_nonce("POST", &token_htu(&state), "jti-preserved", None, Some(&nonce));
+        let mut parts: Vec<String> = valid.split('.').map(str::to_string).collect();
+        parts[2] = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let forged = parts.join(".");
+
+        let rejected = verify_proof_header(
+            &state,
+            &realm_id,
+            Some(MASTER),
+            &headers_with(Some(&forged)),
+            "POST",
+            &["protocol/openid-connect/token"],
+            None,
+        )
+        .await;
+        let Err(DpopRejection::InvalidProof(Some(fresh))) = rejected else {
+            panic!("wrong signature must carry a fresh post-proof response nonce");
+        };
+        assert_ne!(fresh, nonce);
+        let nonce_key = cache_keys::dpop_nonce(&realm_id.0, &nonce);
+        assert!(state.cache.get(&nonce_key).await.unwrap().is_some());
+
+        let accepted = verify_proof_header(
+            &state,
+            &realm_id,
+            Some(MASTER),
+            &headers_with(Some(&valid)),
+            "POST",
+            &["protocol/openid-connect/token"],
+            None,
+        )
+        .await
+        .expect("the invalid signature must burn neither nonce nor jti");
+        assert!(accepted.proof.is_some());
+        assert!(state.cache.get(&nonce_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_mcp_nonce_policy_rejects_downgrade_but_honors_disabled() {
+        let state = test_state_with_mode(DpopNonceMode::Supported).await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let htu = mcp_htu(&state, MASTER);
+        let proof = key.proof("POST", &htu, "jti-strict-downgrade", None);
+        let challenged = verify_mcp_proof_header(
+            &state,
+            &realm_id,
+            &headers_with(Some(&proof)),
+            "POST",
+            &htu,
+            None,
+        )
+        .await;
+        let Err(DpopRejection::UseDpopNonce(nonce)) = challenged else {
+            panic!("MCP must require a nonce when the endpoint mode is supported");
+        };
+        let retry = key.proof_with_nonce("POST", &htu, "jti-strict-retry", None, Some(&nonce));
+        assert!(verify_mcp_proof_header(
+            &state,
+            &realm_id,
+            &headers_with(Some(&retry)),
+            "POST",
+            &htu,
+            None,
+        )
+        .await
+        .is_ok());
+
+        let disabled = test_state_with_mode(DpopNonceMode::Disabled).await;
+        let htu = mcp_htu(&disabled, MASTER);
+        let proof = key.proof("POST", &htu, "jti-strict-disabled", None);
+        let accepted = verify_mcp_proof_header(
+            &disabled,
+            &realm_id,
+            &headers_with(Some(&proof)),
+            "POST",
+            &htu,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(accepted.response_nonce.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_nonce_consumption_has_one_winner_and_replay_fails() {
+        let state = test_state_with_mode(DpopNonceMode::Required).await;
+        let realm_id = RealmId::new(MASTER).unwrap();
+        let key = gen_key();
+        let htu = mcp_htu(&state, MASTER);
+        let initial = key.proof("POST", &htu, "jti-concurrent-init", None);
+        let Err(DpopRejection::UseDpopNonce(nonce)) = verify_mcp_proof_header(
+            &state,
+            &realm_id,
+            &headers_with(Some(&initial)),
+            "POST",
+            &htu,
+            None,
+        )
+        .await
+        else {
+            panic!("initial strict proof must receive a nonce challenge");
+        };
+        let first = key.proof_with_nonce("POST", &htu, "jti-concurrent-1", None, Some(&nonce));
+        let second = key.proof_with_nonce("POST", &htu, "jti-concurrent-2", None, Some(&nonce));
+
+        let mut tasks = Vec::new();
+        for proof in [first, second] {
+            let state = state.clone();
+            let realm_id = realm_id.clone();
+            let htu = htu.clone();
+            tasks.push(tokio::spawn(async move {
+                verify_mcp_proof_header(
+                    &state,
+                    &realm_id,
+                    &headers_with(Some(&proof)),
+                    "POST",
+                    &htu,
+                    None,
+                )
+                .await
+            }));
+        }
+        let first_result = tasks.remove(0).await.unwrap();
+        let second_result = tasks.remove(0).await.unwrap();
+        let successes =
+            [&first_result, &second_result].iter().filter(|result| result.is_ok()).count();
+        let nonce_challenges = [&first_result, &second_result]
+            .iter()
+            .filter(|result| matches!(result, Err(DpopRejection::UseDpopNonce(_))))
+            .count();
+        assert_eq!((successes, nonce_challenges), (1, 1));
+        assert!(state
+            .cache
+            .get(&cache_keys::dpop_nonce(&realm_id.0, &nonce))
+            .await
+            .unwrap()
+            .is_none());
+
+        let replay =
+            key.proof_with_nonce("POST", &htu, "jti-concurrent-replay", None, Some(&nonce));
+        assert!(matches!(
+            verify_mcp_proof_header(
+                &state,
+                &realm_id,
+                &headers_with(Some(&replay)),
+                "POST",
+                &htu,
+                None,
+            )
+            .await,
+            Err(DpopRejection::UseDpopNonce(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn special_realm_token_resolves_to_canonical_resource_and_strict_htu() {
+        let state = test_state().await;
+        let realm = issuerd_core::Realm {
+            id: RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: issuerd_core::RealmName::new("tenant{one}").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+        let master_id = RealmId::new(MASTER).unwrap();
+        let mut user = state
+            .storage
+            .get_user(&master_id, &issuerd_core::UserId::new("admin").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        user.id = issuerd_core::UserId::new("special-user").unwrap();
+        user.realm_id = realm.id.clone();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(
+                &master_id,
+                &issuerd_core::ClientIdentifier::new("admin-cli").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        client.id = issuerd_core::ClientId::new(issuerd_core::utils::generate_id()).unwrap();
+        client.realm_id = realm.id.clone();
+        client.client_id = issuerd_core::ClientIdentifier::new("special-client").unwrap();
+        let access = state
+            .token_manager
+            .issue_access_token(
+                &user,
+                &client,
+                &realm,
+                &["openid".to_string()],
+                &issuerd_core::SessionId::new("special-session").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let validated = state.token_service.validate_access_token(&access.token).unwrap();
+        assert_eq!(
+            validated.claims.iss.as_str(),
+            format!("{}/realms/tenant%7Bone%7D", state.config.issuer_url)
+        );
+        let resolved = state
+            .resolve_issuer_realm(validated.claims.iss.as_str())
+            .await
+            .unwrap()
+            .expect("encoded canonical issuer resolves");
+        assert_eq!(resolved.id, realm.id);
+        let htu = mcp_htu(&state, resolved.name.as_str());
+        assert_eq!(htu, format!("{}/realms/tenant%7Bone%7D/mcp", state.config.issuer_url));
+
+        let key = gen_key();
+        let proof = key.proof("POST", &htu, "jti-special-canonical", Some(&access.token));
+        let accepted = verify_mcp_proof_header(
+            &state,
+            &realm.id,
+            &headers_with(Some(&proof)),
+            "POST",
+            &htu,
+            Some(&access.token),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.proof.unwrap().jkt, key.jkt());
+
+        let alias_htu = format!("{}/realms/{}/mcp", state.config.issuer_url, realm.id);
+        let alias = key.proof("POST", &alias_htu, "jti-special-alias", Some(&access.token));
+        assert!(matches!(
+            verify_mcp_proof_header(
+                &state,
+                &realm.id,
+                &headers_with(Some(&alias)),
+                "POST",
+                &htu,
+                Some(&access.token),
+            )
+            .await,
+            Err(DpopRejection::InvalidProof(_))
+        ));
     }
 }

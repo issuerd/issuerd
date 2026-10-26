@@ -594,11 +594,11 @@ impl PartialEq<&str> for RedirectUri {
 /// * no URL-reserved or query-significant characters (`/ \ ? # % + & =`)
 /// * maximum length 255
 ///
-/// A valid name is always a safe single URL path segment: realm names appear
-/// verbatim in issuer URLs (`{issuer}/realms/{name}`), and discovery runs
-/// `Url::parse` on the issuer (which percent-encodes non-ASCII), so spaces,
-/// query separators, or non-ASCII characters would make the advertised issuer
-/// diverge from the byte-exact `iss` claim in tokens.
+/// [`crate::urls::RealmUrlBuilder`] applies the canonical percent encoding
+/// shared by discovery, token issuers, protected resources, and DPoP targets.
+/// It additionally rejects legacy dot-only names that URL parsers normalize as
+/// path navigation; keeping that check out of this model preserves old JSON
+/// snapshot loading.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct RealmName(String);
@@ -625,10 +625,6 @@ impl RealmName {
                 "realm name must not contain control characters".into(),
             ));
         }
-        // Realm names appear verbatim in URL path segments and issuer URLs
-        // (`/realms/{name}/...`): whitespace or URL-reserved characters would
-        // make the realm unreachable, break `Url::parse` on the issuer, or
-        // make its URLs ambiguous.
         if trimmed.chars().any(|c| c.is_whitespace()) {
             return Err(IssuerdError::InvalidRequest(
                 "realm name must not contain whitespace".into(),
@@ -642,13 +638,8 @@ impl RealmName {
                 "realm name must not contain URL-reserved characters (/ \\ ? # % + & =)".into(),
             ));
         }
-        // Non-ASCII names would be percent-encoded by `Url::parse` in
-        // discovery but embedded raw in token `iss`, breaking the OIDC
-        // Discovery §4.2 byte-exact issuer match.
         if !trimmed.is_ascii() {
-            return Err(IssuerdError::InvalidRequest(
-                "realm name must be ASCII (it is embedded verbatim in issuer URLs)".into(),
-            ));
+            return Err(IssuerdError::InvalidRequest("realm name must be ASCII".into()));
         }
         Ok(Self(trimmed.to_string()))
     }
@@ -4932,10 +4923,16 @@ mod tests {
 
     #[test]
     fn realm_name_non_ascii_fails() {
-        // Discovery percent-encodes non-ASCII via `Url::parse` while token
-        // `iss` embeds the name raw — the two would diverge.
         assert!(RealmName::new("rëalm").is_err());
         assert!(RealmName::new("领域").is_err());
+    }
+
+    #[test]
+    fn realm_name_dot_only_segments_remain_deserializable() {
+        for name in [".", "..", ".realm", "realm."] {
+            let json = serde_json::to_string(name).unwrap();
+            assert_eq!(serde_json::from_str::<RealmName>(&json).unwrap().as_str(), name);
+        }
     }
 
     #[test]

@@ -190,45 +190,46 @@ pub struct DiscoveryResponse {
 
 impl DiscoveryResponse {
     pub fn for_realm(base_url: &str, realm: &str) -> Self {
-        let issuer =
-            Url::parse(&format!("{}/realms/{}", base_url.trim_end_matches('/'), realm)).unwrap();
+        let urls = issuerd_core::urls::RealmUrlBuilder::new(base_url, realm)
+            .expect("the configured base URL and a valid realm name form canonical URLs");
+        let issuer = urls.issuer();
         Self {
-            authorization_endpoint: Url::parse(&format!("{}/protocol/openid-connect/auth", issuer))
-                .unwrap(),
-            token_endpoint: Url::parse(&format!("{}/protocol/openid-connect/token", issuer))
-                .unwrap(),
-            userinfo_endpoint: Url::parse(&format!("{}/protocol/openid-connect/userinfo", issuer))
-                .unwrap(),
-            jwks_uri: Url::parse(&format!("{}/protocol/openid-connect/certs", issuer)).unwrap(),
-            introspection_endpoint: Url::parse(&format!(
-                "{}/protocol/openid-connect/token/introspect",
-                issuer
-            ))
-            .unwrap(),
-            revocation_endpoint: Url::parse(&format!("{}/protocol/openid-connect/revoke", issuer))
-                .unwrap(),
-            end_session_endpoint: Url::parse(&format!("{}/protocol/openid-connect/logout", issuer))
-                .unwrap(),
-            check_session_iframe: Url::parse(&format!(
-                "{}/protocol/openid-connect/check_session_iframe",
-                issuer
-            ))
-            .unwrap(),
-            device_authorization_endpoint: Url::parse(&format!(
-                "{}/protocol/openid-connect/auth/device",
-                issuer
-            ))
-            .unwrap(),
-            backchannel_authentication_endpoint: Url::parse(&format!(
-                "{}/protocol/openid-connect/ext/ciba/auth",
-                issuer
-            ))
-            .unwrap(),
-            pushed_authorization_request_endpoint: Url::parse(&format!(
-                "{}/protocol/openid-connect/ext/par",
-                issuer
-            ))
-            .unwrap(),
+            authorization_endpoint: urls.path(&["protocol", "openid-connect", "auth"]),
+            token_endpoint: urls.path(&["protocol", "openid-connect", "token"]),
+            userinfo_endpoint: urls.path(&["protocol", "openid-connect", "userinfo"]),
+            jwks_uri: urls.path(&["protocol", "openid-connect", "certs"]),
+            introspection_endpoint: urls.path(&[
+                "protocol",
+                "openid-connect",
+                "token",
+                "introspect",
+            ]),
+            revocation_endpoint: urls.path(&["protocol", "openid-connect", "revoke"]),
+            end_session_endpoint: urls.path(&["protocol", "openid-connect", "logout"]),
+            check_session_iframe: urls.path(&[
+                "protocol",
+                "openid-connect",
+                "check_session_iframe",
+            ]),
+            device_authorization_endpoint: urls.path(&[
+                "protocol",
+                "openid-connect",
+                "auth",
+                "device",
+            ]),
+            backchannel_authentication_endpoint: urls.path(&[
+                "protocol",
+                "openid-connect",
+                "ext",
+                "ciba",
+                "auth",
+            ]),
+            pushed_authorization_request_endpoint: urls.path(&[
+                "protocol",
+                "openid-connect",
+                "ext",
+                "par",
+            ]),
             // Set per realm by the server handler only when the
             // realm enables dynamic client registration.
             registration_endpoint: None,
@@ -395,11 +396,11 @@ impl ProtectedResourceMetadata {
 
     /// Build metadata describing the configured DPoP/Bearer profile.
     pub fn for_realm_with_profile(base_url: &str, realm: &str, require_dpop: bool) -> Self {
-        let issuer =
-            Url::parse(&format!("{}/realms/{}", base_url.trim_end_matches('/'), realm)).unwrap();
+        let urls = issuerd_core::urls::RealmUrlBuilder::new(base_url, realm)
+            .expect("the configured base URL and a valid realm name form canonical URLs");
         Self {
-            resource: Url::parse(&format!("{issuer}/mcp")).unwrap(),
-            authorization_servers: vec![issuer],
+            resource: urls.path(&["mcp"]),
+            authorization_servers: vec![urls.issuer()],
             scopes_supported: vec![issuerd_core::MCP_SCOPE_READ.to_string()],
             dpop_bound_access_tokens_required: require_dpop,
             dpop_signing_alg_values_supported:
@@ -415,13 +416,9 @@ impl ProtectedResourceMetadata {
     /// Derive the RFC 9728 §3.1 metadata URL for the realm's MCP resource,
     /// preserving any path prefix in the configured issuer URL.
     pub fn metadata_url_for_realm(base_url: &str, realm: &str) -> Url {
-        let base = Url::parse(base_url).unwrap();
-        let resource_path = format!("{}/realms/{}/mcp", base.path().trim_end_matches('/'), realm);
-        let mut metadata = base;
-        metadata.set_query(None);
-        metadata.set_fragment(None);
-        metadata.set_path(&format!("/.well-known/oauth-protected-resource{resource_path}"));
-        metadata
+        issuerd_core::urls::RealmUrlBuilder::new(base_url, realm)
+            .expect("the configured base URL and a valid realm name form canonical URLs")
+            .with_prefix(&[".well-known", "oauth-protected-resource"], &["mcp"])
     }
 }
 
@@ -654,6 +651,29 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "https://auth.example.com/.well-known/oauth-protected-resource/realms/demo/mcp"
+        );
+    }
+
+    #[test]
+    fn special_realm_urls_share_one_canonical_encoding() {
+        let discovery = DiscoveryResponse::for_realm("https://auth.example.com/iam", "tenant{one}");
+        let resource =
+            ProtectedResourceMetadata::for_realm("https://auth.example.com/iam", "tenant{one}");
+        let issuer = "https://auth.example.com/iam/realms/tenant%7Bone%7D";
+        assert_eq!(discovery.issuer.as_str(), issuer);
+        assert_eq!(
+            discovery.token_endpoint.as_str(),
+            format!("{issuer}/protocol/openid-connect/token")
+        );
+        assert_eq!(resource.authorization_servers, vec![discovery.issuer]);
+        assert_eq!(resource.resource.as_str(), format!("{issuer}/mcp"));
+        assert_eq!(
+            ProtectedResourceMetadata::metadata_url_for_realm(
+                "https://auth.example.com/iam",
+                "tenant{one}"
+            )
+            .as_str(),
+            "https://auth.example.com/.well-known/oauth-protected-resource/iam/realms/tenant%7Bone%7D/mcp"
         );
     }
 

@@ -119,30 +119,37 @@ async fn current_tombstone(
     }
 }
 
-/// Resolve a session's validity snapshot, cache-aside.
-///
-/// `Some` means the session exists (presence is the validity signal, exactly
-/// as the previous direct `get_user_session` check defined it); `None` means
-/// missing, unreadable, or stale-versioned — callers keep their existing
-/// fail-closed handling. Storage errors also surface as `None` here; the
-/// caller's `is_sessionless_client_token` logic decides the final verdict.
+/// Resolve a session's validity snapshot, cache-aside. This compatibility
+/// wrapper keeps the historical collapse of storage failures into `None`.
 pub async fn session_snapshot(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     sid: &SessionId,
 ) -> Option<SessionSnapshot> {
+    match session_snapshot_result(state, realm_id, sid).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            debug!(realm = %realm_id, error = %e, "session read failed");
+            None
+        }
+    }
+}
+
+/// Result-returning session snapshot: `Ok(None)` is a missing or stale session,
+/// while `Err` is a storage failure and must remain retryable by strict callers.
+pub async fn session_snapshot_result(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    sid: &SessionId,
+) -> Result<Option<SessionSnapshot>, issuerd_core::IssuerdError> {
     let ttl_secs = state.config.cache.read_cache_ttl_secs;
     if ttl_secs == 0 {
-        // Cache disabled: pure-DB behavior.
         return match state.storage.get_user_session(realm_id, sid).await {
-            Ok(Some(session)) => Some(SessionSnapshot {
+            Ok(Some(session)) => Ok(Some(SessionSnapshot {
                 user_id: session.user_id,
-            }),
-            Ok(None) => None,
-            Err(e) => {
-                debug!(realm = %realm_id, error = %e, "session read failed");
-                None
-            }
+            })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         };
     }
 
@@ -151,7 +158,7 @@ pub async fn session_snapshot(
         Ok(Some(bytes)) => match parse_entry(&bytes) {
             Some(CacheEntry::Negative { .. }) => {
                 debug!(realm = %realm_id, "session cache: negative hit");
-                None
+                Ok(None)
             }
             Some(CacheEntry::Positive { u, v, g }) => {
                 let Ok(user_id) = UserId::new(&u) else {
@@ -163,13 +170,11 @@ pub async fn session_snapshot(
                         match current_tombstone(&state.cache, realm_id, sid).await {
                             Some(tombstone) if tombstone == g => {
                                 debug!(realm = %realm_id, "session cache: hit");
-                                Some(SessionSnapshot { user_id })
+                                Ok(Some(SessionSnapshot { user_id }))
                             }
                             _ => load_and_cache(state, realm_id, sid, ttl_secs).await,
                         }
                     }
-                    // Version mismatch (bulk revocation) or version read
-                    // failure: re-read from storage.
                     _ => load_and_cache(state, realm_id, sid, ttl_secs).await,
                 }
             }
@@ -186,20 +191,17 @@ pub async fn session_snapshot(
     }
 }
 
-/// Storage read + cache populate behind [`session_snapshot`].
+/// Storage read + cache populate behind [`session_snapshot_result`].
 async fn load_and_cache(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     sid: &SessionId,
     ttl_secs: u64,
-) -> Option<SessionSnapshot> {
+) -> Result<Option<SessionSnapshot>, issuerd_core::IssuerdError> {
     let key = cache_keys::session(realm_id.as_ref(), sid.as_ref());
     let tombstone_before = current_tombstone(&state.cache, realm_id, sid).await;
     match state.storage.get_user_session(realm_id, sid).await {
         Ok(Some(session)) => {
-            // Best-effort version tag: an unreadable counter stores v=0, which
-            // simply re-validates against storage after any bump (a real
-            // version >0 never matches the stored 0, so the entry misses).
             let version =
                 current_version(&state.cache, realm_id, &session.user_id).await.unwrap_or(0);
             let tombstone_after = current_tombstone(&state.cache, realm_id, sid).await;
@@ -218,9 +220,9 @@ async fn load_and_cache(
                     }
                 }
             }
-            Some(SessionSnapshot {
+            Ok(Some(SessionSnapshot {
                 user_id: session.user_id,
-            })
+            }))
         }
         Ok(None) => {
             if let Ok(bytes) = serde_json::to_vec(&CacheEntry::Negative { x: 1 }) {
@@ -228,12 +230,9 @@ async fn load_and_cache(
                     warn!(realm = %realm_id, error = %e, "session cache write failed");
                 }
             }
-            None
+            Ok(None)
         }
-        Err(e) => {
-            debug!(realm = %realm_id, error = %e, "session read failed");
-            None
-        }
+        Err(e) => Err(e),
     }
 }
 

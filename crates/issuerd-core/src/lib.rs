@@ -22,6 +22,7 @@ pub mod scope;
 pub mod service_account;
 pub mod traits;
 pub mod typestate;
+pub mod urls;
 pub mod utils;
 
 pub use broker::{

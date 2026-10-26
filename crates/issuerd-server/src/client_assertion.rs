@@ -247,12 +247,12 @@ async fn validate_assertion(
     // RFC 7523 §3 + RFC 9126 §2: aud must name the authorization server —
     // the realm issuer (realm-NAME based) or one of the assertion-accepting
     // endpoint URLs.
-    let realm_base =
-        format!("{}/realms/{}", state.config.issuer_url.trim_end_matches('/'), realm_name);
+    let urls = issuerd_core::urls::RealmUrlBuilder::new(&state.config.issuer_url, realm_name)
+        .map_err(|_| unauthorized("invalid realm URL"))?;
     let accepted = vec![
-        realm_base.clone(),
-        format!("{realm_base}/protocol/openid-connect/token"),
-        format!("{realm_base}/protocol/openid-connect/ext/par"),
+        urls.issuer().to_string(),
+        urls.path(&["protocol", "openid-connect", "token"]).to_string(),
+        urls.path(&["protocol", "openid-connect", "ext", "par"]).to_string(),
     ];
     let requirements = issuerd_token::ClientAssertionRequirements {
         expected_client_id: client.client_id.as_str(),

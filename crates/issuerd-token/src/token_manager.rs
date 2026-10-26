@@ -12,10 +12,9 @@ use chrono::Utc;
 use issuerd_core::{
     AccessTokenClaims, Acr, Algorithm, Audience, Client, ClientIdentifier, CryptoProvider,
     IdTokenClaims, IntrospectionResponse, Issuer, IssuerdError, Jwk, JwkKty, JwkSet, JwsType,
-    JwtType, KeyId, LogoutToken, LogoutTokenClaims, Nonce, Realm, RealmAccess, RealmName,
-    RefreshTokenClaims, SessionId, User, UserSession, ValidatedAccessToken, ValidatedRefreshToken,
+    JwtType, KeyId, LogoutToken, LogoutTokenClaims, Nonce, Realm, RealmAccess, RefreshTokenClaims,
+    SessionId, User, UserSession, ValidatedAccessToken, ValidatedRefreshToken,
 };
-use url::Url;
 
 use crate::hash::{compute_at_hash, compute_c_hash};
 use crate::jwt::{AccessToken, IdToken, RefreshToken};
@@ -23,11 +22,7 @@ use crate::jwt::{AccessToken, IdToken, RefreshToken};
 /// Manages issuance and validation of JWT tokens.
 pub struct TokenManager<C: CryptoProvider> {
     crypto: Arc<C>,
-    issuer_base_url: String,
-    /// Parsed form of `issuer_base_url`, used for structural issuer
-    /// validation. `None` (an unparseable base URL) fails every issuer
-    /// check closed.
-    issuer_base_parsed: Option<Url>,
+    issuer_base: Option<issuerd_core::urls::RealmIssuerBase>,
     clock_skew: std::time::Duration,
     /// Full published key set (active + passive) — used for verification.
     jwks: std::sync::RwLock<JwkSet>,
@@ -103,12 +98,11 @@ impl<C: CryptoProvider> TokenManager<C> {
         default_alg: Algorithm,
     ) -> Self {
         // Normalize once: every derived issuer/URL assumes no trailing `/`.
-        let issuer_base_url = issuer_base_url.trim_end_matches('/').to_string();
-        let issuer_base_parsed = Url::parse(&issuer_base_url).ok();
+        let issuer_base_url = issuer_base_url.trim_end_matches('/');
+        let issuer_base = issuerd_core::urls::RealmIssuerBase::new(issuer_base_url).ok();
         Self {
             crypto,
-            issuer_base_url,
-            issuer_base_parsed,
+            issuer_base,
             clock_skew,
             active_jwks: std::sync::RwLock::new(jwks.clone()),
             jwks: std::sync::RwLock::new(jwks),
@@ -118,43 +112,24 @@ impl<C: CryptoProvider> TokenManager<C> {
     }
 
     fn issuer_for_realm(&self, realm: &Realm) -> Issuer {
-        Issuer::new(format!("{}/realms/{}", self.issuer_base_url, realm.name.as_str())).unwrap()
+        let issuer = self
+            .issuer_base
+            .as_ref()
+            .and_then(|base| {
+                issuerd_core::urls::RealmUrlBuilder::with_base(base, realm.name.as_str()).ok()
+            })
+            .expect("TokenManager's base URL and a stored realm name form a canonical issuer")
+            .issuer();
+        Issuer::new(issuer.as_str()).expect("the canonical realm issuer is a valid URL")
     }
 
-    /// Structural check that `iss` names a realm of this deployment: parsed
-    /// as a URL, its scheme, host, and port must equal the configured issuer
-    /// base URL exactly, the path must be exactly
-    /// `{base_path}/realms/{name}` where `{name}` passes [`RealmName`]
-    /// validation (a single safe segment — this rejects trailing slashes and
-    /// extra path segments, which leave a `/` or a URL-reserved character in
-    /// the candidate name), and there must be no userinfo, query, or
-    /// fragment. Issuers are realm-NAME based; pre-switch id-spelled issuers
-    /// stay rejected downstream by name-only realm resolution.
+    /// Structural check that `iss` names a realm of this deployment under the
+    /// configured origin and base path. The realm segment is decoded once and
+    /// validated as a [`issuerd_core::RealmName`]; trailing slashes, extra segments,
+    /// userinfo, query strings, and fragments are not accepted here. Name-only
+    /// realm resolution downstream still rejects UUID aliases.
     fn is_realm_issuer(&self, iss: &str) -> bool {
-        let Some(base) = &self.issuer_base_parsed else {
-            return false;
-        };
-        let Ok(url) = Url::parse(iss) else {
-            return false;
-        };
-        if url.scheme() != base.scheme()
-            || url.host_str() != base.host_str()
-            || url.port_or_known_default() != base.port_or_known_default()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return false;
-        }
-        let Some(name) = url
-            .path()
-            .strip_prefix(base.path().trim_end_matches('/'))
-            .and_then(|rest| rest.strip_prefix("/realms/"))
-        else {
-            return false;
-        };
-        RealmName::new(name).is_ok()
+        self.issuer_base.as_ref().and_then(|base| base.realm_name(iss)).is_some()
     }
 
     /// Refresh the cached JWK sets from the crypto provider: the full
@@ -2901,6 +2876,19 @@ mod tests {
         // Path-prefix base requires the prefix.
         let tm = issuer_check_tm("https://ex.com/iam");
         assert!(!tm.is_realm_issuer("https://ex.com/realms/master"));
+    }
+
+    #[test]
+    fn special_realm_issuer_matches_canonical_parser() {
+        let tm = issuer_check_tm("https://ex.com/iam");
+        let realm = Realm {
+            name: issuerd_core::RealmName::new("tenant{one}").unwrap(),
+            ..Default::default()
+        };
+        let issuer = tm.issuer_for_realm(&realm);
+        assert_eq!(issuer.as_str(), "https://ex.com/iam/realms/tenant%7Bone%7D");
+        assert!(tm.is_realm_issuer(issuer.as_str()));
+        assert!(!tm.is_realm_issuer("https://ex.com/realms/tenant%7Bone%7D"));
     }
 
     fn access_claims_with_issuer(iss: &str) -> AccessTokenClaims {

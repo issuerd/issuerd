@@ -80,11 +80,11 @@ pub(crate) async fn extract_request_object_params(
         },
     };
 
-    let issuer = format!(
-        "{}/realms/{}",
-        state.config.issuer_url.trim_end_matches('/'),
-        realm.name.as_str()
-    );
+    let issuer =
+        issuerd_core::urls::RealmUrlBuilder::new(&state.config.issuer_url, realm.name.as_str())
+            .expect("the configured base URL and a stored realm name form a canonical issuer")
+            .issuer()
+            .to_string();
     let requirements = issuerd_token::RequestObjectRequirements {
         expected_client_id: query_client_id,
         accepted_issuer: &issuer,
