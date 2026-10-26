@@ -481,9 +481,12 @@ is advertised — clients discover the requirement from the
 
 ## [mcp]
 
-MCP (Model Context Protocol) surface — groundwork for the MCP resource
-endpoint. The flag currently gates two pieces of the MCP surface:
+MCP (Model Context Protocol) surface. The flag gates three pieces:
 
+- The read-only MCP endpoint at `POST /realms/{realm}/mcp`, with five curated
+  tools, dual-era stateless transport, exact audience/provenance and DPoP
+  enforcement, and distributed invocation limits. See
+  [mcp-server.md](mcp-server.md) for the complete contract and client rigs.
 - RFC 9728 protected-resource metadata. The bare
   `GET /.well-known/oauth-protected-resource` is an explicit
   `resource_metadata` alias for the **master** realm, not origin-level
@@ -499,15 +502,15 @@ endpoint. The flag currently gates two pieces of the MCP surface:
   compared byte-for-byte. Each request may carry at most one `resource`;
   repeated values are rejected with `invalid_target` before query/form maps
   can collapse them. A granted resource becomes the access token's `aud`
-  (`[client_id, resource]`, client id first), preserved through validation and
-  introspection, and rides the refresh token as a `resource` claim. Code
-  redemption may restate it, omit it (inherit), or introduce it when the code
-  carried none; refresh may only restate or omit. Every other grant refuses
-  `resource` when MCP is enabled.
+  (`[client_id, resource]`, client id first) and trusted `resource` claim for
+  resource-server validation, and rides the refresh token as a `resource`
+  claim. Code redemption may restate it, omit it (inherit), or
+  introduce it when the code carried none; refresh may only restate or omit.
+  Every other grant refuses `resource` when MCP is enabled.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` the MCP and metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
 | `require_dpop` | boolean | `true` | Require DPoP-bound tokens and proofs. Set `false` only for explicit Bearer compatibility; strict operation-bound step-up still requires DPoP. |
 | `invocation_rate_limit_per_minute` | integer | `60` | Distributed tool-invocation allowance for each client and subject per minute. |
 | `allowed_origins` | list of strings | `[]` | Exact browser origins allowed at the MCP transport. Empty rejects every present `Origin` when validation is enforced; non-browser requests without `Origin` remain supported. Set list values in the config file, not through a single environment variable. |

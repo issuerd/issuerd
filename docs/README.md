@@ -59,6 +59,7 @@ Depending on your role, you will typically read the set in this order:
 
 | Document | What it covers |
 |---|---|
+| [Read-only MCP server](mcp-server.md) | The realm-scoped external MCP endpoint: five curated read tools, exact resource provenance, DPoP by default, dual-era stateless transport, invocation limits, client configuration, and real TypeScript/`rmcp` acceptance rigs. |
 | [Agentic IAM: MCP tool calls with DPoP and token exchange](agentic-iam-mcp.md) | Securing AI-agent tool calls end to end and governing non-human identities: DPoP sender-constraining (`cnf.jkt`, single-use `jti` replay cache), RFC 8693 audience/scope attenuation per call (per-tool scoped credentials), the resource-server enforcement checklist, a live failure matrix, and the recorded MCP demo. |
 | [Human step-up approval with CIBA](ciba-step-up.md) | Client-Initiated Backchannel Authentication (poll mode) as the human-in-the-loop for privileged agent actions: endpoints and parameters, binding messages, DPoP-bound step-up tokens, the step-up configuration pattern, and the recorded refund-approval demo. |
 | [Runnable example: `examples/agentic-mcp/`](../examples/agentic-mcp/) | The same scenario as a self-contained docker compose stack (chat agent + MCP server + PostgreSQL RLS): `docker compose up -d`, sign in as alice/changeme, and watch every protocol step in the security-trace panel. |

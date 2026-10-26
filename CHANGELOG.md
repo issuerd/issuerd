@@ -22,7 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only MCP server endpoint (Phase 1A).** `[mcp].enabled` exposes `POST /realms/{realm}/mcp` with `realm_get`, `users_search`, `users_get`, `clients_list`, and `clients_get`. The stateless dual-era Streamable HTTP server supports 2025-06-18, 2025-11-25, and 2026-07-28, authorization-filtered tools, curated secret-free DTOs, and distributed per-client+subject invocation limits. Same-realm exact resource provenance and realm roles are enforced on every call; DPoP is required by default, with an explicit Bearer compatibility mode and no downgrade in either direction. Protected-resource metadata now describes the real DPoP/Bearer profile and minimal `mcp:read` scope. ([#39](https://github.com/issuerd/issuerd/issues/39))
 - **External TypeScript MCP acceptance client and read-only rigs.** `examples/mcp-admin` adds a pinned official-SDK public native CLI for authorization-code + PKCE + exact-resource issuance with DPoP, legacy and modern all-tool acceptance runs, idempotent lab setup, a finite in-memory local runner, and a PostgreSQL + Redis Compose rig. The CLI validates RFC 9207 issuer responses on success and error paths and keeps tokens, proofs, keys, cookies, and Authorization headers out of its JSON output.
+
+### Fixed
+
+- **MCP/OAuth protocol hardening.** Authorization responses now carry RFC 9207 `iss` on success and error paths, discovery advertises it together with public `none` client authentication, and authorization-code redemption accepts an omitted `redirect_uri` while retaining exact comparison when present. MCP resource requests require code + PKCE S256 and exact/native-loopback redirect matching, and access tokens carry trusted resource provenance alongside `aud`. Canonical realm URL construction now covers issuer/resource/DPoP paths, duplicate DPoP proofs are rejected, and nonces cannot be downgraded or consumed by an invalid proof.
 
 ## [0.1.24] - 2026-10-25
 
