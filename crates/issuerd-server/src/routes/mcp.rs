@@ -634,13 +634,6 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
     let method = object.get("method").and_then(Value::as_str);
     let params = object.get("params");
     if method == Some("tools/call") {
-        if !matches!(&message, ClientJsonRpcMessage::Request(_)) {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                id,
-                ErrorData::invalid_request("tools/call requires a JSON-RPC request id", None),
-            ));
-        }
         let parsed = serde_json::from_value::<rmcp::model::CallToolRequestParams>(
             params.cloned().unwrap_or(Value::Null),
         )
@@ -723,6 +716,14 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
             StatusCode::BAD_REQUEST,
             None,
             ErrorData::invalid_request("stateless server does not accept JSON-RPC responses", None),
+        ));
+    }
+
+    if method == Some("tools/call") && !matches!(&message, ClientJsonRpcMessage::Request(_)) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            ErrorData::invalid_request("tools/call requires a JSON-RPC request id", None),
         ));
     }
 
@@ -1108,6 +1109,16 @@ mod tests {
             StatusCode::BAD_REQUEST,
             -32600,
         );
+        for invalid_headers in [
+            headers(Some(MODERN_VERSION), None, Some("realm_get")),
+            headers(Some(MODERN_VERSION), Some("tools/list"), Some("realm_get")),
+        ] {
+            assert_rpc_error(
+                validate(&modern_notification, &invalid_headers),
+                StatusCode::BAD_REQUEST,
+                -32020,
+            );
+        }
 
         let executor_owned_argument_validation = json!({
             "jsonrpc":"2.0","id":1,"method":"tools/call",
