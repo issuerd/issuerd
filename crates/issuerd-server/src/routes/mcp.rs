@@ -534,64 +534,8 @@ fn is_supported_version(version: &str) -> bool {
 }
 
 fn validate_post_headers(headers: &HeaderMap) -> Result<(), AdapterError> {
-    if !accepts_media_type(headers, "application/json")
-        || !accepts_media_type(headers, "text/event-stream")
-    {
-        return Err(AdapterError::text(
-            StatusCode::NOT_ACCEPTABLE,
-            "Not Acceptable: Client must accept both application/json and text/event-stream",
-        ));
-    }
-    let mut content_types = headers.get_all(header::CONTENT_TYPE).iter();
-    let content_type = content_types.next().and_then(|value| value.to_str().ok());
-    let valid_content_type = content_types.next().is_none()
-        && content_type.is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
-        });
-    if !valid_content_type {
-        return Err(AdapterError::text(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Unsupported Media Type: Content-Type must be application/json",
-        ));
-    }
-    Ok(())
-}
-
-fn accepts_media_type(headers: &HeaderMap, wanted: &str) -> bool {
-    let (wanted_type, wanted_subtype) = wanted.split_once('/').expect("MIME type has a subtype");
-    headers
-        .get_all(header::ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|entry| {
-            let mut parts = entry.trim().split(';');
-            let media = parts.next().map(str::trim).unwrap_or_default();
-            let wildcard = format!("{wanted_type}/*");
-            if !media.eq_ignore_ascii_case(wanted)
-                && !media.eq_ignore_ascii_case(&wildcard)
-                && !media.eq_ignore_ascii_case("*/*")
-            {
-                return false;
-            }
-            let mut quality = 1.0;
-            for parameter in parts {
-                let Some((name, value)) = parameter.trim().split_once('=') else {
-                    continue;
-                };
-                if name.trim().eq_ignore_ascii_case("q") {
-                    quality = match value.trim().parse::<f32>() {
-                        Ok(value) if (0.0..=1.0).contains(&value) => value,
-                        _ => return false,
-                    };
-                }
-            }
-            let _ = wanted_subtype;
-            quality > 0.0
-        })
+    issuerd_mcp::transport::validate_post_media_headers(headers)
+        .map_err(|error| AdapterError::text(error.status(), error.message()))
 }
 
 async fn read_post_body(body: Body) -> Result<Bytes, AdapterError> {

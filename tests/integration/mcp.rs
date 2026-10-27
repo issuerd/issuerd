@@ -210,6 +210,8 @@ struct RequestOptions {
     origin: Option<String>,
     host: Option<String>,
     last_event_id: Option<String>,
+    accepts: Option<Vec<String>>,
+    content_type: Option<String>,
 }
 
 impl RequestOptions {
@@ -243,13 +245,21 @@ async fn send_mcp(
     options: RequestOptions,
 ) -> reqwest::Response {
     let host = options.host.clone().unwrap_or_else(|| server.host());
+    let accepts = options
+        .accepts
+        .clone()
+        .unwrap_or_else(|| vec!["application/json, text/event-stream".to_string()]);
+    let content_type =
+        options.content_type.clone().unwrap_or_else(|| "application/json".to_string());
     let mut request = server
         .http
         .post(server.mcp_url(realm))
         .header(header::HOST, host)
-        .header(header::ACCEPT, "application/json, text/event-stream")
-        .header(header::CONTENT_TYPE, "application/json")
         .body(body.into());
+    for accept in accepts {
+        request = request.header(header::ACCEPT, accept);
+    }
+    request = request.header(header::CONTENT_TYPE, content_type);
     if let Some(version) = options.version {
         request = request.header("MCP-Protocol-Version", version);
     }
@@ -1029,23 +1039,97 @@ async fn origin_host_methods_and_last_event_id_follow_stateless_transport() {
 }
 
 #[tokio::test]
-async fn host_default_port_is_exact_for_real_requests() {
+async fn host_default_port_accepts_authenticated_requests_with_or_without_explicit_port() {
     let server = spawn_server(ServerOptions {
         issuer_url: Some("http://issuer.example".to_string()),
         ..ServerOptions::default()
     })
     .await;
-    for (host, expected) in [
-        ("issuer.example", StatusCode::UNAUTHORIZED),
-        ("issuer.example:80", StatusCode::UNAUTHORIZED),
-        ("issuer.example:81", StatusCode::FORBIDDEN),
-    ] {
-        let mut options = RequestOptions::legacy();
+    let fixture = make_fixture(&server, "default-port", &["view-realm"]).await;
+    let issued = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+    for host in ["issuer.example", "issuer.example:80"] {
+        let mut options = tool_options("realm_get", &issued.access_token, false);
         options.host = Some(host.to_string());
-        let response =
-            send_mcp(&server, "master", legacy_request("tools/list", json!({})), options).await;
-        assert_eq!(response.status(), expected, "Host: {host}");
+        let response = send_mcp(
+            &server,
+            fixture.realm.name.as_str(),
+            tool_request("realm_get", json!({}), false),
+            options,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "Host: {host}");
+        assert_eq!(response_json(response).await["result"]["isError"], false);
     }
+
+    let mut options = RequestOptions::legacy();
+    options.host = Some("issuer.example:81".to_string());
+    let response = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        legacy_request("tools/list", json!({})),
+        options,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn non_default_missing_host_port_precedes_dpop_and_invocation_accounting() {
+    let server = spawn_server(ServerOptions {
+        issuer_url: Some("http://issuer.example:8080".to_string()),
+        require_dpop: true,
+        invocation_rate_limit: 1,
+        ..ServerOptions::default()
+    })
+    .await;
+    let fixture = make_fixture(&server, "non-default-port", &["view-realm"]).await;
+    let key = DpopKey::new();
+    let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+    let realm = fixture.realm.name.as_str();
+    let proof = dpop_proof(&server, realm, &issued.access_token, &key, None);
+
+    let mut options = tool_options("realm_get", &issued.access_token, false);
+    options.authorization = Some(format!("DPoP {}", issued.access_token));
+    options.proofs = vec![proof.clone()];
+    options.host = Some("issuer.example".to_string());
+    let response =
+        send_mcp(&server, realm, tool_request("realm_get", json!({}), false), options).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut options = tool_options("realm_get", &issued.access_token, false);
+    options.authorization = Some(format!("DPoP {}", issued.access_token));
+    options.proofs = vec![proof];
+    options.host = Some("issuer.example:8080".to_string());
+    let response =
+        send_mcp(&server, realm, tool_request("realm_get", json!({}), false), options).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "early Host rejection must not burn the proof or invocation allowance"
+    );
+    assert_eq!(response_json(response).await["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn case_insensitive_content_type_and_split_accept_succeed_end_to_end() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let fixture = make_fixture(&server, "media-headers", &["view-realm"]).await;
+    let issued = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+    let mut options = tool_options("realm_get", &issued.access_token, false);
+    options.content_type = Some("Application/JSON".to_string());
+    options.accepts = Some(vec![
+        "application/json".to_string(),
+        "text/event-stream".to_string(),
+    ]);
+    let response = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        tool_request("realm_get", json!({}), false),
+        options,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["result"]["isError"], false);
 }
 
 #[tokio::test]

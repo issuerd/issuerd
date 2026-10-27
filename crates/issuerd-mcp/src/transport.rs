@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
+use http_body::Body;
 use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -12,14 +13,54 @@ use crate::{error::McpError, executor::McpToolExecutor, server::IssuerdMcpServer
 
 pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-pub type IssuerdStreamableHttpService =
-    StreamableHttpService<IssuerdMcpServer, NeverSessionManager>;
+type RmcpStreamableHttpService = StreamableHttpService<IssuerdMcpServer, NeverSessionManager>;
+
+#[derive(Clone)]
+pub struct IssuerdStreamableHttpService {
+    inner: RmcpStreamableHttpService,
+    config: McpTransportConfig,
+}
+
+impl<RequestBody> tower_service::Service<http::Request<RequestBody>>
+    for IssuerdStreamableHttpService
+where
+    RequestBody: Body + Send + 'static,
+    RequestBody::Error: Display,
+    RequestBody::Data: Send + 'static,
+{
+    type Response =
+        <RmcpStreamableHttpService as tower_service::Service<http::Request<RequestBody>>>::Response;
+    type Error =
+        <RmcpStreamableHttpService as tower_service::Service<http::Request<RequestBody>>>::Error;
+    type Future =
+        <RmcpStreamableHttpService as tower_service::Service<http::Request<RequestBody>>>::Future;
+
+    fn call(&mut self, mut request: http::Request<RequestBody>) -> Self::Future {
+        let method = request.method().clone();
+        let uri = request.uri().clone();
+        let _ = canonicalize_sdk_request(&self.config, &method, &uri, request.headers_mut());
+        <RmcpStreamableHttpService as tower_service::Service<http::Request<RequestBody>>>::call(
+            &mut self.inner,
+            request,
+        )
+    }
+
+    fn poll_ready(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        <RmcpStreamableHttpService as tower_service::Service<
+            http::Request<RequestBody>,
+        >>::poll_ready(&mut self.inner, context)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct McpTransportConfig {
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
     cancellation_token: CancellationToken,
+    scheme_default_port: Option<u16>,
 }
 
 impl McpTransportConfig {
@@ -34,6 +75,7 @@ impl McpTransportConfig {
             allowed_hosts,
             allowed_origins,
             cancellation_token,
+            scheme_default_port: None,
         })
     }
 
@@ -65,8 +107,11 @@ impl McpTransportConfig {
         let port = url.port_or_known_default().ok_or_else(|| {
             McpError::TransportConfig("issuer_url must have a known HTTP(S) port".into())
         })?;
+        let scheme_default_port = if url.scheme() == "http" { 80 } else { 443 };
         let authority = format!("{host}:{port}");
-        Self::new(vec![authority], allowed_origins, cancellation_token)
+        let mut config = Self::new(vec![authority], allowed_origins, cancellation_token)?;
+        config.scheme_default_port = Some(scheme_default_port);
+        Ok(config)
     }
 
     pub fn allowed_hosts(&self) -> &[String] {
@@ -98,12 +143,13 @@ pub fn streamable_http_service(
     executor: Arc<McpToolExecutor>,
     config: McpTransportConfig,
 ) -> Result<IssuerdStreamableHttpService, McpError> {
-    let config = streamable_http_config(&config);
-    Ok(StreamableHttpService::new(
+    let sdk_config = streamable_http_config(&config);
+    let inner = StreamableHttpService::new(
         move || Ok(IssuerdMcpServer::new(Arc::clone(&executor))),
         Arc::new(NeverSessionManager::default()),
-        config,
-    ))
+        sdk_config,
+    );
+    Ok(IssuerdStreamableHttpService { inner, config })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,18 +159,16 @@ pub struct TransportHeaderError {
 }
 
 impl TransportHeaderError {
+    fn new(status: http::StatusCode, message: &'static str) -> Self {
+        Self { status, message }
+    }
+
     fn bad_request(message: &'static str) -> Self {
-        Self {
-            status: http::StatusCode::BAD_REQUEST,
-            message,
-        }
+        Self::new(http::StatusCode::BAD_REQUEST, message)
     }
 
     fn forbidden(message: &'static str) -> Self {
-        Self {
-            status: http::StatusCode::FORBIDDEN,
-            message,
-        }
+        Self::new(http::StatusCode::FORBIDDEN, message)
     }
 
     pub fn status(self) -> http::StatusCode {
@@ -160,14 +204,40 @@ fn parse_allowed_authority(allowed: &str) -> Option<NormalizedAuthority> {
     Some(normalize_authority(allowed, None))
 }
 
-fn host_is_allowed(host: &NormalizedAuthority, allowed_hosts: &[String]) -> bool {
-    allowed_hosts
+fn request_authority(
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> Result<NormalizedAuthority, TransportHeaderError> {
+    let mut values = headers.get_all(http::header::HOST).iter();
+    if let Some(host) = values.next() {
+        if values.next().is_some() {
+            return Err(TransportHeaderError::bad_request("Bad Request: multiple Host headers"));
+        }
+        let host = host.to_str().map_err(|_| {
+            TransportHeaderError::bad_request("Bad Request: Invalid Host header encoding")
+        })?;
+        let authority = http::uri::Authority::try_from(host)
+            .map_err(|_| TransportHeaderError::bad_request("Bad Request: Invalid Host header"))?;
+        return Ok(normalize_authority(authority.host(), authority.port_u16()));
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| TransportHeaderError::bad_request("Bad Request: missing Host header"))?;
+    Ok(normalize_authority(authority.host(), authority.port_u16()))
+}
+
+fn matching_allowed_authority(
+    host: &NormalizedAuthority,
+    config: &McpTransportConfig,
+) -> Option<NormalizedAuthority> {
+    config
+        .allowed_hosts
         .iter()
         .filter_map(|allowed| parse_allowed_authority(allowed))
-        .any(|allowed| {
+        .find(|allowed| {
             allowed.host == host.host
                 && match allowed.port {
-                    Some(port) => host.port.is_none_or(|host_port| host_port == port),
+                    Some(port) => host.port.or(config.scheme_default_port) == Some(port),
                     None => true,
                 }
         })
@@ -178,25 +248,46 @@ fn validate_host(
     headers: &http::HeaderMap,
     config: &McpTransportConfig,
 ) -> Result<(), TransportHeaderError> {
-    let mut values = headers.get_all(http::header::HOST).iter();
-    let host = if let Some(host) = values.next() {
-        if values.next().is_some() {
-            return Err(TransportHeaderError::bad_request("Bad Request: multiple Host headers"));
-        }
-        let host = host.to_str().map_err(|_| {
-            TransportHeaderError::bad_request("Bad Request: Invalid Host header encoding")
-        })?;
-        let authority = http::uri::Authority::try_from(host)
-            .map_err(|_| TransportHeaderError::bad_request("Bad Request: Invalid Host header"))?;
-        normalize_authority(authority.host(), authority.port_u16())
-    } else {
-        let authority = uri
-            .authority()
-            .ok_or_else(|| TransportHeaderError::bad_request("Bad Request: missing Host header"))?;
-        normalize_authority(authority.host(), authority.port_u16())
-    };
-    if !host_is_allowed(&host, &config.allowed_hosts) {
+    let host = request_authority(uri, headers)?;
+    if matching_allowed_authority(&host, config).is_none() {
         return Err(TransportHeaderError::forbidden("Forbidden: Host header is not allowed"));
+    }
+    Ok(())
+}
+
+fn authority_string(authority: &NormalizedAuthority) -> String {
+    let host = if authority.host.contains(':') {
+        format!("[{}]", authority.host)
+    } else {
+        authority.host.clone()
+    };
+    match authority.port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+fn canonicalize_sdk_request(
+    config: &McpTransportConfig,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &mut http::HeaderMap,
+) -> Result<(), TransportHeaderError> {
+    validate_host_and_origin(config, uri, headers)?;
+    let host = request_authority(uri, headers)?;
+    let allowed = matching_allowed_authority(&host, config)
+        .ok_or_else(|| TransportHeaderError::forbidden("Forbidden: Host header is not allowed"))?;
+    let authority = http::HeaderValue::from_str(&authority_string(&allowed))
+        .map_err(|_| TransportHeaderError::bad_request("Bad Request: Invalid Host header"))?;
+    headers.insert(http::header::HOST, authority);
+    if method == http::Method::POST {
+        validate_post_media_headers(headers)?;
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        headers
+            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
     }
     Ok(())
 }
@@ -232,6 +323,66 @@ pub fn validate_host_and_origin(
     validate_origin(headers, config)
 }
 
+pub fn validate_post_media_headers(headers: &http::HeaderMap) -> Result<(), TransportHeaderError> {
+    if !accepts_media_type(headers, "application/json")
+        || !accepts_media_type(headers, "text/event-stream")
+    {
+        return Err(TransportHeaderError::new(
+            http::StatusCode::NOT_ACCEPTABLE,
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
+        ));
+    }
+    let mut content_types = headers.get_all(http::header::CONTENT_TYPE).iter();
+    let content_type = content_types.next().and_then(|value| value.to_str().ok());
+    let valid_content_type = content_types.next().is_none()
+        && content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+        });
+    if !valid_content_type {
+        return Err(TransportHeaderError::new(
+            http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported Media Type: Content-Type must be application/json",
+        ));
+    }
+    Ok(())
+}
+
+fn accepts_media_type(headers: &http::HeaderMap, wanted: &str) -> bool {
+    let (wanted_type, _) = wanted.split_once('/').expect("MIME type has a subtype");
+    headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|entry| {
+            let mut parts = entry.trim().split(';');
+            let media = parts.next().map(str::trim).unwrap_or_default();
+            let wildcard = format!("{wanted_type}/*");
+            if !media.eq_ignore_ascii_case(wanted)
+                && !media.eq_ignore_ascii_case(&wildcard)
+                && !media.eq_ignore_ascii_case("*/*")
+            {
+                return false;
+            }
+            let mut quality = 1.0;
+            for parameter in parts {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = match value.trim().parse::<f32>() {
+                        Ok(value) if (0.0..=1.0).contains(&value) => value,
+                        _ => return false,
+                    };
+                }
+            }
+            quality > 0.0
+        })
+}
+
 fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, McpError> {
     if hosts.is_empty() {
         return Err(McpError::TransportConfig("allowed_hosts must not be empty".into()));
@@ -253,18 +404,20 @@ fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, McpError> {
 
 fn normalize_origins(origins: Vec<String>) -> Result<Vec<String>, McpError> {
     let mut normalized = Vec::with_capacity(origins.len());
-    for origin in origins {
-        normalized.push(normalize_origin(&origin)?);
+    for (index, origin) in origins.into_iter().enumerate() {
+        let origin = normalize_origin(&origin).map_err(|reason| {
+            McpError::TransportConfig(format!("invalid allowed Origin at index {index}: {reason}"))
+        })?;
+        normalized.push(origin);
     }
     normalized.sort();
     normalized.dedup();
     Ok(normalized)
 }
 
-fn normalize_origin(origin: &str) -> Result<String, McpError> {
+fn normalize_origin(origin: &str) -> Result<String, &'static str> {
     let origin = origin.trim();
-    let url = url::Url::parse(origin)
-        .map_err(|_| McpError::TransportConfig(format!("invalid allowed Origin: {origin}")))?;
+    let url = url::Url::parse(origin).map_err(|_| "not an absolute URL")?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
@@ -272,17 +425,13 @@ fn normalize_origin(origin: &str) -> Result<String, McpError> {
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        return Err(McpError::TransportConfig(format!(
-            "allowed Origin must be an HTTP(S) origin without credentials, path, query, or fragment: {origin}"
-        )));
+        return Err("must be an HTTP(S) origin without credentials, path, query, or fragment");
     }
     let host = match url.host() {
         Some(url::Host::Domain(domain)) => domain.to_string(),
         Some(url::Host::Ipv4(address)) => address.to_string(),
         Some(url::Host::Ipv6(address)) => format!("[{address}]"),
-        None => {
-            return Err(McpError::TransportConfig(format!("allowed Origin has no host: {origin}")));
-        }
+        None => return Err("has no host"),
     };
     let port = match url.port() {
         Some(port) => port,
@@ -611,6 +760,91 @@ mod tests {
             assert_eq!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
             assert_eq!(response.headers().get(http::header::ALLOW).unwrap(), "POST");
             assert!(!response.headers().contains_key("mcp-session-id"));
+        }
+    }
+
+    async fn service_for(config: McpTransportConfig) -> IssuerdStreamableHttpService {
+        let storage: Arc<dyn Storage> = storage().await;
+        streamable_http_service(
+            Arc::new(McpToolExecutor::new(
+                storage,
+                McpRateLimiter::new(Arc::new(InMemoryCache::new()), 60),
+            )),
+            config,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sdk_accepts_default_port_host_with_or_without_explicit_port() {
+        let config = McpTransportConfig::for_issuer(
+            "https://issuer.example",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let mut service = service_for(config).await;
+        for authority in ["issuer.example", "issuer.example:443"] {
+            let mut request = request(None);
+            request.headers_mut().insert(http::header::HOST, authority.parse().unwrap());
+            let response = service.call(request).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK, "Host: {authority}");
+        }
+    }
+
+    #[test]
+    fn non_default_omitted_host_port_is_rejected_by_outer_validation() {
+        let config = McpTransportConfig::for_issuer(
+            "https://issuer.example:8443",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let uri = "https://issuer.example:8443/realms/demo/mcp".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "issuer.example".parse().unwrap());
+        assert_eq!(
+            validate_host_and_origin(&config, &uri, &headers).unwrap_err().status(),
+            http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_accepts_case_insensitive_content_type_and_split_accept() {
+        let mut service = service(Vec::new()).await;
+        let mut mixed_case = request(None);
+        mixed_case
+            .headers_mut()
+            .insert(http::header::CONTENT_TYPE, "Application/JSON".parse().unwrap());
+        assert_eq!(service.call(mixed_case).await.unwrap().status(), http::StatusCode::OK);
+
+        let mut split_accept = request(None);
+        split_accept.headers_mut().remove(http::header::ACCEPT);
+        split_accept
+            .headers_mut()
+            .append(http::header::ACCEPT, "application/json".parse().unwrap());
+        split_accept
+            .headers_mut()
+            .append(http::header::ACCEPT, "text/event-stream".parse().unwrap());
+        assert_eq!(service.call(split_accept).await.unwrap().status(), http::StatusCode::OK);
+    }
+
+    #[test]
+    fn invalid_origin_errors_never_include_the_configured_value() {
+        for origin in [
+            "https://user:ORIGIN-SECRET@client.example",
+            "https://client.example/?access_token=ORIGIN-SECRET",
+            "https://client.example/#ORIGIN-SECRET",
+        ] {
+            let error = McpTransportConfig::for_issuer(
+                "https://issuer.example",
+                vec![origin.to_string()],
+                CancellationToken::new(),
+            )
+            .unwrap_err();
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains("ORIGIN-SECRET"), "{rendered}");
+            assert!(!rendered.contains(origin), "{rendered}");
         }
     }
 }

@@ -2367,6 +2367,7 @@ dependencies = [
  "bytes",
  "chrono",
  "http",
+ "http-body",
  "http-body-util",
  "issuerd-cluster",
  "issuerd-core",
