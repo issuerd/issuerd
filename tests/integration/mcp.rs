@@ -2584,6 +2584,85 @@ async fn invocation_limit_is_shared_by_two_real_nodes() {
     assert_no_store(&second);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invocation_limit_is_atomic_across_two_nodes_with_redis() {
+    if std::process::Command::new("docker").arg("info").output().is_err() {
+        eprintln!("skipping Redis MCP rate-limit test: Docker unavailable");
+        return;
+    }
+    use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage};
+
+    let image = GenericImage::new("redis", "7-alpine")
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"));
+    let container = image.start().await.expect("Redis container start");
+    let host = container.get_host().await.expect("Redis container host");
+    let port = container.get_host_port_ipv4(6379).await.expect("Redis container port");
+    let cache: Arc<dyn DistributedCache> = Arc::new(
+        issuerd_cluster::RedisCache::connect(&format!("redis://{host}:{port}"))
+            .await
+            .expect("Redis connection"),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = crate::harness::test_config();
+    config.issuer_url = "http://cluster.example:8080".to_string();
+    config.mcp.enabled = true;
+    config.mcp.require_dpop = false;
+    config.mcp.invocation_rate_limit_per_minute = 1;
+    let node_a = spawn_listener(
+        listener_a,
+        config.clone(),
+        Some((Arc::clone(&storage), Arc::clone(&cache))),
+    )
+    .await;
+    let node_b = spawn_listener(listener_b, config, Some((storage, cache))).await;
+    let fixture = make_fixture(&node_a, "redis-shared-limit", &["view-realm"]).await;
+    let issued = issue_token(&node_a, &fixture, "openid mcp:read", None, true).await;
+    let realm = fixture.realm.name.as_str();
+    let access_token = issued.access_token.clone();
+
+    let responses = futures::future::join_all((0..8).map(|index| {
+        let server = if index % 2 == 0 { &node_a } else { &node_b };
+        let access_token = access_token.clone();
+        async move {
+            send_mcp(
+                server,
+                realm,
+                tool_request("realm_get", json!({}), false),
+                tool_options("realm_get", &access_token, false),
+            )
+            .await
+        }
+    }))
+    .await;
+    let mut successes = 0;
+    let mut limited = 0;
+    for response in responses {
+        match response.status() {
+            StatusCode::OK => {
+                successes += 1;
+                assert_eq!(response_json(response).await["result"]["isError"], false);
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                limited += 1;
+                let retry_after = response.headers()[header::RETRY_AFTER]
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert!(retry_after > 0);
+                assert_no_store(&response);
+            }
+            status => {
+                let body = response.bytes().await.unwrap();
+                panic!("unexpected Redis rate-limit response {status}: {body:?}");
+            }
+        }
+    }
+    assert_eq!((successes, limited), (1, 7));
+}
+
 #[tokio::test]
 async fn modern_last_event_id_is_ignored_without_a_session_id() {
     let server = spawn_server(ServerOptions::default()).await;

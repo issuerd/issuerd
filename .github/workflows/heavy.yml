@@ -116,6 +116,8 @@ jobs:
         run: ./examples/mcp-admin/scripts/e2e-local.sh
       - name: Real public-native DPoP acceptance (PostgreSQL + Redis)
         run: ./examples/mcp-admin/scripts/e2e-compose.sh
+      - name: Redis-backed cross-node invocation limiting
+        run: cargo test --locked --test integration invocation_limit_is_atomic_across_two_nodes_with_redis
 
   release-build:
     name: release binary (embedded web UI)
