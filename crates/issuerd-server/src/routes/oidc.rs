@@ -3563,11 +3563,26 @@ async fn token_handler_inner(
                 }
             }
 
-            // A resource-bearing code always belongs to the strict MCP code
-            // profile. Legacy cache entries cannot bypass PKCE simply because
-            // they predate that validation rule.
-            if code_data.resource.is_some() && code_data.code_challenge.is_none() {
-                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization code has no PKCE challenge");
+            // RFC 8707 §2.2: the token request may restate the resource
+            // granted with the code verbatim or (when the code carries none)
+            // introduce an allowlisted one — but never contradict the grant.
+            // (Allowlist validation ran in the grant gate above.)
+            let resource = match (&token_req.resource, &code_data.resource) {
+                (Some(requested), Some(granted)) if requested != granted => {
+                    let e = IssuerdError::InvalidTarget(
+                        "resource does not match the resource granted with the code".into(),
+                    );
+                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+                }
+                (Some(requested), _) => Some(requested.clone()),
+                (None, granted) => granted.clone(),
+            };
+
+            // Any effective resource selects the strict MCP code profile,
+            // including one introduced only by this token request. Legacy
+            // cache entries cannot bypass PKCE either.
+            if resource.is_some() && code_data.code_challenge.is_none() {
+                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has no PKCE challenge");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "invalid_grant"})),
@@ -3664,20 +3679,6 @@ async fn token_handler_inner(
                 }
             };
 
-            // RFC 8707 §2.2: the token request may restate the resource
-            // granted with the code verbatim or (when the code carries none)
-            // introduce an allowlisted one — but never contradict the grant.
-            // (Allowlist validation ran in the grant gate above.)
-            let resource = match (&token_req.resource, &code_data.resource) {
-                (Some(requested), Some(granted)) if requested != granted => {
-                    let e = IssuerdError::InvalidTarget(
-                        "resource does not match the resource granted with the code".into(),
-                    );
-                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
-                }
-                (Some(requested), _) => Some(requested.clone()),
-                (None, granted) => granted.clone(),
-            };
             if let Err(e) = crate::routes::protected_resource::validate_resource_param(
                 &state.config,
                 realm.name.as_str(),

@@ -505,6 +505,41 @@ async fn code_redemption_restate_inherit_introduce() {
 }
 
 #[tokio::test]
+async fn non_pkce_confidential_code_cannot_introduce_resource_at_redemption() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-pkce-introduce").await;
+    let client = harness.create_client("ri-pkce-introduce", false).await;
+    harness.create_user("ri-pkce-introduce", "paul", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-pkce-introduce");
+    let query = format!(
+        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state",
+        client.client_id,
+        enc(REDIRECT_URI)
+    );
+
+    let response = authorize(&harness, "ri-pkce-introduce", &query).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    let code = browser_login(&harness, "ri-pkce-introduce", &location, "paul").await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-pkce-introduce"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", REDIRECT_URI),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+                ("resource", &resource),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"], "invalid_grant");
+}
+
+#[tokio::test]
 async fn native_public_client_redeems_resource_code_without_redirect_uri() {
     let harness = harness_with_mcp_enabled().await;
     harness.create_realm("ri-native").await;
