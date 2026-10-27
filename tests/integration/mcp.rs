@@ -88,11 +88,16 @@ impl Drop for Loopback {
 struct FailSetCache {
     inner: issuerd_cluster::InMemoryCache,
     fail_set: AtomicBool,
+    fail_compare_and_delete: AtomicBool,
 }
 
 impl FailSetCache {
     fn fail_sets(&self, fail: bool) {
         self.fail_set.store(fail, Ordering::Relaxed);
+    }
+
+    fn fail_compare_and_delete(&self, fail: bool) {
+        self.fail_compare_and_delete.store(fail, Ordering::Relaxed);
     }
 }
 
@@ -139,6 +144,9 @@ impl DistributedCache for FailSetCache {
         key: &str,
         expected: Vec<u8>,
     ) -> Result<bool, issuerd_core::IssuerdError> {
+        if self.fail_compare_and_delete.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         self.inner.compare_and_delete(key, expected).await
     }
 
@@ -2385,6 +2393,84 @@ async fn fresh_nonce_store_failure_is_503_without_tool_accounting() {
     .await;
     assert_eq!(response.status(), StatusCode::OK, "503 must not consume the tool allowance");
     assert_eq!(response_json(response).await["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn nonce_challenge_store_failures_are_503_without_tool_accounting() {
+    for cas_loser in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::harness::test_config();
+        config.issuer_url = format!("http://{}", listener.local_addr().unwrap());
+        config.mcp.enabled = true;
+        config.mcp.require_dpop = true;
+        config.mcp.invocation_rate_limit_per_minute = 1;
+        config.dpop.nonce.mode = DpopNonceMode::Required;
+        let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let cache = Arc::new(FailSetCache::default());
+        let server = spawn_listener(
+            listener,
+            config,
+            Some((storage, cache.clone() as Arc<dyn DistributedCache>)),
+        )
+        .await;
+        let fixture =
+            make_fixture(&server, &unique("nonce-challenge-failure"), &ALL_READ_ROLES).await;
+        let key = DpopKey::new();
+        let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+
+        let nonce = if cas_loser {
+            let response = call_dpop(
+                &server,
+                &fixture,
+                &issued.access_token,
+                &key,
+                "realm_get",
+                json!({}),
+                None,
+            )
+            .await;
+            let nonce = one_nonce(&response);
+            assert_dpop_error(response, "use_dpop_nonce").await;
+            Some(nonce)
+        } else {
+            None
+        };
+        cache.fail_sets(true);
+        cache.fail_compare_and_delete(cas_loser);
+        let response = call_dpop(
+            &server,
+            &fixture,
+            &issued.access_token,
+            &key,
+            "realm_get",
+            json!({}),
+            nonce.as_deref(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "cas_loser={cas_loser}");
+        assert_no_store(&response);
+        assert!(!response.headers().contains_key("dpop-nonce"));
+
+        cache.fail_sets(false);
+        cache.fail_compare_and_delete(false);
+        let response =
+            call_dpop(&server, &fixture, &issued.access_token, &key, "realm_get", json!({}), None)
+                .await;
+        let retry_nonce = one_nonce(&response);
+        assert_dpop_error(response, "use_dpop_nonce").await;
+        let response = call_dpop(
+            &server,
+            &fixture,
+            &issued.access_token,
+            &key,
+            "realm_get",
+            json!({}),
+            Some(&retry_nonce),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "503 consumed the tool allowance");
+        assert_eq!(response_json(response).await["result"]["isError"], false);
+    }
 }
 
 #[tokio::test]

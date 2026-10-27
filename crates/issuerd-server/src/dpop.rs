@@ -274,7 +274,7 @@ async fn verify_proof_header_inner(
 
     if needs_nonce_challenge {
         tracing::debug!(realm = %realm_id, "DPoP proof without a usable server nonce");
-        return Err(nonce_challenge(state, realm_id).await);
+        return Err(nonce_challenge(state, realm_id, fresh_nonce_policy).await);
     }
 
     // jti single-use (RFC 9449 §11.1). The jti marker and nonce are separate
@@ -307,7 +307,7 @@ async fn verify_proof_header_inner(
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(realm = %realm_id, "DPoP nonce changed or was consumed concurrently");
-                return Err(nonce_challenge(state, realm_id).await);
+                return Err(nonce_challenge(state, realm_id, fresh_nonce_policy).await);
             }
             Err(e) => {
                 tracing::warn!(realm = %realm_id, error = %e, "DPoP nonce consumption failed");
@@ -370,13 +370,19 @@ async fn issue_nonce(state: &ServerState, realm_id: &RealmId) -> Option<String> 
     }
 }
 
-/// Build the `use_dpop_nonce` rejection carrying a fresh nonce. Falls back
-/// to [`DpopRejection::InvalidProof`] when no nonce could be issued (a
-/// challenge without a nonce would send the client into a useless retry
-/// loop; the WARN is already logged by [`issue_nonce`]).
-async fn nonce_challenge(state: &ServerState, realm_id: &RealmId) -> DpopRejection {
+/// Build the `use_dpop_nonce` rejection carrying a fresh nonce. Strict MCP
+/// fails temporarily unavailable when issuance fails; legacy callers keep the
+/// best-effort `invalid_dpop_proof` fallback.
+async fn nonce_challenge(
+    state: &ServerState,
+    realm_id: &RealmId,
+    fresh_nonce_policy: FreshNoncePolicy,
+) -> DpopRejection {
     match issue_nonce(state, realm_id).await {
         Some(nonce) => DpopRejection::UseDpopNonce(nonce),
+        None if fresh_nonce_policy == FreshNoncePolicy::Required => {
+            DpopRejection::TemporarilyUnavailable
+        }
         None => DpopRejection::InvalidProof(None),
     }
 }
