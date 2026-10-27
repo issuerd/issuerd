@@ -2167,6 +2167,39 @@ async fn special_realm_canonical_urls_support_full_dpop_flow() {
     assert_eq!(body["result"]["structuredContent"]["realm"], "tenant{one}");
 }
 
+#[tokio::test]
+async fn dpop_htu_accepts_equivalent_default_port_and_path_encodings() {
+    let server = spawn_server(ServerOptions {
+        issuer_url: Some("http://issuer.example".to_string()),
+        require_dpop: true,
+        ..ServerOptions::default()
+    })
+    .await;
+    let fixture = fixture_named(&server, "tenant{one}", "agent", &ALL_READ_ROLES).await;
+    let key = DpopKey::new();
+    let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+    for htu in [
+        "http://issuer.example:80/realms/tenant%7Bone%7D/mcp",
+        "http://issuer.example/realms/tenant{one}/mcp",
+        "http://issuer.example/realms/tenant%7bone%7d/mcp",
+    ] {
+        let mut proof_options = ProofOpts::new("POST", htu);
+        proof_options.ath = Some(issued.access_token.to_string());
+        let mut options = tool_options("realm_get", &issued.access_token, false);
+        options.authorization = Some(format!("DPoP {}", issued.access_token));
+        options.proofs = vec![key.proof(&proof_options)];
+        let response = send_mcp(
+            &server,
+            fixture.realm.name.as_str(),
+            tool_request("realm_get", json!({}), false),
+            options,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "equivalent HTU rejected: {htu}");
+        assert_eq!(response_json(response).await["result"]["isError"], false);
+    }
+}
+
 fn one_nonce(response: &reqwest::Response) -> String {
     let values = header_values(response, header::HeaderName::from_static("dpop-nonce"));
     assert_eq!(values.len(), 1, "expected exactly one DPoP-Nonce: {values:?}");
