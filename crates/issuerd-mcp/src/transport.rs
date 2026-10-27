@@ -143,7 +143,16 @@ pub fn streamable_http_service(
     executor: Arc<McpToolExecutor>,
     config: McpTransportConfig,
 ) -> Result<IssuerdStreamableHttpService, McpError> {
-    let sdk_config = streamable_http_config(&config);
+    streamable_http_service_with_json_response(executor, config, true)
+}
+
+#[doc(hidden)]
+pub fn streamable_http_service_with_json_response(
+    executor: Arc<McpToolExecutor>,
+    config: McpTransportConfig,
+    json_response: bool,
+) -> Result<IssuerdStreamableHttpService, McpError> {
+    let sdk_config = streamable_http_config(&config).with_json_response(json_response);
     let inner = StreamableHttpService::new(
         move || Ok(IssuerdMcpServer::new(Arc::clone(&executor))),
         Arc::new(NeverSessionManager::default()),

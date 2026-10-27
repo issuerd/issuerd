@@ -17,8 +17,8 @@ use http_body_util::BodyExt as _;
 use issuerd_core::{AccessTokenClaims, IssuerdError, Realm};
 use issuerd_mcp::{
     transport::{
-        streamable_http_service, validate_host_and_origin, IssuerdStreamableHttpService,
-        McpTransportConfig, MAX_REQUEST_BODY_BYTES,
+        validate_host_and_origin, IssuerdStreamableHttpService, McpTransportConfig,
+        MAX_REQUEST_BODY_BYTES,
     },
     McpAuthContext, McpError, McpRateLimiter, McpToolExecutor,
 };
@@ -57,11 +57,20 @@ pub fn mount(
     router: Router<Arc<ServerState>>,
     state: &Arc<ServerState>,
 ) -> Router<Arc<ServerState>> {
+    mount_with_response_mode(router, state, true)
+}
+
+fn mount_with_response_mode(
+    router: Router<Arc<ServerState>>,
+    state: &Arc<ServerState>,
+    json_response: bool,
+) -> Router<Arc<ServerState>> {
     if !state.config.mcp.enabled {
         return router.route("/realms/{realm}/mcp", any(disabled_handler));
     }
     let adapter = Arc::new(
-        McpHttpAdapter::new(Arc::clone(state)).expect("invalid [mcp] transport configuration"),
+        McpHttpAdapter::new(Arc::clone(state), json_response)
+            .expect("invalid [mcp] transport configuration"),
     );
     router.route(
         "/realms/{realm}/mcp",
@@ -84,7 +93,7 @@ struct McpHttpAdapter {
 }
 
 impl McpHttpAdapter {
-    fn new(state: Arc<ServerState>) -> Result<Self, McpError> {
+    fn new(state: Arc<ServerState>, json_response: bool) -> Result<Self, McpError> {
         let transport_config = McpTransportConfig::for_issuer(
             &state.config.issuer_url,
             state.config.mcp.allowed_origins.clone(),
@@ -97,7 +106,11 @@ impl McpHttpAdapter {
                 u64::from(state.config.mcp.invocation_rate_limit_per_minute),
             ),
         ));
-        let service = streamable_http_service(Arc::clone(&executor), transport_config.clone())?;
+        let service = issuerd_mcp::transport::streamable_http_service_with_json_response(
+            Arc::clone(&executor),
+            transport_config.clone(),
+            json_response,
+        )?;
         Ok(Self {
             state,
             executor,
@@ -1517,6 +1530,64 @@ mod tests {
                 );
             }
         }
+        server.stop().await;
+    }
+
+    async fn spawn_loopback_with_response_mode(json_response: bool) -> Loopback {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = crate::config::ServerConfig::with_test_admin();
+        config.issuer_url = format!("http://{address}");
+        config.mcp.enabled = true;
+        config.mcp.require_dpop = false;
+        let state = Arc::new(ServerState::from_config(&config).await.unwrap());
+        let app = mount_with_response_mode(Router::new(), &state, json_response)
+            .with_state(Arc::clone(&state));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        Loopback {
+            base_url: config.issuer_url,
+            state,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_adapter_emits_sse_with_auth_and_no_store() {
+        let server = spawn_loopback_with_response_mode(false).await;
+        let url = format!("{}/realms/master/mcp", server.base_url);
+        let client = reqwest::Client::new();
+        let user = admin_user(&server.state).await;
+        let token = issue_token(&server.state, &user, &["view-realm"], "mcp:read").await;
+        let response = post_raw(
+            &client,
+            &url,
+            Some(&token),
+            Some("2025-11-25"),
+            legacy_request("tools/call", json!({"name":"realm_get","arguments":{}})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+        assert!(!response.headers().contains_key("mcp-session-id"));
+        let body = response.text().await.unwrap();
+        let data = body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE response carries a JSON-RPC event");
+        let message: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(message["result"]["isError"], false);
+        assert_eq!(message["result"]["structuredContent"]["realm"], "master");
         server.stop().await;
     }
 }

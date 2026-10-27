@@ -2583,3 +2583,116 @@ async fn invocation_limit_is_shared_by_two_real_nodes() {
     assert!(retry_after > 0);
     assert_no_store(&second);
 }
+
+#[tokio::test]
+async fn modern_last_event_id_is_ignored_without_a_session_id() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let fixture = make_fixture(&server, "modern-last-event", &["view-realm"]).await;
+    let issued = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+    let mut options = tool_options("realm_get", &issued.access_token, true);
+    options.last_event_id = Some("not-a-session".to_string());
+    let response = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        tool_request("realm_get", json!({}), true),
+        options,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_no_session_id(&response);
+    let body = response_json(response).await;
+    assert_eq!(body["result"]["resultType"], "complete");
+    assert_eq!(body["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn strict_dpop_scope_miss_has_exact_scope_and_algs_challenge() {
+    let server = spawn_server(ServerOptions {
+        require_dpop: true,
+        ..ServerOptions::default()
+    })
+    .await;
+    let fixture = make_fixture(&server, "dpop-scope-miss", &ALL_READ_ROLES).await;
+    let key = DpopKey::new();
+    let issued = issue_token(&server, &fixture, "openid", Some(&key), true).await;
+    let response =
+        call_dpop(&server, &fixture, &issued.access_token, &key, "realm_get", json!({}), None)
+            .await;
+    let challenge =
+        assert_oauth_error(response, StatusCode::FORBIDDEN, "DPoP", "insufficient_scope").await;
+    assert_eq!(
+        challenge,
+        format!(
+            "DPoP error=\"insufficient_scope\", resource_metadata=\"{}\", algs=\"{}\", scope=\"mcp:read\"",
+            server.metadata_url(fixture.realm.name.as_str()),
+            dpop_algs()
+        )
+    );
+}
+
+#[tokio::test]
+async fn bearer_compatibility_still_rejects_both_dpop_downgrades() {
+    let server = spawn_server(ServerOptions {
+        require_dpop: false,
+        ..ServerOptions::default()
+    })
+    .await;
+    let fixture = make_fixture(&server, "compatibility-downgrades", &ALL_READ_ROLES).await;
+    let key = DpopKey::new();
+    let bound = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+    let unbound = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+
+    assert_invalid_bearer_token(
+        &server,
+        fixture.realm.name.as_str(),
+        bearer_call(&server, &fixture, &bound.access_token).await,
+    )
+    .await;
+
+    let mut options = tool_options("realm_get", &unbound.access_token, false);
+    options.authorization = Some(format!("DPoP {}", unbound.access_token));
+    options.proofs = vec![dpop_proof(
+        &server,
+        fixture.realm.name.as_str(),
+        &unbound.access_token,
+        &key,
+        None,
+    )];
+    let response = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        tool_request("realm_get", json!({}), false),
+        options,
+    )
+    .await;
+    assert_dpop_error(response, "invalid_token").await;
+}
+
+async fn expired_variant(server: &Loopback, token: &str) -> String {
+    let header = token.split('.').next().unwrap();
+    let header: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(header).unwrap(),
+    )
+    .unwrap();
+    let mut claims = decode_jwt(token);
+    for claim in ["exp", "iat", "nbf"] {
+        claims[claim] = json!(1);
+    }
+    let algorithm: issuerd_core::Algorithm = header["alg"].as_str().unwrap().parse().unwrap();
+    let key_id = issuerd_core::KeyId::new(header["kid"].as_str().unwrap()).unwrap();
+    server.state.crypto.sign(&claims.to_string(), algorithm, &key_id).await.unwrap()
+}
+
+#[tokio::test]
+async fn expired_resource_bound_token_is_invalid_token() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let fixture = make_fixture(&server, "expired-token", &ALL_READ_ROLES).await;
+    let issued = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+    let expired = expired_variant(&server, &issued.access_token).await;
+    assert_invalid_bearer_token(
+        &server,
+        fixture.realm.name.as_str(),
+        bearer_call(&server, &fixture, &expired).await,
+    )
+    .await;
+}
