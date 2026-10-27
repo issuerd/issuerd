@@ -2586,7 +2586,12 @@ async fn invocation_limit_is_shared_by_two_real_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invocation_limit_is_atomic_across_two_nodes_with_redis() {
-    if std::process::Command::new("docker").arg("info").output().is_err() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !docker_available {
         eprintln!("skipping Redis MCP rate-limit test: Docker unavailable");
         return;
     }
@@ -2622,20 +2627,30 @@ async fn invocation_limit_is_atomic_across_two_nodes_with_redis() {
     let realm = fixture.realm.name.as_str();
     let access_token = issued.access_token.clone();
 
-    let responses = futures::future::join_all((0..8).map(|index| {
-        let server = if index % 2 == 0 { &node_a } else { &node_b };
-        let access_token = access_token.clone();
-        async move {
-            send_mcp(
-                server,
-                realm,
-                tool_request("realm_get", json!({}), false),
-                tool_options("realm_get", &access_token, false),
-            )
-            .await
-        }
-    }))
-    .await;
+    // Keep the burst inside one fixed window; the rate_limit unit tests cover
+    // intentional window transitions separately.
+    let window_second = issuerd_core::utils::now_secs() % 60;
+    if window_second > 45 {
+        tokio::time::sleep(std::time::Duration::from_secs(61 - window_second)).await;
+    }
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures::future::join_all((0..8).map(|index| {
+            let server = if index % 2 == 0 { &node_a } else { &node_b };
+            let access_token = access_token.clone();
+            async move {
+                send_mcp(
+                    server,
+                    realm,
+                    tool_request("realm_get", json!({}), false),
+                    tool_options("realm_get", &access_token, false),
+                )
+                .await
+            }
+        })),
+    )
+    .await
+    .expect("concurrent burst did not complete within one rate-limit window");
     let mut successes = 0;
     let mut limited = 0;
     for response in responses {
