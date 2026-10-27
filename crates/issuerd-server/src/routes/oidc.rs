@@ -3582,10 +3582,33 @@ async fn token_handler_inner(
             };
 
             // Any effective resource selects the strict MCP code profile,
-            // including one introduced only by this token request. Legacy
-            // cache entries cannot bypass PKCE either.
-            if resource.is_some() && code_data.code_challenge.is_none() {
-                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has no PKCE challenge");
+            // including one introduced only by this token request. Redirects
+            // issued under legacy wildcard rules cannot bypass that profile.
+            if resource.is_some() {
+                let redirect_is_valid = url::Url::parse(&code_data.redirect_uri)
+                    .map(|uri| uri.fragment().is_none())
+                    .unwrap_or(false)
+                    && client
+                        .redirect_uris
+                        .iter()
+                        .any(|registered| registered.matches_mcp(&code_data.redirect_uri));
+                if !redirect_is_valid {
+                    warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has a non-MCP redirect URI");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "invalid_grant"})),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Legacy cache entries cannot bypass S256 either.
+            if resource.is_some()
+                && (code_data.code_challenge.is_none()
+                    || code_data.code_challenge_method
+                        != Some(issuerd_core::PkceCodeChallengeMethod::S256))
+            {
+                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has no S256 PKCE challenge");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "invalid_grant"})),

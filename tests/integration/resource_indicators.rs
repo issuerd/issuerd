@@ -540,6 +540,55 @@ async fn non_pkce_confidential_code_cannot_introduce_resource_at_redemption() {
 }
 
 #[tokio::test]
+async fn wildcard_code_cannot_introduce_resource_at_redemption() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-wildcard-introduce").await;
+    let mut client = harness.create_client("ri-wildcard-introduce", true).await;
+    client.redirect_uris =
+        vec![issuerd_core::RedirectUri::new("https://client.example/*").unwrap()];
+    harness.storage.update_client(&client.realm_id, &client).await.unwrap();
+    issuerd_cluster::invalidate::invalidate_client_claims(
+        harness.cache.as_ref(),
+        &client.realm_id,
+        &client.id,
+        client.client_id.as_ref(),
+    )
+    .await;
+    harness.create_user("ri-wildcard-introduce", "wendy", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-wildcard-introduce");
+    let requested_redirect = "https://client.example/attacker/cb";
+    let query = format!(
+        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256",
+        client.client_id,
+        enc(requested_redirect)
+    );
+
+    let response = authorize(&harness, "ri-wildcard-introduce", &query).await;
+    if response.status() != StatusCode::SEE_OTHER {
+        panic!("wildcard authorization failed: {}", json_body(response).await);
+    }
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    let code = browser_login(&harness, "ri-wildcard-introduce", &location, "wendy").await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-wildcard-introduce"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", requested_redirect),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", ""),
+                ("code_verifier", CODE_VERIFIER),
+                ("resource", &resource),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"], "invalid_grant");
+}
+
+#[tokio::test]
 async fn native_public_client_redeems_resource_code_without_redirect_uri() {
     let harness = harness_with_mcp_enabled().await;
     harness.create_realm("ri-native").await;
