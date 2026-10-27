@@ -101,7 +101,10 @@ Wildcard redirects are rejected. Exact matching is required except for the
 native loopback-port exception on `127.0.0.1` and `[::1]`; `localhost` is not
 that exception. At code redemption `redirect_uri` may be omitted, but is
 compared exactly when present. Introducing an allowlisted resource only at
-redemption still requires the code to carry a valid S256 challenge.
+redemption still requires the code to carry a valid S256 challenge. The stored
+code redirect is revalidated under the same MCP profile for introduced,
+inherited, and legacy resource grants, so a resource-less wildcard flow cannot
+be upgraded at redemption.
 
 Refresh tokens carry the granted resource and may only restate it or omit it
 to inherit; they cannot widen it. The refresh-derived access token receives
@@ -115,7 +118,8 @@ valid proof on every POST. The proof is checked for:
 - the token's `cnf.jkt` key binding and the access-token hash (`ath`);
 - `htm=POST` and the canonical MCP `htu` or an RFC 3986-equivalent form (for
   example an explicit default port or normalized unreserved percent encoding;
-  query, fragment, userinfo, and UUID aliases are rejected);
+  query, fragment, userinfo, backslash, control/whitespace, and UUID aliases
+  are rejected);
 - signature algorithm, `iat`, and single-use `jti` in the distributed replay
   cache;
 - the server nonce when nonce mode is enabled.
@@ -126,8 +130,9 @@ validation happens before atomic nonce consumption, so an invalid signature
 cannot burn another request's nonce. `supported` nonce mode is treated as
 `required` at MCP; `disabled` remains disabled. Post-proof success and error
 responses carry the fresh nonce when applicable and are uncacheable. If a
-mandatory fresh nonce cannot be generated or persisted, the request returns 503
-before preflight or tool execution instead of succeeding without one.
+mandatory fresh nonce cannot be generated or persisted during a challenge or
+after proof validation, the request returns 503 before preflight or tool
+execution instead of succeeding without one.
 
 With `require_dpop=false`, genuinely unbound Bearer tokens are accepted for
 read-only interoperability. Both downgrade directions still fail. Strict
