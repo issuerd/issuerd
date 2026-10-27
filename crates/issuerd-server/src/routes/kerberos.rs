@@ -243,12 +243,20 @@ async fn handle_spnego_with_count(
                             .into_response();
                     }
                 };
-                // Same redirect-URI matching rule as the authorization
-                // endpoint (exact or trailing-`*` wildcard), plus no fragment.
+                let strict_mcp = state.config.mcp.enabled && params.contains_key("resource");
+                // Match the authorization endpoint: legacy wildcard matching
+                // ordinarily, exact/native-loopback matching for MCP resources.
                 let has_fragment = url::Url::parse(redirect_uri.as_str())
                     .map(|u| u.fragment().is_some())
                     .unwrap_or(true);
-                if !client.redirect_uris.iter().any(|r| r.matches(&redirect_uri)) || has_fragment {
+                let redirect_registered = client.redirect_uris.iter().any(|registered| {
+                    if strict_mcp {
+                        registered.matches_mcp(redirect_uri.as_str())
+                    } else {
+                        registered.matches(redirect_uri.as_str())
+                    }
+                });
+                if !redirect_registered || has_fragment {
                     return (
                         StatusCode::BAD_REQUEST,
                         axum::Json(serde_json::json!({
@@ -312,16 +320,21 @@ async fn handle_spnego_with_count(
                             .into_response();
                     }
                 };
-                if (client.public_client && code_challenge.is_none())
-                    || ((client.public_client || code_challenge.is_some())
+                if ((client.public_client || strict_mcp) && code_challenge.is_none())
+                    || ((client.public_client || strict_mcp || code_challenge.is_some())
                         && code_challenge_method
                             != Some(issuerd_core::PkceCodeChallengeMethod::S256))
                 {
+                    let error_description = if strict_mcp {
+                        "code_challenge with S256 required for MCP resource requests"
+                    } else {
+                        "code_challenge with S256 required for public clients"
+                    };
                     return (
                         StatusCode::BAD_REQUEST,
                         axum::Json(serde_json::json!({
                             "error": "invalid_request",
-                            "error_description": "code_challenge with S256 required for public clients"
+                            "error_description": error_description
                         })),
                     )
                         .into_response();
@@ -1325,6 +1338,98 @@ mod tests {
                 }),
             })]),
         })
+    }
+
+    async fn mcp_test_state() -> Arc<ServerState> {
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.mcp.enabled = true;
+        let base = ServerState::from_config(&cfg).await.unwrap();
+        Arc::new(ServerState {
+            federation_manager: authenticated_manager(),
+            ..base.clone()
+        })
+    }
+
+    fn mcp_query_with_s256() -> HashMap<String, String> {
+        let mut params = query_with_redirect();
+        params
+            .insert("resource".to_string(), "http://localhost:8080/realms/master/mcp".to_string());
+        let challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(&"a".repeat(43));
+        params.insert("code_challenge".to_string(), challenge);
+        params.insert("code_challenge_method".to_string(), "S256".to_string());
+        params
+    }
+
+    #[tokio::test]
+    async fn spnego_mcp_rejects_wildcard_and_host_prefix_redirects() {
+        for (registered, requested) in [
+            ("http://localhost/*", "http://localhost/callback"),
+            ("http://localhost*", "http://localhost.evil.example/callback"),
+        ] {
+            let state = mcp_test_state().await;
+            seed_test_client(&state).await;
+            let realm_id = issuerd_core::RealmId::new("master").unwrap();
+            let mut client = state
+                .storage
+                .get_client_by_client_id(
+                    &realm_id,
+                    &issuerd_core::ClientIdentifier::new("test-client").unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            client.redirect_uris = vec![issuerd_core::RedirectUri::new(registered).unwrap()];
+            state.storage.update_client(&realm_id, &client).await.unwrap();
+
+            let mut mcp_params = mcp_query_with_s256();
+            mcp_params.insert("redirect_uri".to_string(), requested.to_string());
+            let mcp_response = authenticated_request(&state, mcp_params).await;
+            assert_eq!(mcp_response.status(), StatusCode::BAD_REQUEST, "mcp: {registered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spnego_mcp_confidential_client_requires_s256() {
+        let state = mcp_test_state().await;
+        seed_test_client(&state).await;
+        let mut params = query_with_redirect();
+        params
+            .insert("resource".to_string(), "http://localhost:8080/realms/master/mcp".to_string());
+
+        let response = authenticated_request(&state, params).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn spnego_mcp_exact_and_native_loopback_s256_succeed() {
+        for (registered, requested) in [
+            ("http://localhost/callback", "http://localhost/callback"),
+            ("http://127.0.0.1:8080/callback", "http://127.0.0.1:49152/callback"),
+        ] {
+            let state = mcp_test_state().await;
+            seed_test_client(&state).await;
+            let realm_id = issuerd_core::RealmId::new("master").unwrap();
+            let mut client = state
+                .storage
+                .get_client_by_client_id(
+                    &realm_id,
+                    &issuerd_core::ClientIdentifier::new("test-client").unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            client.redirect_uris = vec![issuerd_core::RedirectUri::new(registered).unwrap()];
+            state.storage.update_client(&realm_id, &client).await.unwrap();
+            let mut params = mcp_query_with_s256();
+            params.insert("redirect_uri".to_string(), requested.to_string());
+
+            let response = authenticated_request(&state, params).await;
+
+            assert_eq!(response.status(), StatusCode::FOUND, "redirect: {registered}");
+            let location = response.headers()["location"].to_str().unwrap();
+            assert!(location.contains("code="), "location: {location}");
+        }
     }
 
     #[tokio::test]
