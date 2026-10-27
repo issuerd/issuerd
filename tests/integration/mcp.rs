@@ -1878,6 +1878,38 @@ async fn unknown_tool_is_counted_once_before_the_invocation_limit() {
     assert_no_store(&response);
 }
 
+#[tokio::test]
+async fn tool_call_notifications_are_rejected_without_invocation_accounting() {
+    for modern in [false, true] {
+        let server = spawn_server(ServerOptions {
+            invocation_rate_limit: 1,
+            ..ServerOptions::default()
+        })
+        .await;
+        let fixture = make_fixture(&server, &unique("tool-notification"), &["view-realm"]).await;
+        let issued = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+        let notification = tool_request("realm_get", json!({}), modern).replace(r#""id":1,"#, "");
+        let response = send_mcp(
+            &server,
+            fixture.realm.name.as_str(),
+            notification,
+            tool_options("realm_get", &issued.access_token, modern),
+        )
+        .await;
+        assert_rpc_error(response, StatusCode::BAD_REQUEST, -32600).await;
+
+        let response = send_mcp(
+            &server,
+            fixture.realm.name.as_str(),
+            tool_request("realm_get", json!({}), modern),
+            tool_options("realm_get", &issued.access_token, modern),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "notification consumed the allowance");
+        assert_eq!(response_json(response).await["result"]["isError"], false);
+    }
+}
+
 async fn assert_invalid_bearer_token(server: &Loopback, realm: &str, response: reqwest::Response) {
     let challenge =
         assert_oauth_error(response, StatusCode::UNAUTHORIZED, "Bearer", "invalid_token").await;

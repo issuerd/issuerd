@@ -621,6 +621,13 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
     let method = object.get("method").and_then(Value::as_str);
     let params = object.get("params");
     if method == Some("tools/call") {
+        if !matches!(&message, ClientJsonRpcMessage::Request(_)) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                id,
+                ErrorData::invalid_request("tools/call requires a JSON-RPC request id", None),
+            ));
+        }
         let parsed = serde_json::from_value::<rmcp::model::CallToolRequestParams>(
             params.cloned().unwrap_or(Value::Null),
         )
@@ -1070,6 +1077,24 @@ mod tests {
         let error = validate(malformed_call, &headers(Some("2025-11-25"), None, None)).unwrap_err();
         assert_eq!(error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert!(String::from_utf8_lossy(&error.body).contains("fail to deserialize request body"));
+
+        let legacy_notification = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"realm_get","arguments":{}}}"#;
+        assert_rpc_error(
+            validate(legacy_notification, &headers(Some("2025-11-25"), None, None)),
+            StatusCode::BAD_REQUEST,
+            -32600,
+        );
+        let modern_notification =
+            modern_body("tools/call", json!({"name":"realm_get","arguments":{}}))
+                .replace(r#""id":7,"#, "");
+        assert_rpc_error(
+            validate(
+                &modern_notification,
+                &headers(Some(MODERN_VERSION), Some("tools/call"), Some("realm_get")),
+            ),
+            StatusCode::BAD_REQUEST,
+            -32600,
+        );
 
         let executor_owned_argument_validation = json!({
             "jsonrpc":"2.0","id":1,"method":"tools/call",
