@@ -196,6 +196,12 @@ fn thumbprint_of(jwk: &DpopJwk) -> String {
 }
 
 fn normalize_htu(raw: &str) -> Option<String> {
+    if raw
+        .chars()
+        .any(|character| character == '\\' || character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
     let url = url::Url::parse(raw).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
@@ -731,6 +737,11 @@ mod tests {
             "https://other.example/realms/demo/mcp",
             "https://idp.example/realms/other/mcp",
             "ftp://idp.example/realms/demo/mcp",
+            "https://idp.example/realms/demo\\mcp",
+            "https://idp.example/realms/demo/%5Cmcp",
+            " https://idp.example/realms/demo/mcp ",
+            "https://idp.example/realms/demo/\tmcp",
+            "https://idp.example/realms/demo/\nmcp",
         ] {
             let mut claims = valid_claims();
             claims["htu"] = serde_json::json!(htu);
