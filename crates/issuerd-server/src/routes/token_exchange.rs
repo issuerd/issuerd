@@ -105,8 +105,8 @@ pub(crate) async fn token_exchange_grant(
     // Realm binding: the stateless validator accepts any realm of this issuer
     // base URL, so the issuer realm must be compared explicitly. The issuer
     // segment is a realm NAME. Cross-realm exchange is not supported.
-    if issuerd_core::typestate::extract_realm_from_issuer(subject_claims.iss.as_str())
-        != Some(realm.name.as_str())
+    if issuerd_core::typestate::extract_realm_name_from_issuer(subject_claims.iss.as_str()).as_ref()
+        != Some(&realm.name)
     {
         warn!(realm = %realm_id, client_id = %client.client_id, iss = %subject_claims.iss.as_str(), "token exchange: subject token from another realm");
         return exchange_error(state, realm_id, client, ip, "invalid_grant").await;

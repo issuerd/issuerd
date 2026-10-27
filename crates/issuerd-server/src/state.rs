@@ -175,9 +175,7 @@ impl ServerState {
     /// the name-based switch (id-spelled issuers) are intentionally NOT
     /// resolved here — they are rejected.
     pub async fn resolve_issuer_realm(&self, issuer: &str) -> Result<Option<Realm>, IssuerdError> {
-        match issuerd_core::typestate::extract_realm_from_issuer(issuer)
-            .and_then(|segment| issuerd_core::urls::decode_realm_segment(segment).ok())
-        {
+        match issuerd_core::typestate::extract_realm_name_from_issuer(issuer) {
             Some(name) => self.realm_by_name_cached(name.as_str()).await,
             None => Ok(None),
         }

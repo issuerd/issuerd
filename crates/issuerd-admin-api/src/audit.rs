@@ -59,8 +59,8 @@ async fn apply_realm_event_config(
 /// fails the UUID conversion on insert.
 async fn issuing_realm_id(state: &AdminApiState, auth: &AdminAuth) -> Option<RealmId> {
     let iss = auth.claims.iss.as_str();
-    let name = issuerd_core::typestate::extract_realm_from_issuer(iss).unwrap_or(iss);
-    match state.storage.get_realm_by_name(name).await {
+    let name = issuerd_core::typestate::extract_realm_name_from_issuer(iss)?;
+    match state.storage.get_realm_by_name(name.as_str()).await {
         Ok(realm) => realm.map(|r| r.id),
         Err(e) => {
             warn!(issuer = %iss, error = %e,
@@ -229,6 +229,24 @@ mod tests {
         let auth = admin_auth_with_issuer("http://localhost:8080/realms/master");
         // The segment is the realm NAME; the id is resolved from storage.
         assert_eq!(issuing_realm_id(&state, &auth).await, Some(RealmId::new("master").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn issuing_realm_id_decodes_raw_and_encoded_special_realm_names() {
+        let state = test_state(vec![]);
+        let realm = issuerd_core::Realm {
+            id: RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: issuerd_core::RealmName::new("tenant{one}").unwrap(),
+            ..Default::default()
+        };
+        state.storage.create_realm(&realm).await.unwrap();
+
+        for segment in ["tenant{one}", "tenant%7Bone%7D"] {
+            let auth = admin_auth_with_issuer(&format!("http://localhost:8080/realms/{segment}"));
+            assert_eq!(issuing_realm_id(&state, &auth).await, Some(realm.id.clone()));
+        }
+        let nested = admin_auth_with_issuer("http://localhost:8080/realms/tenant%257Bone%257D");
+        assert_eq!(issuing_realm_id(&state, &nested).await, None);
     }
 
     #[tokio::test]
