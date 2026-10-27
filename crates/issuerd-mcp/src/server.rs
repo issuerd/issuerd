@@ -309,7 +309,7 @@ mod tests {
 
         let missing = json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"users_get","arguments":{"id":"missing"}}
+            "params":{"name":"users_get","arguments":{"id":"20000000-0000-4000-8000-000000000099"}}
         });
         let (_, response) = call_service(
             &mut service,
