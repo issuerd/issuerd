@@ -146,7 +146,10 @@ impl McpToolExecutor {
     ) -> Result<Value, McpError> {
         let args: UserGetArgs = decode(arguments)?;
         let id = required_id(&args.id, "id")?;
-        let user_id = UserId::new(id).map_err(|error| McpError::InvalidInput(error.to_string()))?;
+        let uuid = uuid::Uuid::parse_str(id)
+            .map_err(|_| McpError::InvalidInput("id must be a user UUID".into()))?;
+        let user_id = UserId::new(uuid.to_string())
+            .map_err(|error| McpError::InvalidInput(error.to_string()))?;
         let user = self
             .storage
             .get_user(&permit.target.realm_id, &user_id)
@@ -477,13 +480,26 @@ mod tests {
             json!({"id": format!(" {ALICE_ID} ")}),
             json!({"id": ""}),
             json!({"id": "x".repeat(256)}),
+            json!({"id": "not-a-uuid"}),
         ] {
             let result = execute(&executor, ToolName::UsersGet, args).await;
-            if matches!(result, Err(McpError::NotFound("user"))) {
-                continue;
-            }
             assert!(matches!(result, Err(McpError::InvalidInput(_))), "{result:?}");
+            assert!(!result.unwrap_err().public_tool_message().contains("storage backend"));
         }
+
+        let unknown = execute(
+            &executor,
+            ToolName::UsersGet,
+            json!({"id": "20000000-0000-4000-8000-000000000099"}),
+        )
+        .await;
+        assert!(matches!(unknown, Err(McpError::NotFound("user"))), "{unknown:?}");
+
+        let uppercase =
+            execute(&executor, ToolName::UsersGet, json!({"id": ALICE_ID.to_uppercase()}))
+                .await
+                .unwrap();
+        assert_eq!(uppercase["id"], ALICE_ID);
     }
 
     #[tokio::test]
