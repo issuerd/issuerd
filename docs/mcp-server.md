@@ -39,9 +39,13 @@ enabled = false
   It does not enable generic CIBA resource issuance or a scope-only approval
   flow. Keep it false for the read-only increment.
 
-Host validation uses the configured `issuer_url` authority. An explicitly
-wrong port is rejected; an omitted Host port means the issuer's default port.
-Host and Origin checks run before request-body and OAuth processing.
+Host validation uses the configured `issuer_url` authority. An omitted Host
+port is interpreted using the issuer's scheme and must match the configured
+port; omitted non-default ports are rejected. Default-port authorities and
+valid case-insensitive `Content-Type` or repeated `Accept` representations are
+canonicalized before `rmcp` dispatch. Host, Origin, and media checks run before
+request-body and OAuth processing, so late SDK rejection cannot consume a proof
+or invocation allowance.
 
 ## Tools and authorization
 
@@ -49,7 +53,7 @@ Host and Origin checks run before request-body and OAuth processing.
 |---|---|---|---|
 | `realm_get` | `mcp:read` | `view-realm`, `manage-realm` | Curated realm configuration |
 | `users_search` | `mcp:read` | `view-users`, `manage-users` | Exact username, exact email, or substring search |
-| `users_get` | `mcp:read` | `view-users`, `manage-users` | User by internal id, direct realm roles and groups |
+| `users_get` | `mcp:read` | `view-users`, `manage-users` | User by canonical internal UUID, direct realm roles and groups |
 | `clients_list` | `mcp:read` | `view-clients`, `manage-clients` | Paginated clients or exact public `clientId` |
 | `clients_get` | `mcp:read` | `view-clients`, `manage-clients` | Client by internal UUID, without secret configuration |
 
@@ -61,9 +65,11 @@ are still mandatory.
 
 `tools/list` is filtered by the caller's actual scope and roles; every
 `tools/call` repeats the same checks. Unknown and under-authorized well-formed
-calls also consume invocation allowance. Exact filters take precedence over
-pagination. Defaults are `first=0`, `max=20`, with `max <= 100` and bounded
-input strings.
+calls also consume invocation allowance. A no-`id` `tools/call` notification is
+rejected as malformed before authentication and consumes no allowance. Exact
+filters take precedence over pagination. Defaults are `first=0`, `max=20`, with
+`max <= 100` and bounded input strings. Malformed user UUID input is an input
+error, not a storage failure.
 
 Outputs use curated DTOs rather than raw storage models. Arbitrary realm,
 user, and client attribute maps, client secrets, credentials, SMTP passwords,
@@ -89,11 +95,13 @@ from direct-access-token response types, password/client-credentials grants,
 and marker-client audiences are not MCP onboarding workarounds. Cross-realm
 administration and unattended M2M require separate policy work.
 
-MCP resource authorization requests use `response_type=code` and PKCE S256 for
-both public and confidential clients. Wildcard redirects are rejected. Exact
-matching is required except for the native loopback-port exception on
-`127.0.0.1` and `[::1]`; `localhost` is not that exception. At code redemption
-`redirect_uri` may be omitted, but is compared exactly when present.
+MCP resource authorization requests, including SPNEGO entry points, use
+`response_type=code` and PKCE S256 for both public and confidential clients.
+Wildcard redirects are rejected. Exact matching is required except for the
+native loopback-port exception on `127.0.0.1` and `[::1]`; `localhost` is not
+that exception. At code redemption `redirect_uri` may be omitted, but is
+compared exactly when present. Introducing an allowlisted resource only at
+redemption still requires the code to carry a valid S256 challenge.
 
 Refresh tokens carry the granted resource and may only restate it or omit it
 to inherit; they cannot widen it. The refresh-derived access token receives
@@ -105,8 +113,9 @@ With `require_dpop=true`, use `Authorization: DPoP <token>` and exactly one
 valid proof on every POST. The proof is checked for:
 
 - the token's `cnf.jkt` key binding and the access-token hash (`ath`);
-- `htm=POST` and the exact canonical MCP `htu` (no query, fragment, or UUID
-  alias);
+- `htm=POST` and the canonical MCP `htu` or an RFC 3986-equivalent form (for
+  example an explicit default port or normalized unreserved percent encoding;
+  query, fragment, userinfo, and UUID aliases are rejected);
 - signature algorithm, `iat`, and single-use `jti` in the distributed replay
   cache;
 - the server nonce when nonce mode is enabled.
@@ -116,7 +125,9 @@ Bearer, and unbound tokens sent with the DPoP scheme are rejected. Nonce
 validation happens before atomic nonce consumption, so an invalid signature
 cannot burn another request's nonce. `supported` nonce mode is treated as
 `required` at MCP; `disabled` remains disabled. Post-proof success and error
-responses carry the fresh nonce when applicable and are uncacheable.
+responses carry the fresh nonce when applicable and are uncacheable. If a
+mandatory fresh nonce cannot be generated or persisted, the request returns 503
+before preflight or tool execution instead of succeeding without one.
 
 With `require_dpop=false`, genuinely unbound Bearer tokens are accepted for
 read-only interoperability. Both downgrade directions still fail. Strict

@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **MCP/OAuth protocol hardening.** Authorization responses now carry RFC 9207 `iss` on success and error paths, discovery advertises it together with public `none` client authentication, and authorization-code redemption accepts an omitted `redirect_uri` while retaining exact comparison when present. MCP resource requests require code + PKCE S256 and exact/native-loopback redirect matching, and access tokens carry trusted resource provenance alongside `aud`. Canonical realm URL construction now covers issuer/resource/DPoP paths, duplicate DPoP proofs are rejected, and nonces cannot be downgraded or consumed by an invalid proof.
+- **MCP authorization and transport review remediation.** The strict resource code profile now also covers SPNEGO and resources introduced only at token redemption. Canonical special-realm issuers work across account, Admin authorization/audit, broker SSO, cookie authentication, and token exchange. MCP transport accepts standard default-port Host and valid media-header representations without late SDK rejection, rejects omitted non-default ports before authentication, and redacts invalid Origin configuration errors.
+- **MCP/DPoP correctness and acceptance.** DPoP HTU comparison now applies URI syntax normalization, mandatory fresh-nonce issuance failure returns 503 before tool execution, and no-`id` tool calls cannot consume invocation allowance. `users_get` validates canonical UUID input. Acceptance now includes adapter-level authenticated SSE, modern resumption headers, strict-DPoP scope challenges, compatibility downgrades, expired tokens, and concurrent two-node rate limiting against real Redis.
 
 ## [0.1.24] - 2026-10-25
 
