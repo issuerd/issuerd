@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -81,6 +81,93 @@ struct Loopback {
 impl Drop for Loopback {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[derive(Default)]
+struct FailSetCache {
+    inner: issuerd_cluster::InMemoryCache,
+    fail_set: AtomicBool,
+}
+
+impl FailSetCache {
+    fn fail_sets(&self, fail: bool) {
+        self.fail_set.store(fail, Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl DistributedCache for FailSetCache {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        if self.fail_set.load(Ordering::Relaxed) {
+            return Err(issuerd_core::IssuerdError::ServerError("injected set failure".into()));
+        }
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), issuerd_core::IssuerdError> {
+        self.inner.delete(key).await
+    }
+
+    async fn get_and_delete(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, issuerd_core::IssuerdError> {
+        self.inner.get_and_delete(key).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> Result<bool, issuerd_core::IssuerdError> {
+        self.inner.compare_and_swap(key, expected, new).await
+    }
+
+    async fn compare_and_delete(
+        &self,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> Result<bool, issuerd_core::IssuerdError> {
+        self.inner.compare_and_delete(key, expected).await
+    }
+
+    async fn increment(
+        &self,
+        key: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<u64, issuerd_core::IssuerdError> {
+        self.inner.increment(key, ttl).await
+    }
+
+    async fn publish(
+        &self,
+        channel: &str,
+        message: Vec<u8>,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        self.inner.publish(channel, message).await
+    }
+
+    async fn subscribe(
+        &self,
+        channel: &str,
+        handler: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        self.inner.subscribe(channel, handler).await
+    }
+
+    async fn scan_keys(&self, pattern: &str) -> Result<Vec<String>, issuerd_core::IssuerdError> {
+        self.inner.scan_keys(pattern).await
     }
 }
 
@@ -2204,6 +2291,68 @@ fn one_nonce(response: &reqwest::Response) -> String {
     let values = header_values(response, header::HeaderName::from_static("dpop-nonce"));
     assert_eq!(values.len(), 1, "expected exactly one DPoP-Nonce: {values:?}");
     values.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn fresh_nonce_store_failure_is_503_without_tool_accounting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = crate::harness::test_config();
+    config.issuer_url = format!("http://{}", listener.local_addr().unwrap());
+    config.mcp.enabled = true;
+    config.mcp.require_dpop = true;
+    config.mcp.invocation_rate_limit_per_minute = 1;
+    config.dpop.nonce.mode = DpopNonceMode::Required;
+    let storage: Arc<dyn Storage> = Arc::new(issuerd_storage::InMemoryStorage::new());
+    let cache = Arc::new(FailSetCache::default());
+    let server = spawn_listener(
+        listener,
+        config,
+        Some((storage, cache.clone() as Arc<dyn DistributedCache>)),
+    )
+    .await;
+    let fixture = make_fixture(&server, "nonce-store-failure", &ALL_READ_ROLES).await;
+    let key = DpopKey::new();
+    let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+
+    let response =
+        call_dpop(&server, &fixture, &issued.access_token, &key, "realm_get", json!({}), None)
+            .await;
+    let first_nonce = one_nonce(&response);
+    assert_dpop_error(response, "use_dpop_nonce").await;
+
+    cache.fail_sets(true);
+    let response = call_dpop(
+        &server,
+        &fixture,
+        &issued.access_token,
+        &key,
+        "realm_get",
+        json!({}),
+        Some(&first_nonce),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_store(&response);
+    assert!(!response.headers().contains_key("dpop-nonce"));
+
+    cache.fail_sets(false);
+    let response =
+        call_dpop(&server, &fixture, &issued.access_token, &key, "realm_get", json!({}), None)
+            .await;
+    let retry_nonce = one_nonce(&response);
+    assert_dpop_error(response, "use_dpop_nonce").await;
+    let response = call_dpop(
+        &server,
+        &fixture,
+        &issued.access_token,
+        &key,
+        "realm_get",
+        json!({}),
+        Some(&retry_nonce),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "503 must not consume the tool allowance");
+    assert_eq!(response_json(response).await["result"]["isError"], false);
 }
 
 #[tokio::test]

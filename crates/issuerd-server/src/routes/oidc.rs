@@ -3399,6 +3399,9 @@ async fn token_handler_inner(
             debug!(realm = %realm_id, client_id = %client.client_id, "DPoP proof without a live server nonce at token endpoint — challenging");
             return crate::dpop::use_dpop_nonce_response(&nonce);
         }
+        Err(crate::dpop::DpopRejection::TemporarilyUnavailable) => {
+            return cache_failure_response(&IssuerdError::TemporarilyUnavailable);
+        }
         Err(crate::dpop::DpopRejection::InvalidProof(nonce)) => {
             warn!(realm = %realm_id, client_id = %client.client_id, "DPoP proof rejected at token endpoint");
             let response =
@@ -6228,6 +6231,9 @@ async fn userinfo_handler_inner(
                             "Resource server requires nonce in DPoP proof",
                             Some(&nonce),
                         );
+                    }
+                    Err(crate::dpop::DpopRejection::TemporarilyUnavailable) => {
+                        return cache_failure_response(&IssuerdError::TemporarilyUnavailable);
                     }
                     Err(crate::dpop::DpopRejection::InvalidProof(nonce)) => {
                         return crate::dpop::challenge_response(

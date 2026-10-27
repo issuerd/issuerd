@@ -297,6 +297,7 @@ impl McpHttpAdapter {
             DpopRejection::UseDpopNonce(nonce) => {
                 (use_dpop_nonce_challenge(metadata, &nonce, None), None)
             }
+            DpopRejection::TemporarilyUnavailable => (service_unavailable(), None),
             DpopRejection::InvalidProof(response_nonce) => {
                 (invalid_dpop_proof_challenge(metadata, None), response_nonce)
             }

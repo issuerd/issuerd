@@ -64,8 +64,8 @@ pub(crate) struct DpopVerification {
     pub proof: Option<issuerd_token::VerifiedDpopProof>,
     /// Fresh server nonce to advertise via the `DPoP-Nonce` response header
     /// (`Some` only when nonce mode is enabled AND a proof was presented —
-    /// Bearer flows never carry it). Issuance failure degrades to `None`
-    /// (WARN logged): the response simply lacks the header.
+    /// Bearer flows never carry it). Legacy issuance failure degrades to
+    /// `None`; strict MCP rejects the request instead.
     pub response_nonce: Option<String>,
 }
 
@@ -82,6 +82,21 @@ pub(crate) enum DpopRejection {
     /// `DPoP-Nonce` header of a `use_dpop_nonce` error response
     /// (RFC 9449 §8/§9 — the client's retry signal).
     UseDpopNonce(String),
+    /// A valid strict-MCP proof was accepted, but its mandatory fresh response
+    /// nonce could not be generated or persisted.
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshNoncePolicy {
+    BestEffort,
+    Required,
+}
+
+#[derive(Clone, Copy)]
+struct NoncePolicy {
+    mode: DpopNonceMode,
+    fresh: FreshNoncePolicy,
 }
 
 /// Accepted `htu` values for `accepted_paths` (realm-relative request paths,
@@ -141,15 +156,18 @@ pub(crate) async fn verify_proof_header(
         headers,
         htm,
         &accepted_htus,
-        state.config.dpop.nonce.mode,
+        NoncePolicy {
+            mode: state.config.dpop.nonce.mode,
+            fresh: FreshNoncePolicy::BestEffort,
+        },
         access_token,
     )
     .await
 }
 
-/// Strict verification for the MCP resource: only the exact canonical HTU is
-/// accepted, and endpoint policy upgrades `supported` nonces to `required`.
-/// Disabled nonce mode remains disabled.
+/// Strict verification for the MCP resource: only the canonical HTU or its
+/// RFC 3986-equivalent forms are accepted. Endpoint policy upgrades `supported`
+/// nonces to `required`; disabled nonce mode remains disabled.
 #[allow(dead_code)]
 pub(crate) async fn verify_mcp_proof_header(
     state: &ServerState,
@@ -170,7 +188,10 @@ pub(crate) async fn verify_mcp_proof_header(
         headers,
         htm,
         &accepted_htu,
-        nonce_mode,
+        NoncePolicy {
+            mode: nonce_mode,
+            fresh: FreshNoncePolicy::Required,
+        },
         access_token,
     )
     .await
@@ -182,9 +203,11 @@ async fn verify_proof_header_inner(
     headers: &axum::http::HeaderMap,
     htm: &str,
     accepted_htu: &[String],
-    nonce_mode: DpopNonceMode,
+    nonce_policy: NoncePolicy,
     access_token: Option<&str>,
 ) -> Result<DpopVerification, DpopRejection> {
+    let nonce_mode = nonce_policy.mode;
+    let fresh_nonce_policy = nonce_policy.fresh;
     let mut values = headers.get_all("dpop").iter();
     let Some(value) = values.next() else {
         return Ok(DpopVerification {
@@ -298,6 +321,12 @@ async fn verify_proof_header_inner(
     } else {
         issue_nonce(state, realm_id).await
     };
+    if nonce_mode != DpopNonceMode::Disabled
+        && fresh_nonce_policy == FreshNoncePolicy::Required
+        && response_nonce.is_none()
+    {
+        return Err(DpopRejection::TemporarilyUnavailable);
+    }
     Ok(DpopVerification {
         proof: Some(verified),
         response_nonce,
@@ -904,6 +933,7 @@ mod tests {
             Ok(_) => "Ok",
             Err(DpopRejection::InvalidProof(_)) => "Err(InvalidProof)",
             Err(DpopRejection::UseDpopNonce(_)) => "Err(UseDpopNonce)",
+            Err(DpopRejection::TemporarilyUnavailable) => "Err(TemporarilyUnavailable)",
         }
     }
 
