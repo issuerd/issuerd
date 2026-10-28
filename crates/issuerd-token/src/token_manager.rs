@@ -4404,7 +4404,7 @@ mod tests {
     /// Feed 1000 random strings into token validation and ensure it never panics.
     #[tokio::test]
     async fn validate_never_panics_on_random_input() {
-        use rand::Rng;
+        use rand::RngExt;
         let crypto = Arc::new(
             RingCryptoProvider::new(CryptoConfig {
                 default_alg: Algorithm::Rs256,
@@ -4420,10 +4420,10 @@ mod tests {
             jwks,
         );
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..1000 {
-            let len = rng.gen_range(0..256);
-            let garbage: String = (0..len).map(|_| rng.gen_range(0u8..128u8) as char).collect();
+            let len = rng.random_range(0..256);
+            let garbage: String = (0..len).map(|_| rng.random_range(0u8..128u8) as char).collect();
             let _ = tm.validate_access_token(&garbage);
         }
     }

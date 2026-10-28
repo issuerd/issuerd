@@ -92,12 +92,12 @@ impl LoadTestHarness {
     }
 
     async fn bootstrap_master(storage: &Arc<dyn issuerd_core::Storage>) {
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
         use chrono::Utc;
         use issuerd_core::{
             Client, ClientId, Credential, CredentialType, Email, Realm, RealmId, Role, User, UserId,
         };
-        use rand::rngs::OsRng;
 
         // PostgreSQL stores realm IDs as UUID, so generate one and keep name = "master".
         let realm_id = RealmId::new(issuerd_core::utils::generate_id()).unwrap();

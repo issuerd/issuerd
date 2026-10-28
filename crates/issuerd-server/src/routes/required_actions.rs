@@ -2010,7 +2010,7 @@ mod tests {
 
     fn temp_password_cred() -> Credential {
         use argon2::{password_hash::SaltString, PasswordHasher};
-        let salt = SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         let hash = argon2::Argon2::default()
             .hash_password(b"Temp1234!", &salt)
             .unwrap()
