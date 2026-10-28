@@ -6,7 +6,7 @@
 #
 # The stack: Issuerd (OIDC IdP, pulled from Docker Hub — no Rust toolchain
 # needed) + the ChatApp (FastAPI/HTMX support-chat UI) + the McpServer
-# (FastMCP resource server, internal only) + PostgreSQL (Issuerd storage AND
+# (MCPServer resource server, internal only) + PostgreSQL (Issuerd storage AND
 # the RLS-protected `shop` database). A one-shot `setup` container applies the
 # two things declarative provisioning cannot express: the
 # `token.exchange.enabled` attribute on the mcp-server client, and the

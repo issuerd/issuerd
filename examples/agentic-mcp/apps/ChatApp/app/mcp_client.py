@@ -1,6 +1,6 @@
 """Minimal hand-rolled MCP streamable-HTTP JSON-RPC client.
 
-The MCP server is a FastMCP streamable-HTTP server with ``stateless_http=True``,
+The MCP server is an MCPServer streamable-HTTP server with ``stateless_http=True``,
 so there is no session header to track: every request is self-contained and
 carries its own DPoP proof (``jti`` values are single-use server-side, so a
 fresh proof is minted per request).

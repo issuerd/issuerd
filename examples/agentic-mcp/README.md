@@ -23,7 +23,7 @@ browser ──► ChatApp (localhost:5108) ──► Issuerd (localhost:8080)
    │            │  FastAPI + HTMX        OIDC IdP: login, token,
    │            │                        exchange, CIBA, DPoP
    │            └─► McpServer (internal only) ──► PostgreSQL
-   │                 FastMCP resource server        shop DB, Row-Level
+   │                 MCPServer resource server      shop DB, Row-Level
    │                 JWT+DPoP+scope enforcement     Security per user sub
    └─ SSO cookie (issuerd) → CIBA approve form POST
 ```
