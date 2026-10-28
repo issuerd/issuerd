@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use issuerd_core::{ClientId, ClientIdentifier, Pagination, RealmId, RealmName, Storage, UserId};
+use issuerd_core::{
+    ClientId, ClientIdentifier, GroupId, Pagination, RealmId, RealmName, RoleName, Storage, UserId,
+};
 use rmcp::model::JsonObject;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,9 +17,11 @@ use crate::{
     policy::{self, PolicyDecision, PolicyDeny, ToolName, ToolPolicy},
     rate_limit::McpRateLimiter,
     tools::{
-        ClientGetArgs, ClientOutput, ClientsListArgs, ClientsOutput, NoArgs, RealmOutput,
-        UserDetailsOutput, UserGetArgs, UserOutput, UsersOutput, UsersSearchArgs,
-        DEFAULT_PAGE_SIZE, MAX_INPUT_STRING_BYTES, MAX_PAGE_SIZE,
+        ClientGetArgs, ClientOutput, ClientsListArgs, ClientsOutput, GroupGetArgs,
+        GroupMembersArgs, GroupOutput, GroupsListArgs, GroupsOutput, NoArgs, RealmOutput,
+        RoleGetArgs, RoleOutput, RolesListArgs, RolesOutput, UserDetailsOutput, UserGetArgs,
+        UserOutput, UsersOutput, UsersSearchArgs, DEFAULT_PAGE_SIZE, MAX_INPUT_STRING_BYTES,
+        MAX_PAGE_SIZE,
     },
 };
 
@@ -85,6 +89,11 @@ impl McpToolExecutor {
             ToolName::UsersGet => self.users_get(permit, arguments).await,
             ToolName::ClientsList => self.clients_list(permit, arguments).await,
             ToolName::ClientsGet => self.clients_get(permit, arguments).await,
+            ToolName::GroupsList => self.groups_list(permit, arguments).await,
+            ToolName::GroupsGet => self.groups_get(permit, arguments).await,
+            ToolName::GroupsMembers => self.groups_members(permit, arguments).await,
+            ToolName::RolesList => self.roles_list(permit, arguments).await,
+            ToolName::RolesGet => self.roles_get(permit, arguments).await,
         }
     }
 
@@ -229,6 +238,132 @@ impl McpToolExecutor {
             .ok_or(McpError::NotFound("client"))?;
         output(ClientOutput::from(&client))
     }
+
+    async fn groups_list(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let args: GroupsListArgs = decode(arguments)?;
+        let pagination = pagination(args.first, args.max)?;
+        let mut groups = self.storage.list_groups(&permit.target.realm_id, &pagination).await?;
+        groups.sort_by(|left, right| {
+            left.name.as_str().cmp(right.name.as_str()).then_with(|| left.id.cmp(&right.id))
+        });
+        output(GroupsOutput {
+            groups: groups.iter().map(GroupOutput::from).collect(),
+        })
+    }
+
+    async fn groups_get(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let args: GroupGetArgs = decode(arguments)?;
+        let id = required_id(&args.id, "id")?;
+        let uuid = uuid::Uuid::parse_str(id)
+            .map_err(|_| McpError::InvalidInput("id must be a group UUID".into()))?;
+        let group_id = GroupId::new(uuid.to_string())
+            .map_err(|error| McpError::InvalidInput(error.to_string()))?;
+        let group = self
+            .storage
+            .get_group(&permit.target.realm_id, &group_id)
+            .await?
+            .ok_or(McpError::NotFound("group"))?;
+        output(GroupOutput::from(&group))
+    }
+
+    async fn groups_members(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let args: GroupMembersArgs = decode(arguments)?;
+        let id = required_id(&args.id, "id")?;
+        let uuid = uuid::Uuid::parse_str(id)
+            .map_err(|_| McpError::InvalidInput("id must be a group UUID".into()))?;
+        let group_id = GroupId::new(uuid.to_string())
+            .map_err(|error| McpError::InvalidInput(error.to_string()))?;
+        let pagination = pagination(args.first, args.max)?;
+        self.storage
+            .get_group(&permit.target.realm_id, &group_id)
+            .await?
+            .ok_or(McpError::NotFound("group"))?;
+        let mut members = self
+            .storage
+            .list_group_members(
+                &permit.target.realm_id,
+                &group_id,
+                pagination.first,
+                pagination.max,
+            )
+            .await?;
+        sort_users(&mut members);
+        output(crate::tools::GroupMembersOutput {
+            members: members.iter().map(UserOutput::from).collect(),
+        })
+    }
+
+    async fn roles_list(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let args: RolesListArgs = decode(arguments)?;
+        let pagination = pagination(args.first, args.max)?;
+        let required = pagination.first.saturating_add(pagination.max);
+        let mut roles = Vec::new();
+        let mut storage_first = 0;
+        if pagination.max > 0 {
+            loop {
+                let batch = self
+                    .storage
+                    .list_roles(
+                        &permit.target.realm_id,
+                        &Pagination {
+                            first: storage_first,
+                            max: 100,
+                        },
+                    )
+                    .await?;
+                let batch_len = batch.len();
+                roles.extend(batch.into_iter().filter(|role| !role.client_role));
+                if batch_len < 100 || roles.len() >= required as usize {
+                    break;
+                }
+                storage_first = storage_first.saturating_add(100);
+            }
+        }
+        roles.sort_by(|left, right| {
+            left.name.as_str().cmp(right.name.as_str()).then_with(|| left.id.cmp(&right.id))
+        });
+        let roles = roles
+            .into_iter()
+            .skip(pagination.first.max(0) as usize)
+            .take(pagination.max.max(0) as usize)
+            .collect::<Vec<_>>();
+        output(RolesOutput {
+            roles: roles.iter().map(RoleOutput::from).collect(),
+        })
+    }
+
+    async fn roles_get(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let args: RoleGetArgs = decode(arguments)?;
+        let name = required_id(&args.name, "name")?;
+        let name =
+            RoleName::new(name).map_err(|error| McpError::InvalidInput(error.to_string()))?;
+        let role = self
+            .storage
+            .get_role_by_name(&permit.target.realm_id, name.as_str())
+            .await?
+            .ok_or(McpError::NotFound("role"))?;
+        output(RoleOutput::from(&role))
+    }
 }
 
 fn deny_to_error(decision: PolicyDecision) -> Result<(), McpError> {
@@ -333,8 +468,12 @@ mod tests {
 
     async fn permit(executor: &McpToolExecutor, tool: ToolName) -> McpToolPermit {
         let role = match tool {
-            ToolName::RealmGet => "view-realm",
-            ToolName::UsersGet | ToolName::UsersSearch => "view-users",
+            ToolName::RealmGet
+            | ToolName::GroupsGet
+            | ToolName::GroupsList
+            | ToolName::RolesGet
+            | ToolName::RolesList => "view-realm",
+            ToolName::UsersGet | ToolName::UsersSearch | ToolName::GroupsMembers => "view-users",
             ToolName::ClientsGet | ToolName::ClientsList => "view-clients",
         };
         executor.preflight(tool.as_str(), auth("mcp:read", &[role]), NOW).await.unwrap()
@@ -347,6 +486,182 @@ mod tests {
     ) -> Result<Value, McpError> {
         let permit = permit(executor, tool).await;
         executor.execute(&permit, arguments(args)).await
+    }
+
+    #[tokio::test]
+    async fn groups_list_and_get_are_sorted_hierarchical_and_redacted() {
+        let executor = executor(storage().await);
+        let all = execute(&executor, ToolName::GroupsList, json!({})).await.unwrap();
+        let groups = all["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["id"], ALPHA_GROUP_ID);
+        assert_eq!(groups[0]["parentId"], Value::Null);
+        assert_eq!(groups[1]["id"], ZETA_GROUP_ID);
+        assert_eq!(groups[1]["parentId"], ALPHA_GROUP_ID);
+        assert_eq!(groups[1]["path"], "/alpha-group/zeta-group");
+        assert!(!all.to_string().contains(GROUP_SECRET));
+        assert!(all["groups"][0].get("attributes").is_none());
+        assert!(all["groups"][0].get("realmRoles").is_none());
+
+        let page = execute(&executor, ToolName::GroupsList, json!({"first":1,"max":1}))
+            .await
+            .unwrap();
+        assert_eq!(page["groups"].as_array().unwrap().len(), 1);
+        let get = execute(&executor, ToolName::GroupsGet, json!({"id":ZETA_GROUP_ID}))
+            .await
+            .unwrap();
+        assert_eq!(get["name"], "zeta-group");
+        assert!(!get.to_string().contains(GROUP_SECRET));
+    }
+
+    #[tokio::test]
+    async fn groups_list_preserves_storage_name_order_across_page_boundaries() {
+        let storage = Arc::new(issuerd_storage::InMemoryStorage::new());
+        let realm = realm();
+        storage.create_realm(&realm).await.unwrap();
+        let parent = group("60000000-0000-4000-8000-000000000001", "z", None);
+        let other_root = group("60000000-0000-4000-8000-000000000002", "b", None);
+        let mut child = group("60000000-0000-4000-8000-000000000003", "a", Some(parent.id.clone()));
+        child.path = issuerd_core::GroupPath::new("/z/a").unwrap();
+        for group in [parent, other_root, child] {
+            storage.create_group(&realm.id, &group).await.unwrap();
+        }
+        let executor = executor(storage);
+
+        let first = execute(&executor, ToolName::GroupsList, json!({"first":0,"max":2}))
+            .await
+            .unwrap();
+        let first_names: Vec<_> = first["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(first_names, ["a", "b"]);
+        let second = execute(&executor, ToolName::GroupsList, json!({"first":2,"max":2}))
+            .await
+            .unwrap();
+        assert_eq!(second["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(second["groups"][0]["name"], "z");
+    }
+
+    #[tokio::test]
+    async fn group_id_and_pagination_inputs_are_validated_before_storage() {
+        let executor = executor(storage().await);
+        for tool in [ToolName::GroupsGet, ToolName::GroupsMembers] {
+            for args in [
+                json!({"id":"not-a-uuid"}),
+                json!({"id":format!(" {ALPHA_GROUP_ID} ")}),
+                json!({"id":""}),
+            ] {
+                assert!(matches!(
+                    execute(&executor, tool, args).await,
+                    Err(McpError::InvalidInput(_))
+                ));
+            }
+            assert_eq!(
+                execute(&executor, tool, json!({"id":"99999999-9999-4999-8999-999999999999"}))
+                    .await,
+                Err(McpError::NotFound("group"))
+            );
+        }
+        for args in [json!({"max":101}), json!({"first":4_294_967_295_u32})] {
+            assert!(matches!(
+                execute(&executor, ToolName::GroupsList, args.clone()).await,
+                Err(McpError::InvalidInput(_))
+            ));
+            assert!(matches!(
+                execute(&executor, ToolName::RolesList, args).await,
+                Err(McpError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            execute(
+                &executor,
+                ToolName::GroupsMembers,
+                json!({"id":"99999999-9999-4999-8999-999999999999","max":101})
+            )
+            .await,
+            Err(McpError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn groups_members_returns_sorted_safe_users() {
+        let executor = executor(storage().await);
+        let result = execute(&executor, ToolName::GroupsMembers, json!({"id":ZETA_GROUP_ID}))
+            .await
+            .unwrap();
+        let names: Vec<_> = result["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|user| user["username"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alice", "alicia", "bob"]);
+        assert!(!result.to_string().contains(USER_SECRET));
+        assert!(result["members"][0].get("credentials").is_none());
+        let page = execute(
+            &executor,
+            ToolName::GroupsMembers,
+            json!({"id":ZETA_GROUP_ID,"first":1,"max":1}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["members"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn roles_list_and_get_preserve_role_shape_without_attributes() {
+        let executor = executor(storage().await);
+        let list = execute(&executor, ToolName::RolesList, json!({})).await.unwrap();
+        let roles = list["roles"].as_array().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0]["name"], "alpha-role");
+        assert_eq!(roles[1]["name"], "zeta-role");
+        assert_eq!(roles[1]["composite"], true);
+        assert_eq!(roles[1]["composites"], json!(["alpha-role"]));
+        assert!(roles.iter().all(|role| role["clientRole"] == false));
+        assert!(!list.to_string().contains(ROLE_SECRET));
+        assert!(list["roles"][0].get("attributes").is_none());
+        let page = execute(&executor, ToolName::RolesList, json!({"first":1,"max":1}))
+            .await
+            .unwrap();
+        assert_eq!(page["roles"].as_array().unwrap().len(), 1);
+        assert_eq!(page["roles"][0]["name"], "zeta-role");
+
+        let realm = execute(&executor, ToolName::RolesGet, json!({"name":"zeta-role"}))
+            .await
+            .unwrap();
+        assert_eq!(realm["containerId"], REALM_ID);
+        let client = execute(&executor, ToolName::RolesGet, json!({"name":"client-only-role"}))
+            .await
+            .unwrap();
+        assert_eq!(client["clientRole"], true);
+        assert_eq!(client["containerId"], ALPHA_CLIENT_ID);
+        for args in [
+            json!({"name":""}),
+            json!({"name":" leading"}),
+            json!({"name":"x".repeat(256)}),
+        ] {
+            assert!(matches!(
+                execute(&executor, ToolName::RolesGet, args).await,
+                Err(McpError::InvalidInput(_))
+            ));
+        }
+        assert_eq!(
+            execute(&executor, ToolName::RolesGet, json!({"name":"missing"})).await,
+            Err(McpError::NotFound("role"))
+        );
+    }
+
+    #[tokio::test]
+    async fn roles_list_empty_page_does_not_read_storage() {
+        let executor = executor(Arc::new(MockStorage::new()));
+        let result = execute(&executor, ToolName::RolesList, json!({"first":99,"max":0}))
+            .await
+            .unwrap();
+        assert!(result["roles"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -585,6 +900,11 @@ mod tests {
             (ToolName::UsersGet, json!({"id": ALICE_ID})),
             (ToolName::ClientsList, json!({})),
             (ToolName::ClientsGet, json!({"id": ALPHA_CLIENT_ID})),
+            (ToolName::GroupsList, json!({})),
+            (ToolName::GroupsGet, json!({"id": ALPHA_GROUP_ID})),
+            (ToolName::GroupsMembers, json!({"id": ZETA_GROUP_ID})),
+            (ToolName::RolesList, json!({})),
+            (ToolName::RolesGet, json!({"name": "zeta-role"})),
         ];
         for (tool, args) in cases {
             let result = execute(&executor, tool, args).await.unwrap();

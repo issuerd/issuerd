@@ -20,9 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-28
+
 ### Added
 
 - **Read-only MCP server endpoint (Phase 1A).** `[mcp].enabled` exposes `POST /realms/{realm}/mcp` with `realm_get`, `users_search`, `users_get`, `clients_list`, and `clients_get`. The stateless dual-era Streamable HTTP server supports 2025-06-18, 2025-11-25, and 2026-07-28, authorization-filtered tools, curated secret-free DTOs, and distributed per-client+subject invocation limits. Same-realm exact resource provenance and realm roles are enforced on every call; DPoP is required by default, with an explicit Bearer compatibility mode and no downgrade in either direction. Protected-resource metadata now describes the real DPoP/Bearer profile and minimal `mcp:read` scope. ([#39](https://github.com/issuerd/issuerd/issues/39))
+- **Group and role MCP read tools (first Phase 1B batch).** The same endpoint now also exposes `groups_list`, `groups_get`, `groups_members`, `roles_list`, and `roles_get` with curated hierarchy/role DTOs and no arbitrary attribute maps. Group configuration and role reads require realm read roles; group member reads require user read roles, matching the Admin API. Role pages are fetched on demand through the existing `Storage::list_roles` API and filtered before caller pagination, so empty pages do not read storage. All ten tools participate in filtered discovery, repeated policy checks, output schemas, distributed invocation limits, dual-era `rmcp` coverage, Admin parity checks, and the external TypeScript DPoP acceptance rigs, including paginated setup and fixture discovery in populated realms. ([#39](https://github.com/issuerd/issuerd/issues/39))
 - **External TypeScript MCP acceptance client and read-only rigs.** `examples/mcp-admin` adds a pinned official-SDK public native CLI for authorization-code + PKCE + exact-resource issuance with DPoP, legacy and modern all-tool acceptance runs, idempotent lab setup, a finite in-memory local runner, and a PostgreSQL + Redis Compose rig. The CLI validates RFC 9207 issuer responses on success and error paths and keeps tokens, proofs, keys, cookies, and Authorization headers out of its JSON output.
 
 ### Fixed

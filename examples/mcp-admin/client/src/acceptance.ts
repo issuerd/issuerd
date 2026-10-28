@@ -25,6 +25,7 @@ import {
   scriptedAuthorization,
 } from "./login.js";
 import { NativeOAuthProvider } from "./provider.js";
+import { findInPages } from "./paging.js";
 import { requireSingleParameter, type AuthorizationEvidence } from "./validation.js";
 
 interface ToolCallEvidence {
@@ -43,6 +44,7 @@ interface EraEvidence {
   discoverSupportedVersions?: string[];
   tools: string[];
   calls: Record<string, ToolCallEvidence>;
+  additionalListCalls: number;
 }
 
 export interface AcceptanceReport {
@@ -92,21 +94,26 @@ async function callTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<ToolCallEvidence> {
-  const result: CallToolResult = await client.callTool({ name, arguments: args });
-  if (result.isError === true || result.structuredContent === undefined) {
-    throw new AcceptanceError(`${name} returned a tool error or no structured content`);
+  try {
+    const result: CallToolResult = await client.callTool({ name, arguments: args });
+    if (result.isError === true || result.structuredContent === undefined) {
+      throw new AcceptanceError(`${name} returned a tool error or no structured content`);
+    }
+    const first = result.content[0];
+    if (!first || first.type !== "text") throw new AcceptanceError(`${name} lacked its text JSON mirror`);
+    if (!isDeepStrictEqual(JSON.parse(first.text), result.structuredContent)) {
+      throw new AcceptanceError(`${name} text mirror differs from structuredContent`);
+    }
+    return {
+      arguments: args,
+      structuredContent: result.structuredContent,
+      outputSchemaValidated: true,
+      textMirrorMatched: true,
+    };
+  } catch (error) {
+    if (error instanceof AcceptanceError) throw error;
+    throw new AcceptanceError(`${name} failed SDK invocation or output schema validation`);
   }
-  const first = result.content[0];
-  if (!first || first.type !== "text") throw new AcceptanceError(`${name} lacked its text JSON mirror`);
-  if (!isDeepStrictEqual(JSON.parse(first.text), result.structuredContent)) {
-    throw new AcceptanceError(`${name} text mirror differs from structuredContent`);
-  }
-  return {
-    arguments: args,
-    structuredContent: result.structuredContent,
-    outputSchemaValidated: true,
-    textMirrorMatched: true,
-  };
 }
 
 async function runEra(
@@ -152,13 +159,31 @@ async function runEra(
     const listed = await client.listTools(undefined, { cacheMode: "refresh" });
     const names = listed.tools.map((tool) => tool.name);
     if (!isDeepStrictEqual(names, [...TOOL_NAMES])) {
-      throw new AcceptanceError("tools/list did not return exactly the five read-only tools in deterministic order");
+      throw new AcceptanceError("tools/list did not return exactly the ten read-only tools in deterministic order");
     }
     for (const tool of listed.tools) {
       if (!tool.outputSchema) throw new AcceptanceError(`${tool.name} has no output schema`);
     }
 
     const calls: Record<string, ToolCallEvidence> = {};
+    let additionalListCalls = 0;
+    const findPagedTool = (
+      name: string,
+      baseArgs: Record<string, unknown>,
+      outputKey: string,
+      predicate: (entry: Record<string, unknown>) => boolean,
+    ) =>
+      findInPages(
+        async (first, max) => {
+          const evidence = await callTool(client, name, { ...baseArgs, first, max });
+          if (calls[name]) additionalListCalls += 1;
+          else calls[name] = evidence;
+          return record(evidence.structuredContent, `${name} output`)[outputKey];
+        },
+        `${name} ${outputKey}`,
+        predicate,
+      );
+
     calls.realm_get = await callTool(client, "realm_get", {});
     const realm = record(calls.realm_get.structuredContent, "realm_get output");
     if (realm.realm !== options.realm) throw new AcceptanceError("realm_get returned the wrong realm");
@@ -190,6 +215,28 @@ async function runEra(
     if (record(calls.clients_get.structuredContent, "clients_get output").id !== clientId) {
       throw new AcceptanceError("clients_get did not return the discovered client UUID");
     }
+
+    const selectedGroup = await findPagedTool("groups_list", {}, "groups", (entry) => entry.name === "mcp-acceptance");
+    if (!selectedGroup) throw new AcceptanceError("groups_list did not discover mcp-acceptance");
+    const groupId = string(selectedGroup.id, "discovered group UUID");
+    calls.groups_get = await callTool(client, "groups_get", { id: groupId });
+    if (record(calls.groups_get.structuredContent, "groups_get output").id !== groupId) {
+      throw new AcceptanceError("groups_get did not return the discovered group UUID");
+    }
+    const member = await findPagedTool("groups_members", { id: groupId }, "members", (entry) => entry.id === userId);
+    if (!member) throw new AcceptanceError("groups_members did not return mcp-observer");
+
+    const selectedRole = await findPagedTool(
+      "roles_list",
+      {},
+      "roles",
+      (entry) => entry.name === "view-realm" && entry.clientRole === false,
+    );
+    if (!selectedRole) throw new AcceptanceError("roles_list did not discover the view-realm realm role");
+    calls.roles_get = await callTool(client, "roles_get", { name: "view-realm" });
+    if (record(calls.roles_get.structuredContent, "roles_get output").id !== selectedRole.id) {
+      throw new AcceptanceError("roles_get did not return the discovered realm role");
+    }
     for (const name of TOOL_NAMES) {
       if (!calls[name]) throw new AcceptanceError(`missing ${name} acceptance call`);
     }
@@ -202,6 +249,7 @@ async function runEra(
       ...(discover ? { discoverSupportedVersions: discover.supportedVersions } : {}),
       tools: names,
       calls,
+      additionalListCalls,
     };
   } finally {
     await client.close();
@@ -284,7 +332,9 @@ export async function runAcceptance(options: CliOptions): Promise<AcceptanceRepo
         }
       }
     }
-    evidence.assertComplete(options.era === "legacy" ? 0 : 7);
+    const additionalModernListCalls =
+      eras.find((era) => era.negotiatedEra === "modern")?.additionalListCalls ?? 0;
+    evidence.assertComplete(options.era === "legacy" ? 0 : TOOL_NAMES.length + 2 + additionalModernListCalls);
     return {
       ok: true,
       sdk: "@modelcontextprotocol/client@2.4.0",

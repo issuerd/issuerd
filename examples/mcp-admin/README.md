@@ -61,7 +61,9 @@ Setup uses the setup-only admin token to create:
 - enabled public native `mcp-admin-native` with optional `mcp:read` and the
   registered redirect `http://127.0.0.1:8080/callback`;
 - `mcp-admin` with `view-realm`, `view-users`, and `view-clients`;
-- additional user `mcp-observer` and client `mcp-reporting` fixtures.
+- additional user `mcp-observer` and client `mcp-reporting` fixtures;
+- group `mcp-acceptance` with `mcp-observer` as a member, plus the realm roles
+  used by role list/get acceptance.
 
 The actual redirect uses an ephemeral `127.0.0.1` listener port. The server must
 accept it through the native loopback-port exception; all other redirect
@@ -82,11 +84,12 @@ Expected `acceptance.json` evidence:
 - RFC 9207 issuer/state/redirect matches for both success and error responses;
 - a legacy `initialize` + `notifications/initialized` connection and, in
   `auto`, SDK auto-negotiation of modern `server/discover`;
-- all five tools in both eras, with IDs for `users_get` and `clients_get`
-  discovered from `users_search` and `clients_list` results;
+- all ten tools in both eras, with IDs for user, client, group, and role detail
+  calls discovered from the corresponding search/list results;
 - SDK `AjvJsonSchemaValidator` checks, exact structured/text mirror checks,
-  and seven modern wire results with `resultType:"complete"` (the SDK itself
-  strips this discriminator from its neutral result objects).
+  and twelve modern wire results with `resultType:"complete"` in the pristine
+  rig, plus any additional paginated lookup results needed in populated realms
+  (the SDK itself strips this discriminator from its neutral result objects).
 
 ## Interactive CLI
 

@@ -4,7 +4,12 @@ export const LEGACY_VERSIONS = ["2025-06-18", "2025-11-25"] as const;
 export const TOOL_NAMES = [
   "clients_get",
   "clients_list",
+  "groups_get",
+  "groups_list",
+  "groups_members",
   "realm_get",
+  "roles_get",
+  "roles_list",
   "users_get",
   "users_search",
 ] as const;

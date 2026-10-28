@@ -15,16 +15,26 @@ const CLIENT_ROLES: &[&str] = &["view-clients", "manage-clients"];
 pub enum ToolName {
     ClientsGet,
     ClientsList,
+    GroupsGet,
+    GroupsList,
+    GroupsMembers,
     RealmGet,
+    RolesGet,
+    RolesList,
     UsersGet,
     UsersSearch,
 }
 
 impl ToolName {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 10] = [
         Self::ClientsGet,
         Self::ClientsList,
+        Self::GroupsGet,
+        Self::GroupsList,
+        Self::GroupsMembers,
         Self::RealmGet,
+        Self::RolesGet,
+        Self::RolesList,
         Self::UsersGet,
         Self::UsersSearch,
     ];
@@ -33,7 +43,12 @@ impl ToolName {
         match self {
             Self::ClientsGet => "clients_get",
             Self::ClientsList => "clients_list",
+            Self::GroupsGet => "groups_get",
+            Self::GroupsList => "groups_list",
+            Self::GroupsMembers => "groups_members",
             Self::RealmGet => "realm_get",
+            Self::RolesGet => "roles_get",
+            Self::RolesList => "roles_list",
             Self::UsersGet => "users_get",
             Self::UsersSearch => "users_search",
         }
@@ -57,7 +72,7 @@ pub struct ToolPolicy {
     pub any_realm_roles: &'static [&'static str],
 }
 
-pub const POLICIES: [ToolPolicy; 5] = [
+pub const POLICIES: [ToolPolicy; 10] = [
     ToolPolicy {
         tool: ToolName::ClientsGet,
         required_scope: MCP_SCOPE_READ,
@@ -69,7 +84,32 @@ pub const POLICIES: [ToolPolicy; 5] = [
         any_realm_roles: CLIENT_ROLES,
     },
     ToolPolicy {
+        tool: ToolName::GroupsGet,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::GroupsList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::GroupsMembers,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: USER_ROLES,
+    },
+    ToolPolicy {
         tool: ToolName::RealmGet,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::RolesGet,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::RolesList,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: REALM_ROLES,
     },
@@ -106,7 +146,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 5] {
+pub fn policies() -> &'static [ToolPolicy; 10] {
     &POLICIES
 }
 
@@ -179,7 +219,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 5);
+        assert_eq!(unique.len(), 10);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -233,9 +273,24 @@ mod tests {
             (ToolName::UsersSearch, "manage-realm"),
             (ToolName::ClientsGet, "manage-users"),
             (ToolName::ClientsList, "view-realm"),
+            (ToolName::GroupsGet, "view-users"),
+            (ToolName::GroupsList, "view-clients"),
+            (ToolName::GroupsMembers, "view-realm"),
+            (ToolName::RolesGet, "manage-users"),
+            (ToolName::RolesList, "manage-clients"),
         ];
         for (tool, wrong_role) in cases {
             assert!(!decide_for(tool, &auth("mcp:read", &[wrong_role])).is_allowed());
+        }
+    }
+
+    #[test]
+    fn group_members_require_user_read_roles_like_the_admin_api() {
+        for role in ["view-users", "manage-users"] {
+            assert!(decide_for(ToolName::GroupsMembers, &auth("mcp:read", &[role])).is_allowed());
+        }
+        for role in ["view-realm", "manage-realm", "view-clients"] {
+            assert!(!decide_for(ToolName::GroupsMembers, &auth("mcp:read", &[role])).is_allowed());
         }
     }
 }

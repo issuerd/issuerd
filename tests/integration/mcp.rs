@@ -49,10 +49,15 @@ const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const REDIRECT_URI: &str = "http://localhost:8080/cb";
 const LEGACY_VERSIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_11_25];
-const TOOL_NAMES: [&str; 5] = [
+const TOOL_NAMES: [&str; 10] = [
     "clients_get",
     "clients_list",
+    "groups_get",
+    "groups_list",
+    "groups_members",
     "realm_get",
+    "roles_get",
+    "roles_list",
     "users_get",
     "users_search",
 ];
@@ -460,7 +465,10 @@ async fn add_roles(server: &Loopback, fixture: &Fixture, roles: &[&str]) {
                         client_id: None,
                         composite: false,
                         composites: Vec::new(),
-                        attributes: HashMap::new(),
+                        attributes: HashMap::from([(
+                            "password".to_string(),
+                            vec!["ROLE-SECRET-CANARY".to_string()],
+                        )]),
                     };
                     server.state.storage.create_role(&fixture.realm.id, &role).await.unwrap();
                     role
@@ -792,6 +800,7 @@ fn assert_tool_result(result: &CallToolResult, schema: &Value, modern: bool) {
 }
 
 async fn exercise_all_tools(
+    server: &Loopback,
     client: &RunningService<RoleClient, ClientConfig>,
     fixture: &Fixture,
     modern: bool,
@@ -808,6 +817,7 @@ async fn exercise_all_tools(
         assert_eq!(list.ttl_ms, None);
         assert_eq!(list.cache_scope, None);
     }
+    let group_id = create_group(server, fixture, &fixture.user, &unique("mcp-group")).await;
     let schemas = output_schemas(&list);
     let calls = [
         ("realm_get", json!({})),
@@ -815,6 +825,11 @@ async fn exercise_all_tools(
         ("users_get", json!({"id":fixture.user.id.to_string()})),
         ("clients_list", json!({"clientId":fixture.client.client_id.as_str()})),
         ("clients_get", json!({"id":fixture.client.id.to_string()})),
+        ("groups_list", json!({})),
+        ("groups_get", json!({"id":group_id})),
+        ("groups_members", json!({"id":group_id})),
+        ("roles_list", json!({})),
+        ("roles_get", json!({"name":"view-realm"})),
     ];
     for (tool, arguments) in calls {
         let params =
@@ -905,7 +920,7 @@ async fn rmcp_legacy_lifecycles_cover_both_versions_and_all_tools() {
         )
         .await;
         assert_peer_info(&client.peer_info().unwrap(), version);
-        exercise_all_tools(&client, &fixture, false).await;
+        exercise_all_tools(&server, &client, &fixture, false).await;
         client.cancel().await.unwrap();
     }
 }
@@ -941,7 +956,7 @@ async fn rmcp_modern_discover_covers_versions_hints_and_all_tools() {
     assert_eq!(discovery.cache_scope, CacheScope::Private);
     assert_eq!(discovery.server_info().unwrap().name, "issuerd");
     assert_eq!(discovery.capabilities.tools.unwrap().list_changed, None);
-    exercise_all_tools(&client, &fixture, true).await;
+    exercise_all_tools(&server, &client, &fixture, true).await;
     client.cancel().await.unwrap();
 }
 
@@ -1130,7 +1145,7 @@ async fn origin_host_methods_and_last_event_id_follow_stateless_transport() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_session_id(&response);
     let body = response_json(response).await;
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 10);
 }
 
 #[tokio::test]
@@ -1405,11 +1420,19 @@ async fn separate_rmcp_service_emits_real_sse_when_json_mode_is_off() {
 #[tokio::test]
 async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
     let server = spawn_server(ServerOptions::default()).await;
+    let realm_tools = &[
+        "groups_get",
+        "groups_list",
+        "realm_get",
+        "roles_get",
+        "roles_list",
+    ][..];
+    let user_tools = &["groups_members", "users_get", "users_search"][..];
     let cases: [(&str, &[&str]); 6] = [
-        ("view-realm", &["realm_get"]),
-        ("manage-realm", &["realm_get"]),
-        ("view-users", &["users_get", "users_search"]),
-        ("manage-users", &["users_get", "users_search"]),
+        ("view-realm", realm_tools),
+        ("manage-realm", realm_tools),
+        ("view-users", user_tools),
+        ("manage-users", user_tools),
         ("view-clients", &["clients_get", "clients_list"]),
         ("manage-clients", &["clients_get", "clients_list"]),
     ];
@@ -1451,6 +1474,11 @@ fn call_arguments(fixture: &Fixture, tool: &str) -> Value {
         "users_get" => json!({"id":fixture.user.id.to_string()}),
         "clients_list" => json!({"clientId":fixture.client.client_id.as_str()}),
         "clients_get" => json!({"id":fixture.client.id.to_string()}),
+        "groups_list" | "roles_list" => json!({}),
+        "groups_get" | "groups_members" => {
+            json!({"id":"00000000-0000-4000-8000-000000000000"})
+        }
+        "roles_get" => json!({"name":"view-realm"}),
         _ => panic!("unknown tool fixture: {tool}"),
     }
 }
@@ -1617,7 +1645,10 @@ async fn create_group(server: &Loopback, fixture: &Fixture, user: &User, name: &
         realm_id: fixture.realm.id.clone(),
         parent_id: None,
         sub_groups: Vec::new(),
-        attributes: HashMap::new(),
+        attributes: HashMap::from([(
+            "password".to_string(),
+            vec!["GROUP-SECRET-CANARY".to_string()],
+        )]),
         realm_roles: Vec::new(),
         client_roles: HashMap::new(),
     };
@@ -1821,6 +1852,100 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
     assert_selected_fields(&output, &expected, CLIENT_FIELDS);
     all_output.push(output);
 
+    let result = client.call_tool(CallToolRequestParams::new("groups_list")).await.unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(&server, &admin, &format!("/admin/realms/{realm_name}/groups")).await;
+    let actual_groups = output["groups"].as_array().unwrap();
+    assert_eq!(actual_groups.len(), expected.as_array().unwrap().len());
+    for actual in actual_groups {
+        let expected_group = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == actual["id"])
+            .unwrap();
+        assert_selected_fields(actual, expected_group, &["id", "name", "path"]);
+        assert_eq!(actual["parentId"], expected_group["parent_id"]);
+    }
+    all_output.push(output);
+
+    let group_id = groups[0].clone();
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("groups_get")
+                .with_arguments(json!({"id":group_id}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected =
+        admin_json(&server, &admin, &format!("/admin/realms/{realm_name}/groups/{group_id}")).await;
+    assert_selected_fields(&output, &expected, &["id", "name", "path"]);
+    assert_eq!(output["parentId"], expected["parent_id"]);
+    all_output.push(output);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("groups_members")
+                .with_arguments(json!({"id":group_id}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(
+        &server,
+        &admin,
+        &format!("/admin/realms/{realm_name}/groups/{group_id}/members"),
+    )
+    .await;
+    let members = output["members"].as_array().unwrap();
+    assert_eq!(members.len(), expected.as_array().unwrap().len());
+    for (actual, expected) in members.iter().zip(expected.as_array().unwrap()) {
+        assert_selected_fields(actual, expected, USER_FIELDS);
+    }
+    all_output.push(output);
+
+    let result = client.call_tool(CallToolRequestParams::new("roles_list")).await.unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(&server, &admin, &format!("/admin/realms/{realm_name}/roles")).await;
+    let actual_roles = output["roles"].as_array().unwrap();
+    assert_eq!(actual_roles.len(), expected.as_array().unwrap().len());
+    for actual in actual_roles {
+        let expected_role = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == actual["id"])
+            .unwrap();
+        assert_selected_fields(
+            actual,
+            expected_role,
+            &["id", "name", "description", "composite", "composites"],
+        );
+        assert_eq!(actual["clientRole"], expected_role["client_role"]);
+        assert_eq!(actual["containerId"], expected_role["container_id"]);
+    }
+    all_output.push(output);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("roles_get")
+                .with_arguments(json!({"name":"zeta-role"}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected =
+        admin_json(&server, &admin, &format!("/admin/realms/{realm_name}/roles/zeta-role")).await;
+    assert_selected_fields(
+        &output,
+        &expected,
+        &["id", "name", "description", "composite", "composites"],
+    );
+    assert_eq!(output["clientRole"], expected["client_role"]);
+    assert_eq!(output["containerId"], expected["container_id"]);
+    all_output.push(output);
+
     let serialized = Value::Array(all_output).to_string();
     for canary in [
         "SMTP-PASSWORD-CANARY",
@@ -1829,6 +1954,8 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
         "USER-SECRET-CANARY",
         "CLIENT-SECRET-CANARY",
         "CLIENT-ATTR-CANARY",
+        "GROUP-SECRET-CANARY",
+        "ROLE-SECRET-CANARY",
         "smtpServer",
         "pairwise_sector_key",
         "attributes",
@@ -2154,18 +2281,15 @@ async fn strict_dpop_succeeds_for_every_tool() {
     let fixture = make_fixture(&server, "strict-tools", &ALL_READ_ROLES).await;
     let key = DpopKey::new();
     let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
+    let group_id = create_group(&server, &fixture, &fixture.user, "strict-tool-group").await;
 
     for tool in TOOL_NAMES {
-        let response = call_dpop(
-            &server,
-            &fixture,
-            &issued.access_token,
-            &key,
-            tool,
-            call_arguments(&fixture, tool),
-            None,
-        )
-        .await;
+        let arguments = match tool {
+            "groups_get" | "groups_members" => json!({"id":&group_id}),
+            _ => call_arguments(&fixture, tool),
+        };
+        let response =
+            call_dpop(&server, &fixture, &issued.access_token, &key, tool, arguments, None).await;
         assert_eq!(response.status(), StatusCode::OK, "tool: {tool}");
         assert_no_session_id(&response);
         assert_no_store(&response);

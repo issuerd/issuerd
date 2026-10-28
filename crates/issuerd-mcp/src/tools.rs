@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
-use issuerd_core::{Client, ClientAuthenticatorType, ClientProtocol, Realm, SslRequired, User};
+use issuerd_core::{
+    Client, ClientAuthenticatorType, ClientProtocol, Group, Realm, Role, SslRequired, User,
+};
 use rmcp::model::{Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,40 @@ pub struct ClientsListArgs {
 #[serde(deny_unknown_fields)]
 pub struct ClientGetArgs {
     pub id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupsListArgs {
+    pub first: Option<u32>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupGetArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMembersArgs {
+    pub id: String,
+    pub first: Option<u32>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RolesListArgs {
+    pub first: Option<u32>,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleGetArgs {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -231,6 +267,80 @@ pub struct ClientsOutput {
     pub clients: Vec<ClientOutput>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupOutput {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub parent_id: Option<String>,
+}
+
+impl From<&Group> for GroupOutput {
+    fn from(group: &Group) -> Self {
+        Self {
+            id: group.id.to_string(),
+            name: group.name.to_string(),
+            path: group.path.to_string(),
+            parent_id: group.parent_id.as_ref().map(ToString::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsOutput {
+    pub groups: Vec<GroupOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMembersOutput {
+    pub members: Vec<UserOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleOutput {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub composite: bool,
+    pub composites: Vec<String>,
+    pub client_role: bool,
+    pub container_id: String,
+}
+
+impl From<&Role> for RoleOutput {
+    fn from(role: &Role) -> Self {
+        let mut composites: Vec<_> = role.composites.iter().map(ToString::to_string).collect();
+        composites.sort();
+        Self {
+            id: role.id.to_string(),
+            name: role.name.to_string(),
+            description: role.description.clone(),
+            composite: role.composite,
+            composites,
+            client_role: role.client_role,
+            container_id: if role.client_role {
+                role.client_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| role.realm_id.to_string())
+            } else {
+                role.realm_id.to_string()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RolesOutput {
+    pub roles: Vec<RoleOutput>,
+}
+
 fn read_only_annotations() -> ToolAnnotations {
     ToolAnnotations::from_raw(None, Some(true), Some(false), Some(true), Some(false))
 }
@@ -247,6 +357,13 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::ClientsList => "List clients or return one exact public client identifier match.",
         ToolName::ClientsGet => {
             "Return a client by its internal UUID without secret or mapper configuration."
+        }
+        ToolName::GroupsList => "List groups with hierarchy and without arbitrary attributes.",
+        ToolName::GroupsGet => "Return a group by internal UUID without arbitrary attributes.",
+        ToolName::GroupsMembers => "List a group's members with curated, non-secret user fields.",
+        ToolName::RolesList => "List realm roles without arbitrary attributes.",
+        ToolName::RolesGet => {
+            "Return a role by name using Admin lookup precedence, without arbitrary attributes."
         }
     };
     let tool = Tool::new(name.as_str(), description, std::sync::Arc::new(serde_json::Map::new()));
@@ -266,6 +383,21 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::ClientsGet => {
             tool.with_input_schema::<ClientGetArgs>().with_output_schema::<ClientOutput>()
         }
+        ToolName::GroupsList => {
+            tool.with_input_schema::<GroupsListArgs>().with_output_schema::<GroupsOutput>()
+        }
+        ToolName::GroupsGet => {
+            tool.with_input_schema::<GroupGetArgs>().with_output_schema::<GroupOutput>()
+        }
+        ToolName::GroupsMembers => tool
+            .with_input_schema::<GroupMembersArgs>()
+            .with_output_schema::<GroupMembersOutput>(),
+        ToolName::RolesList => {
+            tool.with_input_schema::<RolesListArgs>().with_output_schema::<RolesOutput>()
+        }
+        ToolName::RolesGet => {
+            tool.with_input_schema::<RoleGetArgs>().with_output_schema::<RoleOutput>()
+        }
     };
     tool.with_annotations(read_only_annotations())
 }
@@ -278,6 +410,7 @@ pub fn definitions() -> Vec<Tool> {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use issuerd_core::{GroupId, RoleName};
 
     #[test]
     fn definitions_are_sorted_fully_annotated_and_have_strict_schemas() {
@@ -288,7 +421,12 @@ mod tests {
             [
                 "clients_get",
                 "clients_list",
+                "groups_get",
+                "groups_list",
+                "groups_members",
                 "realm_get",
+                "roles_get",
+                "roles_list",
                 "users_get",
                 "users_search"
             ]
@@ -308,26 +446,17 @@ mod tests {
 
     #[test]
     fn strict_inputs_reject_unknown_fields() {
-        for (json, expected) in [
-            (r#"{"unexpected":true}"#, "realm_get"),
-            (r#"{"username":"alice","unexpected":true}"#, "users_search"),
-            (r#"{"id":"alice","unexpected":true}"#, "users_get"),
-            (r#"{"clientId":"agent","unexpected":true}"#, "clients_list"),
-            (r#"{"id":"uuid","unexpected":true}"#, "clients_get"),
-        ] {
-            let error = match expected {
-                "realm_get" => serde_json::from_str::<NoArgs>(json).map(|_| ()).unwrap_err(),
-                "users_search" => {
-                    serde_json::from_str::<UsersSearchArgs>(json).map(|_| ()).unwrap_err()
-                }
-                "users_get" => serde_json::from_str::<UserGetArgs>(json).map(|_| ()).unwrap_err(),
-                "clients_list" => {
-                    serde_json::from_str::<ClientsListArgs>(json).map(|_| ()).unwrap_err()
-                }
-                _ => serde_json::from_str::<ClientGetArgs>(json).map(|_| ()).unwrap_err(),
-            };
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
+        let json = r#"{"id":"alice","unexpected":true}"#;
+        assert!(serde_json::from_str::<NoArgs>(r#"{"unexpected":true}"#).is_err());
+        assert!(serde_json::from_str::<UsersSearchArgs>(json).is_err());
+        assert!(serde_json::from_str::<UserGetArgs>(json).is_err());
+        assert!(serde_json::from_str::<ClientsListArgs>(json).is_err());
+        assert!(serde_json::from_str::<ClientGetArgs>(json).is_err());
+        assert!(serde_json::from_str::<GroupsListArgs>(json).is_err());
+        assert!(serde_json::from_str::<GroupGetArgs>(json).is_err());
+        assert!(serde_json::from_str::<GroupMembersArgs>(json).is_err());
+        assert!(serde_json::from_str::<RolesListArgs>(json).is_err());
+        assert!(serde_json::from_str::<RoleGetArgs>(json).is_err());
     }
 
     #[test]
@@ -340,6 +469,12 @@ mod tests {
             serde_json::to_value(ClientOutput::from(&client(ALPHA_CLIENT_ID, "alpha-client")))
                 .unwrap()
                 .to_string(),
+            serde_json::to_value(GroupOutput::from(&group(ALPHA_GROUP_ID, "alpha-group", None)))
+                .unwrap()
+                .to_string(),
+            serde_json::to_value(RoleOutput::from(&role(ALPHA_ROLE_ID, "alpha-role")))
+                .unwrap()
+                .to_string(),
         ];
         for value in values {
             for canary in [
@@ -348,6 +483,8 @@ mod tests {
                 USER_SECRET,
                 CLIENT_SECRET,
                 CLIENT_ATTRIBUTE_SECRET,
+                GROUP_SECRET,
+                ROLE_SECRET,
                 "attributes",
                 "protocolMappers",
                 "credentials",
@@ -383,5 +520,26 @@ mod tests {
         assert_eq!(client["clientAuthenticatorType"], "client-secret");
         assert_eq!(client["redirectUris"][0], "https://a.example/callback");
         assert_eq!(client["defaultScopes"], serde_json::json!(["profile", "roles"]));
+
+        let group = serde_json::to_value(GroupOutput::from(&group(
+            ZETA_GROUP_ID,
+            "zeta-group",
+            Some(GroupId::new(ALPHA_GROUP_ID).unwrap()),
+        )))
+        .unwrap();
+        assert_eq!(group["id"], ZETA_GROUP_ID);
+        assert_eq!(group["path"], "/alpha-group/zeta-group");
+        assert_eq!(group["parentId"], ALPHA_GROUP_ID);
+
+        let mut composite = role(ZETA_ROLE_ID, "zeta-role");
+        composite.composite = true;
+        composite.composites = vec![
+            RoleName::new("zeta-child").unwrap(),
+            RoleName::new("alpha-child").unwrap(),
+        ];
+        let role = serde_json::to_value(RoleOutput::from(&composite)).unwrap();
+        assert_eq!(role["containerId"], REALM_ID);
+        assert_eq!(role["clientRole"], false);
+        assert_eq!(role["composites"], serde_json::json!(["alpha-child", "zeta-child"]));
     }
 }

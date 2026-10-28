@@ -2,7 +2,7 @@
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
 agent-native administration. The current increment is deliberately read-only:
-five curated tools, no built-in chat, no LLM provider, and no token passthrough
+ten curated tools, no built-in chat, no LLM provider, and no token passthrough
 to another API.
 
 ## Enable and configure
@@ -56,6 +56,11 @@ or invocation allowance.
 | `users_get` | `mcp:read` | `view-users`, `manage-users` | User by canonical internal UUID, direct realm roles and groups |
 | `clients_list` | `mcp:read` | `view-clients`, `manage-clients` | Paginated clients or exact public `clientId` |
 | `clients_get` | `mcp:read` | `view-clients`, `manage-clients` | Client by internal UUID, without secret configuration |
+| `groups_list` | `mcp:read` | `view-realm`, `manage-realm` | Paginated group IDs, names, paths, and parent IDs |
+| `groups_get` | `mcp:read` | `view-realm`, `manage-realm` | Group by canonical internal UUID, without attributes |
+| `groups_members` | `mcp:read` | `view-users`, `manage-users` | Paginated curated members of an existing group |
+| `roles_list` | `mcp:read` | `view-realm`, `manage-realm` | Paginated realm roles, excluding client roles before pagination |
+| `roles_get` | `mcp:read` | `view-realm`, `manage-realm` | Role by name with Admin lookup precedence and container metadata |
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or
@@ -68,14 +73,19 @@ are still mandatory.
 calls also consume invocation allowance. A no-`id` `tools/call` notification is
 rejected as malformed before authentication and consumes no allowance. Exact
 filters take precedence over pagination. Defaults are `first=0`, `max=20`, with
-`max <= 100` and bounded input strings. Malformed user UUID input is an input
-error, not a storage failure.
+`max <= 100` and bounded input strings. Malformed user, client, or group UUID
+input is an input error, not a storage failure. Role names are required and
+bounded. An unknown group is not found rather than an empty member page.
+`groups_list` retains storage name ordering across pages. Member pagination is
+validated before group lookup, and `roles_list` uses bounded on-demand storage
+batches rather than unconditionally loading the complete role catalog.
 
 Outputs use curated DTOs rather than raw storage models. Arbitrary realm,
-user, and client attribute maps, client secrets, credentials, SMTP passwords,
-pairwise sector keys, and protocol-mapper configuration are not returned.
-Directory text can still contain indirect prompt injection: output redaction
-is not a substitute for least privilege and external-client approval UX.
+user, client, group, and role attribute maps, client secrets, credentials, SMTP
+passwords, pairwise sector keys, and protocol-mapper configuration are not
+returned. Directory text can still contain indirect prompt injection: output
+redaction is not a substitute for least privilege and external-client approval
+UX.
 
 ## Resource-specific token profile
 
@@ -213,7 +223,7 @@ Run the branch-built daemon with PostgreSQL and Redis:
 ./examples/mcp-admin/scripts/e2e-compose.sh
 ```
 
-Both scripts complete authorization-code issuance and all five tools in legacy
+Both scripts complete authorization-code issuance and all ten tools in legacy
 and modern modes. The Compose script removes its own project and volumes on
 exit. See [`examples/mcp-admin/README.md`](../examples/mcp-admin/README.md) for
 interactive commands, lab-only credentials, and the evidence schema.

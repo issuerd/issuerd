@@ -22,11 +22,18 @@ pub const BOB_ID: &str = "20000000-0000-4000-8000-000000000003";
 pub const ALPHA_CLIENT_ID: &str = "30000000-0000-4000-8000-000000000001";
 pub const BETA_CLIENT_ID: &str = "30000000-0000-4000-8000-000000000002";
 pub const ZETA_CLIENT_ID: &str = "30000000-0000-4000-8000-000000000003";
+pub const ALPHA_ROLE_ID: &str = "40000000-0000-4000-8000-000000000001";
+pub const ZETA_ROLE_ID: &str = "40000000-0000-4000-8000-000000000002";
+pub const CLIENT_ROLE_ID: &str = "40000000-0000-4000-8000-000000000003";
+pub const ALPHA_GROUP_ID: &str = "50000000-0000-4000-8000-000000000001";
+pub const ZETA_GROUP_ID: &str = "50000000-0000-4000-8000-000000000002";
 pub const REALM_SECRET: &str = "REALM-SMTP-CANARY-SECRET";
 pub const PAIRWISE_SECRET: &str = "PAIRWISE-CANARY-SECRET";
 pub const USER_SECRET: &str = "USER-ATTRIBUTE-CANARY-SECRET";
 pub const CLIENT_SECRET: &str = "CLIENT-CANARY-SECRET";
 pub const CLIENT_ATTRIBUTE_SECRET: &str = "CLIENT-ATTRIBUTE-CANARY-SECRET";
+pub const GROUP_SECRET: &str = "GROUP-ATTRIBUTE-CANARY-SECRET";
+pub const ROLE_SECRET: &str = "ROLE-ATTRIBUTE-CANARY-SECRET";
 
 pub fn auth(scope: &str, roles: &[&str]) -> McpAuthContext {
     auth_with("agent", "internal-user", scope, roles)
@@ -142,6 +149,39 @@ pub fn client(id: &str, client_id: &str) -> Client {
     }
 }
 
+pub fn role(id: &str, name: &str) -> Role {
+    Role {
+        id: RoleId::new(id).unwrap(),
+        name: RoleName::new(name).unwrap(),
+        description: Some(format!("{name} description")),
+        realm_id: RealmId::new(REALM_ID).unwrap(),
+        client_role: false,
+        client_id: None,
+        composite: false,
+        composites: Vec::new(),
+        attributes: HashMap::from([("password".into(), vec![ROLE_SECRET.into()])]),
+    }
+}
+
+pub fn group(id: &str, name: &str, parent_id: Option<GroupId>) -> Group {
+    let path = if parent_id.is_some() {
+        format!("/alpha-group/{name}")
+    } else {
+        format!("/{name}")
+    };
+    Group {
+        id: GroupId::new(id).unwrap(),
+        name: GroupName::new(name).unwrap(),
+        path: GroupPath::new(path).unwrap(),
+        realm_id: RealmId::new(REALM_ID).unwrap(),
+        parent_id,
+        sub_groups: Vec::new(),
+        attributes: HashMap::from([("password".into(), vec![GROUP_SECRET.into()])]),
+        realm_roles: Vec::new(),
+        client_roles: HashMap::new(),
+    }
+}
+
 pub async fn storage() -> Arc<InMemoryStorage> {
     let storage = Arc::new(InMemoryStorage::new());
     let realm = realm();
@@ -161,45 +201,39 @@ pub async fn storage() -> Arc<InMemoryStorage> {
         storage.create_client(&realm.id, &fixture).await.unwrap();
     }
 
-    for (id, name) in [
-        ("40000000-0000-4000-8000-000000000002", "zeta-role"),
-        ("40000000-0000-4000-8000-000000000001", "alpha-role"),
-    ] {
-        let role = Role {
-            id: RoleId::new(id).unwrap(),
-            name: RoleName::new(name).unwrap(),
-            description: None,
-            realm_id: realm.id.clone(),
-            client_role: false,
-            client_id: None,
-            composite: false,
-            composites: Vec::new(),
-            attributes: HashMap::new(),
-        };
+    let mut client_role = role(CLIENT_ROLE_ID, "client-only-role");
+    client_role.client_role = true;
+    client_role.client_id = Some(ClientId::new(ALPHA_CLIENT_ID).unwrap());
+    storage.create_role(&realm.id, &client_role).await.unwrap();
+    for (id, name) in [(ZETA_ROLE_ID, "zeta-role"), (ALPHA_ROLE_ID, "alpha-role")] {
+        let mut role = role(id, name);
+        if name == "zeta-role" {
+            role.composite = true;
+            role.composites = vec![RoleName::new("alpha-role").unwrap()];
+        }
         storage.create_role(&realm.id, &role).await.unwrap();
         storage
             .add_user_realm_role(&realm.id, &UserId::new(ALICE_ID).unwrap(), &role.id)
             .await
             .unwrap();
     }
-    for (id, name) in [
-        ("50000000-0000-4000-8000-000000000002", "zeta-group"),
-        ("50000000-0000-4000-8000-000000000001", "alpha-group"),
-    ] {
-        let group = Group {
-            id: GroupId::new(id).unwrap(),
-            name: GroupName::new(name).unwrap(),
-            path: GroupPath::new(format!("/{name}")).unwrap(),
-            realm_id: realm.id.clone(),
-            parent_id: None,
-            sub_groups: Vec::new(),
-            attributes: HashMap::from([("password".into(), vec![USER_SECRET.into()])]),
-            realm_roles: Vec::new(),
-            client_roles: HashMap::new(),
-        };
+    let alpha_group = group(ALPHA_GROUP_ID, "alpha-group", None);
+    let zeta_group =
+        group(ZETA_GROUP_ID, "zeta-group", Some(GroupId::new(ALPHA_GROUP_ID).unwrap()));
+    for group in [zeta_group, alpha_group] {
         storage.create_group(&realm.id, &group).await.unwrap();
         storage
             .add_user_group(&realm.id, &UserId::new(ALICE_ID).unwrap(), &group.id)
+            .await
+            .unwrap();
+    }
+    for user_id in [ALICIA_ID, BOB_ID] {
+        storage
+            .add_user_group(
+                &realm.id,
+                &UserId::new(user_id).unwrap(),
+                &GroupId::new(ZETA_GROUP_ID).unwrap(),
+            )
             .await
             .unwrap();
     }

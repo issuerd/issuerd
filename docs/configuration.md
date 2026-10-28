@@ -483,7 +483,7 @@ is advertised — clients discover the requirement from the
 
 MCP (Model Context Protocol) surface. The flag gates three pieces:
 
-- The read-only MCP endpoint at `POST /realms/{realm}/mcp`, with five curated
+- The read-only MCP endpoint at `POST /realms/{realm}/mcp`, with ten curated
   tools, dual-era stateless transport, exact audience/provenance and DPoP
   enforcement, and distributed invocation limits. See
   [mcp-server.md](mcp-server.md) for the complete contract and client rigs.

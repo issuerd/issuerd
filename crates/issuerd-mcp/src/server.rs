@@ -266,9 +266,18 @@ mod tests {
         )
         .await;
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "realm_get");
-        assert!(response["result"]["tools"][0]["outputSchema"].is_object());
+        let names: Vec<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "groups_get",
+                "groups_list",
+                "realm_get",
+                "roles_get",
+                "roles_list"
+            ]
+        );
+        assert!(tools.iter().all(|tool| tool["outputSchema"].is_object()));
         assert!(response["result"].get("ttlMs").is_none());
         assert!(response["result"].get("cacheScope").is_none());
         assert!(response["result"].get("resultType").is_none());
@@ -284,7 +293,16 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["clients_get", "clients_list", "users_get", "users_search"]);
+        assert_eq!(
+            names,
+            [
+                "clients_get",
+                "clients_list",
+                "groups_members",
+                "users_get",
+                "users_search"
+            ]
+        );
     }
 
     #[tokio::test]

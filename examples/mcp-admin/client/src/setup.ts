@@ -1,3 +1,5 @@
+import { findInPages } from "./paging.js";
+
 type JsonObject = Record<string, unknown>;
 
 interface SetupOptions {
@@ -190,6 +192,41 @@ class AdminApi {
     return updated === null ? { ...current, ...desired, id: uuid } : object(updated, "updated client");
   }
 
+  async ensureGroup(token: string, name: string, userId: string): Promise<JsonObject> {
+    const base = `/admin/realms/${encodeURIComponent(this.config.realm)}`;
+    let group = await findInPages(
+      (first, max) => this.expect(`${base}/groups?first=${first}&max=${max}`, { token }),
+      "groups",
+      (entry) => entry.name === name,
+    );
+    if (!group) {
+      group = object(
+        await this.expect(
+          `${base}/groups`,
+          { method: "POST", token, body: { name, path: `/${name}` } },
+          [201],
+        ),
+        "created group",
+      );
+    }
+    const groupId = id(group);
+    const member = await findInPages(
+      (first, max) =>
+        this.expect(`${base}/groups/${encodeURIComponent(groupId)}/members?first=${first}&max=${max}`, {
+          token,
+        }),
+      "group members",
+      (entry) => entry.id === userId,
+    );
+    if (!member) {
+      await this.expect(`${base}/users/${encodeURIComponent(userId)}/groups/${encodeURIComponent(groupId)}`, {
+        method: "PUT",
+        token,
+      }, [200, 204]);
+    }
+    return group;
+  }
+
   async ensureUser(
     token: string,
     username: string,
@@ -266,6 +303,7 @@ async function main(): Promise<void> {
     const reporting = await api.ensureClient(token, "mcp-reporting", false);
     const admin = await api.ensureUser(token, "mcp-admin", READ_ROLES, roles);
     const observer = await api.ensureUser(token, "mcp-observer", ["view-users"], roles);
+    const group = await api.ensureGroup(token, "mcp-acceptance", id(observer));
     process.stdout.write(`${JSON.stringify({
       ok: true,
       issuer: `${config.baseUrl}/realms/${config.realm}`,
@@ -285,6 +323,8 @@ async function main(): Promise<void> {
           { id: id(observer), username: "mcp-observer", roles: ["view-users"] },
         ],
         clients: [{ id: id(reporting), clientId: "mcp-reporting" }],
+        groups: [{ id: id(group), name: "mcp-acceptance", member: "mcp-observer" }],
+        roles: READ_ROLES,
       },
     }, null, 2)}\n`);
   } catch (error) {
