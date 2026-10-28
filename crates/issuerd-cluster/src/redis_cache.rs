@@ -58,7 +58,7 @@ impl RedisCache {
             error!(error = %e, "redis client creation failed");
             IssuerdError::ServerError(format!("redis client create failed: {e}"))
         })?;
-        let conn = client.get_multiplexed_tokio_connection().await.map_err(|e| {
+        let conn = client.get_multiplexed_async_connection().await.map_err(|e| {
             let e = sanitized_error(&e, &[redis_url]);
             error!(error = %e, "redis connection failed");
             IssuerdError::ServerError(format!("redis connection failed: {e}"))
