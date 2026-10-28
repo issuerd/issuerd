@@ -146,7 +146,7 @@ impl McpHttpAdapter {
         };
         let target_realm = match resolve_target_realm(&self.state, &parts.uri).await {
             Ok(realm) => realm,
-            Err(response) => return finalize_response(response, None),
+            Err(response) => return finalize_response(*response, None),
         };
         let resource =
             realm_mcp_resource(&self.state.config.issuer_url, target_realm.name.as_str());
@@ -155,7 +155,10 @@ impl McpHttpAdapter {
         let authenticated =
             match self.authenticate(&parts.headers, &target_realm, &resource, &metadata).await {
                 Ok(authenticated) => authenticated,
-                Err((response, nonce)) => return finalize_response(response, nonce.as_deref()),
+                Err(error) => {
+                    let (response, nonce) = *error;
+                    return finalize_response(response, nonce.as_deref());
+                }
             };
         let response_nonce = authenticated.response_nonce;
 
@@ -210,21 +213,25 @@ impl McpHttpAdapter {
         target_realm: &Realm,
         resource: &str,
         metadata: &str,
-    ) -> Result<AuthenticatedRequest, (Response, Option<String>)> {
+    ) -> AuthResult<AuthenticatedRequest> {
         let credential = match parse_authorization(headers, self.state.config.mcp.require_dpop) {
             Ok(Some(credential)) => credential,
             Ok(None) => {
-                return Err((
+                return Err(auth_error(
                     no_credentials_challenge(metadata, self.state.config.mcp.require_dpop),
                     None,
                 ));
             }
             Err(scheme) => {
-                return Err((invalid_token_challenge_for_scheme(scheme, metadata, None), None));
+                return Err(auth_error(
+                    invalid_token_challenge_for_scheme(scheme, metadata, None),
+                    None,
+                ));
             }
         };
         let scheme = credential.scheme;
-        let invalid_token = || (invalid_token_challenge_for_scheme(scheme, metadata, None), None);
+        let invalid_token =
+            || auth_error(invalid_token_challenge_for_scheme(scheme, metadata, None), None);
         let validated =
             self.state
                 .token_service
@@ -232,7 +239,9 @@ impl McpHttpAdapter {
                 .map_err(|error| match error {
                     IssuerdError::ServerError(_)
                     | IssuerdError::KeyEncryption(_)
-                    | IssuerdError::TemporarilyUnavailable => (service_unavailable(), None),
+                    | IssuerdError::TemporarilyUnavailable => {
+                        auth_error(service_unavailable(), None)
+                    }
                     _ => invalid_token(),
                 })?;
         let claims = validated.claims;
@@ -277,14 +286,15 @@ impl McpHttpAdapter {
         metadata: &str,
         credential: &Credential,
         claims: &AccessTokenClaims,
-    ) -> Result<Option<String>, (Response, Option<String>)> {
-        let invalid_token =
-            || (invalid_token_challenge_for_scheme(credential.scheme, metadata, None), None);
+    ) -> AuthResult<Option<String>> {
+        let invalid_token = || {
+            auth_error(invalid_token_challenge_for_scheme(credential.scheme, metadata, None), None)
+        };
         if self.state.config.mcp.require_dpop && credential.scheme != ChallengeScheme::Dpop {
             if claims.cnf.is_some() {
                 return Err(invalid_token());
             }
-            return Err((invalid_dpop_proof_challenge(metadata, None), None));
+            return Err(auth_error(invalid_dpop_proof_challenge(metadata, None), None));
         }
         match credential.scheme {
             ChallengeScheme::Bearer => {
@@ -308,19 +318,19 @@ impl McpHttpAdapter {
         .await
         .map_err(|error| match error {
             DpopRejection::UseDpopNonce(nonce) => {
-                (use_dpop_nonce_challenge(metadata, &nonce, None), None)
+                auth_error(use_dpop_nonce_challenge(metadata, &nonce, None), None)
             }
-            DpopRejection::TemporarilyUnavailable => (service_unavailable(), None),
+            DpopRejection::TemporarilyUnavailable => auth_error(service_unavailable(), None),
             DpopRejection::InvalidProof(response_nonce) => {
-                (invalid_dpop_proof_challenge(metadata, None), response_nonce)
+                auth_error(invalid_dpop_proof_challenge(metadata, None), response_nonce)
             }
         })?;
         let response_nonce = verification.response_nonce;
         let Some(proof) = verification.proof else {
-            return Err((invalid_dpop_proof_challenge(metadata, None), None));
+            return Err(auth_error(invalid_dpop_proof_challenge(metadata, None), None));
         };
         if claims.cnf.as_ref().map(|cnf| &cnf.jkt) != Some(&proof.jkt) {
-            return Err((
+            return Err(auth_error(
                 invalid_token_challenge_for_scheme(credential.scheme, metadata, None),
                 response_nonce,
             ));
@@ -404,11 +414,14 @@ fn authorization_scheme(value: &HeaderValue) -> Option<ChallengeScheme> {
     }
 }
 
-fn token_error(
-    error: McpTokenError,
-    metadata: &str,
-    scheme: ChallengeScheme,
-) -> (Response, Option<String>) {
+type AuthError = Box<(Response, Option<String>)>;
+type AuthResult<T> = Result<T, AuthError>;
+
+fn auth_error(response: Response, nonce: Option<String>) -> AuthError {
+    Box::new((response, nonce))
+}
+
+fn token_error(error: McpTokenError, metadata: &str, scheme: ChallengeScheme) -> AuthError {
     let response = match error {
         McpTokenError::InvalidToken => invalid_token_challenge_for_scheme(scheme, metadata, None),
         McpTokenError::DisabledUser | McpTokenError::DisabledClient => {
@@ -416,7 +429,7 @@ fn token_error(
         }
         McpTokenError::TemporarilyUnavailable => service_unavailable(),
     };
-    (response, None)
+    auth_error(response, None)
 }
 
 fn preflight_error_response(error: McpError, scheme: ChallengeScheme, metadata: &str) -> Response {
@@ -437,24 +450,24 @@ fn preflight_error_response(error: McpError, scheme: ChallengeScheme, metadata: 
     }
 }
 
-async fn resolve_target_realm(state: &Arc<ServerState>, uri: &Uri) -> Result<Realm, Response> {
+async fn resolve_target_realm(state: &Arc<ServerState>, uri: &Uri) -> Result<Realm, Box<Response>> {
     let Some(segment) = uri
         .path()
         .strip_prefix("/realms/")
         .and_then(|path| path.strip_suffix("/mcp"))
         .filter(|segment| !segment.is_empty() && !segment.contains('/'))
     else {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     };
     let Ok(decoded) = issuerd_core::urls::decode_realm_segment(segment) else {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     };
     match state.resolve_realm(segment).await {
         Ok(Some(realm)) if realm.name == decoded => Ok(realm),
-        Ok(_) => Err(StatusCode::NOT_FOUND.into_response()),
+        Ok(_) => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
         Err(error) => {
             tracing::warn!(error = %error, "MCP target realm resolution failed");
-            Err(service_unavailable())
+            Err(Box::new(service_unavailable()))
         }
     }
 }
