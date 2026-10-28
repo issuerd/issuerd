@@ -22,6 +22,7 @@ pub mod scope;
 pub mod service_account;
 pub mod traits;
 pub mod typestate;
+pub mod urls;
 pub mod utils;
 
 pub use broker::{
@@ -36,7 +37,7 @@ pub use client_scope::{
     is_builtin_scope_name, is_mcp_scope_name, mapper_config, validate_no_default_mcp_scopes,
     ClaimTarget, ClientScope, MapperType, ProtocolMapper, ScopeMappings, ATTR_DCR_POLICY,
     BUILTIN_SCOPE_NAMES, DCR_POLICY_OPEN, DEFAULT_DEFAULT_SCOPES, DEFAULT_OPTIONAL_SCOPES,
-    MCP_SCOPE_READ, MCP_SCOPE_WRITE,
+    MCP_SCOPE_READ, MCP_SCOPE_STEP_UP, MCP_SCOPE_WRITE,
 };
 pub use error::{IssuerdError, OAuth2Error, OAuth2ErrorCode};
 pub use events::{AdminEvent, Event, EventType, OperationType, ResourceType};

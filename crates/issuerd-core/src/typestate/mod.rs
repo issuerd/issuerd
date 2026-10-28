@@ -27,7 +27,7 @@ pub use challenge_kind::{
     ChallengeKind, CookieKind, LoginFormKind, OtpFormKind, RedirectKind, WebAuthnKind,
 };
 pub use flow_result::TypedFlowResult;
-pub use realm_bound::{extract_realm_from_issuer, RealmBound};
+pub use realm_bound::{extract_realm_from_issuer, extract_realm_name_from_issuer, RealmBound};
 pub use redirect::SafeRedirectTarget;
 pub use session::TypedSession;
 pub use session_state::{

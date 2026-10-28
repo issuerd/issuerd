@@ -39,6 +39,10 @@ pub async fn admin_auth_middleware(
         warn!(error = %e, "admin API authentication failed");
         AdminApiError::Unauthorized
     })?;
+    if validated.claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+        warn!("admin API authentication failed: operation-bound step-up token presented");
+        return Err(AdminApiError::Unauthorized);
+    }
     // Bearer-only API: a DPoP-bound token (`cnf.jkt`) must be presented with
     // a proof (RFC 9449 §7.1), which this API does not accept — reject the
     // downgrade instead of letting a stolen proof-bound token authenticate
@@ -92,14 +96,16 @@ async fn enforce_realm_binding(
     // The token's home realm name is the trailing segment of the issuer URL
     // (`{base}/realms/{name}`).
     let iss: &str = claims.iss.as_ref();
-    let Some(token_realm) = issuerd_core::typestate::extract_realm_from_issuer(iss) else {
+    let Some(token_realm) = issuerd_core::typestate::extract_realm_name_from_issuer(iss)
+        .map(|name| name.as_str().to_string())
+    else {
         warn!("admin API authorization denied: token issuer carries no realm");
         return Err(AdminApiError::Forbidden);
     };
     // Load the issuing realm once: it drives both the master-realm check and
     // the not_before cutoff. A storage error fails closed: without the realm
     // there is no revocation cutoff to enforce, so the request is rejected.
-    let issuing_realm = match state.storage.get_realm_by_name(token_realm).await {
+    let issuing_realm = match state.storage.get_realm_by_name(&token_realm).await {
         Ok(realm) => realm,
         Err(e) => {
             warn!(realm = %token_realm, error = %e,
@@ -398,8 +404,8 @@ pub fn has_realm_role(auth: &AdminAuth, role: &str) -> bool {
 /// plain issuer-segment comparison is sufficient here.
 pub fn require_master_token(auth: &AdminAuth) -> Result<(), AdminApiError> {
     let iss: &str = auth.claims.iss.as_ref();
-    match issuerd_core::typestate::extract_realm_from_issuer(iss) {
-        Some(realm) if realm == MASTER_REALM => Ok(()),
+    match issuerd_core::typestate::extract_realm_name_from_issuer(iss) {
+        Some(realm) if realm.as_str() == MASTER_REALM => Ok(()),
         Some(realm) => {
             warn!(realm = %realm,
                 "admin API authorization denied: server-global operation requires a master realm token");
@@ -437,6 +443,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }
@@ -465,6 +472,7 @@ mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         }
     }
@@ -497,6 +505,15 @@ mod tests {
     fn require_master_token_accepts_master_issuer() {
         let auth = auth_with_issuer_and_roles(
             "http://localhost:8080/realms/master",
+            vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
+        );
+        assert!(require_master_token(&auth).is_ok());
+    }
+
+    #[test]
+    fn require_master_token_accepts_percent_encoded_master_issuer() {
+        let auth = auth_with_issuer_and_roles(
+            "http://localhost:8080/realms/mast%65r",
             vec![issuerd_core::RoleName::new("manage-realm").unwrap()],
         );
         assert!(require_master_token(&auth).is_ok());
@@ -557,6 +574,7 @@ mod tests {
                     claims: None,
                     cnf: None,
                     authorization_details: None,
+                    resource: None,
                 },
                 header: issuerd_core::JwsHeader {
                     alg: issuerd_core::Algorithm::Rs256,
@@ -1278,6 +1296,14 @@ mod tests {
         claims.cnf = Some(issuerd_core::ConfirmationClaim {
             jkt: "thumbprint".to_string(),
         });
+        let state = lifecycle_state(claims).await;
+        assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn step_up_token_is_not_an_admin_credential() {
+        let mut claims = tenant_claims();
+        claims.scope = issuerd_core::Scope::parse("openid mcp:step_up");
         let state = lifecycle_state(claims).await;
         assert_eq!(call_tenant_users(state).await, StatusCode::UNAUTHORIZED);
     }

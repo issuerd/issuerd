@@ -4161,6 +4161,7 @@ pub(crate) mod tests {
                 claims: None,
                 cnf: None,
                 authorization_details: None,
+                resource: None,
             },
         };
         let id_token = issuerd_token::IdToken {

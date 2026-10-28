@@ -15,6 +15,8 @@ mod admin_depth;
 mod algorithm_agility;
 #[path = "integration/bench.rs"]
 mod bench;
+#[path = "integration/canonical_realm.rs"]
+mod canonical_realm;
 #[path = "integration/client_scopes.rs"]
 mod client_scopes;
 #[path = "integration/cluster.rs"]
@@ -63,6 +65,8 @@ mod jwt_client_auth;
 mod key_encryption;
 #[path = "integration/logout_channels.rs"]
 mod logout_channels;
+#[path = "integration/mcp.rs"]
+mod mcp;
 #[path = "integration/mfa.rs"]
 mod mfa;
 #[path = "integration/oauth2_grants.rs"]

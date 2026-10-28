@@ -154,6 +154,10 @@ impl ServerState {
     /// realm after another realm's id: the name wins). The by-name step goes
     /// through the shared realm cache; the id fallback stays uncached.
     pub async fn resolve_realm(&self, segment: &str) -> Result<Option<Realm>, IssuerdError> {
+        let Ok(segment) = issuerd_core::urls::decode_realm_segment(segment) else {
+            return Ok(None);
+        };
+        let segment = segment.as_str();
         if let Some(realm) = self.realm_by_name_cached(segment).await? {
             return Ok(Some(realm));
         }
@@ -166,13 +170,13 @@ impl ServerState {
     /// Resolve the realm an `iss` claim belongs to.
     ///
     /// Issuers are realm-NAME based (`{issuer_url}/realms/{name}`). The
-    /// trailing `/realms/` segment is extracted and resolved by name; callers
-    /// then use `realm.id` for storage lookups. Tokens issued before the
-    /// name-based switch (id-spelled issuers) are intentionally NOT resolved
-    /// here — they are rejected.
+    /// trailing `/realms/` segment is decoded once and resolved by name;
+    /// callers then use `realm.id` for storage lookups. Tokens issued before
+    /// the name-based switch (id-spelled issuers) are intentionally NOT
+    /// resolved here — they are rejected.
     pub async fn resolve_issuer_realm(&self, issuer: &str) -> Result<Option<Realm>, IssuerdError> {
-        match issuerd_core::typestate::extract_realm_from_issuer(issuer) {
-            Some(name) => self.realm_by_name_cached(name).await,
+        match issuerd_core::typestate::extract_realm_name_from_issuer(issuer) {
+            Some(name) => self.realm_by_name_cached(name.as_str()).await,
             None => Ok(None),
         }
     }

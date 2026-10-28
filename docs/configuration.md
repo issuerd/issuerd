@@ -72,9 +72,9 @@ Configuration is assembled from three layers, later layers winning:
    (`ISSUERD_CLUSTER__NODE_ID` in `docker-compose.cluster.yml`), so the same
    file can be mounted into every node.
 
-> **Warning:** list-valued keys (`cors.allowed_origins`, `proxy.trusted_proxies`,
-> `cluster.redis_nodes`) cannot be expressed reliably as a single environment
-> variable — set them in the config file (the cluster guide documents
+> **Warning:** list-valued keys (`cors.allowed_origins`, `mcp.allowed_origins`,
+> `proxy.trusted_proxies`, `cluster.redis_nodes`) cannot be expressed reliably
+> as a single environment variable — set them in the config file (the cluster guide documents
 > `cluster.redis_nodes` as TOML-only, see [CLUSTERING.md](CLUSTERING.md)).
 
 Behavioral notes:
@@ -481,9 +481,12 @@ is advertised — clients discover the requirement from the
 
 ## [mcp]
 
-MCP (Model Context Protocol) surface — groundwork for the MCP resource
-endpoint. The flag currently gates two pieces of the MCP surface:
+MCP (Model Context Protocol) surface. The flag gates three pieces:
 
+- The read-only MCP endpoint at `POST /realms/{realm}/mcp`, with ten curated
+  tools, dual-era stateless transport, exact audience/provenance and DPoP
+  enforcement, and distributed invocation limits. See
+  [mcp-server.md](mcp-server.md) for the complete contract and client rigs.
 - RFC 9728 protected-resource metadata. The bare
   `GET /.well-known/oauth-protected-resource` is an explicit
   `resource_metadata` alias for the **master** realm, not origin-level
@@ -499,31 +502,49 @@ endpoint. The flag currently gates two pieces of the MCP surface:
   compared byte-for-byte. Each request may carry at most one `resource`;
   repeated values are rejected with `invalid_target` before query/form maps
   can collapse them. A granted resource becomes the access token's `aud`
-  (`[client_id, resource]`, client id first), preserved through validation and
-  introspection, and rides the refresh token as a `resource` claim. Code
-  redemption may restate it, omit it (inherit), or introduce it when the code
-  carried none; refresh may only restate or omit. Every other grant refuses
-  `resource` when MCP is enabled.
+  (`[client_id, resource]`, client id first) and trusted `resource` claim for
+  resource-server validation, and rides the refresh token as a `resource`
+  claim. Code redemption may restate it, omit it (inherit), or
+  introduce it when the code carried none; refresh may only restate or omit.
+  Every other grant refuses `resource` when MCP is enabled.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` both metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
+| `enabled` | boolean | `false` | Master switch for the MCP surface. While `false` the MCP and metadata routes answer `404` (indistinguishable from an unknown realm). Supported authorization/code/refresh flows carrying `resource` fail closed with `invalid_target`; legacy token-exchange requests keep their historical ignore behavior. Requests without `resource` are unchanged. |
+| `require_dpop` | boolean | `true` | Require DPoP-bound tokens and proofs. Set `false` only for explicit Bearer compatibility; strict operation-bound step-up still requires DPoP. |
+| `invocation_rate_limit_per_minute` | integer | `60` | Distributed tool-invocation allowance for each client and subject per minute. |
+| `allowed_origins` | list of strings | `[]` | Exact browser origins allowed at the MCP transport. Empty rejects every present `Origin` when validation is enforced; non-browser requests without `Origin` remain supported. Set list values in the config file, not through a single environment variable. |
+| `step_up.enabled` | boolean | `false` | Independent `[mcp.step_up]` rollout gate for operation-bound behavior; it does not follow `[mcp].enabled`. Enable only after every cluster node and approval route supports it. |
 
 ```toml
 [mcp]
 enabled = false
+require_dpop = true
+invocation_rate_limit_per_minute = 60
+allowed_origins = []
+
+[mcp.step_up]
+enabled = false
 ```
 
-Environment equivalent: `ISSUERD_MCP__ENABLED`.
+Environment equivalents include `ISSUERD_MCP__ENABLED`,
+`ISSUERD_MCP__REQUIRE_DPOP`,
+`ISSUERD_MCP__INVOCATION_RATE_LIMIT_PER_MINUTE`, and
+`ISSUERD_MCP__STEP_UP__ENABLED`.
 
-The document advertises the realm issuer URL as the authorization server, the
-built-in `mcp:read` / `mcp:write` scopes, and the DPoP proof-signing
-algorithms, identical to `dpop_signing_alg_values_supported` in the OIDC
-discovery document. When MCP is enabled, its scopes require an
-administrator's explicit optional assignment: anonymous DCR rejects them in
-either scope list, and Admin API, provisioning, and realm-default paths
-reject default assignments. With MCP disabled, legacy custom scope names keep
-the previous default∪optional behavior.
+The document advertises the realm issuer URL as the authorization server, only
+`mcp:read` as the minimal basic scope, the actual DPoP requirement, and the
+DPoP proof-signing algorithms (identical to
+`dpop_signing_alg_values_supported` in the OIDC discovery document). Strict
+DPoP omits `bearer_methods_supported`; explicit Bearer compatibility
+advertises only `["header"]`. Runtime scope challenges name the exact ordinary
+scopes for the attempted operation and may therefore include `mcp:write`
+without advertising it as a basic PRM scope. Operation-bound approval uses a
+separate authentication challenge, not a general `mcp:step_up` scope challenge.
+When MCP is enabled, its scopes require an administrator's explicit optional assignment:
+anonymous DCR rejects them in either scope list, and Admin API, provisioning,
+and realm-default paths reject default assignments. With MCP disabled, legacy
+custom scope names keep the previous default∪optional behavior.
 
 Before enabling MCP, every cluster node must run the resource-aware version
 (older nodes drop `resource` when rotating refresh tokens), and legacy custom
@@ -899,6 +920,12 @@ lifetime_secs = 30              # single-use nonce TTL; 5-300
 # legacy token exchange keeps its historical ignore behavior.
 [mcp]
 enabled = false
+require_dpop = true
+invocation_rate_limit_per_minute = 60
+allowed_origins = []                # empty = reject every present Origin; non-browser clients omit Origin
+
+[mcp.step_up]
+enabled = false                     # independent operation-bound rollout gate
 
 # ---- Signing-key encryption at rest ------------------------------------------
 # Omitted = signing keys stored in PLAINTEXT in PostgreSQL (startup WARN).

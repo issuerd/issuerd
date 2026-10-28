@@ -1860,8 +1860,8 @@ async fn extract_auth(
     // Verify the token's issuer belongs to this realm. The issuer embeds the
     // realm name.
     let token_realm =
-        issuerd_core::typestate::extract_realm_from_issuer(validated.claims.iss.as_str());
-    if token_realm != Some(realm.name.as_str()) {
+        issuerd_core::typestate::extract_realm_name_from_issuer(validated.claims.iss.as_str());
+    if token_realm.as_ref() != Some(&realm.name) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid_token"})),

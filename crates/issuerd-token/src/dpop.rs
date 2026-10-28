@@ -195,6 +195,88 @@ fn thumbprint_of(jwk: &DpopJwk) -> String {
     b64url_encode(&sha2::Sha256::digest(canonical.as_bytes()))
 }
 
+fn normalize_htu(raw: &str) -> Option<String> {
+    if raw
+        .chars()
+        .any(|character| character == '\\' || character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let userinfo = raw.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    });
+    if userinfo {
+        return None;
+    }
+    let host = match url.host()? {
+        url::Host::Domain(domain) => domain.to_string(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => format!("[{address}]"),
+    };
+    let port = url.port().map(|port| format!(":{port}")).unwrap_or_default();
+    let path = normalize_htu_path(url.path())?;
+    Some(format!("{}://{host}{port}{path}", url.scheme()))
+}
+
+fn normalize_htu_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut normalized = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            normalized.push(char::from(bytes[index]));
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return None;
+        }
+        let high = hex_value(bytes[index + 1])?;
+        let low = hex_value(bytes[index + 2])?;
+        let decoded = (high << 4) | low;
+        if is_unreserved(decoded) {
+            normalized.push(char::from(decoded));
+        } else {
+            normalized.push('%');
+            normalized.push(char::from(hex_digit(high)));
+            normalized.push(char::from(hex_digit(low)));
+        }
+        index += 3;
+    }
+    Some(normalized)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        _ => b'A' + value - 10,
+    }
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
 /// Validate a DPoP proof JWT against the request it accompanies.
 pub fn validate_dpop_proof(
     proof: &str,
@@ -254,7 +336,13 @@ pub fn validate_dpop_proof(
         return Err(IssuerdError::InvalidDpopProof);
     }
     let htu = claims.htu.ok_or(IssuerdError::InvalidDpopProof)?;
-    if !requirements.accepted_htu.iter().any(|accepted| accepted == &htu) {
+    let htu = normalize_htu(&htu).ok_or(IssuerdError::InvalidDpopProof)?;
+    if !requirements
+        .accepted_htu
+        .iter()
+        .filter_map(|accepted| normalize_htu(accepted))
+        .any(|accepted| accepted == htu)
+    {
         return Err(IssuerdError::InvalidDpopProof);
     }
 
@@ -620,6 +708,49 @@ mod tests {
             validate_dpop_proof(&proof, &requirements()),
             Err(IssuerdError::InvalidDpopProof)
         ));
+    }
+
+    #[test]
+    fn htu_syntax_normalization_accepts_only_equivalent_uris() {
+        let key = gen_ec();
+        let req = DpopProofRequirements {
+            accepted_htu: Box::leak(
+                vec!["https://IDP.example/realms/demo/mcp".to_string()].into_boxed_slice(),
+            ),
+            ..requirements()
+        };
+        for htu in [
+            "https://idp.example:443/realms/demo/mcp",
+            "https://idp.example/realms/demo/%6Dcp",
+            "https://idp.example/realms/demo/../demo/mcp",
+        ] {
+            let mut claims = valid_claims();
+            claims["htu"] = serde_json::json!(htu);
+            let proof = key.proof(claims);
+            assert!(validate_dpop_proof(&proof, &req).is_ok(), "equivalent HTU rejected: {htu}");
+        }
+
+        for htu in [
+            "https://idp.example/realms/demo/mcp?code=secret",
+            "https://idp.example/realms/demo/mcp#fragment",
+            "https://user@idp.example/realms/demo/mcp",
+            "https://other.example/realms/demo/mcp",
+            "https://idp.example/realms/other/mcp",
+            "ftp://idp.example/realms/demo/mcp",
+            "https://idp.example/realms/demo\\mcp",
+            "https://idp.example/realms/demo/%5Cmcp",
+            " https://idp.example/realms/demo/mcp ",
+            "https://idp.example/realms/demo/\tmcp",
+            "https://idp.example/realms/demo/\nmcp",
+        ] {
+            let mut claims = valid_claims();
+            claims["htu"] = serde_json::json!(htu);
+            let proof = key.proof(claims);
+            assert!(
+                matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)),
+                "different HTU accepted: {htu}"
+            );
+        }
     }
 
     #[test]

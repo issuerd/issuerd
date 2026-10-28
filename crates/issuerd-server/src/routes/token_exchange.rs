@@ -96,11 +96,17 @@ pub(crate) async fn token_exchange_grant(
         }
     };
 
+    // The reserved operation-bound scope can never enter an ordinary exchange,
+    // including by inheritance from legacy subject-token data.
+    if subject_claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+        return exchange_error(state, realm_id, client, ip, "invalid_scope").await;
+    }
+
     // Realm binding: the stateless validator accepts any realm of this issuer
     // base URL, so the issuer realm must be compared explicitly. The issuer
     // segment is a realm NAME. Cross-realm exchange is not supported.
-    if issuerd_core::typestate::extract_realm_from_issuer(subject_claims.iss.as_str())
-        != Some(realm.name.as_str())
+    if issuerd_core::typestate::extract_realm_name_from_issuer(subject_claims.iss.as_str()).as_ref()
+        != Some(&realm.name)
     {
         warn!(realm = %realm_id, client_id = %client.client_id, iss = %subject_claims.iss.as_str(), "token exchange: subject token from another realm");
         return exchange_error(state, realm_id, client, ip, "invalid_grant").await;
@@ -816,6 +822,55 @@ mod tests {
         let resp = exchange(&fixture.state, &fixture.subject_token).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(resp).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_inherited_step_up_scope() {
+        let fixture = exchange_fixture().await;
+        let subject = fixture
+            .state
+            .token_service
+            .validate_access_token(&fixture.subject_token)
+            .unwrap()
+            .claims;
+        let realm_id = RealmId::new("master").unwrap();
+        let realm = fixture.state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        let user = fixture
+            .state
+            .storage
+            .get_user_by_username(&realm_id, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        let client = fixture
+            .state
+            .storage
+            .get_client_by_client_id(&realm_id, &ClientIdentifier::new("admin-cli").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy_token = fixture
+            .state
+            .token_manager
+            .issue_access_token_with_roles(
+                &user,
+                &client,
+                &realm,
+                &[
+                    "openid".to_string(),
+                    issuerd_core::MCP_SCOPE_STEP_UP.to_string(),
+                ],
+                subject.sid.as_ref().unwrap(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = exchange(&fixture.state, &legacy_token.token).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_scope");
     }
 
     #[tokio::test]

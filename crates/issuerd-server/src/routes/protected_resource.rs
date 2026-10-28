@@ -101,22 +101,15 @@ pub async fn protected_resource_metadata_realm_handler(
     if realm_segment.is_empty() || realm_segment.contains('/') {
         return not_found();
     }
-    let Some(realm_segment) =
-        url::form_urlencoded::parse(format!("realm={realm_segment}").as_bytes())
-            .next()
-            .map(|(_, value)| value.into_owned())
-    else {
+    let Ok(realm_name) = issuerd_core::urls::decode_realm_segment(realm_segment) else {
         return not_found();
     };
-    if issuerd_core::RealmName::new(&realm_segment).is_err() {
-        return not_found();
-    }
-    let expected = realm_mcp_metadata_url(&state.config.issuer_url, &realm_segment);
+    let expected = realm_mcp_metadata_url(&state.config.issuer_url, realm_name.as_str());
     let expected = url::Url::parse(&expected).expect("realm metadata URL is valid");
     if request_path != expected.path() {
         return not_found();
     }
-    serve(&state, &realm_segment).await
+    serve(&state, realm_name.as_str()).await
 }
 
 /// Uniform 404 for a disabled feature gate and an unknown realm alike — a
@@ -131,8 +124,11 @@ async fn serve(state: &Arc<ServerState>, realm_segment: &str) -> Response {
     }
     match state.resolve_realm(realm_segment).await {
         Ok(Some(realm)) if realm_segment == realm.name.as_str() => {
-            let metadata =
-                ProtectedResourceMetadata::for_realm(&state.config.issuer_url, realm.name.as_str());
+            let metadata = ProtectedResourceMetadata::for_realm_with_profile(
+                &state.config.issuer_url,
+                realm.name.as_str(),
+                state.config.mcp.require_dpop,
+            );
             match serde_json::to_vec(&metadata) {
                 Ok(body) => raw_json_response(body),
                 Err(e) => {
@@ -217,6 +213,22 @@ mod tests {
             let err = validate_resource_param(&config, "demo", Some(bad)).unwrap_err();
             assert!(matches!(err, IssuerdError::InvalidTarget(_)), "accepted {bad}");
             assert_eq!(err.oauth_error_code().as_ref(), "invalid_target");
+        }
+    }
+
+    #[test]
+    fn special_realm_resource_match_is_exact_not_normalized() {
+        let mut config = crate::config::ServerConfig::default();
+        config.mcp.enabled = true;
+        let canonical = realm_mcp_resource(&config.issuer_url, "tenant{one}");
+        assert_eq!(canonical, "http://localhost:8080/realms/tenant%7Bone%7D/mcp");
+        assert!(validate_resource_param(&config, "tenant{one}", Some(&canonical)).is_ok());
+        for other in [
+            "http://localhost:8080/realms/tenant{one}/mcp",
+            "http://localhost:8080/realms/tenant%7bone%7d/mcp",
+            "http://localhost:8080/realms/tenant%257Bone%257D/mcp",
+        ] {
+            assert!(validate_resource_param(&config, "tenant{one}", Some(other)).is_err());
         }
     }
 }

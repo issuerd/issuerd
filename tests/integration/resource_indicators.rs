@@ -10,8 +10,9 @@
 //! `invalid_target` while disabled), structural validation at the
 //! authorization and token endpoints (absolute URI, no fragment), the exact
 //! allowlist (only the realm's MCP resource URI), the full authorize → code →
-//! token roundtrip (`aud = [client_id, resource]` on the access token, the
-//! `resource` claim on the refresh token, the ID token untouched), the code
+//! token roundtrip (`aud = [client_id, resource]` plus trusted `resource`
+//! provenance on the access token, the grant on the refresh token, the ID
+//! token untouched), the code
 //! redemption restate/inherit/introduce rules (§2.2), the refresh
 //! restate/omit/reject rules, rejection for every other grant, and PAR
 //! push-time validation + pass-through.
@@ -22,6 +23,8 @@ use base64::Engine;
 use crate::harness::TestHarness;
 
 const REDIRECT_URI: &str = "http://localhost:8080/cb";
+const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
 /// Harness with `[mcp] enabled = true` (`TestHarness::new` runs the default
 /// `false`).
@@ -105,7 +108,7 @@ async fn browser_login(
 /// (already encoded).
 fn code_flow_query(client: &issuerd_core::Client, extra_query: &str) -> String {
     format!(
-        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state{}",
+        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256{}",
         client.client_id,
         enc(REDIRECT_URI),
         extra_query
@@ -140,6 +143,7 @@ async fn redeem_code(
         ("redirect_uri", REDIRECT_URI),
         ("client_id", client.client_id.as_ref()),
         ("client_secret", client.secret.as_deref().unwrap_or("")),
+        ("code_verifier", CODE_VERIFIER),
     ];
     params.extend_from_slice(extra);
     let resp = harness.post_form(&token_path(realm), &params).await;
@@ -313,6 +317,30 @@ async fn enabled_rejects_non_allowlisted_resource() {
 }
 
 #[tokio::test]
+async fn mcp_wildcard_redirect_never_receives_validation_errors() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-wildcard").await;
+    let mut client = harness.create_client("ri-wildcard", false).await;
+    client.redirect_uris = vec![issuerd_core::RedirectUri::new("http://localhost:8080/*").unwrap()];
+    harness.storage.update_client(&client.realm_id, &client).await.unwrap();
+    let resource = mcp_resource(&harness, "ri-wildcard");
+    let query = code_flow_query(&client, &format!("&resource={}", enc(&resource)));
+
+    // One failure happens during parsing, the other during validation. Neither
+    // may fall back to the legacy wildcard redirect matcher.
+    for response_type in ["unsupported", "code+id_token"] {
+        let response = authorize(
+            &harness,
+            "ri-wildcard",
+            &query.replacen("response_type=code", &format!("response_type={response_type}"), 1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "type: {response_type}");
+        assert_eq!(json_body(response).await["error"], "invalid_request");
+    }
+}
+
+#[tokio::test]
 async fn code_flow_binds_resource_as_access_token_audience() {
     let harness = harness_with_mcp_enabled().await;
     harness.create_realm("ri-flow").await;
@@ -336,6 +364,7 @@ async fn code_flow_binds_resource_as_access_token_audience() {
     let access_token = json["access_token"].as_str().unwrap();
     let access_claims = jwt_claims(access_token);
     assert_eq!(access_claims["aud"], serde_json::json!([client.client_id.as_ref(), resource]));
+    assert_eq!(access_claims["resource"], serde_json::json!(resource));
 
     let state = std::sync::Arc::new(
         issuerd_server::state::ServerState::from_components(
@@ -349,6 +378,7 @@ async fn code_flow_binds_resource_as_access_token_audience() {
     let validated = state.token_service.validate_access_token(access_token).unwrap();
     assert!(validated.claims.aud.contains(&resource));
     assert_eq!(validated.claims.aud.values(), &[client.client_id.to_string(), resource.clone()]);
+    assert_eq!(validated.claims.resource.as_deref(), Some(resource.as_str()));
 
     let introspection = harness
         .post_form(
@@ -373,6 +403,55 @@ async fn code_flow_binds_resource_as_access_token_audience() {
     // The ID token is untouched: its audience stays the client alone.
     let id_claims = jwt_claims(json["id_token"].as_str().unwrap());
     assert_eq!(id_claims["aud"], client.client_id.as_ref());
+}
+
+#[tokio::test]
+async fn mapper_produced_resource_audience_has_no_trusted_provenance() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-mapper").await;
+    let mut client = harness.create_client("ri-mapper", false).await;
+    harness.create_user("ri-mapper", "mary", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-mapper");
+
+    client.protocol_mappers.push(issuerd_core::ProtocolMapper {
+        id: issuerd_core::MapperId::new("mapper-mcp-aud").unwrap(),
+        name: "canonical MCP audience without a resource grant".to_string(),
+        mapper_type: issuerd_core::MapperType::Audience,
+        config: std::collections::HashMap::from([(
+            issuerd_core::mapper_config::INCLUDED_CUSTOM_AUDIENCE.to_string(),
+            resource.clone(),
+        )]),
+    });
+    harness.storage.update_client(&client.realm_id, &client).await.unwrap();
+    issuerd_cluster::invalidate::invalidate_client_claims(
+        harness.cache.as_ref(),
+        &client.realm_id,
+        &client.id,
+        client.client_id.as_ref(),
+    )
+    .await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-mapper"),
+            &[
+                ("grant_type", "password"),
+                ("username", "mary"),
+                ("password", "Password123!"),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+                ("scope", "openid"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    let claims = jwt_claims(json["access_token"].as_str().unwrap());
+    assert_eq!(claims["aud"], serde_json::json!([client.client_id.as_ref(), resource]));
+    assert!(
+        claims.get("resource").is_none(),
+        "mapper must not forge resource provenance: {claims}"
+    );
 }
 
 #[tokio::test]
@@ -426,6 +505,123 @@ async fn code_redemption_restate_inherit_introduce() {
 }
 
 #[tokio::test]
+async fn non_pkce_confidential_code_cannot_introduce_resource_at_redemption() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-pkce-introduce").await;
+    let client = harness.create_client("ri-pkce-introduce", false).await;
+    harness.create_user("ri-pkce-introduce", "paul", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-pkce-introduce");
+    let query = format!(
+        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state",
+        client.client_id,
+        enc(REDIRECT_URI)
+    );
+
+    let response = authorize(&harness, "ri-pkce-introduce", &query).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    let code = browser_login(&harness, "ri-pkce-introduce", &location, "paul").await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-pkce-introduce"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", REDIRECT_URI),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", client.secret.as_deref().unwrap()),
+                ("resource", &resource),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn wildcard_code_cannot_introduce_resource_at_redemption() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-wildcard-introduce").await;
+    let mut client = harness.create_client("ri-wildcard-introduce", true).await;
+    client.redirect_uris =
+        vec![issuerd_core::RedirectUri::new("https://client.example/*").unwrap()];
+    harness.storage.update_client(&client.realm_id, &client).await.unwrap();
+    issuerd_cluster::invalidate::invalidate_client_claims(
+        harness.cache.as_ref(),
+        &client.realm_id,
+        &client.id,
+        client.client_id.as_ref(),
+    )
+    .await;
+    harness.create_user("ri-wildcard-introduce", "wendy", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-wildcard-introduce");
+    let requested_redirect = "https://client.example/attacker/cb";
+    let query = format!(
+        "response_type=code&client_id={}&redirect_uri={}&scope=openid&state=ri-state&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256",
+        client.client_id,
+        enc(requested_redirect)
+    );
+
+    let response = authorize(&harness, "ri-wildcard-introduce", &query).await;
+    if response.status() != StatusCode::SEE_OTHER {
+        panic!("wildcard authorization failed: {}", json_body(response).await);
+    }
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    let code = browser_login(&harness, "ri-wildcard-introduce", &location, "wendy").await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-wildcard-introduce"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", requested_redirect),
+                ("client_id", client.client_id.as_ref()),
+                ("client_secret", ""),
+                ("code_verifier", CODE_VERIFIER),
+                ("resource", &resource),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn native_public_client_redeems_resource_code_without_redirect_uri() {
+    let harness = harness_with_mcp_enabled().await;
+    harness.create_realm("ri-native").await;
+    let client = harness.create_client("ri-native", true).await;
+    harness.create_user("ri-native", "nina", "Password123!").await;
+    let resource = mcp_resource(&harness, "ri-native");
+    let code = run_code_flow(
+        &harness,
+        "ri-native",
+        &client,
+        "nina",
+        &format!("&resource={}", enc(&resource)),
+    )
+    .await;
+
+    let response = harness
+        .post_form(
+            &token_path("ri-native"),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("client_id", client.client_id.as_ref()),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    let claims = jwt_claims(json["access_token"].as_str().unwrap());
+    assert_eq!(claims["resource"], serde_json::json!(resource));
+}
+
+#[tokio::test]
 async fn refresh_restate_omit_and_reject() {
     let harness = harness_with_mcp_enabled().await;
     harness.create_realm("ri-refresh").await;
@@ -449,7 +645,9 @@ async fn refresh_restate_omit_and_reject() {
     // Omit = inherit: the rotated pair keeps the grant's resource.
     let (status, json) = refresh(&harness, "ri-refresh", &client, &refresh_token, &[]).await;
     assert_eq!(status, StatusCode::OK, "inheriting refresh failed: {json}");
-    assert_eq!(jwt_claims(json["access_token"].as_str().unwrap())["aud"], expected_aud);
+    let access_claims = jwt_claims(json["access_token"].as_str().unwrap());
+    assert_eq!(access_claims["aud"], expected_aud);
+    assert_eq!(access_claims["resource"], serde_json::json!(resource));
     let rotated = json["refresh_token"].as_str().unwrap().to_string();
     assert_eq!(jwt_claims(&rotated)["resource"], serde_json::json!(resource));
 
@@ -457,7 +655,9 @@ async fn refresh_restate_omit_and_reject() {
     let (status, json) =
         refresh(&harness, "ri-refresh", &client, &rotated, &[("resource", &resource)]).await;
     assert_eq!(status, StatusCode::OK, "restating refresh failed: {json}");
-    assert_eq!(jwt_claims(json["access_token"].as_str().unwrap())["aud"], expected_aud);
+    let access_claims = jwt_claims(json["access_token"].as_str().unwrap());
+    assert_eq!(access_claims["aud"], expected_aud);
+    assert_eq!(access_claims["resource"], serde_json::json!(resource));
     let rotated = json["refresh_token"].as_str().unwrap().to_string();
     assert_eq!(jwt_claims(&rotated)["resource"], serde_json::json!(resource));
 
@@ -856,6 +1056,8 @@ async fn par_push_validates_and_roundtrips_resource() {
                 ("redirect_uri", REDIRECT_URI),
                 ("scope", "openid"),
                 ("client_secret", client.secret.as_deref().unwrap()),
+                ("code_challenge", CODE_CHALLENGE),
+                ("code_challenge_method", "S256"),
                 ("resource", "https://api.example.com/other"),
             ],
         )
@@ -875,6 +1077,8 @@ async fn par_push_validates_and_roundtrips_resource() {
                 ("scope", "openid"),
                 ("state", "ri-par-state"),
                 ("client_secret", client.secret.as_deref().unwrap()),
+                ("code_challenge", CODE_CHALLENGE),
+                ("code_challenge_method", "S256"),
                 ("resource", &resource),
             ],
         )

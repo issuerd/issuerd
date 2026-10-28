@@ -29,6 +29,7 @@ flowchart TD
     issuerd_token["issuerd-token<br/>JWT/JWS/JWK engine"]
     issuerd_storage["issuerd-storage<br/>Storage impls: Postgres / InMemory / JsonFile"]
     issuerd_cluster["issuerd-cluster<br/>DistributedCache: Redis / InMemory"]
+    issuerd_mcp["issuerd-mcp<br/>read-only MCP tools, policy, safe DTOs, stateless rmcp transport"]
     issuerd_core["issuerd-core<br/>types, SPI traits, errors, models — no I/O"]
 
     issuerd --> issuerd_server
@@ -39,6 +40,7 @@ flowchart TD
     issuerd -. "workspace integration tests" .-> issuerd_token
     issuerd -. "workspace integration tests" .-> issuerd_cluster
     issuerd -. "workspace integration tests" .-> issuerd_admin_api
+    issuerd -. "workspace integration tests" .-> issuerd_mcp
     issuerd_server --> issuerd_admin_api
     issuerd_server --> issuerd_auth_flow
     issuerd_server --> issuerd_federation
@@ -46,7 +48,9 @@ flowchart TD
     issuerd_server --> issuerd_token
     issuerd_server --> issuerd_storage
     issuerd_server --> issuerd_cluster
+    issuerd_server --> issuerd_mcp
     issuerd_server --> issuerd_core
+    issuerd_mcp --> issuerd_core
     issuerd_admin_api --> issuerd_auth_flow
     issuerd_admin_api --> issuerd_federation
     issuerd_admin_api --> issuerd_token
@@ -82,6 +86,7 @@ flowchart TD
 ┌──────────────────────────────────────────────────────────────────┐
 │                       Protocol & API Layer                       │
 │     issuerd-protocol │ issuerd-auth-flow │ issuerd-admin-api     │
+│                           issuerd-mcp                           │
 └──────────────────────────────────────────────────────────────────┘
                                   │
 ┌──────────────────────────────────────────────────────────────────┐
@@ -147,8 +152,9 @@ The sanctioned non-`issuerd-core` edges today:
 - `issuerd-auth-flow` → `issuerd-token`, `issuerd-cluster`
 - `issuerd-federation` → `issuerd-storage`
 - `issuerd-admin-api` → `issuerd-auth-flow`, `issuerd-federation`, `issuerd-token`, `issuerd-storage`, `issuerd-cluster`
-- `issuerd-server` → every crate (composition root)
-- `issuerd` → `issuerd-server`, `issuerd-core`, `issuerd-storage` directly from the CLI binary, plus `issuerd-protocol`, `issuerd-auth-flow`, `issuerd-token`, `issuerd-cluster`, and `issuerd-admin-api` declared so the workspace integration tests under `tests/` can use them (`issuerd-federation` likewise, as a dev-dependency)
+- `issuerd-server` → every crate (composition root), including `issuerd-mcp`
+- `issuerd-mcp` → no non-core production dependencies; `issuerd-storage` and `issuerd-cluster` are dev-only, giving the production path `issuerd-core <- issuerd-mcp <- issuerd-server`
+- `issuerd` → `issuerd-server`, `issuerd-core`, `issuerd-storage` directly from the CLI binary, plus `issuerd-protocol`, `issuerd-auth-flow`, `issuerd-token`, `issuerd-cluster`, and `issuerd-admin-api` declared so the workspace integration tests under `tests/` can use them (`issuerd-federation` and `issuerd-mcp` likewise, as dev-dependencies)
 
 New cross-crate edges must follow the same direction — down-layer only, never
 back up into `issuerd-server`/`issuerd-admin-api`, and never introduce a cycle.

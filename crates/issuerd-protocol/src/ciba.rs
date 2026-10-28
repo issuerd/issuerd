@@ -20,6 +20,11 @@ pub struct CibaRequest {
     pub binding_message: Option<String>,
     pub user_code: Option<String>,
     pub requested_expiry: Option<u64>,
+    /// Reserved for the validated operation-bound CIBA profile.
+    pub operation_id: Option<String>,
+    /// Reserved for the same operation-bound profile, never generic CIBA
+    /// resource issuance.
+    pub resource: Option<String>,
 }
 
 impl CibaRequest {
@@ -42,6 +47,8 @@ impl CibaRequest {
             binding_message: body.get("binding_message").cloned(),
             user_code: body.get("user_code").cloned(),
             requested_expiry,
+            operation_id: body.get("operation_id").cloned(),
+            resource: body.get("resource").cloned(),
         };
 
         req.validate()?;
@@ -49,6 +56,15 @@ impl CibaRequest {
     }
 
     pub fn validate(&self) -> Result<(), IssuerdError> {
+        if self.operation_id.is_some() {
+            return Err(IssuerdError::InvalidRequest(
+                "operation_id is not supported for CIBA".into(),
+            ));
+        }
+        if self.resource.is_some() {
+            return Err(IssuerdError::InvalidRequest("resource is not supported for CIBA".into()));
+        }
+
         if self.login_hint.is_none()
             && self.login_hint_token.is_none()
             && self.id_token_hint.is_none()
@@ -192,6 +208,27 @@ mod tests {
         assert_eq!(req.requested_expiry, Some(3600));
     }
 
+    #[test]
+    fn ciba_forward_fields_are_captured_but_rejected_as_unsupported() {
+        for (name, value) in [
+            ("operation_id", "op-1"),
+            ("resource", "https://issuer.example.com/realms/demo/mcp"),
+        ] {
+            let mut body = HashMap::new();
+            body.insert("login_hint".to_string(), "user@example.com".to_string());
+            body.insert(name.to_string(), value.to_string());
+            let err = CibaRequest::parse(&body).unwrap_err();
+            assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+            assert!(err.to_string().contains(name), "{err}");
+        }
+
+        let mut body = HashMap::new();
+        body.insert("login_hint".to_string(), "user@example.com".to_string());
+        let req = CibaRequest::parse(&body).unwrap();
+        assert_eq!(req.operation_id, None);
+        assert_eq!(req.resource, None);
+    }
+
     fn make_test_client() -> issuerd_core::Client {
         issuerd_core::Client {
             id: issuerd_core::ClientId::new("client-1").unwrap(),
@@ -236,5 +273,16 @@ mod tests {
             parse("admin").validate_scope(&client),
             Err(IssuerdError::InvalidScope)
         ));
+
+        let mut legacy = client;
+        legacy.default_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        legacy.optional_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
+        for mcp_enabled in [false, true] {
+            assert!(matches!(
+                parse(issuerd_core::MCP_SCOPE_STEP_UP)
+                    .validate_scope_with_mcp(&legacy, mcp_enabled),
+                Err(IssuerdError::InvalidScope)
+            ));
+        }
     }
 }

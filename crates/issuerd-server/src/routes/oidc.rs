@@ -129,11 +129,12 @@ pub async fn discovery_handler(
             // `dynamic_client_registration_enabled` attribute.
             if realm.dynamic_client_registration_enabled() {
                 discovery.registration_endpoint = Some(
-                    url::Url::parse(&format!(
-                        "{}/clients-registrations/openid-connect",
-                        discovery.issuer
-                    ))
-                    .unwrap(),
+                    issuerd_core::urls::RealmUrlBuilder::new(
+                        &state.config.issuer_url,
+                        realm.name.as_str(),
+                    )
+                    .expect("the configured base URL and a stored realm name form canonical URLs")
+                    .path(&["clients-registrations", "openid-connect"]),
                 );
             }
             // Advertise exactly the algorithms of the active
@@ -682,7 +683,15 @@ async fn try_auth_error_redirect(
         Ok(Some(c)) => c,
         _ => return None,
     };
-    if !client.redirect_uris.iter().any(|r| r.matches(redirect_uri.as_str())) {
+    let strict_mcp = state.config.mcp.enabled && params.contains_key("resource");
+    let redirect_registered = client.redirect_uris.iter().any(|registered| {
+        if strict_mcp {
+            registered.matches_mcp(redirect_uri.as_str())
+        } else {
+            registered.matches(redirect_uri.as_str())
+        }
+    });
+    if !redirect_registered {
         return None;
     }
     let requested_mode = params.get("response_mode").and_then(|s| s.parse::<ResponseMode>().ok());
@@ -738,7 +747,7 @@ async fn resolve_session_from_cookie(
     // realm-NAME based, so compare against the realm name.
     let issuer_realm =
         issuerd_core::typestate::extract_realm_from_issuer(validated.claims.iss.as_str());
-    if issuer_realm != Some(realm.name.as_str()) {
+    if !issuer_matches_realm(validated.claims.iss.as_str(), realm.name.as_str()) {
         tracing::debug!(
             issuer_realm = ?issuer_realm,
             realm = %realm.name,
@@ -1113,7 +1122,15 @@ async fn handle_auth_request(
         // oidcc-ensure-request-object-with-redirect-uri). Render an error instead.
         // Other validation failures (scope, response_type, ...) still redirect to the
         // requested redirect_uri, which is known to be registered at that point.
-        if !client.redirect_uris.iter().any(|r| r.matches(auth_req.redirect_uri.as_str())) {
+        let strict_mcp = state.config.mcp.enabled && auth_req.resource.is_some();
+        let redirect_registered = client.redirect_uris.iter().any(|registered| {
+            if strict_mcp {
+                registered.matches_mcp(auth_req.redirect_uri.as_str())
+            } else {
+                registered.matches(auth_req.redirect_uri.as_str())
+            }
+        });
+        if !redirect_registered {
             return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
         }
         return crate::routes::auth_response::oauth_error_redirect(
@@ -1336,7 +1353,7 @@ async fn handle_auth_request(
                 );
                 // Issuers are realm-NAME based: the segment is
                 // the realm name, not the id.
-                if issuer_realm != Some(realm.name.as_str()) {
+                if !issuer_matches_realm(validated.claims.iss.as_str(), realm.name.as_str()) {
                     tracing::debug!(
                         "auth_handler: ignoring cross-realm issuerd_session cookie for realm {:?}",
                         issuer_realm
@@ -2310,12 +2327,11 @@ pub async fn device_auth_handler(
         return cache_failure_response(&e);
     }
 
-    let issuer = format!(
-        "{}/realms/{}",
-        state.config.issuer_url.trim_end_matches('/'),
-        realm.name.as_str()
-    );
-    let verification_uri = format!("{}/protocol/openid-connect/auth/device-verify", issuer);
+    let verification_uri =
+        issuerd_core::urls::RealmUrlBuilder::new(&state.config.issuer_url, realm.name.as_str())
+            .expect("the configured base URL and a stored realm name form canonical URLs")
+            .path(&["protocol", "openid-connect", "auth", "device-verify"])
+            .to_string();
     let verification_uri_complete = Some(format!("{}?user_code={}", verification_uri, user_code));
 
     let resp = DeviceAuthorizationResponse {
@@ -2570,6 +2586,19 @@ pub async fn ciba_auth_handler(
     axum::extract::Extension(ClientIp(ip)): axum::extract::Extension<ClientIp>,
     body: String,
 ) -> Response {
+    // Detect forward-field multiplicity before form deserialization collapses
+    // repeated keys. Single values are parsed below and rejected as
+    // unsupported until the operation-bound CIBA profile exists.
+    for field in ["operation_id", "resource"] {
+        let count = url::form_urlencoded::parse(body.as_bytes())
+            .filter(|(name, _)| name == field)
+            .count();
+        if count > 1 {
+            let e = IssuerdError::InvalidRequest(format!("{field} must appear at most once"));
+            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        }
+    }
+
     let realm_name = match realm {
         Some(r) => r,
         None => {
@@ -3370,13 +3399,15 @@ async fn token_handler_inner(
             debug!(realm = %realm_id, client_id = %client.client_id, "DPoP proof without a live server nonce at token endpoint — challenging");
             return crate::dpop::use_dpop_nonce_response(&nonce);
         }
-        Err(crate::dpop::DpopRejection::InvalidProof) => {
+        Err(crate::dpop::DpopRejection::TemporarilyUnavailable) => {
+            return cache_failure_response(&IssuerdError::TemporarilyUnavailable);
+        }
+        Err(crate::dpop::DpopRejection::InvalidProof(nonce)) => {
             warn!(realm = %realm_id, client_id = %client.client_id, "DPoP proof rejected at token endpoint");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(error_response(&IssuerdError::InvalidDpopProof)),
-            )
-                .into_response();
+            let response =
+                (StatusCode::BAD_REQUEST, Json(error_response(&IssuerdError::InvalidDpopProof)))
+                    .into_response();
+            return crate::dpop::with_nonce_header(response, nonce.as_deref());
         }
     };
     let dpop_jkt: Option<String> = dpop.proof.map(|p| p.jkt);
@@ -3535,6 +3566,56 @@ async fn token_handler_inner(
                 }
             }
 
+            // RFC 8707 §2.2: the token request may restate the resource
+            // granted with the code verbatim or (when the code carries none)
+            // introduce an allowlisted one — but never contradict the grant.
+            // (Allowlist validation ran in the grant gate above.)
+            let resource = match (&token_req.resource, &code_data.resource) {
+                (Some(requested), Some(granted)) if requested != granted => {
+                    let e = IssuerdError::InvalidTarget(
+                        "resource does not match the resource granted with the code".into(),
+                    );
+                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+                }
+                (Some(requested), _) => Some(requested.clone()),
+                (None, granted) => granted.clone(),
+            };
+
+            // Any effective resource selects the strict MCP code profile,
+            // including one introduced only by this token request. Redirects
+            // issued under legacy wildcard rules cannot bypass that profile.
+            if resource.is_some() {
+                let redirect_is_valid = url::Url::parse(&code_data.redirect_uri)
+                    .map(|uri| uri.fragment().is_none())
+                    .unwrap_or(false)
+                    && client
+                        .redirect_uris
+                        .iter()
+                        .any(|registered| registered.matches_mcp(&code_data.redirect_uri));
+                if !redirect_is_valid {
+                    warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has a non-MCP redirect URI");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "invalid_grant"})),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Legacy cache entries cannot bypass S256 either.
+            if resource.is_some()
+                && (code_data.code_challenge.is_none()
+                    || code_data.code_challenge_method
+                        != Some(issuerd_core::PkceCodeChallengeMethod::S256))
+            {
+                warn!(realm = %realm_id, client_id = %client.client_id, "resource-bearing authorization grant has no S256 PKCE challenge");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            }
+
             // Verify PKCE if code_challenge was present
             if let Some(ref challenge) = code_data.code_challenge {
                 let verifier = token_req.code_verifier.as_deref().unwrap_or("");
@@ -3594,6 +3675,13 @@ async fn token_handler_inner(
                 .unwrap_or_else(|| SessionId::new(issuerd_core::utils::generate_id()).unwrap());
             let auth_time = code_data.auth_time.unwrap_or_else(chrono::Utc::now);
             let scope = code_data.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
 
             // RFC 9396 §6: the token request may narrow the
             // authorization details granted with the code; without it, the
@@ -3617,20 +3705,6 @@ async fn token_handler_inner(
                 }
             };
 
-            // RFC 8707 §2.2: the token request may restate the resource
-            // granted with the code verbatim or (when the code carries none)
-            // introduce an allowlisted one — but never contradict the grant.
-            // (Allowlist validation ran in the grant gate above.)
-            let resource = match (&token_req.resource, &code_data.resource) {
-                (Some(requested), Some(granted)) if requested != granted => {
-                    let e = IssuerdError::InvalidTarget(
-                        "resource does not match the resource granted with the code".into(),
-                    );
-                    return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
-                }
-                (Some(requested), _) => Some(requested.clone()),
-                (None, granted) => granted.clone(),
-            };
             if let Err(e) = crate::routes::protected_resource::validate_resource_param(
                 &state.config,
                 realm.name.as_str(),
@@ -4308,6 +4382,14 @@ async fn token_handler_inner(
                     .into_response();
             }
 
+            if validated.claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
+
             // DPoP (RFC 9449 §5.1): a bound refresh token may only
             // be redeemed together with a proof from the same key, and the
             // rotated tokens keep the binding ("slide"). An unbound token
@@ -4971,6 +5053,13 @@ async fn token_handler_inner(
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
             let scope = consumed.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -5337,6 +5426,13 @@ async fn token_handler_inner(
 
             let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
             let scope = consumed.scope.clone();
+            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_response(&IssuerdError::InvalidScope)),
+                )
+                    .into_response();
+            }
             let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
 
             let session = issuerd_core::UserSession {
@@ -5513,9 +5609,7 @@ async fn refresh_replay_response(
     ip: &std::net::IpAddr,
     claims: &issuerd_core::RefreshTokenClaims,
 ) -> Response {
-    if issuerd_core::typestate::extract_realm_from_issuer(claims.iss.as_str())
-        == Some(realm.name.as_str())
-    {
+    if issuer_matches_realm(claims.iss.as_str(), realm.name.as_str()) {
         if let Err(e) = state.storage.delete_user_session(&realm.id, &claims.sid).await {
             error!(realm = %realm.id, client_id = %client.client_id, error = %e, "refresh replay family revocation failed");
             return (
@@ -5547,6 +5641,12 @@ async fn refresh_replay_response(
 
 fn verify_pkce(verifier: &str, challenge: &str, method: Option<PkceCodeChallengeMethod>) -> bool {
     issuerd_protocol::pkce::PkceVerifier::verify(verifier, challenge, method).is_ok()
+}
+
+fn issuer_matches_realm(issuer: &str, realm_name: &str) -> bool {
+    issuerd_core::typestate::extract_realm_from_issuer(issuer)
+        .and_then(|segment| issuerd_core::urls::decode_realm_segment(segment).ok())
+        .is_some_and(|name| name == realm_name)
 }
 
 /// Check whether an access token's underlying user session has been deleted.
@@ -5866,8 +5966,9 @@ pub(crate) async fn enforce_oob_second_factor(
 
 /// Token-validity gates shared by endpoints that serve bearer-token callers
 /// (userinfo, the account API): explicit revocation (RFC 7009 / auth-code
-/// reuse teardown), issuer-realm resolution, backing-session existence, and
-/// realm `not_before`. Runs AFTER the stateless cryptographic validation;
+/// reuse teardown), reserved step-up scope rejection, issuer-realm resolution,
+/// backing-session existence, and realm `not_before`. Runs AFTER the stateless
+/// cryptographic validation;
 /// invalid tokens answer `401 invalid_token`; cache failures answer
 /// `503 temporarily_unavailable`. Returns the issuer realm (when resolvable)
 /// and the session snapshot (when the token carries a live session) so the
@@ -5886,6 +5987,13 @@ pub(crate) async fn enforce_token_validity(
         (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_token"})))
             .into_response()
     };
+
+    // Operation-bound step-up tokens are not general bearer credentials.
+    // Until their dedicated MCP execution path exists, no non-MCP API may
+    // accept the reserved scope, including from legacy token data.
+    if claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
+        return Err(invalid());
+    }
 
     // Check revocation list first; marker-store failures fail closed.
     match state.cache.get(&format!("revoked:{token}")).await {
@@ -5932,6 +6040,119 @@ pub(crate) async fn enforce_token_validity(
     }
 
     Ok((issuer_realm, session))
+}
+
+/// Strict MCP authentication failures with their HTTP mappings.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpTokenError {
+    InvalidToken,
+    DisabledUser,
+    DisabledClient,
+    TemporarilyUnavailable,
+}
+
+#[allow(dead_code)]
+impl McpTokenError {
+    pub(crate) fn http_status(self) -> StatusCode {
+        match self {
+            Self::InvalidToken => StatusCode::UNAUTHORIZED,
+            Self::DisabledUser | Self::DisabledClient => StatusCode::FORBIDDEN,
+            Self::TemporarilyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+/// Issuer realm and interactive session validated together for MCP.
+#[allow(dead_code)]
+pub(crate) struct McpTokenValidity {
+    pub realm: Realm,
+    pub session: crate::session_cache::SessionSnapshot,
+}
+
+/// MCP-only validity gates. Unlike `enforce_token_validity`, this requires an
+/// interactive persisted session and permits the reserved step-up scope only
+/// on the MCP endpoint. Backend failures stay retryable.
+#[allow(dead_code)]
+pub(crate) async fn enforce_mcp_token_validity(
+    state: &Arc<ServerState>,
+    token: &str,
+    claims: &AccessTokenClaims,
+) -> Result<McpTokenValidity, McpTokenError> {
+    match state.cache.get(&format!("revoked:{token}")).await {
+        Ok(Some(_)) => return Err(McpTokenError::InvalidToken),
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "MCP token revocation cache read failed");
+            return Err(McpTokenError::TemporarilyUnavailable);
+        }
+    }
+
+    let realm = match state.resolve_issuer_realm(claims.iss.as_str()).await {
+        Ok(Some(realm)) => realm,
+        Ok(None) => return Err(McpTokenError::InvalidToken),
+        Err(e) => {
+            warn!(error = %e, "MCP token issuer resolution failed");
+            return Err(McpTokenError::TemporarilyUnavailable);
+        }
+    };
+    let Some(sid) = claims.sid.as_ref() else {
+        return Err(McpTokenError::InvalidToken);
+    };
+    let session = match crate::session_cache::session_snapshot_result(state, &realm.id, sid).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Err(McpTokenError::InvalidToken),
+        Err(e) => {
+            warn!(realm = %realm.id, error = %e, "MCP token session read failed");
+            return Err(McpTokenError::TemporarilyUnavailable);
+        }
+    };
+    if realm.not_before > 0 && claims.iat < realm.not_before {
+        return Err(McpTokenError::InvalidToken);
+    }
+
+    Ok(McpTokenValidity { realm, session })
+}
+
+/// Resolve the internal user id from the validated session, never the pairwise
+/// or otherwise externally visible token subject.
+#[allow(dead_code)]
+pub(crate) async fn resolve_mcp_token_user(
+    state: &Arc<ServerState>,
+    validity: &McpTokenValidity,
+) -> Result<issuerd_core::User, McpTokenError> {
+    match state.storage.get_user(&validity.realm.id, &validity.session.user_id).await {
+        Ok(Some(user)) if user.enabled => Ok(user),
+        Ok(Some(_)) => Err(McpTokenError::DisabledUser),
+        Ok(None) => Err(McpTokenError::InvalidToken),
+        Err(e) => {
+            warn!(realm = %validity.realm.id, error = %e, "MCP token user resolution failed");
+            Err(McpTokenError::TemporarilyUnavailable)
+        }
+    }
+}
+
+/// Resolve the authorized party as an enabled client. There is deliberately no
+/// fallback to `aud`, which may contain the MCP resource or multiple audiences.
+#[allow(dead_code)]
+pub(crate) async fn resolve_mcp_azp_client(
+    state: &Arc<ServerState>,
+    validity: &McpTokenValidity,
+    claims: &AccessTokenClaims,
+) -> Result<issuerd_core::Client, McpTokenError> {
+    let Some(azp) = claims.azp.as_deref() else {
+        return Err(McpTokenError::InvalidToken);
+    };
+    let identifier = ClientIdentifier::new(azp).map_err(|_| McpTokenError::InvalidToken)?;
+    match state.storage.get_client_by_client_id(&validity.realm.id, &identifier).await {
+        Ok(Some(client)) if client.enabled => Ok(client),
+        Ok(Some(_)) => Err(McpTokenError::DisabledClient),
+        Ok(None) => Err(McpTokenError::InvalidToken),
+        Err(e) => {
+            warn!(realm = %validity.realm.id, error = %e, "MCP token azp client resolution failed");
+            Err(McpTokenError::TemporarilyUnavailable)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6034,11 +6255,14 @@ async fn userinfo_handler_inner(
                             Some(&nonce),
                         );
                     }
-                    Err(crate::dpop::DpopRejection::InvalidProof) => {
+                    Err(crate::dpop::DpopRejection::TemporarilyUnavailable) => {
+                        return cache_failure_response(&IssuerdError::TemporarilyUnavailable);
+                    }
+                    Err(crate::dpop::DpopRejection::InvalidProof(nonce)) => {
                         return crate::dpop::challenge_response(
                             "invalid_dpop_proof",
                             "the DPoP proof is invalid",
-                            None,
+                            nonce.as_deref(),
                         );
                     }
                 };
@@ -6065,7 +6289,7 @@ async fn userinfo_handler_inner(
                     return crate::dpop::challenge_response(
                         "invalid_token",
                         "the token is not bound to the proof key",
-                        None,
+                        dpop_response_nonce.as_deref(),
                     );
                 }
             }
@@ -6818,8 +7042,7 @@ pub async fn revoke_handler(
             }
 
             let matches_client = |iss: &issuerd_core::Issuer, aud: &issuerd_core::Audience| {
-                issuerd_core::typestate::extract_realm_from_issuer(iss.as_str())
-                    == Some(realm.name.as_str())
+                issuer_matches_realm(iss.as_str(), realm.name.as_str())
                     && aud.contains(client.client_id.as_ref())
             };
             let mut validated_token = false;
@@ -6973,13 +7196,11 @@ pub async fn introspect_handler(
                         // client the token was issued to, within this realm.
                         // Realm not_before: tokens issued before the realm's
                         // cutoff report inactive (0 = no cutoff).
-                        let token_realm =
-                            issuerd_core::typestate::extract_realm_from_issuer(claims.iss.as_str());
                         let token_client =
                             claims.azp.clone().unwrap_or_else(|| claims.aud.as_str().to_string());
                         // The token's issuer segment is a realm NAME;
                         // compare it against the introspecting realm's name.
-                        if token_realm != Some(realm.name.as_str())
+                        if !issuer_matches_realm(claims.iss.as_str(), realm.name.as_str())
                             || token_client != client.client_id.as_str()
                             || (realm.not_before > 0 && claims.iat < realm.not_before)
                             || session_invalidated(&state, &claims).await
@@ -8742,6 +8963,36 @@ mod tests {
             axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
             axum::http::HeaderMap::new(),
             body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(extract_json(response).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn resource_auth_code_without_pkce_is_rejected_even_without_redirect_uri() {
+        let state = setup_state().await;
+        let code = issuerd_core::utils::generate_id();
+        let mut code_data = sample_auth_code_data();
+        code_data.user_id = "admin".to_string();
+        code_data.client_id = "admin-cli".to_string();
+        code_data.resource = Some("http://localhost:8080/realms/master/mcp".to_string());
+        state
+            .cache
+            .set(
+                &auth_code_cache_key("master", &code),
+                serde_json::to_vec(&code_data).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        let response = token_handler(
+            State(state),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!("grant_type=authorization_code&code={code}&client_id=admin-cli"),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -11814,6 +12065,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ciba_auth_handler_forward_fields_and_duplicates_rejected() {
+        let state = setup_state().await;
+        for body in [
+            "login_hint=admin&operation_id=op-1",
+            "login_hint=admin&resource=https://issuer.example.com/realms/master/mcp",
+            "login_hint=admin&operation_id=op-1&operation_id=op-2",
+            "login_hint=admin&resource=https://a.example&resource=https://b.example",
+        ] {
+            let response = ciba_auth_handler(
+                State(state.clone()),
+                axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(extract_json(response).await["error"], "invalid_request", "body: {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn ciba_auth_handler_unknown_user() {
         let state = setup_state().await;
         let client = issuerd_core::Client {
@@ -14336,7 +14608,335 @@ mod tests {
             claims: None,
             cnf: None,
             authorization_details: None,
+            resource: None,
         }
+    }
+
+    fn mcp_test_realm() -> Realm {
+        Realm {
+            id: RealmId::new("master").unwrap(),
+            name: issuerd_core::RealmName::new("master").unwrap(),
+            ..Default::default()
+        }
+    }
+
+    fn mcp_test_session(sid: &issuerd_core::SessionId) -> issuerd_core::UserSession {
+        let now = chrono::Utc::now();
+        issuerd_core::UserSession {
+            id: sid.clone(),
+            realm_id: RealmId::new("master").unwrap(),
+            user_id: issuerd_core::UserId::new("admin").unwrap(),
+            login_username: issuerd_core::Username::new("admin").unwrap(),
+            ip_address: "127.0.0.1".parse().unwrap(),
+            auth_method: issuerd_core::AuthMethod::Password,
+            remember_me: false,
+            offline: false,
+            started: now,
+            last_session_refresh: now,
+            auth_time: now,
+            impersonator: None,
+            clients: vec![],
+        }
+    }
+
+    async fn seed_mcp_test_session(state: &Arc<ServerState>, sid: &issuerd_core::SessionId) {
+        state
+            .storage
+            .create_user_session(&RealmId::new("master").unwrap(), &mcp_test_session(sid))
+            .await
+            .unwrap();
+    }
+
+    async fn state_with_mock_storage(storage: issuerd_core::MockStorage) -> Arc<ServerState> {
+        let mut state = setup_state().await;
+        let state_mut = Arc::get_mut(&mut state).expect("fresh test state has one Arc owner");
+        state_mut.storage = Arc::new(storage);
+        state_mut.config.cache.read_cache_ttl_secs = 0;
+        state
+    }
+
+    async fn mcp_validity_with_session(
+        state: &Arc<ServerState>,
+        claims: &AccessTokenClaims,
+    ) -> McpTokenValidity {
+        seed_mcp_test_session(state, claims.sid.as_ref().unwrap()).await;
+        enforce_mcp_token_validity(state, "token", claims).await.unwrap()
+    }
+
+    fn expect_mcp_error<T>(
+        result: Result<T, McpTokenError>,
+        expected: McpTokenError,
+        status: StatusCode,
+    ) {
+        let error = result.err().expect("expected MCP authentication failure");
+        assert_eq!(error, expected);
+        assert_eq!(error.http_status(), status);
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_rejects_revoked_token() {
+        let state = setup_state().await;
+        state.cache.set("revoked:token", vec![1], None).await.unwrap();
+        let claims = access_claims("admin", None, "admin-cli");
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &claims).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_maps_revocation_cache_failure_to_503() {
+        let cache = Arc::new(RecordingCache {
+            fail_get: true,
+            ..Default::default()
+        });
+        let state = state_with_recording_cache(cache).await;
+        let claims = access_claims("admin", None, "admin-cli");
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &claims).await,
+            McpTokenError::TemporarilyUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_requires_a_real_interactive_session() {
+        let state = setup_state().await;
+        let sessionless = access_claims("admin-cli", None, "admin-cli");
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &sessionless).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+
+        let synthetic = access_claims(
+            "admin-cli",
+            Some(issuerd_core::SessionId::new("synthetic-client-session").unwrap()),
+            "admin-cli",
+        );
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &synthetic).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_maps_issuer_storage_failure_to_503() {
+        let mut storage = issuerd_core::MockStorage::new();
+        storage
+            .expect_get_realm_by_name()
+            .returning(|_| Err(IssuerdError::ServerError("issuer storage down".to_string())));
+        let state = state_with_mock_storage(storage).await;
+        let claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-issuer-failure").unwrap()),
+            "admin-cli",
+        );
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &claims).await,
+            McpTokenError::TemporarilyUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_maps_session_storage_failure_to_503() {
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_realm_by_name().returning(|_| Ok(Some(mcp_test_realm())));
+        storage
+            .expect_get_user_session()
+            .returning(|_, _| Err(IssuerdError::ServerError("session storage down".to_string())));
+        let state = state_with_mock_storage(storage).await;
+        let claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-storage-failure").unwrap()),
+            "admin-cli",
+        );
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &claims).await,
+            McpTokenError::TemporarilyUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_validity_enforces_realm_not_before() {
+        let state = setup_state().await;
+        let claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-not-before").unwrap()),
+            "admin-cli",
+        );
+        seed_mcp_test_session(&state, claims.sid.as_ref().unwrap()).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.not_before = claims.iat + 1;
+        state.storage.update_realm(&realm).await.unwrap();
+        expect_mcp_error(
+            enforce_mcp_token_validity(&state, "token", &claims).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_pairwise_user_resolution_uses_session_and_allows_step_up_scope() {
+        let state = setup_state().await;
+        let mut claims = access_claims(
+            "pairwise-hmac-sub",
+            Some(issuerd_core::SessionId::new("sid-pairwise").unwrap()),
+            "admin-cli",
+        );
+        claims.scope = Scope::parse("openid mcp:step_up");
+        let validity = mcp_validity_with_session(&state, &claims).await;
+        let user = resolve_mcp_token_user(&state, &validity).await.unwrap();
+        assert_eq!(user.id.as_ref(), "admin");
+        let client = resolve_mcp_azp_client(&state, &validity, &claims).await.unwrap();
+        assert_eq!(client.client_id.as_ref(), "admin-cli");
+    }
+
+    #[tokio::test]
+    async fn mcp_user_resolution_rejects_missing_and_disabled_users() {
+        let state = setup_state().await;
+        let claims = access_claims(
+            "pairwise-hmac-sub",
+            Some(issuerd_core::SessionId::new("sid-disabled-user").unwrap()),
+            "admin-cli",
+        );
+        let validity = mcp_validity_with_session(&state, &claims).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let user_id = issuerd_core::UserId::new("admin").unwrap();
+        let mut user = state.storage.get_user(&realm_id, &user_id).await.unwrap().unwrap();
+        user.enabled = false;
+        state.storage.update_user(&realm_id, &user).await.unwrap();
+        expect_mcp_error(
+            resolve_mcp_token_user(&state, &validity).await,
+            McpTokenError::DisabledUser,
+            StatusCode::FORBIDDEN,
+        );
+        state.storage.delete_user(&realm_id, &user_id).await.unwrap();
+        expect_mcp_error(
+            resolve_mcp_token_user(&state, &validity).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_user_resolution_maps_storage_failure_to_503() {
+        let sid = issuerd_core::SessionId::new("sid-user-failure").unwrap();
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_realm_by_name().returning(|_| Ok(Some(mcp_test_realm())));
+        let session = mcp_test_session(&sid);
+        storage
+            .expect_get_user_session()
+            .returning(move |_, _| Ok(Some(session.clone())));
+        storage
+            .expect_get_user()
+            .returning(|_, _| Err(IssuerdError::ServerError("user storage down".to_string())));
+        let state = state_with_mock_storage(storage).await;
+        let claims = access_claims("pairwise-hmac-sub", Some(sid), "admin-cli");
+        let validity = enforce_mcp_token_validity(&state, "token", &claims).await.unwrap();
+        expect_mcp_error(
+            resolve_mcp_token_user(&state, &validity).await,
+            McpTokenError::TemporarilyUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_azp_is_required_and_never_falls_back_to_audience() {
+        let state = setup_state().await;
+        let mut claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-missing-azp").unwrap()),
+            "admin-cli",
+        );
+        claims.azp = None;
+        let validity = mcp_validity_with_session(&state, &claims).await;
+        expect_mcp_error(
+            resolve_mcp_azp_client(&state, &validity, &claims).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_azp_client_must_exist_and_be_enabled() {
+        let state = setup_state().await;
+        let claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-missing-client").unwrap()),
+            "no-such-client",
+        );
+        let validity = mcp_validity_with_session(&state, &claims).await;
+        expect_mcp_error(
+            resolve_mcp_azp_client(&state, &validity, &claims).await,
+            McpTokenError::InvalidToken,
+            StatusCode::UNAUTHORIZED,
+        );
+
+        let state = setup_state().await;
+        let claims = access_claims(
+            "admin",
+            Some(issuerd_core::SessionId::new("sid-disabled-client").unwrap()),
+            "admin-cli",
+        );
+        let validity = mcp_validity_with_session(&state, &claims).await;
+        let realm_id = RealmId::new("master").unwrap();
+        let identifier = ClientIdentifier::new("admin-cli").unwrap();
+        let mut client = state
+            .storage
+            .get_client_by_client_id(&realm_id, &identifier)
+            .await
+            .unwrap()
+            .unwrap();
+        client.enabled = false;
+        state.storage.update_client(&realm_id, &client).await.unwrap();
+        expect_mcp_error(
+            resolve_mcp_azp_client(&state, &validity, &claims).await,
+            McpTokenError::DisabledClient,
+            StatusCode::FORBIDDEN,
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_azp_resolution_maps_storage_failure_to_503() {
+        let sid = issuerd_core::SessionId::new("sid-client-failure").unwrap();
+        let mut storage = issuerd_core::MockStorage::new();
+        storage.expect_get_realm_by_name().returning(|_| Ok(Some(mcp_test_realm())));
+        let session = mcp_test_session(&sid);
+        storage
+            .expect_get_user_session()
+            .returning(move |_, _| Ok(Some(session.clone())));
+        storage
+            .expect_get_client_by_client_id()
+            .returning(|_, _| Err(IssuerdError::ServerError("client storage down".to_string())));
+        let state = state_with_mock_storage(storage).await;
+        let claims = access_claims("admin", Some(sid), "admin-cli");
+        let validity = enforce_mcp_token_validity(&state, "token", &claims).await.unwrap();
+        expect_mcp_error(
+            resolve_mcp_azp_client(&state, &validity, &claims).await,
+            McpTokenError::TemporarilyUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_token_validity_rejects_only_reserved_step_up_scope() {
+        let state = setup_state().await;
+        let mut claims = access_claims("admin", None, "admin-cli");
+        claims.scope = Scope::parse("openid mcp:step_up");
+        let Err(response) = enforce_token_validity(&state, "token", &claims).await else {
+            panic!("step-up token must not pass shared non-MCP validity");
+        };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(extract_json(response).await["error"], "invalid_token");
+
+        claims.scope = Scope::parse("openid profile");
+        assert!(enforce_token_validity(&state, "token", &claims).await.is_ok());
     }
 
     /// Regression test: a pairwise subject can never resolve to a

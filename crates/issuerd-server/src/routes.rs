@@ -31,6 +31,7 @@ mod jar;
 mod kerberos;
 pub(crate) mod login_api;
 pub mod logout;
+mod mcp;
 pub(crate) mod oidc;
 mod par;
 mod protected_resource;
@@ -179,7 +180,7 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
                 .use_pkce_with_authorization_code_grant(true),
         );
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(system::health_handler))
         .route("/ready", get(system::ready_handler))
         .route("/health/ready", get(system::ready_handler))
@@ -360,7 +361,9 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .merge(admin_nested)
         .merge(swagger)
         .route("/{*path}", get(web_ui::static_handler))
-        .route("/", get(|| async { Redirect::temporary(web_ui::ADMIN_CONSOLE_PREFIX) }))
+        .route("/", get(|| async { Redirect::temporary(web_ui::ADMIN_CONSOLE_PREFIX) }));
+    let router = mcp::mount(router, &state);
+    router
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::extract::Request| {

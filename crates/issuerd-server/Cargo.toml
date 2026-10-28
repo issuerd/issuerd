@@ -20,9 +20,14 @@ issuerd-storage = { workspace = true }
 issuerd-cluster = { workspace = true }
 issuerd-federation = { workspace = true }
 issuerd-admin-api = { workspace = true }
+issuerd-mcp = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 axum-server = { workspace = true }
+bytes = "1"
+http-body-util = "0.1"
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

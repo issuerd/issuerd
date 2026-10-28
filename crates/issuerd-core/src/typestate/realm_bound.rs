@@ -10,7 +10,7 @@
 //! prevents accidental use of the value in a handler for a different realm
 //! without an explicit verification call.
 
-use crate::{IssuerdError, RealmId};
+use crate::{IssuerdError, RealmId, RealmName};
 
 /// Extract the realm name from an OIDC issuer URL of the form
 /// `https://host/realms/{realm}` or `https://host/realms/{realm}/`.
@@ -27,6 +27,13 @@ pub fn extract_realm_from_issuer(issuer: &str) -> Option<&str> {
         return None;
     }
     Some(realm)
+}
+
+/// Extract and decode the realm name from an OIDC issuer URL exactly once.
+/// Both canonical percent-encoded and legacy raw realm names are accepted.
+/// Callers must resolve the returned name; no realm-id alias fallback is implied.
+pub fn extract_realm_name_from_issuer(issuer: &str) -> Option<RealmName> {
+    crate::urls::decode_realm_segment(extract_realm_from_issuer(issuer)?).ok()
 }
 
 /// A value `T` that has been bound to a specific realm.
@@ -101,6 +108,46 @@ mod tests {
         assert_eq!(extract_realm_from_issuer("https://id.example.com"), None);
         assert_eq!(extract_realm_from_issuer("https://evil.com/"), None);
         assert_eq!(extract_realm_from_issuer(""), None);
+    }
+
+    #[test]
+    fn extract_realm_name_decodes_raw_and_encoded_spellings_exactly_once() {
+        for (segment, expected) in [
+            ("master", "master"),
+            ("tenant{one}", "tenant{one}"),
+            ("tenant%7Bone%7D", "tenant{one}"),
+            ("tenant%7bone%7d", "tenant{one}"),
+        ] {
+            let issuer = format!("https://id.example.com/realms/{segment}");
+            assert_eq!(
+                extract_realm_name_from_issuer(&issuer),
+                Some(RealmName::new(expected).unwrap()),
+                "{segment}"
+            );
+            assert_eq!(
+                extract_realm_name_from_issuer(&format!("{issuer}/")),
+                Some(RealmName::new(expected).unwrap()),
+                "{segment}/"
+            );
+        }
+
+        for segment in [
+            "tenant%257Bone%257D",
+            "a%2Fb",
+            "%20master%20",
+            " master ",
+            "%2E",
+            "%2E%2E",
+            "%",
+            "%FF",
+        ] {
+            assert_eq!(
+                extract_realm_name_from_issuer(&format!("https://id.example.com/realms/{segment}")),
+                None,
+                "{segment}"
+            );
+        }
+        assert_eq!(extract_realm_name_from_issuer("https://id.example.com/"), None);
     }
 
     #[test]

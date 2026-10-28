@@ -8,8 +8,8 @@
 //!
 //! Covered: the `[mcp] enabled` gate (uniform 404 when disabled), the bare
 //! master-realm route, the path-suffixed per-realm route, the unknown-realm
-//! 404, the exact document shape (five fields, no nulls), the response
-//! headers mirroring the OIDC discovery document, and the DPoP alg list's
+//! 404, the strict and Bearer-compatible document shapes, response headers
+//! mirroring the OIDC discovery document, and the DPoP alg list's
 //! equality with the OIDC discovery advertisement.
 
 use axum::body::Body;
@@ -28,8 +28,13 @@ fn realm_path(realm: &str) -> String {
 /// Harness with `[mcp] enabled = true` (`TestHarness::new` runs the default
 /// `false`).
 async fn harness_with_mcp_enabled() -> TestHarness {
+    harness_with_mcp_profile(true).await
+}
+
+async fn harness_with_mcp_profile(require_dpop: bool) -> TestHarness {
     let mut config = crate::harness::test_config();
     config.mcp.enabled = true;
+    config.mcp.require_dpop = require_dpop;
     let state = std::sync::Arc::new(
         issuerd_server::state::ServerState::from_config(&config).await.unwrap(),
     );
@@ -62,7 +67,7 @@ async fn disabled_gate_answers_404_on_both_routes() {
 }
 
 #[tokio::test]
-async fn bare_route_serves_master_realm_resource() {
+async fn bare_route_serves_strict_dpop_metadata_by_default() {
     let harness = harness_with_mcp_enabled().await;
     let resp = get(&harness, BARE_PATH).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -78,27 +83,37 @@ async fn bare_route_serves_master_realm_resource() {
     let issuer = format!("{}/realms/master", harness.base_url);
     assert_eq!(json["resource"], format!("{issuer}/mcp"));
     assert_eq!(json["authorization_servers"], serde_json::json!([issuer]));
-    assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read", "mcp:write"]));
-    // The served DPoP alg set IS the proof validator's accept set.
+    assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read"]));
+    assert_eq!(json["dpop_bound_access_tokens_required"], true);
     let expected_algs: Vec<&str> = issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED
         .iter()
         .map(|alg| alg.as_str())
         .collect();
     assert_eq!(json["dpop_signing_alg_values_supported"], serde_json::json!(expected_algs));
-    assert_eq!(json["bearer_methods_supported"], serde_json::json!(["header"]));
-    // Exactly these five fields, no extras, no nulls (RFC 9728 §3.2).
+    assert!(json.get("bearer_methods_supported").is_none());
     let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
         [
             "authorization_servers",
-            "bearer_methods_supported",
+            "dpop_bound_access_tokens_required",
             "dpop_signing_alg_values_supported",
             "resource",
             "scopes_supported"
         ]
     );
+}
+
+#[tokio::test]
+async fn bearer_compatibility_is_explicit_in_metadata() {
+    let harness = harness_with_mcp_profile(false).await;
+    let resp = get(&harness, BARE_PATH).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["dpop_bound_access_tokens_required"], false);
+    assert_eq!(json["bearer_methods_supported"], serde_json::json!(["header"]));
+    assert_eq!(json["scopes_supported"], serde_json::json!(["mcp:read"]));
 }
 
 #[tokio::test]
@@ -217,11 +232,13 @@ async fn challenge_metadata_url_roundtrips_to_the_same_resource() {
             "demo",
         );
     let challenge =
-        issuerd_server::challenges::invalid_token_challenge(metadata_url.as_str(), None);
+        issuerd_server::challenges::no_credentials_challenge(metadata_url.as_str(), true);
     assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         challenge.headers()[axum::http::header::WWW_AUTHENTICATE].to_str().unwrap(),
-        format!("Bearer resource_metadata=\"{metadata_url}\"")
+        format!(
+            "DPoP resource_metadata=\"{metadata_url}\", algs=\"RS256 RS384 RS512 ES256 ES384 EdDSA\", scope=\"mcp:read\""
+        )
     );
 
     let resp = get(&harness, metadata_url.path()).await;

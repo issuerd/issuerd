@@ -16,7 +16,6 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use base64::Engine as _;
-use ring::signature::KeyPair as _;
 use tower::ServiceExt as _;
 
 use crate::harness::TestHarness;
@@ -59,77 +58,16 @@ fn decode_payload(token: &str) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// DPoP key + proof minting (hand-rolled compact JWS: the header must carry
-// the `jwk` claim, which the server's CryptoProvider cannot produce)
+// DPoP key + endpoint-specific proof helpers
 // ---------------------------------------------------------------------------
 
-struct DpopKey {
-    pair: ring::signature::EcdsaKeyPair,
-    jwk: serde_json::Value,
-}
+use crate::harness::dpop::{DpopKey, ProofOpts};
 
 fn dpop_key() -> DpopKey {
-    let rng = ring::rand::SystemRandom::new();
-    let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-        &rng,
-    )
-    .unwrap();
-    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-        doc.as_ref(),
-        &rng,
-    )
-    .unwrap();
-    let public = pair.public_key().as_ref();
-    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-    let jwk = serde_json::json!({
-        "kty": "EC", "crv": "P-256", "x": b64(&public[1..33]), "y": b64(&public[33..65]),
-    });
-    DpopKey { pair, jwk }
-}
-
-/// Proof overrides; `Default` produces a valid token-endpoint POST proof.
-struct ProofOpts {
-    htm: String,
-    htu: String,
-    jti: String,
-    iat: i64,
-    ath: Option<String>,
-    typ: String,
-    nonce: Option<String>,
+    DpopKey::new()
 }
 
 impl DpopKey {
-    fn jkt(&self) -> String {
-        issuerd_token::jwk_thumbprint(&self.jwk).unwrap()
-    }
-
-    fn proof(&self, opts: &ProofOpts) -> String {
-        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let header = serde_json::json!({"alg": "ES256", "typ": opts.typ, "jwk": self.jwk});
-        let mut claims = serde_json::json!({
-            "jti": opts.jti,
-            "htm": opts.htm,
-            "htu": opts.htu,
-            "iat": opts.iat,
-        });
-        if let Some(ref ath) = opts.ath {
-            claims["ath"] = serde_json::json!(issuerd_token::access_token_hash(ath));
-        }
-        if let Some(ref nonce) = opts.nonce {
-            claims["nonce"] = serde_json::json!(nonce);
-        }
-        let input = format!(
-            "{}.{}",
-            b64(&serde_json::to_vec(&header).unwrap()),
-            b64(&serde_json::to_vec(&claims).unwrap())
-        );
-        let rng = ring::rand::SystemRandom::new();
-        let sig = self.pair.sign(&rng, input.as_bytes()).unwrap();
-        format!("{input}.{}", b64(sig.as_ref()))
-    }
-
     fn token_proof(&self, harness: &TestHarness, realm: &str) -> String {
         self.token_proof_with_nonce(harness, realm, None)
     }
@@ -140,15 +78,9 @@ impl DpopKey {
         realm: &str,
         nonce: Option<&str>,
     ) -> String {
-        self.proof(&ProofOpts {
-            htm: "POST".to_string(),
-            htu: token_htu(harness, realm),
-            jti: issuerd_core::utils::generate_id(),
-            iat: chrono::Utc::now().timestamp(),
-            ath: None,
-            typ: "dpop+jwt".to_string(),
-            nonce: nonce.map(str::to_string),
-        })
+        let mut opts = ProofOpts::new("POST", token_htu(harness, realm));
+        opts.nonce = nonce.map(str::to_string);
+        self.proof(&opts)
     }
 
     fn userinfo_proof(&self, harness: &TestHarness, realm: &str, method: &str, at: &str) -> String {
@@ -163,15 +95,10 @@ impl DpopKey {
         at: &str,
         nonce: Option<&str>,
     ) -> String {
-        self.proof(&ProofOpts {
-            htm: method.to_string(),
-            htu: userinfo_htu(harness, realm),
-            jti: issuerd_core::utils::generate_id(),
-            iat: chrono::Utc::now().timestamp(),
-            ath: Some(at.to_string()),
-            typ: "dpop+jwt".to_string(),
-            nonce: nonce.map(str::to_string),
-        })
+        let mut opts = ProofOpts::new(method, userinfo_htu(harness, realm));
+        opts.ath = Some(at.to_string());
+        opts.nonce = nonce.map(str::to_string);
+        self.proof(&opts)
     }
 }
 

@@ -61,6 +61,7 @@ CRATES = [
     "issuerd-federation",
     "issuerd-auth-flow",
     "issuerd-admin-api",
+    "issuerd-mcp",
     "issuerd-server",
 ]
 

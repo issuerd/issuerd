@@ -92,7 +92,7 @@ downloads). The test environment itself never touches the internet —
 | `oidcc-frontchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-frontchannel-logout-op.json` | front-channel iframes with iss+sid — **PASSED** |
 | `oidcc-backchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-backchannel-logout-op.json` | signed logout tokens — **PASSED** (2 expected TLS-header warnings per run — the suite's nginx-proxy header cannot exist in the proxy-less stack) |
 
-Latest full self-hosted run used suite `release-v5.3.2`: **0 failures, 0 warnings** on all plans — per-module detail in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Latest full self-hosted run on **2026-10-27** used suite `release-v5.3.3`: **all plans OK, 0 unexpected failures and 0 unexpected warnings** across all 43 invocations. The 24 failures and 12 warnings are the declared expected sets described above; standalone key rotation passed. Current evidence is at `results/html-reports-20261026-205311/index.html`; per-module analysis is in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 

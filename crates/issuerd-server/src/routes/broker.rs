@@ -132,14 +132,21 @@ struct BrokerFirstLoginData {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// The URL the external IdP redirects back to. Uses the URL path segment the
-/// request arrived on (a realm name in practice) so the IdP's redirect matches
-/// the registered client exactly.
+fn realm_path_segment(realm_segment: &str) -> String {
+    let decoded = issuerd_core::urls::decode_realm_segment(realm_segment)
+        .map(|realm| realm.as_str().to_string())
+        .unwrap_or_else(|_| realm_segment.to_string());
+    url_path_segment(&decoded)
+}
+
+/// The URL the external IdP redirects back to. The realm segment is decoded
+/// before canonical encoding so an already-encoded request path is not encoded
+/// a second time.
 fn callback_url(state: &ServerState, realm_segment: &str, alias: &str) -> String {
     format!(
         "{}/realms/{}/broker/{}/endpoint",
         state.config.issuer_url.trim_end_matches('/'),
-        url_path_segment(realm_segment),
+        realm_path_segment(realm_segment),
         url_path_segment(alias)
     )
 }
@@ -222,7 +229,7 @@ fn error_redirect_to_login(
         let url = format!(
             "/login.html?execution_id={}&realm={}&error={}",
             url_path_segment(flow),
-            url_path_segment(realm_segment),
+            realm_path_segment(realm_segment),
             url_path_segment(error)
         );
         return Redirect::to(&url).into_response();
@@ -576,8 +583,8 @@ async fn session_cookie_user(
     let token = super::oidc::find_realm_cookie(headers, &realm.id, "issuerd_session")?;
     let validated = state.token_service.validate_sso_session_token(&token).ok()?;
     let token_realm =
-        issuerd_core::typestate::extract_realm_from_issuer(validated.claims.iss.as_str());
-    if token_realm != Some(realm.name.as_str()) {
+        issuerd_core::typestate::extract_realm_name_from_issuer(validated.claims.iss.as_str());
+    if token_realm.as_ref() != Some(&realm.name) {
         return None;
     }
     Some(validated.claims.sub)
@@ -595,7 +602,7 @@ async fn finish_linking(
     external_refresh_token: Option<String>,
 ) -> Response {
     let account_url = |query: &str| {
-        format!("/realms/{}/account/linked-accounts?{query}", url_path_segment(realm_segment))
+        format!("/realms/{}/account/linked-accounts?{query}", realm_path_segment(realm_segment))
     };
 
     // The browser must hold a live session for the user the link token was
@@ -885,7 +892,7 @@ async fn finish_login(
             }
             let url = format!(
                 "/realms/{}/broker/first-login/{execution}",
-                url_path_segment(realm_segment)
+                realm_path_segment(realm_segment)
             );
             let mut resp = Redirect::to(&url).into_response();
             if let Ok(v) = axum::http::HeaderValue::from_str(&flow_cookie_header(
@@ -1229,7 +1236,7 @@ async fn create_link_for_new_user(
 // ---------------------------------------------------------------------------
 
 fn first_login_url(realm_segment: &str, execution: &str) -> String {
-    format!("/realms/{}/broker/first-login/{execution}", url_path_segment(realm_segment))
+    format!("/realms/{}/broker/first-login/{execution}", realm_path_segment(realm_segment))
 }
 
 async fn load_first_login_entry(

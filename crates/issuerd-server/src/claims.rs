@@ -148,17 +148,19 @@ fn address_object(user: &User) -> Map<String, Value> {
 /// group membership) may never emit. Those mappers copy user- or
 /// group-editable data, so letting them write a claim that token consumers
 /// trust for authorization (`realm_access`/`resource_access` read by the
-/// admin API, `aud`, `cnf`, `authorization_details`, `allowed_origins`) or
-/// a registered/protocol claim (`sub`, `iss`, ... — also guarded for signed
-/// tokens by the token manager, but not for the userinfo body) would let
-/// that data forge them. The fixed-name mappers that legitimately produce
-/// `realm_access`/`resource_access`/`aud`/`allowed_origins` are unaffected.
+/// admin API, `aud`, `cnf`, `authorization_details`, `resource`,
+/// `allowed_origins`) or a registered/protocol claim (`sub`, `iss`, ... — also
+/// guarded for signed tokens by the token manager, but not for the userinfo
+/// body) would let that data forge them. The fixed-name mappers that
+/// legitimately produce `realm_access`/`resource_access`/`aud`/`allowed_origins`
+/// are unaffected.
 const PROTECTED_MAPPER_CLAIMS: &[&str] = &[
     "realm_access",
     "resource_access",
     "aud",
     "cnf",
     "authorization_details",
+    "resource",
     "allowed_origins",
     "iss",
     "sub",
@@ -623,11 +625,12 @@ pub(crate) fn bind_authorization_details_overlay(
 }
 
 /// Merge an RFC 8707 `resource` indicator into a claims overlay as the
-/// access token's `aud` claim: exactly `[client_id, resource]`. Same
-/// mechanics as `bind_authorization_details_overlay` — injected
-/// post-mapper-evaluation, so it replaces any `aud` an Audience mapper
-/// produced. The client id stays FIRST: the refresh grant's client binding
-/// and the userinfo client resolution read the first `aud` entry.
+/// access token's `aud` claim (exactly `[client_id, resource]`) and its
+/// trusted resource-provenance claim. Same mechanics as
+/// `bind_authorization_details_overlay` — injected post-mapper-evaluation, so
+/// it replaces any `aud` an Audience mapper produced. The client id stays
+/// FIRST: the refresh grant's client binding and the userinfo client
+/// resolution read the first `aud` entry.
 pub(crate) fn bind_resource_aud_overlay(
     overlay: Option<Map<String, Value>>,
     client_id: &str,
@@ -638,6 +641,7 @@ pub(crate) fn bind_resource_aud_overlay(
         (overlay, Some(resource)) => {
             let mut map = overlay.unwrap_or_default();
             map.insert("aud".to_string(), serde_json::json!([client_id, resource]));
+            map.insert("resource".to_string(), Value::String(resource.to_string()));
             Some(map)
         }
     }
@@ -930,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_resource_aud_overlay_sets_client_first_array() {
+    fn bind_resource_aud_overlay_sets_client_first_array_and_provenance() {
         let resource = "https://issuer.example.com/realms/demo/mcp";
 
         // None input: overlay passes through untouched.
@@ -946,18 +950,26 @@ mod tests {
         // order, preserving other overlay keys.
         let out = bind_resource_aud_overlay(Some(existing), "client1", Some(resource)).unwrap();
         assert_eq!(out.get("aud"), Some(&serde_json::json!(["client1", resource])));
+        assert_eq!(out.get("resource"), Some(&Value::String(resource.into())));
         assert_eq!(out.get("sub_claim"), Some(&Value::String("x".into())));
 
-        // A mapper-produced `aud` is replaced wholesale.
+        // A mapper can produce the canonical audience without a trusted
+        // resource grant. The two token shapes remain distinguishable.
         let mut with_mapper_aud = Map::new();
-        with_mapper_aud.insert("aud".to_string(), serde_json::json!(["client1", "other"]));
+        with_mapper_aud.insert("aud".to_string(), serde_json::json!(["client1", resource]));
+        let mapper_only =
+            bind_resource_aud_overlay(Some(with_mapper_aud.clone()), "client1", None).unwrap();
+        assert_eq!(mapper_only.get("aud"), Some(&serde_json::json!(["client1", resource])));
+        assert!(!mapper_only.contains_key("resource"));
+
         let out =
             bind_resource_aud_overlay(Some(with_mapper_aud), "client1", Some(resource)).unwrap();
         assert_eq!(out.get("aud"), Some(&serde_json::json!(["client1", resource])));
+        assert_eq!(out.get("resource"), Some(&Value::String(resource.into())));
 
-        // No pre-existing overlay: one is created.
+        // No pre-existing overlay: one is created with exactly aud+resource.
         let out = bind_resource_aud_overlay(None, "client1", Some(resource)).unwrap();
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
@@ -1489,7 +1501,18 @@ mod tests {
         );
         let forged_aud =
             mapper("forged aud", MapperType::GroupMembership, &[("claim.name", "aud")]);
-        let mappers = [&forged_roles, &forged_sub, &forged_resource, &forged_aud];
+        let forged_provenance = mapper(
+            "forged provenance",
+            MapperType::UserAttribute,
+            &[("user.attribute", "department"), ("claim.name", "resource")],
+        );
+        let mappers = [
+            &forged_roles,
+            &forged_sub,
+            &forged_resource,
+            &forged_aud,
+            &forged_provenance,
+        ];
         for target in [
             ClaimTarget::AccessToken,
             ClaimTarget::IdToken,

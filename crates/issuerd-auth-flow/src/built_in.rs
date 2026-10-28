@@ -84,16 +84,17 @@ impl issuerd_core::Authenticator for CookieAuthenticator {
                     // redirect loop. Issuers are realm-NAME based, so resolve this
                     // flow's realm and compare names; a storage failure rejects
                     // the cookie (fail closed).
-                    let issuer_realm =
-                        issuerd_core::typestate::extract_realm_from_issuer(claims.iss.as_str());
+                    let issuer_realm = issuerd_core::typestate::extract_realm_name_from_issuer(
+                        claims.iss.as_str(),
+                    );
                     let realm_name = self
                         .storage
                         .get_realm(&context.realm_id)
                         .await
                         .ok()
                         .flatten()
-                        .map(|r| r.name.as_str().to_string());
-                    if issuer_realm == realm_name.as_deref() {
+                        .map(|r| r.name);
+                    if issuer_realm == realm_name {
                         context.user_id = Some(claims.sub);
                         if let Some(sid) = claims.sid {
                             context.session_id = Some(sid);
@@ -2346,6 +2347,7 @@ mod tests {
                         claims: None,
                         cnf: None,
                         authorization_details: None,
+                        resource: None,
                     },
                     header: issuerd_core::JwsHeader {
                         alg: Algorithm::Hs256,
@@ -2428,6 +2430,31 @@ mod tests {
         assert_auth_success(result);
         assert_eq!(ctx.user_id, Some(UserId::new("alice").unwrap()));
         assert_eq!(ctx.session_id, Some(SessionId::new("sess-1").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cookie_authenticator_accepts_raw_and_encoded_special_realm_names() {
+        for issuer_realm in ["tenant{one}", "tenant%7Bone%7D"] {
+            let storage = Arc::new(InMemoryStorage::new());
+            storage
+                .create_realm(&issuerd_core::Realm {
+                    id: RealmId::new("special-realm-id").unwrap(),
+                    name: issuerd_core::RealmName::new("tenant{one}").unwrap(),
+                    ..issuerd_core::Realm::default()
+                })
+                .await
+                .unwrap();
+            let auth = CookieAuthenticator::new(
+                Arc::new(MockTokenService::for_realm(true, issuer_realm)),
+                storage,
+            );
+            let mut ctx = test_context();
+            ctx.realm_id = RealmId::new("special-realm-id").unwrap();
+            ctx.attributes.insert("session_cookie".to_string(), "valid".to_string());
+
+            assert_auth_success(auth.authenticate(&mut ctx).await);
+            assert_eq!(ctx.user_id, Some(UserId::new("alice").unwrap()));
+        }
     }
 
     #[tokio::test]

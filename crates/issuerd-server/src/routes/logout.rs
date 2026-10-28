@@ -312,7 +312,10 @@ pub fn frontchannel_logout_page(continue_url: Option<&str>, iframe_urls: &[Strin
 /// The token issuer URL for a realm — must match `iss` in issued tokens
 /// (`TokenManager::issuer_for_realm`). Issuers are realm-NAME based.
 pub fn issuer_for_realm(issuer_base: &str, realm_name: &str) -> String {
-    format!("{}/realms/{}", issuer_base.trim_end_matches('/'), realm_name)
+    issuerd_core::urls::RealmUrlBuilder::new(issuer_base, realm_name)
+        .expect("the configured base URL and a valid realm name form a canonical issuer")
+        .issuer()
+        .to_string()
 }
 
 #[cfg(test)]

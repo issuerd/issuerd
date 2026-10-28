@@ -3,6 +3,10 @@
 //
 // OIDC discovery and JWKS endpoint integration tests (dual-target).
 
+use axum::body::Body;
+use axum::http::Request;
+use tower::ServiceExt as _;
+
 use crate::harness::for_each_target;
 
 #[tokio::test]
@@ -51,4 +55,22 @@ async fn certs_returns_valid_jwks() {
         target.cleanup().await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn issuerd_discovery_advertises_public_client_auth_and_rfc9207() {
+    let harness = crate::harness::TestHarness::new().await;
+    let request = Request::builder()
+        .uri("/.well-known/openid-configuration")
+        .body(Body::empty())
+        .unwrap();
+    let response = harness.app.clone().oneshot(harness.add_connect_info(request)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["token_endpoint_auth_methods_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("none")));
+    assert_eq!(json["authorization_response_iss_parameter_supported"], true);
 }
