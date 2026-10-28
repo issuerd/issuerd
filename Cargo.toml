@@ -148,7 +148,7 @@ rustls-pki-types = "1.14"
 p256 = "0.14"
 p384 = "0.14"
 p521 = "0.14"
-rand = "0.8"
+rand = "0.10"
 
 # Storage
 # 0.9: the combined `runtime-tokio-rustls` feature was deleted upstream — it is
