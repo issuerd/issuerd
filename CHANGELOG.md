@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Reproducible build and test dependencies.** Container builds now verify the rustup installer, Python images use hash-locked requirements, Windows release builds enforce Chocolatey checksums, and the Flux installer and remaining Node base image are pinned. The fuzz lockfile is synchronized with current workspace dependencies.
+
 ## [0.2.0] - 2026-10-28
 
 ### Added

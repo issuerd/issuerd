@@ -23,6 +23,32 @@ updates:
     labels:
       - no-changelog
 
+  # Hash-locked Python dependencies for the example and conformance images.
+  - package-ecosystem: pip
+    directory: /examples/agentic-mcp/apps/ChatApp
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: pip
+    directory: /examples/agentic-mcp/apps/McpServer
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: pip
+    directory: /examples/agentic-mcp/setup
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+  - package-ecosystem: pip
+    directory: /tests/conformance
+    schedule:
+      interval: weekly
+    labels:
+      - no-changelog
+
   # Docker base images — one entry per directory containing a Dockerfile.
   - package-ecosystem: docker
     directory: /

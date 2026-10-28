@@ -62,9 +62,12 @@ RUN curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${
 ENV OPENSSL_DIR=/usr/local/openssl3
 ENV OPENSSL_STATIC=1
 
-# Pinned Rust toolchain (same pin as the canonical Dockerfile).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.95.0 \
+# Pinned Rust toolchain and installer checksum (same pins as the canonical Dockerfile).
+ARG RUSTUP_INSTALLER_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0
+RUN curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && echo "${RUSTUP_INSTALLER_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - \
+    && sh /tmp/rustup-init.sh -y --default-toolchain 1.95.0 \
+    && rm -f /tmp/rustup-init.sh \
     && /root/.cargo/bin/rustc --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
