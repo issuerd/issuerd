@@ -624,7 +624,7 @@ jobs:
       # .cargo/config.toml points at a dev-host path, so override via env.
       - if: ${{ env.ACT != 'true' }}
         name: Strawberry Perl (vendored openssl build)
-        run: choco install strawberryperl --no-progress -y
+        run: choco install strawberryperl --version=5.42.3.1 --require-checksums --no-progress -y
       - if: ${{ env.ACT != 'true' }}
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - if: ${{ env.ACT != 'true' }}
@@ -694,7 +694,7 @@ jobs:
       # .cargo/config.toml points at a dev-host path, so override via env.
       - if: ${{ env.ACT != 'true' }}
         name: Strawberry Perl (vendored openssl build)
-        run: choco install strawberryperl --no-progress -y
+        run: choco install strawberryperl --version=5.42.3.1 --require-checksums --no-progress -y
       - if: ${{ env.ACT != 'true' }}
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - if: ${{ env.ACT != 'true' }}

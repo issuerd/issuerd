@@ -29,16 +29,19 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821c
 FROM ${BUILDER_IMAGE} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+ARG RUSTUP_INSTALLER_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0
 
 # System build dependencies (libkrb5 for the Kerberos federation provider,
-# libclang for bindgen) and the pinned Rust toolchain. sqlx is a pure-Rust
-# PostgreSQL driver — no libpq needed at build time or runtime.
+# libclang for bindgen) and the pinned Rust toolchain with a verified installer.
+# sqlx is a pure-Rust PostgreSQL driver — no libpq needed at build time or runtime.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl build-essential libssl-dev pkg-config \
         libkrb5-dev libclang-dev clang \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.95.0 \
+    && curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && echo "${RUSTUP_INSTALLER_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - \
+    && sh /tmp/rustup-init.sh -y --default-toolchain 1.95.0 \
+    && rm -f /tmp/rustup-init.sh \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.cargo/bin:${PATH}"

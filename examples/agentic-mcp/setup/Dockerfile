@@ -2,9 +2,10 @@ FROM python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a53
 
 ENV PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir httpx==0.28.1 asyncpg==0.31.0
-
 WORKDIR /srv/setup
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+
 COPY setup.py verify.py ./
 
 # One-shot post-provision step (see setup.py); verify.py is the opt-in

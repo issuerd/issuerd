@@ -59,17 +59,18 @@ jobs:
       - name: Install Flux (z3 + liquid-fixpoint + cargo-flux)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLUX_INSTALL_REF: 9fe62fab121a3b26f2fb4ffdf8fb39e44904e3c2
+          FLUX_INSTALL_SHA256: 40331a9b530926347005ffd55c72dd723f126d20c405aed8303e94040eb32809
         run: |
-          # Fetch the installer through the authenticated GitHub API, not
-          # raw.githubusercontent.com: the raw CDN rate-limits the shared
-          # runner egress IPs with transient 403s (flux job failed on this
-          # 2026-10-20). Fall back to the raw URL with retries if the API
-          # itself hiccups.
-          gh api repos/flux-rs/flux/contents/install.sh \
+          # Fetch the pinned installer through the authenticated GitHub API,
+          # falling back to the raw URL if the API hiccups. Both sources must
+          # produce the same verified file before anything is executed.
+          gh api "repos/flux-rs/flux/contents/install.sh?ref=${FLUX_INSTALL_REF}" \
             -H "Accept: application/vnd.github.raw" > flux-install.sh \
             || curl -fsSL --retry 5 --retry-all-errors \
-                https://raw.githubusercontent.com/flux-rs/flux/main/install.sh > flux-install.sh
-          bash flux-install.sh
+                "https://raw.githubusercontent.com/flux-rs/flux/${FLUX_INSTALL_REF}/install.sh" > flux-install.sh
+          echo "${FLUX_INSTALL_SHA256}  flux-install.sh" | sha256sum -c -
+          bash < flux-install.sh
       # Scoped to the annotated defs (SecondsNonZero, models.rs): the flux
       # driver ICEs on ordinary iterator chains elsewhere in the crate
       # (flux-rs/flux#1666 at projections.rs:382, plus infer.rs:484), so a
