@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **Reproducible build and test dependencies.** Container builds now verify the rustup installer, Python images use hash-locked requirements, Windows release builds enforce Chocolatey checksums, and the Flux installer and remaining Node base image are pinned. The fuzz lockfile is synchronized with current workspace dependencies.
+- **ChatApp dependency security.** Upgrade FastAPI to 0.162.0 and Starlette to 1.6.0 to include fixes for host/path validation, endpoint dispatch, Windows StaticFiles SSRF, and urlencoded form resource limits.
 
 ## [0.2.0] - 2026-10-28
 
