@@ -49,7 +49,8 @@ const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const REDIRECT_URI: &str = "http://localhost:8080/cb";
 const LEGACY_VERSIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_11_25];
-const TOOL_NAMES: [&str; 10] = [
+const TOOL_NAMES: [&str; 15] = [
+    "attack_detection_status",
     "clients_get",
     "clients_list",
     "groups_get",
@@ -59,6 +60,10 @@ const TOOL_NAMES: [&str; 10] = [
     "roles_get",
     "roles_list",
     "users_get",
+    "users_get_credentials",
+    "users_get_groups",
+    "users_get_role_mappings",
+    "users_get_sessions",
     "users_search",
 ];
 const ALL_READ_ROLES: [&str; 6] = [
@@ -820,9 +825,14 @@ async fn exercise_all_tools(
     let group_id = create_group(server, fixture, &fixture.user, &unique("mcp-group")).await;
     let schemas = output_schemas(&list);
     let calls = [
+        ("attack_detection_status", json!({"id":fixture.user.id.to_string()})),
         ("realm_get", json!({})),
         ("users_search", json!({"username":fixture.user.username.as_str()})),
         ("users_get", json!({"id":fixture.user.id.to_string()})),
+        ("users_get_credentials", json!({"id":fixture.user.id.to_string()})),
+        ("users_get_groups", json!({"id":fixture.user.id.to_string()})),
+        ("users_get_role_mappings", json!({"id":fixture.user.id.to_string()})),
+        ("users_get_sessions", json!({"id":fixture.user.id.to_string()})),
         ("clients_list", json!({"clientId":fixture.client.client_id.as_str()})),
         ("clients_get", json!({"id":fixture.client.id.to_string()})),
         ("groups_list", json!({})),
@@ -1145,7 +1155,7 @@ async fn origin_host_methods_and_last_event_id_follow_stateless_transport() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_session_id(&response);
     let body = response_json(response).await;
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 15);
 }
 
 #[tokio::test]
@@ -1427,12 +1437,30 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
         "roles_get",
         "roles_list",
     ][..];
-    let user_tools = &["groups_members", "users_get", "users_search"][..];
+    let user_tools = &[
+        "groups_members",
+        "users_get",
+        "users_get_credentials",
+        "users_get_groups",
+        "users_get_role_mappings",
+        "users_get_sessions",
+        "users_search",
+    ][..];
+    let manage_user_tools = &[
+        "attack_detection_status",
+        "groups_members",
+        "users_get",
+        "users_get_credentials",
+        "users_get_groups",
+        "users_get_role_mappings",
+        "users_get_sessions",
+        "users_search",
+    ][..];
     let cases: [(&str, &[&str]); 6] = [
         ("view-realm", realm_tools),
         ("manage-realm", realm_tools),
         ("view-users", user_tools),
-        ("manage-users", user_tools),
+        ("manage-users", manage_user_tools),
         ("view-clients", &["clients_get", "clients_list"]),
         ("manage-clients", &["clients_get", "clients_list"]),
     ];
@@ -1471,7 +1499,12 @@ fn call_arguments(fixture: &Fixture, tool: &str) -> Value {
     match tool {
         "realm_get" => json!({}),
         "users_search" => json!({"username":fixture.user.username.as_str()}),
-        "users_get" => json!({"id":fixture.user.id.to_string()}),
+        "attack_detection_status"
+        | "users_get"
+        | "users_get_credentials"
+        | "users_get_groups"
+        | "users_get_role_mappings"
+        | "users_get_sessions" => json!({"id":fixture.user.id.to_string()}),
         "clients_list" => json!({"clientId":fixture.client.client_id.as_str()}),
         "clients_get" => json!({"id":fixture.client.id.to_string()}),
         "groups_list" | "roles_list" => json!({}),
@@ -1580,6 +1613,26 @@ fn assert_selected_fields(actual: &Value, admin: &Value, fields: &[&str]) {
             admin[admin_field.as_str()],
             "selected Admin field {admin_field}"
         );
+    }
+}
+
+const ROLE_DETAIL_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "description",
+    "composite",
+    "composites",
+    "clientRole",
+    "containerId",
+];
+
+fn assert_role_mapping_fields(actual: &Value, expected: &Value) {
+    let actual = actual.as_array().unwrap();
+    let expected = expected.as_array().unwrap();
+    assert_eq!(actual.len(), expected.len());
+    for role in actual {
+        let admin = expected.iter().find(|candidate| candidate["id"] == role["id"]).unwrap();
+        assert_selected_fields(role, admin, ROLE_DETAIL_FIELDS);
     }
 }
 
@@ -1709,6 +1762,31 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
         user: alice.clone(),
     };
     add_roles(&server, &alice_roles, &["zeta-role", "alpha-role"]).await;
+    for name in ["client-reader", "client-available"] {
+        let role = Role {
+            id: RoleId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: RoleName::new(name).unwrap(),
+            description: Some(format!("{name} description")),
+            realm_id: fixture.realm.id.clone(),
+            client_role: true,
+            client_id: Some(fixture.client.id.clone()),
+            composite: false,
+            composites: Vec::new(),
+            attributes: HashMap::from([(
+                "password".to_string(),
+                vec!["ROLE-SECRET-CANARY".to_string()],
+            )]),
+        };
+        server.state.storage.create_role(&fixture.realm.id, &role).await.unwrap();
+        if name == "client-reader" {
+            server
+                .state
+                .storage
+                .add_user_client_role(&fixture.realm.id, &alice.id, &role.id)
+                .await
+                .unwrap();
+        }
+    }
     let mut groups = vec![
         create_group(&server, &fixture, &alice, "zeta-group").await,
         create_group(&server, &fixture, &alice, "alpha-group").await,
@@ -1815,6 +1893,235 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
     assert_eq!(output["groups"], json!(groups));
     all_output.push(output);
 
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("users_get_groups")
+                .with_arguments(json!({"id":alice.id.to_string()}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(
+        &server,
+        &admin,
+        &format!("/admin/realms/{realm_name}/users/{}/groups", alice.id),
+    )
+    .await;
+    let mut actual_group_ids: Vec<_> = output["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["id"].as_str().unwrap().to_string())
+        .collect();
+    actual_group_ids.sort();
+    let mut expected_group_ids: Vec<_> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect();
+    expected_group_ids.sort();
+    assert_eq!(actual_group_ids, expected_group_ids);
+    for group in output["groups"].as_array().unwrap() {
+        let expected = admin_json(
+            &server,
+            &admin,
+            &format!("/admin/realms/{realm_name}/groups/{}", group["id"].as_str().unwrap()),
+        )
+        .await;
+        assert_selected_fields(group, &expected, &["id", "name", "path"]);
+        assert_eq!(group["parentId"], expected["parent_id"]);
+    }
+    all_output.push(output);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("users_get_role_mappings")
+                .with_arguments(json!({"id":alice.id.to_string()}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    for (field, suffix) in [
+        ("realmMappings", "realm"),
+        ("availableRealmMappings", "realm/available"),
+        ("effectiveRealmMappings", "realm/composite"),
+    ] {
+        let expected = admin_json(
+            &server,
+            &admin,
+            &format!("/admin/realms/{realm_name}/users/{}/role-mappings/{suffix}", alice.id),
+        )
+        .await;
+        assert_role_mapping_fields(&output[field], &expected);
+    }
+    let client_mappings = &output["clientMappings"][fixture.client.client_id.as_str()];
+    assert_eq!(client_mappings["id"], fixture.client.id.to_string());
+    assert_eq!(client_mappings["client"], fixture.client.client_id.to_string());
+    for (field, suffix) in [
+        ("mappings", ""),
+        ("availableMappings", "/available"),
+        ("effectiveMappings", "/composite"),
+    ] {
+        let expected = admin_json(
+            &server,
+            &admin,
+            &format!(
+                "/admin/realms/{realm_name}/users/{}/role-mappings/clients/{}{suffix}",
+                alice.id, fixture.client.id
+            ),
+        )
+        .await;
+        assert_role_mapping_fields(&client_mappings[field], &expected);
+    }
+    all_output.push(output);
+
+    let result =
+        client
+            .call_tool(CallToolRequestParams::new("users_get_sessions").with_arguments(
+                json!({"id":fixture.user.id.to_string()}).as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(
+        &server,
+        &admin,
+        &format!("/admin/realms/{realm_name}/users/{}/sessions", fixture.user.id),
+    )
+    .await;
+    let sessions = output["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), expected.as_array().unwrap().len());
+    assert!(!sessions.is_empty());
+    for session in sessions {
+        let admin = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == session["id"])
+            .unwrap();
+        assert_selected_fields(
+            session,
+            admin,
+            &[
+                "id",
+                "username",
+                "userId",
+                "ipAddress",
+                "started",
+                "lastAccess",
+                "offline",
+                "clients",
+            ],
+        );
+        for field in [
+            "rememberMe",
+            "authTime",
+            "impersonator",
+            "redirectUri",
+            "state",
+        ] {
+            assert!(session.get(field).is_none());
+        }
+    }
+    all_output.push(output);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("users_get_credentials")
+                .with_arguments(json!({"id":alice.id.to_string()}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(
+        &server,
+        &admin,
+        &format!("/admin/realms/{realm_name}/users/{}/credentials", alice.id),
+    )
+    .await;
+    let credentials = output["credentials"].as_array().unwrap();
+    assert_eq!(credentials.len(), expected.as_array().unwrap().len());
+    assert!(!credentials.is_empty());
+    for credential in credentials {
+        let admin = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == credential["id"])
+            .unwrap();
+        assert_selected_fields(
+            credential,
+            admin,
+            &[
+                "id",
+                "type",
+                "userLabel",
+                "createdDate",
+                "priority",
+                "temporary",
+            ],
+        );
+        for field in ["secretData", "credentialData", "value"] {
+            assert!(credential.get(field).is_none());
+        }
+    }
+    all_output.push(output);
+
+    for (ip, count) in [("192.0.2.1", "4"), ("192.0.2.2", "3")] {
+        server
+            .state
+            .cache
+            .set(
+                &format!(
+                    "login-failure:{}:{}:{ip}",
+                    fixture.realm.id,
+                    fixture.user.username.as_str()
+                ),
+                count.as_bytes().to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    server
+        .state
+        .cache
+        .set(
+            &format!(
+                "login-lockout:{}:{}:192.0.2.1",
+                fixture.realm.id,
+                fixture.user.username.as_str()
+            ),
+            b"1".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    let result =
+        client
+            .call_tool(CallToolRequestParams::new("attack_detection_status").with_arguments(
+                json!({"id":fixture.user.id.to_string()}).as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+    let output = result.structured_content.clone().unwrap();
+    let expected = admin_json(
+        &server,
+        &admin,
+        &format!(
+            "/admin/realms/{realm_name}/attack-detection/brute-force/users/{}",
+            fixture.user.id
+        ),
+    )
+    .await;
+    for field in ["userId", "username", "numFailures", "locked"] {
+        assert_eq!(output[field], expected[field], "selected Admin field {field}");
+    }
+    assert_eq!(output["numFailures"], 7);
+    assert_eq!(output["locked"], true);
+    all_output.push(output);
+
     let arguments = json!({
         "clientId":format!("  {}  ", fixture.client.client_id.as_str()),
         "first":99,
@@ -1909,14 +2216,16 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
     let output = result.structured_content.clone().unwrap();
     let expected = admin_json(&server, &admin, &format!("/admin/realms/{realm_name}/roles")).await;
     let actual_roles = output["roles"].as_array().unwrap();
-    assert_eq!(actual_roles.len(), expected.as_array().unwrap().len());
+    let expected_roles: Vec<_> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|role| role["client_role"] == false)
+        .collect();
+    assert_eq!(actual_roles.len(), expected_roles.len());
     for actual in actual_roles {
-        let expected_role = expected
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|candidate| candidate["id"] == actual["id"])
-            .unwrap();
+        let expected_role =
+            expected_roles.iter().find(|candidate| candidate["id"] == actual["id"]).unwrap();
         assert_selected_fields(
             actual,
             expected_role,
@@ -1960,11 +2269,17 @@ async fn all_tools_match_selected_admin_fields_without_secret_channels() {
         "pairwise_sector_key",
         "attributes",
         "protocolMappers",
-        "credentials",
     ] {
         assert!(!serialized.contains(canary), "MCP leaked {canary}: {serialized}");
     }
-    for forbidden_key in ["\"secret\"", "\"password\""] {
+    for forbidden_key in [
+        "\"secret\":",
+        "\"password\":",
+        "\"secretData\":",
+        "\"credentialData\":",
+        "\"secret_data\":",
+        "\"credential_data\":",
+    ] {
         assert!(
             !serialized.contains(forbidden_key),
             "MCP exposed forbidden key {forbidden_key}: {serialized}"

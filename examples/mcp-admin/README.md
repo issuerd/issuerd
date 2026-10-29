@@ -60,7 +60,8 @@ Setup uses the setup-only admin token to create:
 - realm `mcp-demo`;
 - enabled public native `mcp-admin-native` with optional `mcp:read` and the
   registered redirect `http://127.0.0.1:8080/callback`;
-- `mcp-admin` with `view-realm`, `view-users`, and `view-clients`;
+- `mcp-admin` with `view-realm`, `view-users`, `manage-users`, and `view-clients`
+  (`manage-users` is required only for attack-detection status);
 - additional user `mcp-observer` and client `mcp-reporting` fixtures;
 - group `mcp-acceptance` with `mcp-observer` as a member, plus the realm roles
   used by role list/get acceptance.
@@ -84,10 +85,10 @@ Expected `acceptance.json` evidence:
 - RFC 9207 issuer/state/redirect matches for both success and error responses;
 - a legacy `initialize` + `notifications/initialized` connection and, in
   `auto`, SDK auto-negotiation of modern `server/discover`;
-- all ten tools in both eras, with IDs for user, client, group, and role detail
+- all 15 tools in both eras, with IDs for user, client, group, and role detail
   calls discovered from the corresponding search/list results;
 - SDK `AjvJsonSchemaValidator` checks, exact structured/text mirror checks,
-  and twelve modern wire results with `resultType:"complete"` in the pristine
+  and 17 modern wire results with `resultType:"complete"` in the pristine
   rig, plus any additional paginated lookup results needed in populated realms
   (the SDK itself strips this discriminator from its neutral result objects).
 

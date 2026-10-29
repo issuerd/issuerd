@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
 use issuerd_core::{
-    Client, ClientAuthenticatorType, ClientProtocol, Group, Realm, Role, SslRequired, User,
+    AuthMethod, Client, ClientAuthenticatorType, ClientProtocol, Credential, CredentialType, Group,
+    Realm, Role, SslRequired, User, UserSession,
 };
 use rmcp::model::{Tool, ToolAnnotations};
 use schemars::JsonSchema;
@@ -341,18 +342,151 @@ pub struct RolesOutput {
     pub roles: Vec<RoleOutput>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientRoleMappingsOutput {
+    pub id: String,
+    pub client: String,
+    pub mappings: Vec<RoleOutput>,
+    pub available_mappings: Vec<RoleOutput>,
+    pub effective_mappings: Vec<RoleOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRoleMappingsOutput {
+    pub realm_mappings: Vec<RoleOutput>,
+    pub available_realm_mappings: Vec<RoleOutput>,
+    pub effective_realm_mappings: Vec<RoleOutput>,
+    pub client_mappings: std::collections::BTreeMap<String, ClientRoleMappingsOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSessionOutput {
+    pub id: String,
+    pub username: String,
+    pub user_id: String,
+    pub ip_address: String,
+    pub started: i64,
+    pub last_access: i64,
+    pub offline: bool,
+    pub clients: std::collections::BTreeMap<String, String>,
+}
+
+impl From<&UserSession> for UserSessionOutput {
+    fn from(session: &UserSession) -> Self {
+        Self {
+            id: session.id.to_string(),
+            username: session.login_username.to_string(),
+            user_id: session.user_id.to_string(),
+            ip_address: session.ip_address.to_string(),
+            started: session.started.timestamp(),
+            last_access: session.last_session_refresh.timestamp(),
+            offline: session.offline,
+            clients: session
+                .clients
+                .iter()
+                .map(|client| {
+                    let method = match client.auth_method {
+                        AuthMethod::Password => "password",
+                        AuthMethod::Spnego => "spnego",
+                        AuthMethod::Ciba => "ciba",
+                        AuthMethod::IdentityProvider => "identity_provider",
+                        AuthMethod::Impersonation => "impersonation",
+                    };
+                    (client.client_id.to_string(), method.to_string())
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSessionsOutput {
+    pub sessions: Vec<UserSessionOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialOutput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub credential_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_label: Option<String>,
+    pub created_date: i64,
+    pub priority: i32,
+    pub temporary: bool,
+}
+
+impl From<&Credential> for CredentialOutput {
+    fn from(credential: &Credential) -> Self {
+        let credential_type = match &credential.credential_type {
+            CredentialType::Password => "password".into(),
+            CredentialType::Totp => "totp".into(),
+            CredentialType::Hotp => "hotp".into(),
+            CredentialType::WebAuthn => "web_authn".into(),
+            CredentialType::WebAuthnPasswordless => "web_authn_passwordless".into(),
+            CredentialType::Kerberos => "kerberos".into(),
+            CredentialType::SshPublicKey => "ssh_public_key".into(),
+            CredentialType::Custom(value) => value.clone(),
+        };
+        Self {
+            id: credential.id.to_string(),
+            credential_type,
+            user_label: credential.user_label.clone(),
+            created_date: credential.created_date.timestamp_millis(),
+            priority: credential.priority,
+            temporary: credential
+                .credential_data
+                .get("temporary")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserCredentialsOutput {
+    pub credentials: Vec<CredentialOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AttackDetectionStatusOutput {
+    pub user_id: String,
+    pub username: String,
+    #[schemars(with = "i32")]
+    pub num_failures: u32,
+    pub locked: bool,
+}
+
 fn read_only_annotations() -> ToolAnnotations {
     ToolAnnotations::from_raw(None, Some(true), Some(false), Some(true), Some(false))
 }
 
 pub fn definition(name: ToolName) -> Tool {
     let description = match name {
+        ToolName::AttackDetectionStatus => {
+            "Return a user's aggregated brute-force failure count and lockout state."
+        }
         ToolName::RealmGet => "Return the current realm's curated, non-secret configuration.",
         ToolName::UsersSearch => {
             "Search users by exact username, exact email, or a username/email substring."
         }
         ToolName::UsersGet => {
             "Return a user by internal id, including direct realm roles and groups."
+        }
+        ToolName::UsersGetGroups => "Return a user's direct group memberships without attributes.",
+        ToolName::UsersGetRoleMappings => {
+            "Return direct, available, and effective realm and client role mappings for a user."
+        }
+        ToolName::UsersGetSessions => "Return a user's active sessions with curated fields.",
+        ToolName::UsersGetCredentials => {
+            "Return credential metadata without secret data or credential payloads."
         }
         ToolName::ClientsList => "List clients or return one exact public client identifier match.",
         ToolName::ClientsGet => {
@@ -368,6 +502,9 @@ pub fn definition(name: ToolName) -> Tool {
     };
     let tool = Tool::new(name.as_str(), description, std::sync::Arc::new(serde_json::Map::new()));
     let tool = match name {
+        ToolName::AttackDetectionStatus => tool
+            .with_input_schema::<UserGetArgs>()
+            .with_output_schema::<AttackDetectionStatusOutput>(),
         ToolName::RealmGet => {
             tool.with_input_schema::<NoArgs>().with_output_schema::<RealmOutput>()
         }
@@ -377,6 +514,18 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::UsersGet => tool
             .with_input_schema::<UserGetArgs>()
             .with_output_schema::<UserDetailsOutput>(),
+        ToolName::UsersGetGroups => {
+            tool.with_input_schema::<UserGetArgs>().with_output_schema::<GroupsOutput>()
+        }
+        ToolName::UsersGetRoleMappings => tool
+            .with_input_schema::<UserGetArgs>()
+            .with_output_schema::<UserRoleMappingsOutput>(),
+        ToolName::UsersGetSessions => tool
+            .with_input_schema::<UserGetArgs>()
+            .with_output_schema::<UserSessionsOutput>(),
+        ToolName::UsersGetCredentials => tool
+            .with_input_schema::<UserGetArgs>()
+            .with_output_schema::<UserCredentialsOutput>(),
         ToolName::ClientsList => tool
             .with_input_schema::<ClientsListArgs>()
             .with_output_schema::<ClientsOutput>(),
@@ -419,6 +568,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "attack_detection_status",
                 "clients_get",
                 "clients_list",
                 "groups_get",
@@ -428,6 +578,10 @@ mod tests {
                 "roles_get",
                 "roles_list",
                 "users_get",
+                "users_get_credentials",
+                "users_get_groups",
+                "users_get_role_mappings",
+                "users_get_sessions",
                 "users_search"
             ]
         );
@@ -475,6 +629,21 @@ mod tests {
             serde_json::to_value(RoleOutput::from(&role(ALPHA_ROLE_ID, "alpha-role")))
                 .unwrap()
                 .to_string(),
+            serde_json::to_value(CredentialOutput::from(&credential(
+                "credential-fixture",
+                CredentialType::Password,
+                10,
+                1_700_000_000,
+            )))
+            .unwrap()
+            .to_string(),
+            serde_json::to_value(UserSessionOutput::from(&session(
+                "session-fixture",
+                ALICE_ID,
+                1_700_000_000,
+            )))
+            .unwrap()
+            .to_string(),
         ];
         for value in values {
             for canary in [
@@ -485,6 +654,7 @@ mod tests {
                 CLIENT_ATTRIBUTE_SECRET,
                 GROUP_SECRET,
                 ROLE_SECRET,
+                CREDENTIAL_SECRET,
                 "attributes",
                 "protocolMappers",
                 "credentials",
