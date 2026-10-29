@@ -2212,10 +2212,10 @@ pub(crate) async fn finish_sso_login(
 fn generate_user_code() -> String {
     // User-friendly code: 8 chars, uppercase, no ambiguous characters
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let chars: String = (0..8)
         .map(|_| {
-            let idx = rand::Rng::gen_range(&mut rng, 0..CHARSET.len());
+            let idx = rand::RngExt::random_range(&mut rng, 0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect();
@@ -8589,7 +8589,7 @@ mod tests {
         // A local credential must only ever be consulted when the provider
         // errors (or is gone) — never when it actively rejects.
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        let salt = SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         let hash = Argon2::default().hash_password(b"localpass123", &salt).unwrap().to_string();
         let cred = issuerd_core::Credential {
             id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
@@ -10194,8 +10194,8 @@ mod tests {
         state.storage.create_user(&user.realm_id, &user).await.unwrap();
 
         // Hash password with argon2
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let hash = argon2.hash_password("temppass".as_bytes(), &salt).unwrap().to_string();
@@ -12680,7 +12680,9 @@ mod tests {
             };
             state.storage.create_user(&realm_id, &user).await.unwrap();
 
-            let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+            let salt = argon2::password_hash::SaltString::generate(
+                &mut argon2::password_hash::rand_core::OsRng,
+            );
             let hash = argon2::Argon2::default()
                 .hash_password("pass".as_bytes(), &salt)
                 .unwrap()
@@ -12771,7 +12773,9 @@ mod tests {
         };
         state.storage.create_user(&realm_id, &user).await.unwrap();
 
-        let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
         let hash = argon2::Argon2::default()
             .hash_password("pass".as_bytes(), &salt)
             .unwrap()
@@ -12893,7 +12897,9 @@ mod tests {
         };
         state.storage.create_user(&realm_id, &user).await.unwrap();
 
-        let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
         let hash = argon2::Argon2::default()
             .hash_password("pass".as_bytes(), &salt)
             .unwrap()
@@ -13018,7 +13024,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         state.storage.create_user(&realm_id, &user1).await.unwrap();
-        let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
         let hash = argon2::Argon2::default()
             .hash_password("pass".as_bytes(), &salt)
             .unwrap()
@@ -13051,7 +13059,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         state.storage.create_user(&realm_id, &user2).await.unwrap();
-        let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
         let hash = argon2::Argon2::default()
             .hash_password("pass".as_bytes(), &salt)
             .unwrap()

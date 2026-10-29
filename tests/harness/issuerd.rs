@@ -160,8 +160,8 @@ impl super::target::OidcTestTarget for IssuerdTarget {
         };
         self.storage.create_user(&user.realm_id, &user).await.unwrap();
 
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
