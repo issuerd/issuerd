@@ -161,7 +161,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres",
 # Cache / Cluster
 # 0.29: drops rustls-pemfile (RUSTSEC-2025-0134) from the tree — native-certs
 # moved to 0.8 (rustls-pki-types). Same feature names as 0.27.
-redis = { version = "0.29", features = ["tokio-rustls-comp", "cluster-async"] }
+redis = { version = "1.8", features = ["tokio-rustls-comp", "cluster-async"] }
 
 # Observability
 tracing = "0.1"
