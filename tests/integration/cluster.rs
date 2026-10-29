@@ -246,8 +246,8 @@ async fn create_user(storage: &Arc<dyn Storage>, realm: &str, username: &str, pa
     };
     storage.create_user(&user.realm_id, &user).await.unwrap();
 
+    use argon2::password_hash::rand_core::OsRng;
     use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default().hash_password(password.as_bytes(), &salt).unwrap().to_string();
 

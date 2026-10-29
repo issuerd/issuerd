@@ -15,7 +15,7 @@ use issuerd_core::{
 };
 use p256::elliptic_curve::{sec1::ToSec1Point as _, Generate as _};
 use p256::pkcs8::EncodePrivateKey as _;
-use rand::RngCore;
+use rand::Rng;
 use ring::signature::KeyPair;
 
 /// Configuration for cryptographic operations.
@@ -410,7 +410,7 @@ fn generate_hmac_key(kid: &KeyId, alg: Algorithm) -> Result<(Vec<u8>, Jwk), Issu
         _ => unreachable!(),
     };
     let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
 
     let k = URL_SAFE_NO_PAD.encode(&bytes);
 

@@ -3485,8 +3485,8 @@ pub(crate) mod tests {
         };
         state.storage.create_user(&realm_id, &user).await.unwrap();
 
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         let hash = Argon2::default().hash_password("pass".as_bytes(), &salt).unwrap().to_string();
         let cred = issuerd_core::Credential {
@@ -4865,8 +4865,8 @@ pub(crate) mod tests {
         };
         state.storage.create_user(&realm_id, &user).await.unwrap();
 
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let hash = argon2.hash_password("secret".as_bytes(), &salt).unwrap().to_string();

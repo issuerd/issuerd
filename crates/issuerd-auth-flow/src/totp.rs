@@ -103,9 +103,9 @@ fn otpauth_algorithm(alg: &OtpHashAlgorithm) -> &'static str {
 /// Generate a fresh TOTP secret: 20 random bytes (160 bits, the RFC 4226
 /// recommended minimum) base32-encoded without padding.
 pub fn generate_secret() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 20];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base32_encode(&bytes)
 }
 

@@ -1718,8 +1718,8 @@ async fn seed_master_realm(storage: &Arc<dyn issuerd_core::Storage>) {
     };
     storage.create_user(&realm.id, &admin_user).await.unwrap();
 
+    use argon2::password_hash::rand_core::OsRng;
     use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default().hash_password("admin".as_bytes(), &salt).unwrap().to_string();
     let cred = issuerd_core::Credential {
