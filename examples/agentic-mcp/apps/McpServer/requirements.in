@@ -2,5 +2,5 @@ mcp==1.30.0
 pyjwt==2.15.1
 cryptography==50.0.1
 asyncpg==0.32.0
-uvicorn==0.53.0
+uvicorn==0.54.0
 starlette==1.6.0
