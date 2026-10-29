@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use issuerd_core::{
     Alias, Client, ClientAuthenticatorType, ClientId, ClientIdentifier, ClientProtocol, Credential,
@@ -14,7 +15,6 @@ use issuerd_core::{
     ProvisionConfig, Realm, RealmId, RealmName, RedirectUri, Requirement, Role, RoleId, RoleName,
     Scope, SecondsNonZero, SslRequired, Storage, User, UserId, Username, WebOrigin,
 };
-use rand::rngs::OsRng;
 use tracing::{info, warn};
 
 /// Loads and applies a `ProvisionConfig` to `Storage` exactly once.

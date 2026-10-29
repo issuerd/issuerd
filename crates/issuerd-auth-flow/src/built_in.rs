@@ -139,8 +139,8 @@ thread_local! {
 fn dummy_password_hash() -> &'static str {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HASH.get_or_init(|| {
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
             .hash_password(b"dummy-password", &salt)
@@ -1428,8 +1428,8 @@ pub async fn set_user_password(
         storage.delete_credential(realm_id, user_id, &cred.id).await?;
     }
 
+    use argon2::password_hash::rand_core::OsRng;
     use argon2::{password_hash::SaltString, PasswordHasher};
-    use rand::rngs::OsRng;
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(new_password.as_bytes(), &salt)
@@ -2177,8 +2177,8 @@ mod tests {
     }
 
     fn hash_password(password: &str) -> String {
+        use argon2::password_hash::rand_core::OsRng;
         use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-        use rand::rngs::OsRng;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string()
