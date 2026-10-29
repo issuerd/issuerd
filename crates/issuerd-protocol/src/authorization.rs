@@ -1813,7 +1813,7 @@ mod tests {
     /// Generate 1000 random parameter maps and ensure `parse` never panics.
     #[test]
     fn parse_never_panics_on_random_input() {
-        use rand::Rng;
+        use rand::RngExt;
         let keys = [
             "response_type",
             "client_id",
@@ -1836,15 +1836,15 @@ mod tests {
             "request",
             "request_uri",
         ];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..1000 {
             let mut params = HashMap::new();
-            let num_entries = rng.gen_range(0..keys.len());
+            let num_entries = rng.random_range(0..keys.len());
             for _ in 0..num_entries {
-                let key = keys[rng.gen_range(0..keys.len())];
-                let value_len = rng.gen_range(0..64);
+                let key = keys[rng.random_range(0..keys.len())];
+                let value_len = rng.random_range(0..64);
                 let value: String =
-                    (0..value_len).map(|_| rng.gen_range(32u8..127u8) as char).collect();
+                    (0..value_len).map(|_| rng.random_range(32u8..127u8) as char).collect();
                 params.insert(key.to_string(), value);
             }
             let _ = AuthorizationRequest::parse(&params);

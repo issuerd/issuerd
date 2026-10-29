@@ -804,8 +804,8 @@ async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError>
     state.storage.create_user(&realm.id, &admin_user).await?;
 
     // Hash password with argon2
+    use argon2::password_hash::rand_core::OsRng;
     use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
     let (password, generated) = resolve_bootstrap_admin_password(&state.config);
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -890,9 +890,9 @@ fn resolve_bootstrap_admin_password(config: &ServerConfig) -> (String, bool) {
         return (password.to_string(), false);
     }
     use base64::Engine;
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 18];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     (base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes), true)
 }
 

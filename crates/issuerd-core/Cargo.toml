@@ -38,4 +38,4 @@ flux-rs = { git = "https://github.com/flux-rs/flux.git" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rstest = { workspace = true }
 serde-saphyr = { workspace = true }
-toml = "0.8"
+toml = "1.1"
