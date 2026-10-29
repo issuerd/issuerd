@@ -168,7 +168,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .expect("generate self-signed cert");
         std::fs::write(&cert_path, cert.cert.pem()).expect("write cert pem");
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key pem");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key pem");
 
         let config = ServerConfig {
             bind: "127.0.0.1".to_string(),
@@ -229,7 +229,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .expect("generate self-signed cert");
         std::fs::write(&cert_path, cert.cert.pem()).expect("write cert pem");
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key pem");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key pem");
 
         let config = ServerConfig {
             bind: "127.0.0.1".to_string(),
@@ -285,7 +285,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .expect("generate self-signed cert");
         std::fs::write(&cert_path, cert.cert.pem()).expect("write cert pem");
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key pem");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key pem");
 
         let _guard = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = _guard.local_addr().unwrap();

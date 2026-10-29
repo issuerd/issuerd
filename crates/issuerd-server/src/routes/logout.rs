@@ -841,13 +841,13 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "issuerd logout test CA");
         let ca_key = rcgen::KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
         let server_key = rcgen::KeyPair::generate().unwrap();
         let server_cert =
             rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
                 .unwrap()
-                .signed_by(&server_key, &ca_cert, &ca_key)
+                .signed_by(&server_key, &ca_cert)
                 .unwrap();
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
             server_cert.pem().into_bytes(),

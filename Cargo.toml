@@ -213,7 +213,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 base64 = "0.23"
 
 # Test certificate generation
-rcgen = "0.13"
+rcgen = "0.14"
 
 # LDAP / Kerberos federation
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
