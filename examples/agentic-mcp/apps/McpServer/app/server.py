@@ -1,4 +1,4 @@
-"""FastMCP server exposing the two demo tools.
+"""MCP server exposing the two demo tools.
 
 Streamable-HTTP transport at /mcp in stateless mode: no server-side MCP
 sessions, so every request is independently authenticated by the auth
@@ -6,27 +6,20 @@ middleware (the demo client sends a fresh DPoP proof per request, and proof
 jtis are single-use). Responses are plain JSON (json_response=True), which
 the stateless client accepts via its ``Accept: application/json`` header.
 
-Both tools return CallToolResult directly: FastMCP passes those through
+Both tools return CallToolResult directly: MCPServer passes those through
 untouched, so error results carry the exact demo message (e.g.
 "order 3 not found") instead of an SDK-generated prefix.
 """
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent
 
 from app.auth import current_auth, validate_sub_uuid
 from app.db import rls_connection
 
-mcp = FastMCP(
-    "shop-mcp",
-    stateless_http=True,
-    json_response=True,
-    streamable_http_path="/mcp",
-    host="0.0.0.0",
-    port=8000,
-)
+mcp = MCPServer("shop-mcp")
 
 ORDERS_SQL = "SELECT id, item, amount, status FROM orders ORDER BY id"
 REFUND_SQL = "UPDATE orders SET status='refunded' WHERE id=$1 RETURNING id, item, amount, status"

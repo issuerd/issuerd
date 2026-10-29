@@ -1,4 +1,4 @@
-mcp==1.30.0
+mcp==2.3.0
 pyjwt==2.15.1
 cryptography==50.0.2
 asyncpg==0.32.0
