@@ -189,6 +189,24 @@ pub struct DiscoveryResponse {
 }
 
 impl DiscoveryResponse {
+    /// Build the discovery document for a realm.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use issuerd_protocol::discovery::DiscoveryResponse;
+    ///
+    /// let response = DiscoveryResponse::for_realm("https://issuer.example", "demo");
+    /// assert_eq!(response.issuer.as_str(), "https://issuer.example/realms/demo");
+    /// assert_eq!(
+    ///     response.token_endpoint.as_str(),
+    ///     "https://issuer.example/realms/demo/protocol/openid-connect/token"
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when the configured base URL and realm name cannot form canonical URLs.
     pub fn for_realm(base_url: &str, realm: &str) -> Self {
         let urls = issuerd_core::urls::RealmUrlBuilder::new(base_url, realm)
             .expect("the configured base URL and a valid realm name form canonical URLs");
