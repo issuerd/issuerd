@@ -1,0 +1,26 @@
+bind = "0.0.0.0"
+port = 8080
+issuer_url = "http://127.0.0.1:8080"
+redis = "redis://redis:6379"
+
+[storage.postgres]
+url = "postgres://issuerd:issuerd_secret@postgres:5432/issuerd"
+
+[cluster]
+enabled = true
+
+[web_ui]
+enabled = false
+
+[logging]
+format = "pretty"
+level = "info"
+
+[mcp]
+enabled = true
+
+[mcp.step_up]
+enabled = true
+
+[dpop.nonce]
+mode = "required"

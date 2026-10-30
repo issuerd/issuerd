@@ -75,3 +75,13 @@ for (const era of report.eras) {
 }
 console.log(JSON.stringify({ok: true, evidence: process.argv[1], eras: report.eras.map(era => era.negotiatedEra)}));
 ' "$RUNTIME/acceptance.json"
+
+export ISSUERD_ISSUER="$ISSUER"
+export MCP_CLIENT_SECRET="${MCP_CLIENT_SECRET:-mcp-step-up-secret}"
+node "$CLIENT/dist/src/step-up.js" | tee "$RUNTIME/step-up-acceptance.json"
+node -e '
+const fs = require("node:fs");
+const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+if (!report.ok || report.resources.length !== 3 || !report.strict.replayReconciled || report.strict.cibaReplay !== "invalid_grant") process.exit(1);
+console.log(JSON.stringify({ok: true, evidence: process.argv[1], strict: report.strict.execution}));
+' "$RUNTIME/step-up-acceptance.json"

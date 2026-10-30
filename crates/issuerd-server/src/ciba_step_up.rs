@@ -45,6 +45,14 @@ pub fn approval_url(state: &ServerState, realm_name: &str, approval_id: &str) ->
     )
 }
 
+fn persisted_uuid(realm_id: &RealmId, auth_req_id: &str, kind: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("mcp-ciba:{realm_id}:{kind}:{auth_req_id}").as_bytes(),
+    )
+    .to_string()
+}
+
 pub async fn initiate(
     state: Arc<ServerState>,
     realm: Realm,
@@ -251,24 +259,31 @@ pub async fn issue(
         return error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
     let realm_id = realm.id.clone();
-    let session_id = SessionId::new(format!("mcp-ciba-session-{}", req_data.auth_req_id))
-        .expect("CIBA identifiers are nonempty");
+    let session_id = SessionId::new(persisted_uuid(&realm_id, &req_data.auth_req_id, "session"))
+        .expect("deterministic CIBA session IDs are UUIDs");
     let auth_time = chrono::DateTime::from_timestamp(approval_auth_time, 0)
         .expect("approval timestamp came from the system clock");
-    if state
-        .storage
-        .get_user_session(&realm_id, &session_id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
+    let approval_auth_method = match req_data
+        .approval_amr
+        .as_ref()
+        .and_then(|methods| methods.first())
+        .map(String::as_str)
     {
+        Some("kba") => AuthMethod::Spnego,
+        Some("idp") => AuthMethod::IdentityProvider,
+        _ => AuthMethod::Password,
+    };
+    let existing_session = match state.storage.get_user_session(&realm_id, &session_id).await {
+        Ok(session) => session,
+        Err(error) => return temporary(&error),
+    };
+    if existing_session.is_none() {
         let session = UserSession {
             id: session_id.clone(),
             realm_id: realm_id.clone(),
             user_id: user.id.clone(),
             login_username: user.username.clone(),
-            auth_method: AuthMethod::Password,
+            auth_method: approval_auth_method,
             remember_me: false,
             offline: false,
             ip_address: ip,
@@ -277,13 +292,17 @@ pub async fn issue(
             auth_time,
             impersonator: None,
             clients: vec![ClientSession {
-                id: ClientSessionId::new(format!("mcp-ciba-client-{}", req_data.auth_req_id))
-                    .expect("CIBA identifiers are nonempty"),
+                id: ClientSessionId::new(persisted_uuid(
+                    &realm_id,
+                    &req_data.auth_req_id,
+                    "client",
+                ))
+                .expect("deterministic CIBA client-session IDs are UUIDs"),
                 client_id: client.id.clone(),
                 session_id: session_id.clone(),
                 redirect_uri: None,
                 state: None,
-                auth_method: AuthMethod::Password,
+                auth_method: approval_auth_method,
                 timestamp: auth_time,
             }],
         };
@@ -1353,5 +1372,16 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn persisted_ciba_ids_are_stable_distinct_uuids() {
+        let realm = RealmId::new("10000000-0000-4000-8000-000000000001").unwrap();
+        let session = persisted_uuid(&realm, "request-id", "session");
+        let client = persisted_uuid(&realm, "request-id", "client");
+        assert_eq!(session, persisted_uuid(&realm, "request-id", "session"));
+        assert_ne!(session, client);
+        assert!(uuid::Uuid::parse_str(&session).is_ok());
+        assert!(uuid::Uuid::parse_str(&client).is_ok());
     }
 }

@@ -112,10 +112,12 @@ jobs:
       - name: Check the pinned external client
         working-directory: examples/mcp-admin/client
         run: npm ci && npm run build && npm run typecheck && npm test && npm audit
-      - name: Real public-native DPoP acceptance (in-memory)
+      - name: Real public and confidential MCP acceptance (in-memory)
         run: ./examples/mcp-admin/scripts/e2e-local.sh
-      - name: Real public-native DPoP acceptance (PostgreSQL + Redis)
+      - name: Real public and confidential MCP acceptance (PostgreSQL + Redis)
         run: ./examples/mcp-admin/scripts/e2e-compose.sh
+      - name: Three-node operation-bound CIBA acceptance (PostgreSQL + Redis)
+        run: ./examples/mcp-admin/scripts/e2e-step-up-cluster.sh
       - name: Redis-backed cross-node invocation limiting
         run: cargo test --locked --test integration invocation_limit_is_atomic_across_two_nodes_with_redis
 

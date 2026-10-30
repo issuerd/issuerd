@@ -82,6 +82,22 @@ services:
       setup:
         condition: service_completed_successfully
 
+  step-up-client:
+    build: ./client
+    image: issuerd-mcp-admin-client:local
+    network_mode: service:issuerd
+    restart: "no"
+    environment:
+      ISSUERD_ISSUER: http://127.0.0.1:8080/realms/mcp-demo
+      MCP_CONFIDENTIAL_CLIENT_ID: mcp-admin-confidential
+      MCP_CLIENT_SECRET: mcp-step-up-secret
+      MCP_USERNAME: mcp-admin
+      MCP_PASSWORD: Password123!
+    command: ["node", "dist/src/step-up.js"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
 volumes:
   postgres-data:
     driver: local

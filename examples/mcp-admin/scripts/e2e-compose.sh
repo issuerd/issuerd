@@ -8,6 +8,9 @@ COMPOSE=(docker compose -f "$EXAMPLE_DIR/docker-compose.yml")
 cleanup() {
   status=$?
   trap - EXIT INT TERM
+  if [[ "$status" != "0" ]]; then
+    "${COMPOSE[@]}" logs --tail=150 issuerd >&2 || true
+  fi
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   exit "$status"
 }
@@ -30,3 +33,4 @@ if [[ "$setup_exit" != "0" ]]; then
 fi
 
 timeout 180 "${COMPOSE[@]}" run --rm --no-deps client
+timeout 180 "${COMPOSE[@]}" run --rm --no-deps step-up-client

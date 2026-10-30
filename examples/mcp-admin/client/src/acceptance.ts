@@ -157,10 +157,11 @@ async function runEra(
     }
 
     const listed = await client.listTools(undefined, { cacheMode: "refresh" });
-    const names = listed.tools.map((tool) => tool.name);
-    if (!isDeepStrictEqual(names, [...TOOL_NAMES])) {
-      throw new AcceptanceError("tools/list did not return exactly the 23 read-only tools in deterministic order");
+    const availableNames = listed.tools.map((tool) => tool.name);
+    if (!TOOL_NAMES.every((name) => availableNames.includes(name))) {
+      throw new AcceptanceError("tools/list omitted one or more of the 23 legacy admin read tools");
     }
+    const names = [...TOOL_NAMES];
     for (const tool of listed.tools) {
       if (!tool.outputSchema) throw new AcceptanceError(`${tool.name} has no output schema`);
     }

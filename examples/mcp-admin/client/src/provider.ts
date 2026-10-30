@@ -19,6 +19,8 @@ interface ProviderOptions {
   resource: string;
   clientId: string;
   redirectUri: string;
+  clientSecret?: string;
+  scope?: string;
 }
 
 export class IssuerStateStore {
@@ -107,12 +109,14 @@ export class NativeOAuthProvider implements OAuthClientProvider {
   get clientMetadata(): OAuthClientMetadata {
     return {
       redirect_uris: [this.options.redirectUri],
-      token_endpoint_auth_method: "none",
+      token_endpoint_auth_method: this.options.clientSecret === undefined ? "none" : "client_secret_basic",
       grant_types: ["authorization_code"],
       response_types: ["code"],
       application_type: "native",
-      client_name: "Issuerd MCP read-only acceptance CLI",
-      scope: MCP_SCOPE,
+      client_name: this.options.clientSecret === undefined
+        ? "Issuerd MCP read-only acceptance CLI"
+        : "Issuerd MCP confidential step-up acceptance CLI",
+      scope: this.options.scope ?? MCP_SCOPE,
     };
   }
 
@@ -123,7 +127,8 @@ export class NativeOAuthProvider implements OAuthClientProvider {
     if (existing) return existing;
     const registration: StoredOAuthClientInformation = {
       client_id: this.options.clientId,
-      token_endpoint_auth_method: "none",
+      ...(this.options.clientSecret === undefined ? {} : { client_secret: this.options.clientSecret }),
+      token_endpoint_auth_method: this.options.clientSecret === undefined ? "none" : "client_secret_basic",
       issuer,
     };
     this.store.register(issuer, registration);
@@ -140,9 +145,9 @@ export class NativeOAuthProvider implements OAuthClientProvider {
       throw new Error("authorization server did not issue a DPoP-bound access token");
     }
     const granted = new Set((tokens.scope ?? "").split(/\s+/).filter(Boolean));
-    const expected = new Set(MCP_SCOPE.split(" "));
+    const expected = new Set((this.options.scope ?? MCP_SCOPE).split(" "));
     if (granted.size !== expected.size || ![...expected].every((scope) => granted.has(scope))) {
-      throw new Error("authorization server did not grant exactly openid mcp:read");
+      throw new Error("authorization server did not grant the exact requested scope set");
     }
     this.store.saveTokens(issuer, tokens);
   }
@@ -188,8 +193,9 @@ export class NativeOAuthProvider implements OAuthClientProvider {
     if (metadata.authorization_response_iss_parameter_supported !== true) {
       throw new Error("authorization server does not advertise RFC 9207 issuer responses");
     }
-    if (!metadata.token_endpoint_auth_methods_supported?.includes("none")) {
-      throw new Error("authorization server does not advertise public client authentication");
+    const authenticationMethod = this.options.clientSecret === undefined ? "none" : "client_secret_basic";
+    if (!metadata.token_endpoint_auth_methods_supported?.includes(authenticationMethod)) {
+      throw new Error("authorization server does not advertise the configured client authentication method");
     }
     this.store.saveDiscovery(issuer, state);
   }
