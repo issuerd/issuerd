@@ -227,6 +227,34 @@ class AdminApi {
     return group;
   }
 
+  async ensureIdentityProvider(token: string, alias: string): Promise<JsonObject> {
+    const base = `/admin/realms/${encodeURIComponent(this.config.realm)}/identity-provider/instances`;
+    const path = `${base}/${encodeURIComponent(alias)}`;
+    const existing = await this.request(path, { token });
+    if (existing.status === 200) return object(existing.json, "identity provider");
+    if (existing.status !== 404) throw new Error(`identity provider lookup returned HTTP ${existing.status}`);
+    return object(
+      await this.expect(
+        base,
+        {
+          method: "POST",
+          token,
+          body: {
+            alias,
+            provider_id: "oidc",
+            enabled: true,
+            config: {
+              clientId: "mcp-acceptance-broker",
+              clientSecret: "lab-only-mcp-acceptance-secret",
+            },
+          },
+        },
+        [201],
+      ),
+      "created identity provider",
+    );
+  }
+
   async ensureUser(
     token: string,
     username: string,
@@ -304,6 +332,7 @@ async function main(): Promise<void> {
     const admin = await api.ensureUser(token, "mcp-admin", READ_ROLES, roles);
     const observer = await api.ensureUser(token, "mcp-observer", ["view-users"], roles);
     const group = await api.ensureGroup(token, "mcp-acceptance", id(observer));
+    const identityProvider = await api.ensureIdentityProvider(token, "mcp-acceptance-idp");
     process.stdout.write(`${JSON.stringify({
       ok: true,
       issuer: `${config.baseUrl}/realms/${config.realm}`,
@@ -324,6 +353,7 @@ async function main(): Promise<void> {
         ],
         clients: [{ id: id(reporting), clientId: "mcp-reporting" }],
         groups: [{ id: id(group), name: "mcp-acceptance", member: "mcp-observer" }],
+        identityProviders: [{ alias: identityProvider.alias }],
         roles: READ_ROLES,
       },
     }, null, 2)}\n`);

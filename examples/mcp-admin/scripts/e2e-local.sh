@@ -71,7 +71,7 @@ const fs = require("node:fs");
 const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 if (!report.ok || report.eras.length !== 2) process.exit(1);
 for (const era of report.eras) {
-  if (era.tools.length !== 15 || Object.keys(era.calls).length !== 15) process.exit(1);
+  if (era.tools.length !== 23 || Object.keys(era.calls).length !== 23) process.exit(1);
 }
 console.log(JSON.stringify({ok: true, evidence: process.argv[1], eras: report.eras.map(era => era.negotiatedEra)}));
 ' "$RUNTIME/acceptance.json"

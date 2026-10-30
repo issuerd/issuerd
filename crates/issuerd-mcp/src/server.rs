@@ -270,11 +270,18 @@ mod tests {
         assert_eq!(
             names,
             [
+                "events_search",
+                "flows_list",
                 "groups_get",
                 "groups_list",
+                "idp_get",
+                "idp_list",
+                "keys_list",
                 "realm_get",
                 "roles_get",
-                "roles_list"
+                "roles_list",
+                "serverinfo_get",
+                "sessions_list"
             ]
         );
         assert!(tools.iter().all(|tool| tool["outputSchema"].is_object()));
@@ -296,6 +303,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "client_scopes_list",
                 "clients_get",
                 "clients_list",
                 "groups_members",

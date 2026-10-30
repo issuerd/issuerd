@@ -9,7 +9,13 @@ use rmcp::model::{Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::policy::ToolName;
+use crate::{
+    policy::ToolName,
+    read_inventory::{
+        ClientScopesOutput, EventsOutput, EventsSearchArgs, FlowsOutput, IdpsOutput, KeysOutput,
+        ServerInfoOutput, SessionsListArgs, SessionsOutput,
+    },
+};
 
 pub const DEFAULT_PAGE_SIZE: u32 = 20;
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -473,6 +479,22 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::AttackDetectionStatus => {
             "Return a user's aggregated brute-force failure count and lockout state."
         }
+        ToolName::ClientScopesList => {
+            "List client scopes with safe mapper types and claim-target summaries."
+        }
+        ToolName::EventsSearch => {
+            "Search user or admin audit events with filters, retention clamps, and totals."
+        }
+        ToolName::FlowsList => {
+            "List authentication flows and stages without arbitrary authenticator configuration."
+        }
+        ToolName::IdpGet => {
+            "Return an identity provider with credentials and private keys omitted."
+        }
+        ToolName::IdpList => "List identity providers with credentials and private keys omitted.",
+        ToolName::KeysList => "List public signing-key metadata without private key material.",
+        ToolName::ServerinfoGet => "Return dynamic server capabilities and enum metadata.",
+        ToolName::SessionsList => "List active realm sessions with a matching total count.",
         ToolName::RealmGet => "Return the current realm's curated, non-secret configuration.",
         ToolName::UsersSearch => {
             "Search users by exact username, exact email, or a username/email substring."
@@ -505,6 +527,26 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::AttackDetectionStatus => tool
             .with_input_schema::<UserGetArgs>()
             .with_output_schema::<AttackDetectionStatusOutput>(),
+        ToolName::ClientScopesList => tool
+            .with_input_schema::<SessionsListArgs>()
+            .with_output_schema::<ClientScopesOutput>(),
+        ToolName::EventsSearch => tool
+            .with_input_schema::<EventsSearchArgs>()
+            .with_output_schema::<EventsOutput>(),
+        ToolName::FlowsList => {
+            tool.with_input_schema::<NoArgs>().with_output_schema::<FlowsOutput>()
+        }
+        ToolName::IdpGet => tool
+            .with_input_schema::<RoleGetArgs>()
+            .with_output_schema::<crate::read_inventory::IdpOutput>(),
+        ToolName::IdpList => tool.with_input_schema::<NoArgs>().with_output_schema::<IdpsOutput>(),
+        ToolName::KeysList => tool.with_input_schema::<NoArgs>().with_output_schema::<KeysOutput>(),
+        ToolName::ServerinfoGet => {
+            tool.with_input_schema::<NoArgs>().with_output_schema::<ServerInfoOutput>()
+        }
+        ToolName::SessionsList => tool
+            .with_input_schema::<SessionsListArgs>()
+            .with_output_schema::<SessionsOutput>(),
         ToolName::RealmGet => {
             tool.with_input_schema::<NoArgs>().with_output_schema::<RealmOutput>()
         }
@@ -565,26 +607,8 @@ mod tests {
     fn definitions_are_sorted_fully_annotated_and_have_strict_schemas() {
         let definitions = definitions();
         let names: Vec<_> = definitions.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "attack_detection_status",
-                "clients_get",
-                "clients_list",
-                "groups_get",
-                "groups_list",
-                "groups_members",
-                "realm_get",
-                "roles_get",
-                "roles_list",
-                "users_get",
-                "users_get_credentials",
-                "users_get_groups",
-                "users_get_role_mappings",
-                "users_get_sessions",
-                "users_search"
-            ]
-        );
+        let expected: Vec<_> = ToolName::ALL.iter().map(|tool| tool.as_str()).collect();
+        assert_eq!(names, expected);
         for tool in definitions {
             let annotations = tool.annotations.unwrap();
             assert_eq!(annotations.read_only_hint, Some(true));

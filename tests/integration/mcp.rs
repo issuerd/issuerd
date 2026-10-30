@@ -14,8 +14,9 @@ use std::{
 use axum::http::{header, Method, StatusCode};
 use base64::Engine as _;
 use issuerd_core::{
-    Client, DistributedCache, Group, GroupId, GroupName, GroupPath, Realm, RealmAccess, Role,
-    RoleId, RoleName, Scope, SessionId, Storage, User,
+    Alias, Client, DistributedCache, Group, GroupId, GroupName, GroupPath, IdentityProviderConfig,
+    IdentityProviderId, ProviderId, Realm, RealmAccess, Role, RoleId, RoleName, Scope, SessionId,
+    Storage, User,
 };
 use issuerd_protocol::discovery::ProtectedResourceMetadata;
 use issuerd_server::{
@@ -49,16 +50,24 @@ const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const REDIRECT_URI: &str = "http://localhost:8080/cb";
 const LEGACY_VERSIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_11_25];
-const TOOL_NAMES: [&str; 15] = [
+const TOOL_NAMES: [&str; 23] = [
     "attack_detection_status",
+    "client_scopes_list",
     "clients_get",
     "clients_list",
+    "events_search",
+    "flows_list",
     "groups_get",
     "groups_list",
     "groups_members",
+    "idp_get",
+    "idp_list",
+    "keys_list",
     "realm_get",
     "roles_get",
     "roles_list",
+    "serverinfo_get",
+    "sessions_list",
     "users_get",
     "users_get_credentials",
     "users_get_groups",
@@ -823,9 +832,36 @@ async fn exercise_all_tools(
         assert_eq!(list.cache_scope, None);
     }
     let group_id = create_group(server, fixture, &fixture.user, &unique("mcp-group")).await;
+    server
+        .state
+        .storage
+        .create_identity_provider(
+            &fixture.realm.id,
+            &IdentityProviderConfig {
+                id: IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+                alias: Alias::new("mcp-idp").unwrap(),
+                provider_id: ProviderId::new("oidc"),
+                enabled: true,
+                config: HashMap::from([
+                    ("clientId".to_string(), "public-client".to_string()),
+                    ("clientSecret".to_string(), "mcp-secret-canary".to_string()),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
     let schemas = output_schemas(&list);
     let calls = [
         ("attack_detection_status", json!({"id":fixture.user.id.to_string()})),
+        ("client_scopes_list", json!({})),
+        ("events_search", json!({})),
+        ("events_search", json!({"admin":true})),
+        ("flows_list", json!({})),
+        ("idp_list", json!({})),
+        ("idp_get", json!({"name":"mcp-idp"})),
+        ("keys_list", json!({})),
+        ("serverinfo_get", json!({})),
+        ("sessions_list", json!({})),
         ("realm_get", json!({})),
         ("users_search", json!({"username":fixture.user.username.as_str()})),
         ("users_get", json!({"id":fixture.user.id.to_string()})),
@@ -1155,7 +1191,7 @@ async fn origin_host_methods_and_last_event_id_follow_stateless_transport() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_session_id(&response);
     let body = response_json(response).await;
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 15);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 23);
 }
 
 #[tokio::test]
@@ -1431,11 +1467,18 @@ async fn separate_rmcp_service_emits_real_sse_when_json_mode_is_off() {
 async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
     let server = spawn_server(ServerOptions::default()).await;
     let realm_tools = &[
+        "events_search",
+        "flows_list",
         "groups_get",
         "groups_list",
+        "idp_get",
+        "idp_list",
+        "keys_list",
         "realm_get",
         "roles_get",
         "roles_list",
+        "serverinfo_get",
+        "sessions_list",
     ][..];
     let user_tools = &[
         "groups_members",
@@ -1461,8 +1504,8 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
         ("manage-realm", realm_tools),
         ("view-users", user_tools),
         ("manage-users", manage_user_tools),
-        ("view-clients", &["clients_get", "clients_list"]),
-        ("manage-clients", &["clients_get", "clients_list"]),
+        ("view-clients", &["client_scopes_list", "clients_get", "clients_list"]),
+        ("manage-clients", &["client_scopes_list", "clients_get", "clients_list"]),
     ];
     for (role, expected) in cases {
         let fixture = make_fixture(&server, &unique("filter"), &[role]).await;
@@ -1508,6 +1551,9 @@ fn call_arguments(fixture: &Fixture, tool: &str) -> Value {
         "clients_list" => json!({"clientId":fixture.client.client_id.as_str()}),
         "clients_get" => json!({"id":fixture.client.id.to_string()}),
         "groups_list" | "roles_list" => json!({}),
+        "client_scopes_list" | "events_search" | "flows_list" | "idp_list" | "keys_list"
+        | "serverinfo_get" | "sessions_list" => json!({}),
+        "idp_get" => json!({"name":"mcp-idp"}),
         "groups_get" | "groups_members" => {
             json!({"id":"00000000-0000-4000-8000-000000000000"})
         }
@@ -2597,6 +2643,21 @@ async fn strict_dpop_succeeds_for_every_tool() {
     let key = DpopKey::new();
     let issued = issue_token(&server, &fixture, "openid mcp:read", Some(&key), true).await;
     let group_id = create_group(&server, &fixture, &fixture.user, "strict-tool-group").await;
+    server
+        .state
+        .storage
+        .create_identity_provider(
+            &fixture.realm.id,
+            &IdentityProviderConfig {
+                id: IdentityProviderId::new(issuerd_core::utils::generate_id()).unwrap(),
+                alias: Alias::new("mcp-idp").unwrap(),
+                provider_id: ProviderId::new("oidc"),
+                enabled: true,
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
 
     for tool in TOOL_NAMES {
         let arguments = match tool {

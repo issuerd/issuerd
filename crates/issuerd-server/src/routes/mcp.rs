@@ -56,20 +56,22 @@ const MODERN_VERSION: &str = "2026-07-28";
 pub fn mount(
     router: Router<Arc<ServerState>>,
     state: &Arc<ServerState>,
+    admin_state: Arc<issuerd_admin_api::state::AdminApiState>,
 ) -> Router<Arc<ServerState>> {
-    mount_with_response_mode(router, state, true)
+    mount_with_response_mode(router, state, admin_state, true)
 }
 
 fn mount_with_response_mode(
     router: Router<Arc<ServerState>>,
     state: &Arc<ServerState>,
+    admin_state: Arc<issuerd_admin_api::state::AdminApiState>,
     json_response: bool,
 ) -> Router<Arc<ServerState>> {
     if !state.config.mcp.enabled {
         return router.route("/realms/{realm}/mcp", any(disabled_handler));
     }
     let adapter = Arc::new(
-        McpHttpAdapter::new(Arc::clone(state), json_response)
+        McpHttpAdapter::new(Arc::clone(state), admin_state, json_response)
             .expect("invalid [mcp] transport configuration"),
     );
     router.route(
@@ -93,19 +95,28 @@ struct McpHttpAdapter {
 }
 
 impl McpHttpAdapter {
-    fn new(state: Arc<ServerState>, json_response: bool) -> Result<Self, McpError> {
+    fn new(
+        state: Arc<ServerState>,
+        admin_state: Arc<issuerd_admin_api::state::AdminApiState>,
+        json_response: bool,
+    ) -> Result<Self, McpError> {
         let transport_config = McpTransportConfig::for_issuer(
             &state.config.issuer_url,
             state.config.mcp.allowed_origins.clone(),
             CancellationToken::new(),
         )?;
-        let executor = Arc::new(McpToolExecutor::new(
-            Arc::clone(&state.storage),
-            McpRateLimiter::new(
-                Arc::clone(&state.cache),
-                u64::from(state.config.mcp.invocation_rate_limit_per_minute),
-            ),
-        ));
+        let executor = Arc::new(
+            McpToolExecutor::new(
+                Arc::clone(&state.storage),
+                McpRateLimiter::new(
+                    Arc::clone(&state.cache),
+                    u64::from(state.config.mcp.invocation_rate_limit_per_minute),
+                ),
+            )
+            .with_application_service(Arc::new(
+                crate::mcp_service::ServerMcpApplicationService::new(admin_state),
+            )),
+        );
         let service = issuerd_mcp::transport::streamable_http_service_with_json_response(
             Arc::clone(&executor),
             transport_config.clone(),
@@ -1417,7 +1428,7 @@ mod tests {
         .await;
         assert_eq!(list.status(), StatusCode::OK);
         let list = response_json(list).await;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 23);
 
         let call = legacy_request("tools/call", json!({"name":"realm_get","arguments":{}}));
         let first = post_raw(&client, &url, Some(&token), Some("2025-11-25"), call.clone()).await;
@@ -1565,7 +1576,8 @@ mod tests {
         config.mcp.enabled = true;
         config.mcp.require_dpop = false;
         let state = Arc::new(ServerState::from_config(&config).await.unwrap());
-        let app = mount_with_response_mode(Router::new(), &state, json_response)
+        let admin_state = crate::mcp_service::admin_state(&state);
+        let app = mount_with_response_mode(Router::new(), &state, admin_state, json_response)
             .with_state(Arc::clone(&state));
         let task = tokio::spawn(async move {
             let _ = axum::serve(

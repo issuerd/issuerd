@@ -2,7 +2,7 @@
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
 agent-native administration. The current increment is deliberately read-only:
-15 curated tools, no built-in chat, no LLM provider, and no token passthrough
+23 curated tools, no built-in chat, no LLM provider, and no token passthrough
 to another API.
 
 ## Enable and configure
@@ -66,6 +66,14 @@ or invocation allowance.
 | `groups_members` | `mcp:read` | `view-users`, `manage-users` | Paginated curated members of an existing group |
 | `roles_list` | `mcp:read` | `view-realm`, `manage-realm` | Paginated realm roles, excluding client roles before pagination |
 | `roles_get` | `mcp:read` | `view-realm`, `manage-realm` | Role by name with Admin lookup precedence and container metadata |
+| `serverinfo_get` | `mcp:read` | `view-realm`, `manage-realm` | Dynamic server capabilities and enum metadata |
+| `events_search` | `mcp:read` | `view-realm`, `manage-realm` | Filtered user/admin events with retention clamps and totals |
+| `sessions_list` | `mcp:read` | `view-realm`, `manage-realm` | Paginated realm sessions and total count |
+| `keys_list` | `mcp:read` | `view-realm`, `manage-realm` | Public signing-key metadata only |
+| `client_scopes_list` | `mcp:read` | `view-clients`, `manage-clients` | Scopes with safe mapper and claim-target summaries |
+| `idp_list` | `mcp:read` | `view-realm`, `manage-realm` | Identity providers with sensitive configuration omitted |
+| `idp_get` | `mcp:read` | `view-realm`, `manage-realm` | Identity provider by alias with sensitive configuration omitted |
+| `flows_list` | `mcp:read` | `view-realm`, `manage-realm` | Flows and stages without authenticator configuration |
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or
@@ -236,7 +244,7 @@ Run the branch-built daemon with PostgreSQL and Redis:
 ./examples/mcp-admin/scripts/e2e-compose.sh
 ```
 
-Both scripts complete authorization-code issuance and all 15 tools in legacy
+Both scripts complete authorization-code issuance and all 23 tools in legacy
 and modern modes. The Compose script removes its own project and volumes on
 exit. See [`examples/mcp-admin/README.md`](../examples/mcp-admin/README.md) for
 interactive commands, lab-only credentials, and the evidence schema.

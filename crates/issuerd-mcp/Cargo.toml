@@ -13,6 +13,8 @@ categories = ["authentication", "web-programming"]
 
 [dependencies]
 issuerd-core = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 http = "1"
 http-body = "1"
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

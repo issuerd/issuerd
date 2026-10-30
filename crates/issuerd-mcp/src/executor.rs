@@ -44,13 +44,26 @@ pub struct McpToolPermit {
 
 #[derive(Clone)]
 pub struct McpToolExecutor {
-    storage: Arc<dyn Storage>,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) application: Option<Arc<dyn crate::services::McpApplicationService>>,
     limiter: McpRateLimiter,
 }
 
 impl McpToolExecutor {
     pub fn new(storage: Arc<dyn Storage>, limiter: McpRateLimiter) -> Self {
-        Self { storage, limiter }
+        Self {
+            storage,
+            application: None,
+            limiter,
+        }
+    }
+
+    pub fn with_application_service(
+        mut self,
+        application: Arc<dyn crate::services::McpApplicationService>,
+    ) -> Self {
+        self.application = Some(application);
+        self
     }
 
     pub fn limiter(&self) -> &McpRateLimiter {
@@ -89,6 +102,16 @@ impl McpToolExecutor {
         match permit.tool {
             ToolName::AttackDetectionStatus => {
                 self.attack_detection_status(permit, arguments).await
+            }
+            ToolName::ClientScopesList
+            | ToolName::EventsSearch
+            | ToolName::FlowsList
+            | ToolName::IdpGet
+            | ToolName::IdpList
+            | ToolName::KeysList
+            | ToolName::ServerinfoGet
+            | ToolName::SessionsList => {
+                crate::read_inventory::execute(self, permit, arguments).await
             }
             ToolName::RealmGet => self.realm_get(permit, arguments).await,
             ToolName::UsersSearch => self.users_search(permit, arguments).await,
@@ -624,12 +647,12 @@ fn deny_to_error(decision: PolicyDecision) -> Result<(), McpError> {
     }
 }
 
-fn decode<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
+pub(crate) fn decode<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
         .map_err(|error| McpError::InvalidInput(error.to_string()))
 }
 
-fn output(value: impl Serialize) -> Result<Value, McpError> {
+pub(crate) fn output(value: impl Serialize) -> Result<Value, McpError> {
     serde_json::to_value(value).map_err(|_| {
         McpError::Backend(issuerd_core::IssuerdError::ServerError(
             "tool result serialization failed".into(),
@@ -672,7 +695,7 @@ fn validate_bounded(value: &str, field: &str, maximum_bytes: usize) -> Result<()
     Ok(())
 }
 
-fn pagination(first: Option<u32>, max: Option<u32>) -> Result<Pagination, McpError> {
+pub(crate) fn pagination(first: Option<u32>, max: Option<u32>) -> Result<Pagination, McpError> {
     let first = first.unwrap_or(0);
     let max = max.unwrap_or(DEFAULT_PAGE_SIZE);
     if max > MAX_PAGE_SIZE {
@@ -718,10 +741,17 @@ mod tests {
         let role = match tool {
             ToolName::AttackDetectionStatus => "manage-users",
             ToolName::RealmGet
+            | ToolName::EventsSearch
+            | ToolName::FlowsList
             | ToolName::GroupsGet
             | ToolName::GroupsList
+            | ToolName::IdpGet
+            | ToolName::IdpList
+            | ToolName::KeysList
             | ToolName::RolesGet
-            | ToolName::RolesList => "view-realm",
+            | ToolName::RolesList
+            | ToolName::ServerinfoGet
+            | ToolName::SessionsList => "view-realm",
             ToolName::UsersGet
             | ToolName::UsersGetCredentials
             | ToolName::UsersGetGroups
@@ -729,7 +759,9 @@ mod tests {
             | ToolName::UsersGetSessions
             | ToolName::UsersSearch
             | ToolName::GroupsMembers => "view-users",
-            ToolName::ClientsGet | ToolName::ClientsList => "view-clients",
+            ToolName::ClientScopesList | ToolName::ClientsGet | ToolName::ClientsList => {
+                "view-clients"
+            }
         };
         executor.preflight(tool.as_str(), auth("mcp:read", &[role]), NOW).await.unwrap()
     }

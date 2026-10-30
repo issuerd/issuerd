@@ -14,14 +14,22 @@ const CLIENT_ROLES: &[&str] = &["view-clients", "manage-clients"];
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
     AttackDetectionStatus,
+    ClientScopesList,
     ClientsGet,
     ClientsList,
+    EventsSearch,
+    FlowsList,
     GroupsGet,
     GroupsList,
     GroupsMembers,
+    IdpGet,
+    IdpList,
+    KeysList,
     RealmGet,
     RolesGet,
     RolesList,
+    ServerinfoGet,
+    SessionsList,
     UsersGet,
     UsersGetCredentials,
     UsersGetGroups,
@@ -31,16 +39,24 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 23] = [
         Self::AttackDetectionStatus,
+        Self::ClientScopesList,
         Self::ClientsGet,
         Self::ClientsList,
+        Self::EventsSearch,
+        Self::FlowsList,
         Self::GroupsGet,
         Self::GroupsList,
         Self::GroupsMembers,
+        Self::IdpGet,
+        Self::IdpList,
+        Self::KeysList,
         Self::RealmGet,
         Self::RolesGet,
         Self::RolesList,
+        Self::ServerinfoGet,
+        Self::SessionsList,
         Self::UsersGet,
         Self::UsersGetCredentials,
         Self::UsersGetGroups,
@@ -52,14 +68,22 @@ impl ToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AttackDetectionStatus => "attack_detection_status",
+            Self::ClientScopesList => "client_scopes_list",
             Self::ClientsGet => "clients_get",
             Self::ClientsList => "clients_list",
+            Self::EventsSearch => "events_search",
+            Self::FlowsList => "flows_list",
             Self::GroupsGet => "groups_get",
             Self::GroupsList => "groups_list",
             Self::GroupsMembers => "groups_members",
+            Self::IdpGet => "idp_get",
+            Self::IdpList => "idp_list",
+            Self::KeysList => "keys_list",
             Self::RealmGet => "realm_get",
             Self::RolesGet => "roles_get",
             Self::RolesList => "roles_list",
+            Self::ServerinfoGet => "serverinfo_get",
+            Self::SessionsList => "sessions_list",
             Self::UsersGet => "users_get",
             Self::UsersGetCredentials => "users_get_credentials",
             Self::UsersGetGroups => "users_get_groups",
@@ -87,11 +111,16 @@ pub struct ToolPolicy {
     pub any_realm_roles: &'static [&'static str],
 }
 
-pub const POLICIES: [ToolPolicy; 15] = [
+pub const POLICIES: [ToolPolicy; 23] = [
     ToolPolicy {
         tool: ToolName::AttackDetectionStatus,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: &["manage-users"],
+    },
+    ToolPolicy {
+        tool: ToolName::ClientScopesList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: CLIENT_ROLES,
     },
     ToolPolicy {
         tool: ToolName::ClientsGet,
@@ -102,6 +131,16 @@ pub const POLICIES: [ToolPolicy; 15] = [
         tool: ToolName::ClientsList,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: CLIENT_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::EventsSearch,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::FlowsList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
     },
     ToolPolicy {
         tool: ToolName::GroupsGet,
@@ -119,6 +158,21 @@ pub const POLICIES: [ToolPolicy; 15] = [
         any_realm_roles: USER_ROLES,
     },
     ToolPolicy {
+        tool: ToolName::IdpGet,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::IdpList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::KeysList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
         tool: ToolName::RealmGet,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: REALM_ROLES,
@@ -130,6 +184,16 @@ pub const POLICIES: [ToolPolicy; 15] = [
     },
     ToolPolicy {
         tool: ToolName::RolesList,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::ServerinfoGet,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: REALM_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::SessionsList,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: REALM_ROLES,
     },
@@ -186,7 +250,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 15] {
+pub fn policies() -> &'static [ToolPolicy; 23] {
     &POLICIES
 }
 
@@ -259,7 +323,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 15);
+        assert_eq!(unique.len(), 23);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();

@@ -63,8 +63,9 @@ Setup uses the setup-only admin token to create:
 - `mcp-admin` with `view-realm`, `view-users`, `manage-users`, and `view-clients`
   (`manage-users` is required only for attack-detection status);
 - additional user `mcp-observer` and client `mcp-reporting` fixtures;
-- group `mcp-acceptance` with `mcp-observer` as a member, plus the realm roles
-  used by role list/get acceptance.
+- group `mcp-acceptance` with `mcp-observer` as a member, realm roles used by
+  role list/get acceptance, and `mcp-acceptance-idp` with a lab-only credential
+  that acceptance proves is omitted from MCP output.
 
 The actual redirect uses an ephemeral `127.0.0.1` listener port. The server must
 accept it through the native loopback-port exception; all other redirect
@@ -85,10 +86,10 @@ Expected `acceptance.json` evidence:
 - RFC 9207 issuer/state/redirect matches for both success and error responses;
 - a legacy `initialize` + `notifications/initialized` connection and, in
   `auto`, SDK auto-negotiation of modern `server/discover`;
-- all 15 tools in both eras, with IDs for user, client, group, and role detail
-  calls discovered from the corresponding search/list results;
+- all 23 tools in both eras, with IDs for user, client, group, role, and IdP
+  detail calls discovered from the corresponding search/list results;
 - SDK `AjvJsonSchemaValidator` checks, exact structured/text mirror checks,
-  and 17 modern wire results with `resultType:"complete"` in the pristine
+  and 25 modern wire results with `resultType:"complete"` in the pristine
   rig, plus any additional paginated lookup results needed in populated realms
   (the SDK itself strips this discriminator from its neutral result objects).
 

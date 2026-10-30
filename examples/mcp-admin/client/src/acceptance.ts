@@ -159,7 +159,7 @@ async function runEra(
     const listed = await client.listTools(undefined, { cacheMode: "refresh" });
     const names = listed.tools.map((tool) => tool.name);
     if (!isDeepStrictEqual(names, [...TOOL_NAMES])) {
-      throw new AcceptanceError("tools/list did not return exactly the fifteen read-only tools in deterministic order");
+      throw new AcceptanceError("tools/list did not return exactly the 23 read-only tools in deterministic order");
     }
     for (const tool of listed.tools) {
       if (!tool.outputSchema) throw new AcceptanceError(`${tool.name} has no output schema`);
@@ -280,6 +280,68 @@ async function runEra(
     if (record(calls.roles_get.structuredContent, "roles_get output").id !== selectedRole.id) {
       throw new AcceptanceError("roles_get did not return the discovered realm role");
     }
+
+    calls.client_scopes_list = await callTool(client, "client_scopes_list", { first: 0, max: 100 });
+    const clientScopes = records(
+      record(calls.client_scopes_list.structuredContent, "client scopes output").clientScopes,
+      "client scopes",
+    );
+    if (!clientScopes.some((entry) => entry.name === "profile")) {
+      throw new AcceptanceError("client_scopes_list omitted the profile scope");
+    }
+    for (const scope of clientScopes) {
+      for (const mapper of records(scope.protocolMappers ?? [], "protocol mapper summaries")) {
+        if ("config" in mapper) throw new AcceptanceError("client_scopes_list returned raw mapper configuration");
+      }
+    }
+
+    calls.events_search = await callTool(client, "events_search", { first: 0, max: 20 });
+    const eventOutput = record(calls.events_search.structuredContent, "event search output");
+    if (eventOutput.kind !== "user" || typeof eventOutput.total !== "number") {
+      throw new AcceptanceError("events_search returned an invalid user-event page");
+    }
+    records(eventOutput.events, "audit events");
+
+    calls.flows_list = await callTool(client, "flows_list", {});
+    const flows = records(record(calls.flows_list.structuredContent, "flows output").flows, "flows");
+    if (!flows.some((entry) => entry.alias === "browser")) {
+      throw new AcceptanceError("flows_list omitted the browser flow");
+    }
+
+    calls.idp_list = await callTool(client, "idp_list", {});
+    const idps = records(
+      record(calls.idp_list.structuredContent, "identity providers output").identityProviders,
+      "identity providers",
+    );
+    if (!idps.some((entry) => entry.alias === "mcp-acceptance-idp")) {
+      throw new AcceptanceError("idp_list omitted the acceptance identity provider");
+    }
+    calls.idp_get = await callTool(client, "idp_get", { name: "mcp-acceptance-idp" });
+    const idpConfig = record(record(calls.idp_get.structuredContent, "identity provider output").config, "IdP config");
+    for (const key of Object.keys(idpConfig)) {
+      if (/secret|credential|password|private.?key|token/i.test(key)) {
+        throw new AcceptanceError("idp_get returned a sensitive configuration value");
+      }
+    }
+
+    calls.keys_list = await callTool(client, "keys_list", {});
+    const keys = records(record(calls.keys_list.structuredContent, "keys output").keys, "signing keys");
+    if (!keys.length || keys.some((entry) => "privateDer" in entry || "privateKey" in entry)) {
+      throw new AcceptanceError("keys_list returned no public metadata or leaked private material");
+    }
+
+    calls.serverinfo_get = await callTool(client, "serverinfo_get", {});
+    const serverInfo = record(calls.serverinfo_get.structuredContent, "server info output");
+    string(serverInfo.version, "server version");
+    record(serverInfo.capabilities, "server capabilities");
+
+    calls.sessions_list = await callTool(client, "sessions_list", { first: 0, max: 20 });
+    const realmSessions = record(calls.sessions_list.structuredContent, "realm sessions output");
+    records(realmSessions.sessions, "realm sessions");
+    if (typeof realmSessions.total !== "number") {
+      throw new AcceptanceError("sessions_list omitted the total count");
+    }
+
     for (const name of TOOL_NAMES) {
       if (!calls[name]) throw new AcceptanceError(`missing ${name} acceptance call`);
     }
