@@ -300,6 +300,10 @@ mod tests {
                 "clients_list",
                 "groups_members",
                 "users_get",
+                "users_get_credentials",
+                "users_get_groups",
+                "users_get_role_mappings",
+                "users_get_sessions",
                 "users_search"
             ]
         );

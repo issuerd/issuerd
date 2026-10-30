@@ -17,7 +17,7 @@ interface RequestOptions {
   body?: unknown;
 }
 
-const READ_ROLES = ["view-realm", "view-users", "view-clients"] as const;
+const READ_ROLES = ["view-realm", "view-users", "manage-users", "view-clients"] as const;
 const REGISTERED_REDIRECT = "http://127.0.0.1:8080/callback";
 
 function options(env: NodeJS.ProcessEnv): SetupOptions {

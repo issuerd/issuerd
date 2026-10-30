@@ -26,6 +26,10 @@ impl McpRateLimiter {
         self.per_minute
     }
 
+    pub(crate) fn cache(&self) -> &Arc<dyn DistributedCache> {
+        &self.cache
+    }
+
     pub async fn acquire(&self, auth: &McpAuthContext, now: u64) -> Result<(), McpError> {
         let window = now / WINDOW_SECS;
         let key = invocation_key(auth, window);

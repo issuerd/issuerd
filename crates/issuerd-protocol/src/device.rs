@@ -17,6 +17,27 @@ pub struct DeviceAuthorizationRequest {
 }
 
 impl DeviceAuthorizationRequest {
+    /// Parse a device authorization form body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use issuerd_core::IssuerdError;
+    /// use issuerd_protocol::device::DeviceAuthorizationRequest;
+    /// use std::collections::HashMap;
+    ///
+    /// let body = HashMap::from([
+    ///     ("client_id".into(), "device-client".into()),
+    ///     ("scope".into(), "openid profile".into()),
+    /// ]);
+    /// let request = DeviceAuthorizationRequest::parse(&body)?;
+    /// assert_eq!(request.client_id.as_str(), "device-client");
+    /// assert!(request.scope.contains("profile"));
+    ///
+    /// let error = DeviceAuthorizationRequest::parse(&HashMap::new()).unwrap_err();
+    /// assert_eq!(error, IssuerdError::InvalidRequest("missing client_id".into()));
+    /// # Ok::<(), IssuerdError>(())
+    /// ```
     pub fn parse(body: &HashMap<String, String>) -> Result<Self, IssuerdError> {
         let client_id = body
             .get("client_id")

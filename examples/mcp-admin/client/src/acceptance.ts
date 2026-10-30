@@ -159,7 +159,7 @@ async function runEra(
     const listed = await client.listTools(undefined, { cacheMode: "refresh" });
     const names = listed.tools.map((tool) => tool.name);
     if (!isDeepStrictEqual(names, [...TOOL_NAMES])) {
-      throw new AcceptanceError("tools/list did not return exactly the ten read-only tools in deterministic order");
+      throw new AcceptanceError("tools/list did not return exactly the fifteen read-only tools in deterministic order");
     }
     for (const tool of listed.tools) {
       if (!tool.outputSchema) throw new AcceptanceError(`${tool.name} has no output schema`);
@@ -202,6 +202,41 @@ async function runEra(
       throw new AcceptanceError("users_get did not return the discovered user id");
     }
 
+    calls.users_get_role_mappings = await callTool(client, "users_get_role_mappings", { id: userId });
+    const roleMappings = record(calls.users_get_role_mappings.structuredContent, "role mappings output");
+    const directRealmRoles = records(roleMappings.realmMappings, "direct realm mappings");
+    const effectiveRealmRoles = records(roleMappings.effectiveRealmMappings, "effective realm mappings");
+    if (!directRealmRoles.some((entry) => entry.name === "view-users")) {
+      throw new AcceptanceError("users_get_role_mappings omitted the direct view-users role");
+    }
+    if (!effectiveRealmRoles.some((entry) => entry.name === "view-users")) {
+      throw new AcceptanceError("users_get_role_mappings omitted the effective view-users role");
+    }
+
+    calls.users_get_credentials = await callTool(client, "users_get_credentials", { id: userId });
+    const credentials = records(
+      record(calls.users_get_credentials.structuredContent, "credentials output").credentials,
+      "credential metadata",
+    );
+    if (!credentials.some((entry) => entry.type === "password")) {
+      throw new AcceptanceError("users_get_credentials omitted the observer password metadata");
+    }
+    for (const credential of credentials) {
+      if ("secretData" in credential || "credentialData" in credential || "value" in credential) {
+        throw new AcceptanceError("users_get_credentials returned a credential payload");
+      }
+    }
+
+    calls.users_get_sessions = await callTool(client, "users_get_sessions", { id: userId });
+    const sessions = records(record(calls.users_get_sessions.structuredContent, "sessions output").sessions, "sessions");
+    if (sessions.length !== 0) throw new AcceptanceError("observer unexpectedly has an interactive acceptance session");
+
+    calls.attack_detection_status = await callTool(client, "attack_detection_status", { id: userId });
+    const attackStatus = record(calls.attack_detection_status.structuredContent, "attack status output");
+    if (attackStatus.userId !== userId || typeof attackStatus.numFailures !== "number" || typeof attackStatus.locked !== "boolean") {
+      throw new AcceptanceError("attack_detection_status returned an invalid status");
+    }
+
     const clientsArgs = { first: 0, max: 20 };
     calls.clients_list = await callTool(client, "clients_list", clientsArgs);
     const clients = records(
@@ -219,6 +254,14 @@ async function runEra(
     const selectedGroup = await findPagedTool("groups_list", {}, "groups", (entry) => entry.name === "mcp-acceptance");
     if (!selectedGroup) throw new AcceptanceError("groups_list did not discover mcp-acceptance");
     const groupId = string(selectedGroup.id, "discovered group UUID");
+    calls.users_get_groups = await callTool(client, "users_get_groups", { id: userId });
+    const userGroups = records(
+      record(calls.users_get_groups.structuredContent, "user groups output").groups,
+      "user groups",
+    );
+    if (!userGroups.some((entry) => entry.id === groupId)) {
+      throw new AcceptanceError("users_get_groups omitted the discovered membership");
+    }
     calls.groups_get = await callTool(client, "groups_get", { id: groupId });
     if (record(calls.groups_get.structuredContent, "groups_get output").id !== groupId) {
       throw new AcceptanceError("groups_get did not return the discovered group UUID");

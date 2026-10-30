@@ -28,6 +28,30 @@ pub struct CibaRequest {
 }
 
 impl CibaRequest {
+    /// Parse and validate a CIBA form body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use issuerd_core::IssuerdError;
+    /// use issuerd_protocol::ciba::CibaRequest;
+    /// use std::collections::HashMap;
+    ///
+    /// let body = HashMap::from([
+    ///     ("login_hint".into(), "user@example.com".into()),
+    ///     ("scope".into(), "openid profile".into()),
+    /// ]);
+    /// let request = CibaRequest::parse(&body)?;
+    /// assert_eq!(request.login_hint.as_deref(), Some("user@example.com"));
+    /// assert!(request.scope.contains("profile"));
+    ///
+    /// let error = CibaRequest::parse(&HashMap::new()).unwrap_err();
+    /// assert_eq!(
+    ///     error,
+    ///     IssuerdError::InvalidRequest("at least one hint must be provided".into())
+    /// );
+    /// # Ok::<(), IssuerdError>(())
+    /// ```
     pub fn parse(body: &HashMap<String, String>) -> Result<Self, IssuerdError> {
         let scope = parse_scope(body.get("scope"));
 

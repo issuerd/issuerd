@@ -14,6 +14,27 @@ pub struct IntrospectionRequest {
 }
 
 impl IntrospectionRequest {
+    /// Parse a token introspection form body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use issuerd_core::{IssuerdError, TokenTypeHint};
+    /// use issuerd_protocol::introspection::IntrospectionRequest;
+    /// use std::collections::HashMap;
+    ///
+    /// let body = HashMap::from([
+    ///     ("token".into(), "opaque-token".into()),
+    ///     ("token_type_hint".into(), "access_token".into()),
+    /// ]);
+    /// let request = IntrospectionRequest::parse(&body)?;
+    /// assert_eq!(request.token, "opaque-token");
+    /// assert_eq!(request.token_type_hint, Some(TokenTypeHint::AccessToken));
+    ///
+    /// let error = IntrospectionRequest::parse(&HashMap::new()).unwrap_err();
+    /// assert_eq!(error, IssuerdError::InvalidRequest("missing token".into()));
+    /// # Ok::<(), IssuerdError>(())
+    /// ```
     pub fn parse(body: &HashMap<String, String>) -> Result<Self, IssuerdError> {
         let token = body
             .get("token")
@@ -43,6 +64,27 @@ pub struct RevocationRequest {
 }
 
 impl RevocationRequest {
+    /// Parse a token revocation form body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use issuerd_core::{IssuerdError, TokenTypeHint};
+    /// use issuerd_protocol::introspection::RevocationRequest;
+    /// use std::collections::HashMap;
+    ///
+    /// let body = HashMap::from([
+    ///     ("token".into(), "opaque-token".into()),
+    ///     ("token_type_hint".into(), "refresh_token".into()),
+    /// ]);
+    /// let request = RevocationRequest::parse(&body)?;
+    /// assert_eq!(request.token, "opaque-token");
+    /// assert_eq!(request.token_type_hint, Some(TokenTypeHint::RefreshToken));
+    ///
+    /// let error = RevocationRequest::parse(&HashMap::new()).unwrap_err();
+    /// assert_eq!(error, IssuerdError::InvalidRequest("missing token".into()));
+    /// # Ok::<(), IssuerdError>(())
+    /// ```
     pub fn parse(body: &HashMap<String, String>) -> Result<Self, IssuerdError> {
         let token = body
             .get("token")

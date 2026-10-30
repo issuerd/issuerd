@@ -1417,7 +1417,7 @@ mod tests {
         .await;
         assert_eq!(list.status(), StatusCode::OK);
         let list = response_json(list).await;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 15);
 
         let call = legacy_request("tools/call", json!({"name":"realm_get","arguments":{}}));
         let first = post_raw(&client, &url, Some(&token), Some("2025-11-25"), call.clone()).await;

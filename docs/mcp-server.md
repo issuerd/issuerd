@@ -2,7 +2,7 @@
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
 agent-native administration. The current increment is deliberately read-only:
-ten curated tools, no built-in chat, no LLM provider, and no token passthrough
+15 curated tools, no built-in chat, no LLM provider, and no token passthrough
 to another API.
 
 ## Enable and configure
@@ -54,6 +54,11 @@ or invocation allowance.
 | `realm_get` | `mcp:read` | `view-realm`, `manage-realm` | Curated realm configuration |
 | `users_search` | `mcp:read` | `view-users`, `manage-users` | Exact username, exact email, or substring search |
 | `users_get` | `mcp:read` | `view-users`, `manage-users` | User by canonical internal UUID, direct realm roles and groups |
+| `users_get_groups` | `mcp:read` | `view-users`, `manage-users` | Curated direct group memberships |
+| `users_get_role_mappings` | `mcp:read` | `view-users`, `manage-users` | Direct, available, and effective realm/client role mappings |
+| `users_get_sessions` | `mcp:read` | `view-users`, `manage-users` | Active sessions with curated Admin fields |
+| `users_get_credentials` | `mcp:read` | `view-users`, `manage-users` | Scalar credential metadata without payloads |
+| `attack_detection_status` | `mcp:read` | `manage-users` | Aggregated login failures and lockout state |
 | `clients_list` | `mcp:read` | `view-clients`, `manage-clients` | Paginated clients or exact public `clientId` |
 | `clients_get` | `mcp:read` | `view-clients`, `manage-clients` | Client by internal UUID, without secret configuration |
 | `groups_list` | `mcp:read` | `view-realm`, `manage-realm` | Paginated group IDs, names, paths, and parent IDs |
@@ -75,17 +80,25 @@ rejected as malformed before authentication and consumes no allowance. Exact
 filters take precedence over pagination. Defaults are `first=0`, `max=20`, with
 `max <= 100` and bounded input strings. Malformed user, client, or group UUID
 input is an input error, not a storage failure. Role names are required and
-bounded. An unknown group is not found rather than an empty member page.
-`groups_list` retains storage name ordering across pages. Member pagination is
-validated before group lookup, and `roles_list` uses bounded on-demand storage
-batches rather than unconditionally loading the complete role catalog.
+bounded. Unknown groups and users are not found rather than empty detail pages.
+Every user-detail read validates and canonicalizes its internal user UUID and
+requires an existing user. Session reads retain the Admin API's bounded
+100-record page. Role mappings separate direct assignments from available and
+effective roles; effective roles include group inheritance and composite
+expansion. `groups_list` retains storage name ordering across pages. Member
+pagination is validated before group lookup, and `roles_list` uses bounded
+on-demand storage batches rather than unconditionally loading the complete role
+catalog.
 
 Outputs use curated DTOs rather than raw storage models. Arbitrary realm,
-user, client, group, and role attribute maps, client secrets, credentials, SMTP
-passwords, pairwise sector keys, and protocol-mapper configuration are not
-returned. Directory text can still contain indirect prompt injection: output
-redaction is not a substitute for least privilege and external-client approval
-UX.
+user, client, group, and role attribute maps, client secrets, raw credential
+material, `secretData`/`credentialData` payloads, SMTP passwords, pairwise
+sector keys, and protocol-mapper configuration are not returned. Credential
+metadata contains only id, type, optional label, creation time, priority, and
+the derived temporary flag. Session output omits redirect/state and other
+client-session internals. Directory text can still contain indirect prompt
+injection: output redaction is not a substitute for least privilege and
+external-client approval UX.
 
 ## Resource-specific token profile
 
@@ -223,7 +236,7 @@ Run the branch-built daemon with PostgreSQL and Redis:
 ./examples/mcp-admin/scripts/e2e-compose.sh
 ```
 
-Both scripts complete authorization-code issuance and all ten tools in legacy
+Both scripts complete authorization-code issuance and all 15 tools in legacy
 and modern modes. The Compose script removes its own project and volumes on
 exit. See [`examples/mcp-admin/README.md`](../examples/mcp-admin/README.md) for
 interactive commands, lab-only credentials, and the evidence schema.

@@ -8,6 +8,18 @@ use std::collections::HashMap;
 use issuerd_core::{IssuerdError, Scope};
 
 /// Parse an optional space-separated scope string into a normalized `Scope`.
+///
+/// # Examples
+///
+/// ```
+/// use issuerd_protocol::utils::parse_scope;
+///
+/// let input = "profile openid profile".to_string();
+/// let scope = parse_scope(Some(&input));
+/// assert_eq!(scope.len(), 2);
+/// assert_eq!(scope.to_space_separated(), "openid profile");
+/// assert!(parse_scope(None).is_empty());
+/// ```
 pub fn parse_scope(input: Option<&String>) -> Scope {
     input.map(|s| Scope::parse(s)).unwrap_or_default()
 }
