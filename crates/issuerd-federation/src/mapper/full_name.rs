@@ -101,4 +101,63 @@ mod tests {
         assert_eq!(u.first_name.as_deref(), Some("John"));
         assert_eq!(u.last_name, None);
     }
+
+    #[test]
+    fn empty_cn_does_not_set_names() {
+        let mapper = FullNameMapper {
+            ldap_attribute: "cn".to_string(),
+        };
+        let mut u = user();
+        mapper.map_user(&attrs(""), &mut u).unwrap();
+        assert_eq!(u.first_name, None);
+        assert_eq!(u.last_name, None);
+    }
+
+    #[test]
+    fn whitespace_follows_first_space_split_and_display_name_trimming() {
+        let mapper = FullNameMapper {
+            ldap_attribute: "cn".to_string(),
+        };
+        let mut leading = user();
+        mapper.map_user(&attrs("  John Doe  "), &mut leading).unwrap();
+        assert_eq!(leading.first_name, None);
+        assert_eq!(leading.last_name.as_deref(), Some("John Doe"));
+
+        let mut trailing = user();
+        mapper.map_user(&attrs("John Doe  "), &mut trailing).unwrap();
+        assert_eq!(trailing.first_name.as_deref(), Some("John"));
+        assert_eq!(trailing.last_name.as_deref(), Some("Doe"));
+    }
+
+    #[test]
+    fn missing_attribute_leaves_existing_names_untouched() {
+        let mapper = FullNameMapper {
+            ldap_attribute: "cn".to_string(),
+        };
+        let mut u = user();
+        u.first_name = issuerd_core::DisplayName::new("Existing").ok();
+        u.last_name = issuerd_core::DisplayName::new("Name").ok();
+        mapper.map_user(&HashMap::new(), &mut u).unwrap();
+        assert_eq!(u.first_name.as_deref(), Some("Existing"));
+        assert_eq!(u.last_name.as_deref(), Some("Name"));
+    }
+
+    #[test]
+    fn custom_attribute_from_config_is_requested_and_mapped() {
+        let mapper = FullNameMapper::from_config(&HashMap::from([(
+            "ldap.full.name.attribute".to_string(),
+            " displayName ".to_string(),
+        )]));
+        assert_eq!(mapper.ldap_attribute, "displayName");
+        assert_eq!(mapper.requested_attributes(), vec!["displayName"]);
+
+        let ldap_attrs = HashMap::from([
+            ("cn".to_string(), vec!["Wrong Name".to_string()]),
+            ("displayName".to_string(), vec!["Jane Doe".to_string()]),
+        ]);
+        let mut u = user();
+        mapper.map_user(&ldap_attrs, &mut u).unwrap();
+        assert_eq!(u.first_name.as_deref(), Some("Jane"));
+        assert_eq!(u.last_name.as_deref(), Some("Doe"));
+    }
 }
