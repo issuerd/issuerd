@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **User-directory MCP read tools (second Phase 1B batch).** The read-only endpoint now exposes `users_get_groups`, `users_get_role_mappings`, `users_get_sessions`, `users_get_credentials`, and `attack_detection_status`, bringing the inventory to 15 tools. Role mappings distinguish direct, available, and effective realm/client roles; sessions use curated Admin fields; credential output contains only scalar metadata without secret or credential-data payloads; attack status aggregates real distributed failure and lockout state and requires `manage-users`. All tools have strict schemas, repeated scope/role checks, Admin parity, redaction, dual-era `rmcp`, strict-DPoP, and external TypeScript acceptance coverage. ([#39](https://github.com/issuerd/issuerd/issues/39))
 
+### Fixed
+
+- **Phase 1C MCP read correctness.** `users_get_role_mappings` now returns a tool error instead of incomplete direct/available/effective mappings when group role reads fail. The `attack_detection_status` output schema covers the full unsigned 32-bit failure-counter range while remaining compatible with the official TypeScript validator.
+
 ### Security
 
 - **Reproducible build and test dependencies.** Container builds now verify the rustup installer, Python images use hash-locked requirements, Windows release builds enforce Chocolatey checksums, and the Flux installer and remaining Node base image are pinned. The fuzz lockfile is synchronized with current workspace dependencies.

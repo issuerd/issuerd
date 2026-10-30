@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use issuerd_core::{
-    effective_user_roles, escape_scan_pattern, list_all_roles, ClientId, ClientIdentifier, GroupId,
+    escape_scan_pattern, expand_composites, list_all_roles, ClientId, ClientIdentifier, GroupId,
     Pagination, RealmId, RealmName, Role, RoleName, Storage, User, UserId,
 };
 use rmcp::model::JsonObject;
@@ -254,8 +254,33 @@ impl McpToolExecutor {
             .await?
             .into_iter()
             .collect();
-        let effective =
-            effective_user_roles(self.storage.as_ref(), &permit.target.realm_id, &user_id).await?;
+        let group_ids = self.storage.list_user_groups(&permit.target.realm_id, &user_id).await?;
+        let groups = self.storage.get_groups_batch(&permit.target.realm_id, &group_ids).await?;
+        let mut seeds: Vec<_> = all_roles
+            .iter()
+            .filter(|role| {
+                direct_realm_ids.contains(&role.id) || direct_client_ids.contains(&role.id)
+            })
+            .cloned()
+            .collect();
+        for group in groups {
+            seeds.extend(
+                all_roles
+                    .iter()
+                    .filter(|role| {
+                        if role.client_role {
+                            role.client_id
+                                .as_ref()
+                                .and_then(|client_id| group.client_roles.get(client_id))
+                                .is_some_and(|names| names.contains(&role.name))
+                        } else {
+                            group.realm_roles.contains(&role.name)
+                        }
+                    })
+                    .cloned(),
+            );
+        }
+        let effective = expand_composites(seeds, &all_roles);
         let effective_ids: HashSet<_> = effective.iter().map(|role| role.id.clone()).collect();
 
         let realm_mappings = role_outputs(
@@ -1206,6 +1231,25 @@ mod tests {
         assert!(result["clientMappings"].get("beta-client").is_none());
         assert!(!result.to_string().contains(ROLE_SECRET));
         assert!(client["mappings"][0].get("attributes").is_none());
+    }
+
+    #[tokio::test]
+    async fn users_get_role_mappings_does_not_hide_group_storage_failures() {
+        let expected_user = user(ALICE_ID, "alice", "alice@example.com");
+        let mut mock = MockStorage::new();
+        mock.expect_get_user().returning(move |_, _| Ok(Some(expected_user.clone())));
+        mock.expect_list_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_realm_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_client_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_groups()
+            .returning(|_, _| Err(IssuerdError::TemporarilyUnavailable));
+        mock.expect_list_clients().returning(|_, _| Ok(Vec::new()));
+        let executor = executor(Arc::new(mock));
+
+        assert_eq!(
+            execute(&executor, ToolName::UsersGetRoleMappings, json!({"id": ALICE_ID})).await,
+            Err(McpError::Backend(IssuerdError::TemporarilyUnavailable))
+        );
     }
 
     #[tokio::test]

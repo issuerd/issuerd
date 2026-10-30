@@ -459,7 +459,7 @@ pub struct UserCredentialsOutput {
 pub struct AttackDetectionStatusOutput {
     pub user_id: String,
     pub username: String,
-    #[schemars(with = "i32")]
+    #[schemars(with = "i64", range(min = 0, max = 4294967295_i64))]
     pub num_failures: u32,
     pub locked: bool,
 }
@@ -596,6 +596,18 @@ mod tests {
             assert_eq!(tool.output_schema.as_ref().unwrap()["type"], "object");
         }
         assert!(definition(ToolName::RealmGet).input_schema.get("properties").is_none());
+    }
+
+    #[test]
+    fn attack_detection_counter_schema_covers_the_full_u32_range() {
+        let definition = definition(ToolName::AttackDetectionStatus);
+        let schema = definition.output_schema.unwrap();
+        let counter = &schema["properties"]["numFailures"];
+        assert_eq!(counter["type"], "integer");
+        assert_eq!(counter["minimum"], 0);
+        assert_eq!(counter["maximum"], serde_json::json!(u32::MAX));
+        assert_ne!(counter["format"], "int32");
+        assert_ne!(counter["format"], "uint32");
     }
 
     #[test]
