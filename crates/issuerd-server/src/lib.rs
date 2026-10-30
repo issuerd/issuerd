@@ -20,6 +20,7 @@ pub mod event_listeners;
 pub mod groups;
 pub mod i18n;
 pub mod mcp_service;
+pub mod mcp_write;
 pub mod middleware;
 pub mod openapi;
 pub mod outbound_http;

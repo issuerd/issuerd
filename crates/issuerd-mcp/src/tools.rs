@@ -475,6 +475,9 @@ fn read_only_annotations() -> ToolAnnotations {
 }
 
 pub fn definition(name: ToolName) -> Tool {
+    if let Some(tool) = crate::write_tools::definition(name) {
+        return tool;
+    }
     let description = match name {
         ToolName::AttackDetectionStatus => {
             "Return a user's aggregated brute-force failure count and lockout state."
@@ -521,6 +524,7 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::RolesGet => {
             "Return a role by name using Admin lookup precedence, without arbitrary attributes."
         }
+        _ => unreachable!("admin writes have separate definitions"),
     };
     let tool = Tool::new(name.as_str(), description, std::sync::Arc::new(serde_json::Map::new()));
     let tool = match name {
@@ -589,6 +593,7 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::RolesGet => {
             tool.with_input_schema::<RoleGetArgs>().with_output_schema::<RoleOutput>()
         }
+        _ => unreachable!("admin writes have separate definitions"),
     };
     tool.with_annotations(read_only_annotations())
 }
@@ -610,11 +615,22 @@ mod tests {
         let expected: Vec<_> = ToolName::ALL.iter().map(|tool| tool.as_str()).collect();
         assert_eq!(names, expected);
         for tool in definitions {
+            let name = ToolName::parse(tool.name.as_ref()).unwrap();
+            let create = matches!(
+                name,
+                ToolName::UsersCreate
+                    | ToolName::GroupsCreate
+                    | ToolName::GroupsAddChild
+                    | ToolName::RolesCreate
+                    | ToolName::ClientsCreate
+            );
+            let external = name == ToolName::UsersSendActionsEmail;
+            let read_only = name.tier() == crate::policy::RiskTier::T0;
             let annotations = tool.annotations.unwrap();
-            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.read_only_hint, Some(read_only));
             assert_eq!(annotations.destructive_hint, Some(false));
-            assert_eq!(annotations.idempotent_hint, Some(true));
-            assert_eq!(annotations.open_world_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(read_only || (!create && !external)));
+            assert_eq!(annotations.open_world_hint, Some(external));
             assert_eq!(tool.input_schema["type"], "object");
             assert_eq!(tool.input_schema["additionalProperties"], false);
             assert_eq!(tool.output_schema.as_ref().unwrap()["type"], "object");

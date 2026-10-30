@@ -99,6 +99,15 @@ impl McpToolExecutor {
         arguments: Option<JsonObject>,
     ) -> Result<Value, McpError> {
         deny_to_error(policy::decide(permit.policy, &permit.auth))?;
+        if crate::write_tools::is_admin_write(permit.tool) {
+            let operation = crate::write_tools::parse_operation(permit.tool, arguments)?;
+            let application = self.application.as_ref().ok_or_else(|| {
+                McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                    "MCP application service is not configured".into(),
+                ))
+            })?;
+            return application.write(&permit.auth, operation).await;
+        }
         match permit.tool {
             ToolName::AttackDetectionStatus => {
                 self.attack_detection_status(permit, arguments).await
@@ -127,6 +136,7 @@ impl McpToolExecutor {
             ToolName::GroupsMembers => self.groups_members(permit, arguments).await,
             ToolName::RolesList => self.roles_list(permit, arguments).await,
             ToolName::RolesGet => self.roles_get(permit, arguments).await,
+            _ => unreachable!("admin writes use the application service"),
         }
     }
 
@@ -762,8 +772,14 @@ mod tests {
             ToolName::ClientScopesList | ToolName::ClientsGet | ToolName::ClientsList => {
                 "view-clients"
             }
+            _ => "manage-realm",
         };
-        executor.preflight(tool.as_str(), auth("mcp:read", &[role]), NOW).await.unwrap()
+        let scope = if tool.tier() == crate::policy::RiskTier::T0 {
+            "mcp:read"
+        } else {
+            "mcp:write"
+        };
+        executor.preflight(tool.as_str(), auth(scope, &[role]), NOW).await.unwrap()
     }
 
     async fn execute(

@@ -3376,3 +3376,65 @@ async fn expired_resource_bound_token_is_invalid_token() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let fixture = make_fixture(&server, "write-service", &ALL_READ_ROLES).await;
+    let username = unique("created-by-mcp");
+    let issued = issue_token(&server, &fixture, "openid mcp:write", None, true).await;
+    let client = rmcp_client(
+        &server,
+        &fixture,
+        &issued.access_token,
+        ProtocolVersion::V_2025_11_25,
+        ClientLifecycleMode::Initialize,
+    )
+    .await;
+    let arguments = json!({"username": username, "email": "mcp-write@example.com"});
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("users_create")
+                .with_arguments(arguments.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_tool_result(
+        &result,
+        &output_schemas(&client.list_tools(None).await.unwrap())["users_create"],
+        false,
+    );
+    let output = result.structured_content.unwrap();
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["tool"], "users_create");
+    let created = server
+        .state
+        .storage
+        .get_user_by_username(&fixture.realm.id, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output["id"], created.id.to_string());
+    assert!(server
+        .state
+        .storage
+        .list_credentials(&fixture.realm.id, &created.id)
+        .await
+        .unwrap()
+        .is_empty());
+    client.cancel().await.unwrap();
+
+    let read_only = issue_token(&server, &fixture, "openid mcp:read", None, true).await;
+    let rejected = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        tool_request("users_create", json!({"username": unique("must-not-be-created")}), false),
+        tool_options("users_create", &read_only.access_token, false),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert!(rejected.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap()
+        .contains("mcp:write"));
+}

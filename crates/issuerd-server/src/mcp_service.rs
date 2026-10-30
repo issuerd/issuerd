@@ -77,4 +77,12 @@ impl McpApplicationService for ServerMcpApplicationService {
             capabilities,
         })
     }
+
+    async fn write(
+        &self,
+        auth: &issuerd_mcp::McpAuthContext,
+        operation: issuerd_mcp::write_tools::McpOperation,
+    ) -> Result<serde_json::Value, McpError> {
+        crate::mcp_write::write(self.admin_state.clone(), auth, operation).await
+    }
 }

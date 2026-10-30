@@ -22,6 +22,10 @@ pub enum McpError {
     TemporarilyUnavailable(&'static str),
     #[error("invalid tool input: {0}")]
     InvalidInput(String),
+    #[error("{0}")]
+    Forbidden(&'static str),
+    #[error("{0}")]
+    Conflict(&'static str),
     #[error("{0} not found")]
     NotFound(&'static str),
     #[error("storage backend failure: {0}")]
@@ -55,6 +59,7 @@ impl McpError {
             Self::RateLimited { .. } => "invocation rate limit exceeded".to_string(),
             Self::TemporarilyUnavailable(_) => "service temporarily unavailable".to_string(),
             Self::InvalidInput(message) => format!("invalid tool input: {message}"),
+            Self::Forbidden(message) | Self::Conflict(message) => message.to_string(),
             Self::NotFound(entity) => format!("{entity} not found"),
             Self::Backend(_) if self.is_temporary() => {
                 "storage backend temporarily unavailable".to_string()

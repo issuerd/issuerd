@@ -1,9 +1,9 @@
-# Read-only MCP server
+# MCP server
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
-agent-native administration. The current increment is deliberately read-only:
-23 curated tools, no built-in chat, no LLM provider, and no token passthrough
-to another API.
+agent-native administration. The current surface has 23 curated read tools and
+19 reversible admin-write tools, with no built-in chat, no LLM provider, and no
+token passthrough to another API.
 
 ## Enable and configure
 
@@ -74,12 +74,36 @@ or invocation allowance.
 | `idp_list` | `mcp:read` | `view-realm`, `manage-realm` | Identity providers with sensitive configuration omitted |
 | `idp_get` | `mcp:read` | `view-realm`, `manage-realm` | Identity provider by alias with sensitive configuration omitted |
 | `flows_list` | `mcp:read` | `view-realm`, `manage-realm` | Flows and stages without authenticator configuration |
+| `users_create` | `mcp:write` | `manage-users` | Create a user without credentials |
+| `users_update` | `mcp:write` | `manage-users` | Profile and safe attributes; enabled state is separate |
+| `users_set_enabled` | `mcp:write` | `manage-users` | Enable or disable a user |
+| `users_send_actions_email` | `mcp:write` | `manage-users` | Send the existing required-action email |
+| `users_revoke_sessions` | `mcp:write` | `manage-users` **and** `manage-realm` | Revoke one or all user sessions |
+| `users_add_to_group` / `users_remove_from_group` | `mcp:write` | `manage-users` | Reversible group membership changes |
+| `users_assign_role` / `users_unassign_role` | `mcp:write` | `manage-users` | Realm/client role mappings |
+| `groups_assign_role` / `groups_unassign_role` | `mcp:write` | `manage-realm` | Group role mappings |
+| `groups_create` | `mcp:write` | `manage-realm` | Create a top-level group |
+| `groups_update` | `mcp:write` | `manage-realm` | Rename or update safe group attributes |
+| `groups_add_child` | `mcp:write` | `manage-realm` | Create a child group |
+| `roles_create` | `mcp:write` | `manage-realm` | Create a realm role |
+| `roles_update` | `mcp:write` | `manage-realm` | Rename/update a realm role |
+| `clients_create` | `mcp:write` | `manage-clients` | Safe client creation; never Admin API access |
+| `clients_update_profile` | `mcp:write` | `manage-clients` | Display name and description only |
+| `clients_set_default_scopes` | `mcp:write` | `manage-clients` | Replace default/optional scopes; never default `mcp:*` |
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or
 through anonymous dynamic registration. MCP does not require the Admin API's
 `admin_api_access` client attribute, but the user's corresponding realm roles
 are still mandatory.
+
+Reversible T2 writes require `mcp:write` explicitly as an optional client scope
+and the listed manage roles. `mcp:write` does not imply `mcp:read`. Their
+annotations drive external-client confirmation UX; they are not a server-side
+approval substitute. Each call invokes the existing Admin application handler,
+so validation, audit events, required-action email, logout notification, and
+cache invalidation match the Admin API. Secret-bearing attributes are rejected,
+and client creation can never set `admin_api_access`.
 
 `tools/list` is filtered by the caller's actual scope and roles; every
 `tools/call` repeats the same checks. Unknown and under-authorized well-formed
@@ -261,8 +285,8 @@ its complete DPoP flow can be verified.
 
 Current boundaries:
 
-- no writes, account-self-service family, resources/prompts, cross-realm master
-  operations, unattended M2M, or built-in chat;
+- no account-self-service family, strict T3 writes, resources/prompts,
+  cross-realm master operations, unattended M2M, or built-in chat;
 - no generic CIBA `resource` or `operation_id` acceptance and no ordinary
   `mcp:step_up` issuance;
 - no secret rotation, raw credentials, TOTP seeds/QR codes, bulk export,

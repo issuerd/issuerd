@@ -29,7 +29,7 @@ flowchart TD
     issuerd_token["issuerd-token<br/>JWT/JWS/JWK engine"]
     issuerd_storage["issuerd-storage<br/>Storage impls: Postgres / InMemory / JsonFile"]
     issuerd_cluster["issuerd-cluster<br/>DistributedCache: Redis / InMemory"]
-    issuerd_mcp["issuerd-mcp<br/>read-only MCP tools, policy, safe DTOs, stateless rmcp transport"]
+    issuerd_mcp["issuerd-mcp<br/>curated MCP tools, policy, safe DTOs, stateless rmcp transport"]
     issuerd_core["issuerd-core<br/>types, SPI traits, errors, models — no I/O"]
 
     issuerd --> issuerd_server

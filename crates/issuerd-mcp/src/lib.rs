@@ -14,6 +14,7 @@ pub mod server;
 pub mod services;
 pub mod tools;
 pub mod transport;
+pub mod write_tools;
 
 #[cfg(test)]
 mod test_support;
