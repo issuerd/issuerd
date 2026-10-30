@@ -21,7 +21,7 @@ pub const DEFAULT_PAGE_SIZE: u32 = 20;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_INPUT_STRING_BYTES: usize = 255;
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
@@ -475,6 +475,9 @@ fn read_only_annotations() -> ToolAnnotations {
 }
 
 pub fn definition(name: ToolName) -> Tool {
+    if let Some(tool) = crate::account_tools::definition(name) {
+        return tool;
+    }
     if let Some(tool) = crate::write_tools::definition(name) {
         return tool;
     }
@@ -625,7 +628,14 @@ mod tests {
                     | ToolName::ClientsCreate
             );
             let external = name == ToolName::UsersSendActionsEmail;
-            let read_only = name.tier() == crate::policy::RiskTier::T0;
+            let read_only = name.tier() == crate::policy::RiskTier::T0
+                || matches!(
+                    name,
+                    ToolName::MeGetProfile
+                        | ToolName::MeSessionsList
+                        | ToolName::MeConsentsList
+                        | ToolName::MeLinkedAccountsList
+                );
             let annotations = tool.annotations.unwrap();
             assert_eq!(annotations.read_only_hint, Some(read_only));
             assert_eq!(annotations.destructive_hint, Some(false));

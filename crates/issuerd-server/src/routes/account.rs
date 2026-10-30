@@ -241,8 +241,23 @@ pub async fn account_logout_session_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let current_sid = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|token| state.token_service.validate_access_token(token).ok())
+        .and_then(|validated| validated.claims.sid);
+    account_logout_session_with_guard(&state, realm, &guard, session_id, current_sid).await
+}
 
-    let sid = match SessionId::new(session_id.clone()) {
+pub async fn account_logout_session_with_guard(
+    state: &Arc<ServerState>,
+    realm_name: Option<String>,
+    guard: &AccountSessionGuard,
+    session_id: String,
+    current_sid: Option<SessionId>,
+) -> Response {
+    let sid = match SessionId::new(session_id) {
         Ok(id) => id,
         Err(_) => {
             return (
@@ -289,7 +304,7 @@ pub async fn account_logout_session_handler(
         )
             .into_response();
     }
-    crate::session_cache::invalidate_session(&state, &guard.realm_id, &sid).await;
+    crate::session_cache::invalidate_session(state, &guard.realm_id, &sid).await;
     let realm = state.storage.get_realm(&guard.realm_id).await.ok().flatten();
     // Back-channel logout: notify clients with a `backchannel_logout_uri`
     // (fire-and-forget).
@@ -302,20 +317,16 @@ pub async fn account_logout_session_handler(
     // must not touch it. The clear needs the realm (the cookie name is
     // name-scoped with an id fallback) — a transient realm-fetch failure
     // skips it, matching the notifier's best-effort posture.
-    let deleted_current = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .and_then(|token| state.token_service.validate_access_token(token).ok())
-        .and_then(|v| v.claims.sid)
-        .is_some_and(|current| current == sid);
+    let deleted_current = current_sid.is_some_and(|current| current == sid);
     let mut resp = StatusCode::NO_CONTENT.into_response();
     if deleted_current {
         if let Some(realm) = &realm {
-            if let Ok(v) = axum::http::HeaderValue::from_str(
-                &super::oidc::session_state_cookie_clear(realm, state.config.secure_cookies()),
-            ) {
-                resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+            if realm_name.as_deref() == Some(realm.name.as_str()) {
+                if let Ok(value) = axum::http::HeaderValue::from_str(
+                    &super::oidc::session_state_cookie_clear(realm, state.config.secure_cookies()),
+                ) {
+                    resp.headers_mut().append(axum::http::header::SET_COOKIE, value);
+                }
             }
         }
     }
@@ -350,11 +361,19 @@ pub async fn account_update_me_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let realm_model = match load_realm(&state, &guard).await {
+    account_update_me_with_guard(&state, &guard, body).await
+}
+
+pub async fn account_update_me_with_guard(
+    state: &Arc<ServerState>,
+    guard: &AccountSessionGuard,
+    body: UpdateMeRequest,
+) -> Response {
+    let realm_model = match load_realm(state, guard).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let mut user = match load_user(&state, &guard).await {
+    let mut user = match load_user(state, guard).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -390,7 +409,7 @@ pub async fn account_update_me_handler(
 
     let mut send_verification = false;
     if let Some(email) = body.email {
-        match apply_email_change(&state, &guard, &realm_model, &mut user, email).await {
+        match apply_email_change(state, guard, &realm_model, &mut user, email).await {
             Ok(v) => send_verification = v,
             Err(resp) => return resp,
         }
@@ -417,7 +436,7 @@ pub async fn account_update_me_handler(
     // delivery failure (the user can retrigger it from the login flow).
     if send_verification {
         if let Err(e) = send_verification_email(
-            &state,
+            state,
             &realm_model,
             realm_model.name.as_ref(),
             &user,
@@ -430,7 +449,7 @@ pub async fn account_update_me_handler(
         }
     }
 
-    match build_me_response(&state, &guard.realm_id, &user).await {
+    match build_me_response(state, &guard.realm_id, &user).await {
         Ok(me) => Json(me).into_response(),
         Err(resp) => resp,
     }
@@ -1328,7 +1347,14 @@ pub async fn account_delete_consent_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    account_delete_consent_with_guard(&state, &guard, client_id).await
+}
 
+pub async fn account_delete_consent_with_guard(
+    state: &Arc<ServerState>,
+    guard: &AccountSessionGuard,
+    client_id: String,
+) -> Response {
     // The path param is the human client_id string, not the internal UUID.
     let identifier = match ClientIdentifier::new(client_id) {
         Ok(id) => id,
@@ -1568,7 +1594,14 @@ pub async fn account_unlink_identity_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    account_unlink_identity_with_guard(&state, &guard, alias).await
+}
 
+pub async fn account_unlink_identity_with_guard(
+    state: &Arc<ServerState>,
+    guard: &AccountSessionGuard,
+    alias: String,
+) -> Response {
     let links = match state
         .storage
         .list_identity_provider_links(&guard.realm_id, &guard.user_id)
@@ -1587,7 +1620,7 @@ pub async fn account_unlink_identity_handler(
     // Last sign-in method guard: without a password credential, unlinking the
     // only IdP link would leave the account with no way to sign in at all.
     if links.len() == 1 {
-        match has_credential(&state, &guard, CredentialType::Password).await {
+        match has_credential(state, guard, CredentialType::Password).await {
             Ok(true) => {}
             Ok(false) => {
                 return bad_request("cannot unlink the only sign-in method; set a password first")
@@ -1672,7 +1705,7 @@ async fn load_realm(
 /// Resolve the user's realm-role names and build the `me` response object.
 /// Shared by GET and PUT so both return the identical shape.
 #[allow(clippy::result_large_err)]
-async fn build_me_response(
+pub async fn build_me_response(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     user: &User,

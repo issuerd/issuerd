@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_tools;
 pub mod auth;
 pub mod error;
 pub mod executor;

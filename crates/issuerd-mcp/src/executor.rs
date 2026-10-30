@@ -99,6 +99,15 @@ impl McpToolExecutor {
         arguments: Option<JsonObject>,
     ) -> Result<Value, McpError> {
         deny_to_error(policy::decide(permit.policy, &permit.auth))?;
+        if crate::account_tools::is_account_tool(permit.tool) {
+            let operation = crate::account_tools::parse_operation(permit.tool, arguments)?;
+            let application = self.application.as_ref().ok_or_else(|| {
+                McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                    "MCP application service is not configured".into(),
+                ))
+            })?;
+            return application.account(&permit.auth, operation).await;
+        }
         if crate::write_tools::is_admin_write(permit.tool) {
             let operation = crate::write_tools::parse_operation(permit.tool, arguments)?;
             let application = self.application.as_ref().ok_or_else(|| {

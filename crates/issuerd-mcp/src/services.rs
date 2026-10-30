@@ -17,4 +17,10 @@ pub trait McpApplicationService: Send + Sync {
         auth: &McpAuthContext,
         operation: McpOperation,
     ) -> Result<serde_json::Value, McpError>;
+
+    async fn account(
+        &self,
+        auth: &McpAuthContext,
+        operation: McpOperation,
+    ) -> Result<serde_json::Value, McpError>;
 }

@@ -1,9 +1,9 @@
 # MCP server
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
-agent-native administration. The current surface has 23 curated read tools and
-19 reversible admin-write tools, with no built-in chat, no LLM provider, and no
-token passthrough to another API.
+agent-native administration. The current surface has 52 curated tools across
+read-only administration, reversible admin writes, and account self-service,
+with no built-in chat, no LLM provider, and no token passthrough to another API.
 
 ## Enable and configure
 
@@ -90,6 +90,16 @@ or invocation allowance.
 | `clients_create` | `mcp:write` | `manage-clients` | Safe client creation; never Admin API access |
 | `clients_update_profile` | `mcp:write` | `manage-clients` | Display name and description only |
 | `clients_set_default_scopes` | `mcp:write` | `manage-clients` | Replace default/optional scopes; never default `mcp:*` |
+| `me_get_profile` | `openid` | self only | Own profile and direct realm roles |
+| `me_update_profile` | `openid` | self only | Own profile with Account email-verification semantics |
+| `me_sessions_list` | `openid` | self only | Own active sessions |
+| `me_sessions_logout` | `openid` | self only | Log out one owned session |
+| `me_consents_list` | `openid` | self only | Own client consents |
+| `me_consents_revoke` | `openid` | self only | Revoke an owned consent |
+| `me_linked_accounts_list` | `openid` | self only | Own linked external identities |
+| `me_linked_accounts_unlink` | `openid` | self only | Unlink with last-sign-in-method protection |
+| `me_totp_enroll` | `openid` | self only | Same-origin TOTP enrollment link only |
+| `me_webauthn_register` | `openid` | self only | Same-origin WebAuthn registration link only |
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or
@@ -285,8 +295,8 @@ its complete DPoP flow can be verified.
 
 Current boundaries:
 
-- no account-self-service family, strict T3 writes, resources/prompts,
-  cross-realm master operations, unattended M2M, or built-in chat;
+- no strict T3 writes, resources/prompts, cross-realm master operations,
+  unattended M2M, or built-in chat;
 - no generic CIBA `resource` or `operation_id` acceptance and no ordinary
   `mcp:step_up` issuance;
 - no secret rotation, raw credentials, TOTP seeds/QR codes, bulk export,

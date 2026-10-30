@@ -19,6 +19,7 @@ pub mod email;
 pub mod event_listeners;
 pub mod groups;
 pub mod i18n;
+pub mod mcp_account;
 pub mod mcp_service;
 pub mod mcp_write;
 pub mod middleware;

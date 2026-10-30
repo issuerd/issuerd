@@ -50,7 +50,7 @@ const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const REDIRECT_URI: &str = "http://localhost:8080/cb";
 const LEGACY_VERSIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_11_25];
-const TOOL_NAMES: [&str; 23] = [
+const TOOL_NAMES: [&str; 33] = [
     "attack_detection_status",
     "client_scopes_list",
     "clients_get",
@@ -63,6 +63,16 @@ const TOOL_NAMES: [&str; 23] = [
     "idp_get",
     "idp_list",
     "keys_list",
+    "me_consents_list",
+    "me_consents_revoke",
+    "me_get_profile",
+    "me_linked_accounts_list",
+    "me_linked_accounts_unlink",
+    "me_sessions_list",
+    "me_sessions_logout",
+    "me_totp_enroll",
+    "me_update_profile",
+    "me_webauthn_register",
     "realm_get",
     "roles_get",
     "roles_list",
@@ -862,6 +872,16 @@ async fn exercise_all_tools(
         ("keys_list", json!({})),
         ("serverinfo_get", json!({})),
         ("sessions_list", json!({})),
+        ("me_consents_list", json!({})),
+        ("me_consents_revoke", json!({"clientId":fixture.client.client_id.as_str()})),
+        ("me_get_profile", json!({})),
+        ("me_linked_accounts_list", json!({})),
+        ("me_linked_accounts_unlink", json!({"alias":"unknown-idp"})),
+        ("me_sessions_list", json!({})),
+        ("me_sessions_logout", json!({"id":"00000000-0000-4000-8000-000000000000"})),
+        ("me_totp_enroll", json!({})),
+        ("me_update_profile", json!({"firstName":"MCP Matrix"})),
+        ("me_webauthn_register", json!({})),
         ("realm_get", json!({})),
         ("users_search", json!({"username":fixture.user.username.as_str()})),
         ("users_get", json!({"id":fixture.user.id.to_string()})),
@@ -1191,7 +1211,7 @@ async fn origin_host_methods_and_last_event_id_follow_stateless_transport() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_session_id(&response);
     let body = response_json(response).await;
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 23);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 33);
 }
 
 #[tokio::test]
@@ -1474,6 +1494,16 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
         "idp_get",
         "idp_list",
         "keys_list",
+        "me_consents_list",
+        "me_consents_revoke",
+        "me_get_profile",
+        "me_linked_accounts_list",
+        "me_linked_accounts_unlink",
+        "me_sessions_list",
+        "me_sessions_logout",
+        "me_totp_enroll",
+        "me_update_profile",
+        "me_webauthn_register",
         "realm_get",
         "roles_get",
         "roles_list",
@@ -1482,6 +1512,16 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
     ][..];
     let user_tools = &[
         "groups_members",
+        "me_consents_list",
+        "me_consents_revoke",
+        "me_get_profile",
+        "me_linked_accounts_list",
+        "me_linked_accounts_unlink",
+        "me_sessions_list",
+        "me_sessions_logout",
+        "me_totp_enroll",
+        "me_update_profile",
+        "me_webauthn_register",
         "users_get",
         "users_get_credentials",
         "users_get_groups",
@@ -1492,6 +1532,16 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
     let manage_user_tools = &[
         "attack_detection_status",
         "groups_members",
+        "me_consents_list",
+        "me_consents_revoke",
+        "me_get_profile",
+        "me_linked_accounts_list",
+        "me_linked_accounts_unlink",
+        "me_sessions_list",
+        "me_sessions_logout",
+        "me_totp_enroll",
+        "me_update_profile",
+        "me_webauthn_register",
         "users_get",
         "users_get_credentials",
         "users_get_groups",
@@ -1499,13 +1549,28 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
         "users_get_sessions",
         "users_search",
     ][..];
+    let client_tools = &[
+        "client_scopes_list",
+        "clients_get",
+        "clients_list",
+        "me_consents_list",
+        "me_consents_revoke",
+        "me_get_profile",
+        "me_linked_accounts_list",
+        "me_linked_accounts_unlink",
+        "me_sessions_list",
+        "me_sessions_logout",
+        "me_totp_enroll",
+        "me_update_profile",
+        "me_webauthn_register",
+    ][..];
     let cases: [(&str, &[&str]); 6] = [
         ("view-realm", realm_tools),
         ("manage-realm", realm_tools),
         ("view-users", user_tools),
         ("manage-users", manage_user_tools),
-        ("view-clients", &["client_scopes_list", "clients_get", "clients_list"]),
-        ("manage-clients", &["client_scopes_list", "clients_get", "clients_list"]),
+        ("view-clients", client_tools),
+        ("manage-clients", client_tools),
     ];
     for (role, expected) in cases {
         let fixture = make_fixture(&server, &unique("filter"), &[role]).await;
@@ -1525,7 +1590,7 @@ async fn rmcp_tools_are_filtered_by_each_role_family_and_scope() {
     }
 
     let fixture = make_fixture(&server, "scope-filter", &ALL_READ_ROLES).await;
-    let issued = issue_token(&server, &fixture, "openid", None, true).await;
+    let issued = issue_token(&server, &fixture, "profile", None, true).await;
     let client = rmcp_client(
         &server,
         &fixture,
@@ -1557,6 +1622,16 @@ fn call_arguments(fixture: &Fixture, tool: &str) -> Value {
         "groups_get" | "groups_members" => {
             json!({"id":"00000000-0000-4000-8000-000000000000"})
         }
+        "me_consents_list"
+        | "me_get_profile"
+        | "me_linked_accounts_list"
+        | "me_sessions_list"
+        | "me_totp_enroll"
+        | "me_webauthn_register" => json!({}),
+        "me_consents_revoke" => json!({"clientId":fixture.client.client_id.as_str()}),
+        "me_linked_accounts_unlink" => json!({"alias":"unknown-idp"}),
+        "me_sessions_logout" => json!({"id":"00000000-0000-4000-8000-000000000000"}),
+        "me_update_profile" => json!({"firstName":"MCP Matrix"}),
         "roles_get" => json!({"name":"view-realm"}),
         _ => panic!("unknown tool fixture: {tool}"),
     }
@@ -1571,6 +1646,24 @@ async fn every_direct_scope_and_role_denial_has_its_exact_http_mapping() {
     let role_denied_token = issue_token(&server, &role_denied, "openid mcp:read", None, true).await;
 
     for tool in TOOL_NAMES {
+        if tool.starts_with("me_") {
+            for (fixture, token) in [
+                (&under_scoped, &under_scoped_token.access_token),
+                (&role_denied, &role_denied_token.access_token),
+            ] {
+                let response = send_mcp(
+                    &server,
+                    fixture.realm.name.as_str(),
+                    tool_request(tool, call_arguments(fixture, tool), false),
+                    tool_options(tool, token, false),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK, "self-service tool: {tool}");
+                let body = response_json(response).await;
+                assert_eq!(body["result"]["isError"], false, "self-service tool: {tool}");
+            }
+            continue;
+        }
         let realm = under_scoped.realm.name.as_str();
         let response = send_mcp(
             &server,
@@ -3437,4 +3530,84 @@ async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service(
         .to_str()
         .unwrap()
         .contains("mcp:write"));
+}
+
+#[tokio::test]
+async fn ordinary_openid_token_is_limited_to_the_account_family() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let fixture = make_fixture(&server, "account-service", &ALL_READ_ROLES).await;
+    let issued = issue_token(&server, &fixture, "openid", None, true).await;
+    let client = rmcp_client(
+        &server,
+        &fixture,
+        &issued.access_token,
+        ProtocolVersion::V_2025_11_25,
+        ClientLifecycleMode::Initialize,
+    )
+    .await;
+    let list = client.list_tools(None).await.unwrap();
+    let names: Vec<_> = list.tools.iter().map(|tool| tool.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        [
+            "me_consents_list",
+            "me_consents_revoke",
+            "me_get_profile",
+            "me_linked_accounts_list",
+            "me_linked_accounts_unlink",
+            "me_sessions_list",
+            "me_sessions_logout",
+            "me_totp_enroll",
+            "me_update_profile",
+            "me_webauthn_register",
+        ]
+    );
+
+    let profile = client.call_tool(CallToolRequestParams::new("me_get_profile")).await.unwrap();
+    assert_tool_result(&profile, &output_schemas(&list)["me_get_profile"], false);
+    assert_eq!(profile.structured_content.as_ref().unwrap()["id"], fixture.user.id.to_string());
+
+    let updated = client
+        .call_tool(
+            CallToolRequestParams::new("me_update_profile")
+                .with_arguments(json!({"firstName": "MCP Updated"}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_tool_result(&updated, &output_schemas(&list)["me_update_profile"], false);
+    assert_eq!(updated.structured_content.as_ref().unwrap()["firstName"], "MCP Updated");
+    assert_eq!(
+        server
+            .state
+            .storage
+            .get_user(&fixture.realm.id, &fixture.user.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .first_name
+            .unwrap()
+            .as_str(),
+        "MCP Updated"
+    );
+
+    let enrollment = client.call_tool(CallToolRequestParams::new("me_totp_enroll")).await.unwrap();
+    assert_tool_result(&enrollment, &output_schemas(&list)["me_totp_enroll"], false);
+    assert!(enrollment.structured_content.as_ref().unwrap()["actionUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/realms/{}/account/security", fixture.realm.name)));
+    client.cancel().await.unwrap();
+
+    let rejected = send_mcp(
+        &server,
+        fixture.realm.name.as_str(),
+        tool_request("realm_get", json!({}), false),
+        tool_options("realm_get", &issued.access_token, false),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert!(rejected.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap()
+        .contains("mcp:read"));
 }

@@ -47,11 +47,15 @@ pub fn admin_state(state: &Arc<ServerState>) -> Arc<AdminApiState> {
 
 pub struct ServerMcpApplicationService {
     admin_state: Arc<AdminApiState>,
+    server_state: Arc<ServerState>,
 }
 
 impl ServerMcpApplicationService {
-    pub fn new(admin_state: Arc<AdminApiState>) -> Self {
-        Self { admin_state }
+    pub fn new(admin_state: Arc<AdminApiState>, server_state: Arc<ServerState>) -> Self {
+        Self {
+            admin_state,
+            server_state,
+        }
     }
 }
 
@@ -84,5 +88,13 @@ impl McpApplicationService for ServerMcpApplicationService {
         operation: issuerd_mcp::write_tools::McpOperation,
     ) -> Result<serde_json::Value, McpError> {
         crate::mcp_write::write(self.admin_state.clone(), auth, operation).await
+    }
+
+    async fn account(
+        &self,
+        auth: &issuerd_mcp::McpAuthContext,
+        operation: issuerd_mcp::write_tools::McpOperation,
+    ) -> Result<serde_json::Value, McpError> {
+        crate::mcp_account::account(self.server_state.clone(), auth, operation).await
     }
 }

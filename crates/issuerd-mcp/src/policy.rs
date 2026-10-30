@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
-use issuerd_core::{MCP_SCOPE_READ, MCP_SCOPE_WRITE};
+use issuerd_core::{MCP_SCOPE_READ, MCP_SCOPE_STEP_UP, MCP_SCOPE_WRITE};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::McpAuthContext;
@@ -13,6 +13,7 @@ const MANAGE_REALM: &[&str] = &["manage-realm"];
 const MANAGE_USERS: &[&str] = &["manage-users"];
 const MANAGE_CLIENTS: &[&str] = &["manage-clients"];
 const REVOKE_SESSION_ROLES: &[&str] = &["manage-users", "manage-realm"];
+const NO_ROLES: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskTier {
@@ -45,6 +46,16 @@ pub enum ToolName {
     IdpGet,
     IdpList,
     KeysList,
+    MeConsentsList,
+    MeConsentsRevoke,
+    MeGetProfile,
+    MeLinkedAccountsList,
+    MeLinkedAccountsUnlink,
+    MeSessionsList,
+    MeSessionsLogout,
+    MeTotpEnroll,
+    MeUpdateProfile,
+    MeWebauthnRegister,
     RealmGet,
     RolesCreate,
     RolesGet,
@@ -70,7 +81,7 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 52] = [
         Self::AttackDetectionStatus,
         Self::ClientScopesList,
         Self::ClientsCreate,
@@ -91,6 +102,16 @@ impl ToolName {
         Self::IdpGet,
         Self::IdpList,
         Self::KeysList,
+        Self::MeConsentsList,
+        Self::MeConsentsRevoke,
+        Self::MeGetProfile,
+        Self::MeLinkedAccountsList,
+        Self::MeLinkedAccountsUnlink,
+        Self::MeSessionsList,
+        Self::MeSessionsLogout,
+        Self::MeTotpEnroll,
+        Self::MeUpdateProfile,
+        Self::MeWebauthnRegister,
         Self::RealmGet,
         Self::RolesCreate,
         Self::RolesGet,
@@ -137,6 +158,16 @@ impl ToolName {
             Self::IdpGet => "idp_get",
             Self::IdpList => "idp_list",
             Self::KeysList => "keys_list",
+            Self::MeConsentsList => "me_consents_list",
+            Self::MeConsentsRevoke => "me_consents_revoke",
+            Self::MeGetProfile => "me_get_profile",
+            Self::MeLinkedAccountsList => "me_linked_accounts_list",
+            Self::MeLinkedAccountsUnlink => "me_linked_accounts_unlink",
+            Self::MeSessionsList => "me_sessions_list",
+            Self::MeSessionsLogout => "me_sessions_logout",
+            Self::MeTotpEnroll => "me_totp_enroll",
+            Self::MeUpdateProfile => "me_update_profile",
+            Self::MeWebauthnRegister => "me_webauthn_register",
             Self::RealmGet => "realm_get",
             Self::RolesCreate => "roles_create",
             Self::RolesGet => "roles_get",
@@ -187,6 +218,16 @@ impl ToolName {
             | Self::UsersGetRoleMappings
             | Self::UsersGetSessions
             | Self::UsersSearch => RiskTier::T0,
+            Self::MeConsentsList
+            | Self::MeConsentsRevoke
+            | Self::MeGetProfile
+            | Self::MeLinkedAccountsList
+            | Self::MeLinkedAccountsUnlink
+            | Self::MeSessionsList
+            | Self::MeSessionsLogout
+            | Self::MeTotpEnroll
+            | Self::MeUpdateProfile
+            | Self::MeWebauthnRegister => RiskTier::T1,
             _ => RiskTier::T2,
         }
     }
@@ -219,7 +260,7 @@ macro_rules! policy {
     };
 }
 
-pub const POLICIES: [ToolPolicy; 42] = [
+pub const POLICIES: [ToolPolicy; 52] = [
     policy!(AttackDetectionStatus, MCP_SCOPE_READ, MANAGE_USERS),
     policy!(ClientScopesList, MCP_SCOPE_READ, CLIENT_ROLES),
     policy!(ClientsCreate, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
@@ -240,6 +281,16 @@ pub const POLICIES: [ToolPolicy; 42] = [
     policy!(IdpGet, MCP_SCOPE_READ, REALM_ROLES),
     policy!(IdpList, MCP_SCOPE_READ, REALM_ROLES),
     policy!(KeysList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(MeConsentsList, "openid", NO_ROLES),
+    policy!(MeConsentsRevoke, "openid", NO_ROLES),
+    policy!(MeGetProfile, "openid", NO_ROLES),
+    policy!(MeLinkedAccountsList, "openid", NO_ROLES),
+    policy!(MeLinkedAccountsUnlink, "openid", NO_ROLES),
+    policy!(MeSessionsList, "openid", NO_ROLES),
+    policy!(MeSessionsLogout, "openid", NO_ROLES),
+    policy!(MeTotpEnroll, "openid", NO_ROLES),
+    policy!(MeUpdateProfile, "openid", NO_ROLES),
+    policy!(MeWebauthnRegister, "openid", NO_ROLES),
     policy!(RealmGet, MCP_SCOPE_READ, REALM_ROLES),
     policy!(RolesCreate, MCP_SCOPE_WRITE, MANAGE_REALM),
     policy!(RolesGet, MCP_SCOPE_READ, REALM_ROLES),
@@ -285,7 +336,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 42] {
+pub fn policies() -> &'static [ToolPolicy; 52] {
     &POLICIES
 }
 
@@ -298,8 +349,14 @@ pub fn policy_for(tool: ToolName) -> &'static ToolPolicy {
 }
 
 pub fn decide(policy: &ToolPolicy, auth: &McpAuthContext) -> PolicyDecision {
+    if auth.has_scope(MCP_SCOPE_STEP_UP) && policy.tool.tier() != RiskTier::T3 {
+        return PolicyDecision::Deny(PolicyDeny::MissingScope(policy.required_scope));
+    }
     if !auth.has_scope(policy.required_scope) {
         return PolicyDecision::Deny(PolicyDeny::MissingScope(policy.required_scope));
+    }
+    if policy.tool.tier() == RiskTier::T1 {
+        return PolicyDecision::Allow;
     }
     let role_allowed = if policy.tool == ToolName::UsersRevokeSessions {
         auth.has_realm_role("manage-users") && auth.has_realm_role("manage-realm")
@@ -363,7 +420,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 42);
+        assert_eq!(unique.len(), 52);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -380,8 +437,12 @@ mod tests {
         for policy in policies() {
             let scope = match policy.tool.tier() {
                 RiskTier::T0 => "mcp:read",
+                RiskTier::T1 => "openid",
                 _ => "mcp:write",
             };
+            if policy.any_realm_roles.is_empty() {
+                assert!(decide(policy, &auth(scope, &[])).is_allowed());
+            }
             for role in policy.any_realm_roles {
                 let roles = if policy.tool == ToolName::UsersRevokeSessions {
                     vec![
@@ -397,19 +458,28 @@ mod tests {
                 };
                 assert!(decide(policy, &auth(scope, &roles)).is_allowed());
             }
+            let without_scope = if policy.tool.tier() == RiskTier::T1 {
+                "profile"
+            } else {
+                "openid"
+            };
             assert_eq!(
-                decide(policy, &auth("openid", policy.any_realm_roles)),
+                decide(policy, &auth(without_scope, policy.any_realm_roles)),
                 PolicyDecision::Deny(PolicyDeny::MissingScope(scope))
             );
+            if policy.tool.tier() == RiskTier::T1 {
+                assert!(decide(policy, &auth(scope, &["unrelated"])).is_allowed());
+            } else {
+                assert_eq!(
+                    decide(policy, &auth(scope, &["unrelated"])),
+                    PolicyDecision::Deny(PolicyDeny::MissingRole {
+                        tool: policy.tool,
+                        roles: policy.any_realm_roles,
+                    })
+                );
+            }
             assert_eq!(
-                decide(policy, &auth(scope, &["unrelated"])),
-                PolicyDecision::Deny(PolicyDeny::MissingRole {
-                    tool: policy.tool,
-                    roles: policy.any_realm_roles,
-                })
-            );
-            assert_eq!(
-                decide(policy, &auth("openid", &["unrelated"])),
+                decide(policy, &auth(without_scope, &["unrelated"])),
                 PolicyDecision::Deny(PolicyDeny::MissingScope(scope)),
                 "scope denial precedes role denial"
             );

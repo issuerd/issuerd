@@ -114,7 +114,10 @@ impl McpHttpAdapter {
                 ),
             )
             .with_application_service(Arc::new(
-                crate::mcp_service::ServerMcpApplicationService::new(admin_state),
+                crate::mcp_service::ServerMcpApplicationService::new(
+                    admin_state,
+                    Arc::clone(&state),
+                ),
             )),
         );
         let service = issuerd_mcp::transport::streamable_http_service_with_json_response(
