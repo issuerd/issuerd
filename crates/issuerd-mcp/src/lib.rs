@@ -11,6 +11,7 @@ pub mod json;
 pub mod policy;
 pub mod rate_limit;
 pub mod read_inventory;
+pub mod resources;
 pub mod server;
 pub mod services;
 pub mod step_up;
