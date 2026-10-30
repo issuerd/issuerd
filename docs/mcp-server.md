@@ -279,8 +279,8 @@ after proof validation, the request returns 503 before preflight or tool
 execution instead of succeeding without one.
 
 With `require_dpop=false`, genuinely unbound Bearer tokens are accepted for
-read-only interoperability. Both downgrade directions still fail. Strict
-future operation-bound approval will always require DPoP regardless of this
+read-only and ordinary interoperability. Both downgrade directions still fail.
+Strict operation-bound approval always requires DPoP regardless of this
 compatibility setting.
 
 ## Discovery and challenge behavior

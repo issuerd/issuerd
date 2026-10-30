@@ -2609,8 +2609,7 @@ pub async fn ciba_auth_handler(
     body: String,
 ) -> Response {
     // Detect forward-field multiplicity before form deserialization collapses
-    // repeated keys. Single values are parsed below and rejected as
-    // unsupported until the operation-bound CIBA profile exists.
+    // repeated keys. Operation-bound requests are validated and dispatched below.
     for field in ["operation_id", "resource"] {
         let count = url::form_urlencoded::parse(body.as_bytes())
             .filter(|(name, _)| name == field)
@@ -2791,6 +2790,26 @@ pub async fn ciba_auth_handler(
             .into_response();
     }
 
+    if ciba_req.operation_id.is_none() {
+        // Legacy CIBA retains its scope validation and errors. Strict requests
+        // use the single-purpose scope validator in `ciba_step_up::initiate`.
+        if let Err(e) = ciba_req.validate_scope_with_mcp(&client, state.config.mcp.enabled) {
+            emit_oidc_event(
+                &state,
+                &realm_id,
+                EventType::CibaAuthError,
+                &ip,
+                Some(client.id.clone()),
+                None,
+                None,
+                Some(e.oauth_error_code().to_string()),
+                HashMap::new(),
+            )
+            .await;
+            return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
+        }
+    }
+
     if ciba_req.operation_id.is_some() {
         return crate::ciba_step_up::initiate(state, realm, client, ciba_req, ip).await;
     }
@@ -2802,25 +2821,6 @@ pub async fn ciba_auth_handler(
             ))),
         )
             .into_response();
-    }
-
-    // The requested scope must be assigned to the client — otherwise CIBA
-    // would be a side channel around the authorize-endpoint scope check
-    // (e.g. picking up an unassigned `offline_access`).
-    if let Err(e) = ciba_req.validate_scope_with_mcp(&client, state.config.mcp.enabled) {
-        emit_oidc_event(
-            &state,
-            &realm_id,
-            EventType::CibaAuthError,
-            &ip,
-            Some(client.id.clone()),
-            None,
-            None,
-            Some(e.oauth_error_code().to_string()),
-            HashMap::new(),
-        )
-        .await;
-        return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
 
     // Resolve user from login_hint (simple username lookup for MVP)
@@ -2993,7 +2993,19 @@ pub async fn ciba_approve_handler(
     let original_bytes = match state.cache.get(&cache_key).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
+            emit_oidc_event(
+                &state,
+                &realm_id,
+                EventType::CibaAuthError,
+                &ip,
+                None,
+                None,
+                None,
+                Some("expired_token".to_string()),
+                HashMap::new(),
+            )
+            .await;
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "expired_token"})))
                 .into_response();
         }
         Err(error) => return cache_failure_response(&error),
@@ -11748,11 +11760,23 @@ mod tests {
     #[tokio::test]
     async fn ciba_auth_handler_forward_fields_and_duplicates_rejected() {
         let state = setup_state().await;
-        for body in [
-            "login_hint=admin&operation_id=op-1",
-            "login_hint=admin&resource=https://issuer.example.com/realms/master/mcp",
-            "login_hint=admin&operation_id=op-1&operation_id=op-2",
-            "login_hint=admin&resource=https://a.example&resource=https://b.example",
+        for (body, status, expected) in [
+            ("login_hint=admin&operation_id=op-1", StatusCode::BAD_REQUEST, "invalid_scope"),
+            (
+                "login_hint=admin&resource=https://issuer.example.com/realms/master/mcp",
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+            ),
+            (
+                "login_hint=admin&operation_id=op-1&operation_id=op-2",
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                "login_hint=admin&resource=https://a.example&resource=https://b.example",
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
         ] {
             let response = ciba_auth_handler(
                 State(state.clone()),
@@ -11761,8 +11785,8 @@ mod tests {
                 body.to_string(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
-            assert_eq!(extract_json(response).await["error"], "invalid_request", "body: {body}");
+            assert_eq!(response.status(), status, "body: {body}");
+            assert_eq!(extract_json(response).await["error"], expected, "body: {body}");
         }
     }
 
@@ -13496,7 +13520,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = extract_json(response).await;
-        assert_eq!(json["error"], "invalid_grant");
+        assert_eq!(json["error"], "expired_token");
     }
 
     #[tokio::test]

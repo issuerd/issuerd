@@ -242,7 +242,8 @@ async fn ciba_grant() {
         .await;
     assert_eq!(approve_resp.status(), 200);
 
-    // Step 4: Poll token endpoint again — should succeed
+    // Step 4: Poll token endpoint again after the advertised interval.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     let token_resp2 = harness
         .post_form(
             "/realms/test/protocol/openid-connect/token",
@@ -448,7 +449,8 @@ async fn ciba_audit_events_record_lifecycle() {
         .await;
     assert_eq!(approve.status(), 200);
 
-    // Step 4: the successful poll mints tokens -> login with method=ciba
+    // Step 4: the successful poll after the advertised interval mints tokens.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     let poll = harness
         .post_form(
             "/realms/test/protocol/openid-connect/token",

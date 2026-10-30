@@ -526,6 +526,15 @@ async fn poll_locked(
         Err(error) => return temporary(&error),
     }
     if req_data.denied {
+        crate::routes::oidc::emit_ciba_poll_error(
+            &state,
+            &realm_id,
+            &ip,
+            &client,
+            req_data.user_id.as_deref(),
+            "access_denied",
+        )
+        .await;
         return error(StatusCode::BAD_REQUEST, "access_denied");
     }
     if !req_data.authorized {

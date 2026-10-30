@@ -48,7 +48,7 @@ impl CibaRequest {
     /// let error = CibaRequest::parse(&HashMap::new()).unwrap_err();
     /// assert_eq!(
     ///     error,
-    ///     IssuerdError::InvalidRequest("at least one hint must be provided".into())
+    ///     IssuerdError::InvalidRequest("exactly one hint must be provided".into())
     /// );
     /// # Ok::<(), IssuerdError>(())
     /// ```
@@ -80,11 +80,6 @@ impl CibaRequest {
     }
 
     pub fn validate(&self) -> Result<(), IssuerdError> {
-        if !self.scope.contains("openid") {
-            return Err(IssuerdError::InvalidRequest(
-                "scope must contain openid for this CIBA profile".into(),
-            ));
-        }
         let hints = usize::from(self.login_hint.is_some())
             + usize::from(self.login_hint_token.is_some())
             + usize::from(self.id_token_hint.is_some());
@@ -277,6 +272,17 @@ mod tests {
 
         body.insert("scope".to_string(), "openid".to_string());
         assert_eq!(CibaRequest::parse(&body).unwrap_err(), IssuerdError::InvalidScope);
+    }
+
+    #[test]
+    fn openid_is_required_only_for_operation_bound_requests() {
+        let mut legacy = HashMap::new();
+        legacy.insert("login_hint".to_string(), "user@example.com".to_string());
+        legacy.insert("scope".to_string(), "mcp:read".to_string());
+        assert!(CibaRequest::parse(&legacy).is_ok());
+
+        legacy.insert("operation_id".to_string(), "op-1".to_string());
+        assert_eq!(CibaRequest::parse(&legacy).unwrap_err(), IssuerdError::InvalidScope);
     }
 
     fn make_test_client() -> issuerd_core::Client {

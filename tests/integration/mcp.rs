@@ -793,7 +793,9 @@ fn assert_peer_info(info: &ServerPeerInfo, version: ProtocolVersion) {
     assert_eq!(server_info.version, env!("CARGO_PKG_VERSION"));
     let tools = info.capabilities.tools.as_ref().unwrap();
     assert_eq!(tools.list_changed, None);
-    assert!(info.capabilities.resources.is_none());
+    let resources = info.capabilities.resources.as_ref().unwrap();
+    assert_eq!(resources.list_changed, None);
+    assert_eq!(resources.subscribe, None);
     assert!(info.capabilities.prompts.is_none());
 }
 
