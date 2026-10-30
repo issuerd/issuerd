@@ -1,9 +1,10 @@
 # MCP server
 
 Issuerd exposes a realm-scoped Model Context Protocol (MCP) server for external
-agent-native administration. The current surface has 52 curated tools across
-read-only administration, reversible admin writes, and account self-service,
-with no built-in chat, no LLM provider, and no token passthrough to another API.
+agent-native administration. The current surface has 67 curated tools across
+read-only administration, reversible admin writes, account self-service, and
+strict operation-bound actions, plus three read-only resources. There is no
+built-in chat, no LLM provider, and no token passthrough to another API.
 
 ## Enable and configure
 
@@ -25,8 +26,7 @@ enabled = false
   metadata routes. A disabled endpoint returns the same 404 as an unknown one.
 - `require_dpop=true` is the secure default. `false` is an explicit Bearer
   compatibility choice for clients such as `rmcp` or MCP Inspector; it is not
-  an automatic fallback and will not relax strict operation-bound approval in
-  a later write increment.
+  an automatic fallback and never relaxes strict operation-bound approval.
 - `invocation_rate_limit_per_minute` is a distributed fixed-window limit per
   realm, authorizing client (`azp`), and internal user. Zero rejects every
   invocation rather than disabling the limit. Excess returns 429 with
@@ -35,9 +35,9 @@ enabled = false
   `Origin` but permits non-browser requests without that header. Default ports
   are normalized; credentials, paths, queries, fragments, wildcards, and
   `Origin: null` are rejected.
-- `[mcp.step_up]` is a separate rollout gate for future operation-bound writes.
-  It does not enable generic CIBA resource issuance or a scope-only approval
-  flow. Keep it false for the read-only increment.
+- `[mcp.step_up]` is a separate rollout gate for strict operations. Keep it
+  false until every node and approval route supports exact-operation CIBA. It
+  does not enable generic CIBA resource issuance or a scope-only approval flow.
 
 Host validation uses the configured `issuer_url` authority. An omitted Host
 port is interpreted using the issuer's scheme and must match the configured
@@ -100,6 +100,26 @@ or invocation allowance.
 | `me_linked_accounts_unlink` | `openid` | self only | Unlink with last-sign-in-method protection |
 | `me_totp_enroll` | `openid` | self only | Same-origin TOTP enrollment link only |
 | `me_webauthn_register` | `openid` | self only | Same-origin WebAuthn registration link only |
+| `users_delete` | `mcp:write` + fresh approval | `manage-users` | Delete one exact user and expected state |
+| `groups_delete` | `mcp:write` + fresh approval | `manage-realm` | Delete one exact group and expected state |
+| `roles_delete` | `mcp:write` + fresh approval | `manage-realm` | Delete one exact realm role and expected state |
+| `clients_delete` | `mcp:write` + fresh approval | `manage-clients` | Delete one exact client and expected state |
+| `clients_update_security` | `mcp:write` + fresh approval | `manage-clients` | Change exact client security settings without secrets |
+| `realm_update_settings` | `mcp:write` + fresh approval | `manage-realm` | Change exact realm settings and expected state |
+| `events_config_update` | `mcp:write` + fresh approval | `manage-realm` | Change event settings; administrative audit cannot be disabled |
+| `idp_create` | `mcp:write` + fresh approval | `manage-realm` | Create a disabled IdP without secret-bearing configuration |
+| `idp_update` | `mcp:write` + fresh approval | `manage-realm` | Update an IdP without replacing omitted secrets |
+| `idp_delete` | `mcp:write` + fresh approval | `manage-realm` | Delete one exact IdP and expected state |
+| `flows_update_executions` | `mcp:write` + fresh approval | `manage-realm` | Update custom-flow execution requirements |
+| `push_not_before` | `mcp:write` + fresh approval | `manage-realm` | Push exact realm revocation time |
+| `realm_delete` | `mcp:write` + fresh approval | `manage-realm` | Delete the current realm after exact name confirmation |
+| `me_totp_delete` | `openid` + fresh approval | self only | Delete own TOTP enrollment with exact expected credentials |
+| `me_webauthn_delete` | `openid` + fresh approval | self only | Delete one owned WebAuthn credential |
+
+User/group role assignment and unassignment remain ordinary T2 writes for
+non-administrative roles. They become strict operations whenever the target
+role's composite closure contains a view/manage administrative role or
+`realm-admin`.
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or
@@ -141,6 +161,65 @@ the derived temporary flag. Session output omits redirect/state and other
 client-session internals. Directory text can still contain indirect prompt
 injection: output redaction is not a substitute for least privilege and
 external-client approval UX.
+
+## Strict operation-bound approval
+
+With `[mcp.step_up].enabled=true`, strict tools follow one exact transaction
+rather than granting general write authority:
+
+1. An ordinary DPoP-bound token with `mcp:write` and the required role (or the
+   correct self-service subject) calls the tool. The server canonicalizes the
+   typed tool and arguments, captures the expected mutation state, stores a
+   five-minute pending operation, and returns HTTP 401 with a
+   `step_up_required` body and a DPoP `insufficient_user_authentication`
+   challenge. Bearer compatibility cannot create or execute an operation.
+2. A confidential client starts CIBA with the returned `operation_id`, binding
+   message, exact canonical `resource`, `login_hint`, and
+   `scope="openid mcp:step_up"`. `acr_values=0` is supported; other requested
+   contexts are rejected explicitly. The operation is atomically claimed and
+   the response contains an independent `approval_url`.
+3. The hinted user authenticates freshly before the server renders any
+   details. The approval page escapes the normalized arguments, expected state,
+   exact mutation, target, client, realm, binding message, and expiry. GET has
+   no decision side effect; POST requires a session-bound CSRF proof and has
+   one terminal winner. Authentication must be no more than five minutes old.
+   CIBA and impersonation sessions cannot approve. The legacy JSON approval
+   endpoint cannot approve an operation-bound request.
+4. The same client polls with the original DPoP key and exact resource. The
+   result is a DPoP token carrying only `openid mcp:step_up`, with no refresh
+   token. Its durable grant expires at the minimum of two minutes, token
+   expiry, and operation expiry. Unknown, cross-client, or consumed request IDs
+   return `invalid_grant`; actual expiry returns `expired_token`. Polls are
+   serialized and use the advertised five-second interval.
+5. The client retries the original tool with byte-equivalent typed arguments.
+   The server compares every operation, subject, client, realm, resource, key,
+   hash, and precondition binding, then atomically records the grant state,
+   target mutation, and redacted result. PostgreSQL, in-memory, and JSON
+   backends implement the same conditional transaction contract.
+
+The single-purpose token cannot call unrelated tools or UserInfo, Account, or
+Admin APIs. A changed precondition returns 409 and a definite failed grant; an
+unknown outcome returns a retryable error and never causes a blind second
+mutation. Repeating the exact call returns the recorded successful result
+without repeating audit, invalidation, or mutation. A new approval is never a
+substitute for reconciling an unknown outcome.
+
+## Read-only resources
+
+The endpoint advertises resources without `listChanged` or subscriptions:
+
+| URI | Policy | Content |
+|---|---|---|
+| `issuerd://realm/{realm}/clients` | `mcp:read` + client read role | Complete redacted client catalog |
+| `issuerd://realm/{realm}/roles` | `mcp:read` + realm read role | Complete realm-role catalog, excluding client roles |
+| `issuerd://realm/{realm}/config` | `mcp:read` + realm read role | Curated non-secret realm configuration |
+
+`resources/list` exposes only resources allowed by the caller's current scope
+and roles. Every `resources/read` repeats policy and consumes the same
+invocation allowance as a tool call. Content is JSON text with
+`mimeType="application/json"`; list/read results carry zero-TTL private cache
+hints. Resource URIs must match the authenticated realm exactly, including
+spelling and escaping; there are no cross-realm or secret-bearing resources.
 
 ## Resource-specific token profile
 
@@ -278,12 +357,24 @@ Run the branch-built daemon with PostgreSQL and Redis:
 ./examples/mcp-admin/scripts/e2e-compose.sh
 ```
 
-Both scripts complete authorization-code issuance and all 23 tools in legacy
-and modern modes. The Compose script removes its own project and volumes on
-exit. See [`examples/mcp-admin/README.md`](../examples/mcp-admin/README.md) for
-interactive commands, lab-only credentials, and the evidence schema.
+Run exact-operation CIBA across three nodes sharing PostgreSQL and Redis:
 
-The nightly `heavy.yml` workflow runs the same npm checks and both rigs.
+```bash
+./examples/mcp-admin/scripts/e2e-step-up-cluster.sh
+```
+
+The public native profile completes authorization-code issuance and all 23
+legacy admin read tools in legacy and modern modes. The confidential profile
+uses `client_secret_basic`, PKCE S256, and one SDK `DpopSession` to read all
+three resources, perform a reversible write, approve an exact `users_delete`,
+reject changed arguments and unrelated use, and reconcile an exact replay.
+The cluster runner requires approval on node 2, polling on node 3, and final
+execution on node 1 without changing the canonical URL or DPoP key. Compose
+runners remove their own projects and volumes on exit. See
+[`examples/mcp-admin/README.md`](../examples/mcp-admin/README.md) for interactive
+commands, lab-only credentials, and the evidence schema.
+
+The nightly `heavy.yml` workflow runs the same npm checks and all three rigs.
 Ordinary `cargo test` does not require npm.
 
 ## Other clients and current limits
@@ -295,15 +386,14 @@ its complete DPoP flow can be verified.
 
 Current boundaries:
 
-- no strict T3 writes, resources/prompts, cross-realm master operations,
-  unattended M2M, or built-in chat;
-- no generic CIBA `resource` or `operation_id` acceptance and no ordinary
-  `mcp:step_up` issuance;
+- no prompts, cross-realm master operations, unattended M2M, or built-in chat;
+- CIBA `resource` and `operation_id` are accepted only for validated strict
+  operations, never as a generic scope-only approval or ordinary login path;
 - no secret rotation, raw credentials, TOTP seeds/QR codes, bulk export,
   impersonation, or audit deletion;
-- strict operation-bound approval, when implemented, will use a fresh
-  server-rendered ceremony, a single-purpose token without refresh, and a
-  durable exact-operation grant — not a reusable CIBA scope token.
+- service-account provisioning, built-in flow editing, secret-bearing IdP
+  configuration, and disabling administrative audit are rejected rather than
+  approximated by the strict transaction model.
 
 ## Verification
 
@@ -313,6 +403,8 @@ The relevant local gates are:
 cargo test --test integration mcp::
 cargo test -p issuerd-mcp
 cargo test -p issuerd-server routes::mcp::tests
+cargo test -p issuerd-server ciba
+cargo test -p issuerd-storage step_up
 ```
 
 The full increment additionally passes the workspace Rust gates and the npm
