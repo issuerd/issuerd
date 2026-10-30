@@ -475,6 +475,9 @@ fn read_only_annotations() -> ToolAnnotations {
 }
 
 pub fn definition(name: ToolName) -> Tool {
+    if let Some(tool) = crate::strict_tools::definition(name) {
+        return tool;
+    }
     if let Some(tool) = crate::account_tools::definition(name) {
         return tool;
     }
@@ -638,8 +641,17 @@ mod tests {
                 );
             let annotations = tool.annotations.unwrap();
             assert_eq!(annotations.read_only_hint, Some(read_only));
-            assert_eq!(annotations.destructive_hint, Some(false));
-            assert_eq!(annotations.idempotent_hint, Some(read_only || (!create && !external)));
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(name.tier() == crate::policy::RiskTier::T3)
+            );
+            assert_eq!(
+                annotations.idempotent_hint,
+                Some(
+                    name.tier() != crate::policy::RiskTier::T3
+                        && (read_only || (!create && !external))
+                )
+            );
             assert_eq!(annotations.open_world_hint, Some(external));
             assert_eq!(tool.input_schema["type"], "object");
             assert_eq!(tool.input_schema["additionalProperties"], false);

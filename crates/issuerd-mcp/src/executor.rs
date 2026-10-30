@@ -47,6 +47,7 @@ pub struct McpToolExecutor {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) application: Option<Arc<dyn crate::services::McpApplicationService>>,
     limiter: McpRateLimiter,
+    step_up_enabled: bool,
 }
 
 impl McpToolExecutor {
@@ -55,7 +56,17 @@ impl McpToolExecutor {
             storage,
             application: None,
             limiter,
+            step_up_enabled: false,
         }
+    }
+
+    pub fn with_step_up(mut self, enabled: bool) -> Self {
+        self.step_up_enabled = enabled;
+        self
+    }
+
+    pub fn step_up_enabled(&self) -> bool {
+        self.step_up_enabled
     }
 
     pub fn with_application_service(
@@ -79,6 +90,9 @@ impl McpToolExecutor {
         self.limiter.acquire(&auth, now).await?;
         let tool = ToolName::parse(tool_name)
             .ok_or_else(|| McpError::UnknownTool(tool_name.to_string()))?;
+        if crate::strict_tools::is_strict(tool) && !self.step_up_enabled {
+            return Err(McpError::UnknownTool(tool_name.to_string()));
+        }
         let tool_policy = policy::policy_for(tool);
         deny_to_error(policy::decide(tool_policy, &auth))?;
         let target = McpTarget {

@@ -3,9 +3,9 @@
 
 use issuerd_core::IssuerdError;
 
-use crate::policy::ToolName;
+use crate::{policy::ToolName, step_up::PendingOperation};
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum McpError {
     #[error("unknown MCP tool: {0}")]
     UnknownTool(String),
@@ -38,12 +38,20 @@ pub enum McpError {
     TransportConfig(String),
     #[error("invalid JSON: {0}")]
     InvalidJson(String),
+    #[error("fresh operation-bound approval is required")]
+    StepUpRequired(Box<PendingOperation>),
+    #[error("operation binding mismatch")]
+    OperationBindingMismatch,
+    #[error("step-up grant expired")]
+    GrantExpired,
+    #[error("step-up execution outcome is unknown")]
+    OutcomeUnknown,
 }
 
 impl McpError {
     pub fn is_temporary(&self) -> bool {
         match self {
-            Self::TemporarilyUnavailable(_) => true,
+            Self::TemporarilyUnavailable(_) | Self::OutcomeUnknown => true,
             Self::Backend(error) => matches!(error, IssuerdError::TemporarilyUnavailable),
             _ => false,
         }
@@ -69,6 +77,10 @@ impl McpError {
             Self::PermitMismatch => "invalid preflight permit".to_string(),
             Self::TransportConfig(_) => "transport configuration failure".to_string(),
             Self::InvalidJson(message) => format!("invalid JSON: {message}"),
+            Self::StepUpRequired(_) => "fresh operation-bound approval is required".to_string(),
+            Self::OperationBindingMismatch => "operation binding mismatch".to_string(),
+            Self::GrantExpired => "step-up grant expired".to_string(),
+            Self::OutcomeUnknown => "step-up execution outcome is unknown".to_string(),
         }
     }
 }

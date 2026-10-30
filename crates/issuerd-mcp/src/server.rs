@@ -60,7 +60,10 @@ impl ServerHandler for IssuerdMcpServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        crate::policy::ToolName::parse(name).map(crate::tools::definition)
+        crate::policy::ToolName::parse(name).and_then(|tool| {
+            (self.executor.step_up_enabled() || !crate::strict_tools::is_strict(tool))
+                .then(|| crate::tools::definition(tool))
+        })
     }
 
     async fn list_tools(
@@ -72,8 +75,10 @@ impl ServerHandler for IssuerdMcpServer {
         let tools = crate::tools::definitions()
             .into_iter()
             .filter(|tool| {
-                crate::policy::ToolName::parse(tool.name.as_ref())
-                    .is_some_and(|name| policy::decide_for(name, &auth).is_allowed())
+                crate::policy::ToolName::parse(tool.name.as_ref()).is_some_and(|name| {
+                    (self.executor.step_up_enabled() || !crate::strict_tools::is_strict(name))
+                        && policy::decide_for(name, &auth).is_allowed()
+                })
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools))

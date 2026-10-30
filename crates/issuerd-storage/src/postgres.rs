@@ -4023,7 +4023,7 @@ mod tests {
             .list_client_scopes(&realm.id, &Pagination::new(0, i32::MAX))
             .await
             .unwrap();
-        assert_eq!(scopes.len(), 10);
+        assert_eq!(scopes.len(), 11);
     }
 
     #[tokio::test]

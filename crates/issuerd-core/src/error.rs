@@ -55,6 +55,8 @@ pub enum OAuth2ErrorCode {
     /// (not an absolute URI, or carries a fragment) or names a resource the
     /// authorization server does not recognize (fail-closed allowlist).
     InvalidTarget,
+    /// OpenID CIBA Core Section 13 — the binding message is unacceptable.
+    InvalidBindingMessage,
 }
 
 impl std::fmt::Display for OAuth2ErrorCode {
@@ -86,6 +88,7 @@ impl AsRef<str> for OAuth2ErrorCode {
             OAuth2ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
             OAuth2ErrorCode::InvalidAuthorizationDetails => "invalid_authorization_details",
             OAuth2ErrorCode::InvalidTarget => "invalid_target",
+            OAuth2ErrorCode::InvalidBindingMessage => "invalid_binding_message",
         }
     }
 }
@@ -193,6 +196,8 @@ pub enum IssuerdError {
     InvalidAuthorizationDetails(String),
     #[error("invalid target: {0}")]
     InvalidTarget(String),
+    #[error("invalid binding message: {0}")]
+    InvalidBindingMessage(String),
     #[error("signing-key encryption error: {0}")]
     KeyEncryption(String),
 }
@@ -222,6 +227,7 @@ impl IssuerdError {
                 OAuth2ErrorCode::InvalidAuthorizationDetails
             }
             IssuerdError::InvalidTarget(_) => OAuth2ErrorCode::InvalidTarget,
+            IssuerdError::InvalidBindingMessage(_) => OAuth2ErrorCode::InvalidBindingMessage,
             IssuerdError::KeyEncryption(_) => OAuth2ErrorCode::ServerError,
         }
     }
@@ -248,6 +254,7 @@ impl IssuerdError {
             IssuerdError::InvalidDpopProof => 400,
             IssuerdError::InvalidAuthorizationDetails(_) => 400,
             IssuerdError::InvalidTarget(_) => 400,
+            IssuerdError::InvalidBindingMessage(_) => 400,
             IssuerdError::KeyEncryption(_) => 500,
         }
     }

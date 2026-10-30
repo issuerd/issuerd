@@ -284,7 +284,7 @@ mod tests {
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 10);
+        assert_eq!(scopes.len(), 11);
         for expected in builtin_client_scopes(&realm) {
             assert!(
                 scopes.iter().any(|s| s.name == expected.name),
@@ -341,7 +341,7 @@ mod tests {
         );
         first.unwrap();
         second.unwrap();
-        assert_eq!(storage.list_client_scopes(&realm, &ALL).await.unwrap().len(), 10);
+        assert_eq!(storage.list_client_scopes(&realm, &ALL).await.unwrap().len(), 11);
     }
 
     #[tokio::test]
@@ -366,7 +366,7 @@ mod tests {
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();
 
         let scopes = storage.list_client_scopes(&realm, &ALL).await.unwrap();
-        assert_eq!(scopes.len(), 10);
+        assert_eq!(scopes.len(), 11);
         let profile = scopes.iter().find(|s| s.name == "profile").unwrap();
         assert_eq!(profile.id, preexisting.id);
         assert_eq!(profile.description, preexisting.description);

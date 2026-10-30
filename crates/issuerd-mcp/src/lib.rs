@@ -13,6 +13,8 @@ pub mod rate_limit;
 pub mod read_inventory;
 pub mod server;
 pub mod services;
+pub mod step_up;
+pub mod strict_tools;
 pub mod tools;
 pub mod transport;
 pub mod write_tools;
