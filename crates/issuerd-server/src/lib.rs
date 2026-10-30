@@ -8,6 +8,8 @@
 pub mod bootstrap;
 pub mod broker;
 pub mod challenges;
+pub mod ciba_approval;
+pub mod ciba_step_up;
 pub mod claims;
 pub mod claims_cache;
 pub mod client_assertion;
@@ -21,6 +23,7 @@ pub mod groups;
 pub mod i18n;
 pub mod mcp_account;
 pub mod mcp_service;
+pub mod mcp_strict;
 pub mod mcp_write;
 pub mod middleware;
 pub mod openapi;

@@ -595,7 +595,7 @@ pub struct DeviceCodeData {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CibaAuthReqData {
     pub auth_req_id: String,
     pub client_id: String,
@@ -609,10 +609,32 @@ pub struct CibaAuthReqData {
     pub last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Absolute expiry; polling/approval must not extend it.
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub operation: Option<issuerd_mcp::step_up::PendingOperation>,
+    #[serde(default)]
+    pub requested_acr_values: Option<Vec<String>>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
+    #[serde(default)]
+    pub approval_auth_time: Option<i64>,
+    #[serde(default)]
+    pub approval_acr: Option<String>,
+    #[serde(default)]
+    pub approval_amr: Option<Vec<String>>,
+    #[serde(default = "default_ciba_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_ciba_poll_interval() -> u64 {
+    5
 }
 
 /// Remaining TTL for a device/CIBA cache entry, or `None` once expired.
-fn remaining_ttl(expires_at: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+pub(crate) fn remaining_ttl(
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
     (expires_at - chrono::Utc::now()).to_std().ok()
 }
 
@@ -726,7 +748,7 @@ pub(crate) fn wants_html(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-async fn resolve_session_from_cookie(
+pub(crate) async fn resolve_session_from_cookie(
     state: &Arc<ServerState>,
     headers: &axum::http::HeaderMap,
     realm: &issuerd_core::Realm,
@@ -2679,7 +2701,10 @@ pub async fn ciba_auth_handler(
                 HashMap::new(),
             )
             .await;
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"})))
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid_client"})),
+            )
                 .into_response();
         }
     };
@@ -2699,7 +2724,10 @@ pub async fn ciba_auth_handler(
                 HashMap::new(),
             )
             .await;
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"})))
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid_client"})),
+            )
                 .into_response();
         }
         Err(e) => {
@@ -2759,7 +2787,20 @@ pub async fn ciba_auth_handler(
             HashMap::new(),
         )
         .await;
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_client"})))
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid_client"})))
+            .into_response();
+    }
+
+    if ciba_req.operation_id.is_some() {
+        return crate::ciba_step_up::initiate(state, realm, client, ciba_req, ip).await;
+    }
+    if ciba_req.resource.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_response(&IssuerdError::InvalidTarget(
+                "resource requires an operation-bound CIBA request".into(),
+            ))),
+        )
             .into_response();
     }
 
@@ -2807,7 +2848,7 @@ pub async fn ciba_auth_handler(
         }
     };
 
-    let auth_req_id = issuerd_core::utils::generate_id();
+    let auth_req_id = issuerd_mcp::step_up::secure_id();
     let expires_in: u64 = ciba_req.requested_expiry.unwrap_or(120).min(600);
     let interval: u64 = 5;
 
@@ -2823,12 +2864,22 @@ pub async fn ciba_auth_handler(
         client_notification_token: ciba_req.client_notification_token.clone(),
         last_polled_at: None,
         expires_at: chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64),
+        resource: None,
+        operation: None,
+        requested_acr_values: Some(ciba_req.acr_values.clone()),
+        approval_id: None,
+        approval_auth_time: None,
+        approval_acr: None,
+        approval_amr: None,
+        poll_interval_secs: interval,
     };
 
     let cache_key = issuerd_cluster::cache_keys::ciba_auth_req(&auth_req_id);
     let cache_value = serde_json::to_vec(&req_data).unwrap();
     let ttl = Some(std::time::Duration::from_secs(expires_in));
-    let _ = state.cache.set(&cache_key, cache_value, ttl).await;
+    if let Err(error) = state.cache.set(&cache_key, cache_value, ttl).await {
+        return cache_failure_response(&error);
+    }
 
     let mut details = HashMap::new();
     details.insert("scope".to_string(), ciba_req.scope.to_vec().join(" "));
@@ -2939,46 +2990,29 @@ pub async fn ciba_approve_handler(
     }
 
     let cache_key = issuerd_cluster::cache_keys::ciba_auth_req(auth_req_id);
-    let mut req_data: CibaAuthReqData = match state.cache.get(&cache_key).await {
-        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-            Ok(d) => d,
-            Err(_) => {
-                emit_oidc_event(
-                    &state,
-                    &realm_id,
-                    EventType::CibaAuthError,
-                    &ip,
-                    None,
-                    None,
-                    None,
-                    Some("expired_token".to_string()),
-                    HashMap::new(),
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "expired_token"})),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            emit_oidc_event(
-                &state,
-                &realm_id,
-                EventType::CibaAuthError,
-                &ip,
-                None,
-                None,
-                None,
-                Some("expired_token".to_string()),
-                HashMap::new(),
-            )
-            .await;
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "expired_token"})))
+    let original_bytes = match state.cache.get(&cache_key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
+                .into_response();
+        }
+        Err(error) => return cache_failure_response(&error),
+    };
+    let mut req_data: CibaAuthReqData = match serde_json::from_slice(&original_bytes) {
+        Ok(data) => data,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"})))
                 .into_response();
         }
     };
+    if req_data.operation.is_some() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_request"})))
+            .into_response();
+    }
+    if req_data.authorized || req_data.denied {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "invalid_request"})))
+            .into_response();
+    }
 
     if req_data.realm_id != realm_id.0 {
         emit_oidc_event(
@@ -3025,15 +3059,31 @@ pub async fn ciba_approve_handler(
         }
     }
 
+    let actual_amr = match session.as_ref().expect("session was required").auth_method {
+        issuerd_core::AuthMethod::Password => "pwd",
+        issuerd_core::AuthMethod::Spnego => "kba",
+        issuerd_core::AuthMethod::IdentityProvider => "idp",
+        issuerd_core::AuthMethod::Ciba | issuerd_core::AuthMethod::Impersonation => {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"})))
+                .into_response();
+        }
+    };
+    if action == "approve"
+        && req_data
+            .requested_acr_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty() && !values.iter().any(|value| value == "0"))
+    {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "access_denied"})))
+            .into_response();
+    }
     let event_type = match action {
         "approve" => {
             req_data.authorized = true;
-            req_data.last_polled_at = None;
             EventType::CibaApprove
         }
         "deny" => {
             req_data.denied = true;
-            req_data.last_polled_at = None;
             EventType::CibaDeny
         }
         _ => {
@@ -3056,10 +3106,14 @@ pub async fn ciba_approve_handler(
                 .into_response();
         }
     };
+    req_data.approval_auth_time =
+        Some(session.as_ref().expect("session was required").auth_time.timestamp());
+    req_data.approval_acr = Some("0".into());
+    req_data.approval_amr = Some(vec![actual_amr.into()]);
 
     let cache_value = serde_json::to_vec(&req_data).unwrap();
     // Approval must not extend the request's lifetime.
-    let Some(ttl) = remaining_ttl(req_data.expires_at) else {
+    let Some(_ttl) = remaining_ttl(req_data.expires_at) else {
         emit_oidc_event(
             &state,
             &realm_id,
@@ -3075,7 +3129,18 @@ pub async fn ciba_approve_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "expired_token"})))
             .into_response();
     };
-    let _ = state.cache.set(&cache_key, cache_value, Some(ttl)).await;
+    match state
+        .cache
+        .compare_and_swap(&cache_key, Some(original_bytes), cache_value)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "invalid_request"})))
+                .into_response();
+        }
+        Err(error) => return cache_failure_response(&error),
+    }
 
     let event_client_id = resolve_ciba_client_uuid(&state, &realm_id, &req_data.client_id).await;
     let mut details = HashMap::new();
@@ -3117,7 +3182,7 @@ async fn resolve_ciba_client_uuid(
 /// Emit a `login_error` event for a failed CIBA poll (`expired_token`,
 /// `access_denied`, cross-client `invalid_grant`). `authorization_pending`
 /// and `slow_down` are protocol chatter and never reach this helper.
-async fn emit_ciba_poll_error(
+pub(crate) async fn emit_ciba_poll_error(
     state: &Arc<ServerState>,
     realm_id: &RealmId,
     ip: &std::net::IpAddr,
@@ -3433,16 +3498,15 @@ async fn token_handler_inner(
         return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
     }
 
-    // RFC 8707 §2.1/§2.2: `resource` is honored only on the
-    // authorization_code and refresh_token grants — every other grant
-    // refuses the parameter fail-closed (like `authorization_details`
-    // above) — and any present value must be on the server's allowlist
-    // (gated on `[mcp] enabled`). The grant handlers below additionally
-    // enforce consistency with the underlying grant's resource.
+    // Resource indicators are accepted on code, refresh, and CIBA grants.
+    // Every CIBA restatement is checked against the initiating request below.
     if let Some(resource) = token_req.resource.as_deref() {
-        if !matches!(token_req.grant_type, GrantType::AuthorizationCode | GrantType::RefreshToken) {
+        if !matches!(
+            token_req.grant_type,
+            GrantType::AuthorizationCode | GrantType::RefreshToken | GrantType::Ciba
+        ) {
             let e = IssuerdError::InvalidTarget(
-                "resource is only supported for the authorization_code and refresh_token grants"
+                "resource is only supported for authorization_code, refresh_token, and CIBA grants"
                     .into(),
             );
             return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
@@ -3455,6 +3519,12 @@ async fn token_handler_inner(
             warn!(realm = %realm_id, client_id = %client.client_id, error = %e, "token request resource validation failed");
             return (StatusCode::BAD_REQUEST, Json(error_response(&e))).into_response();
         }
+    }
+
+    if token_req.grant_type == GrantType::Ciba {
+        let response =
+            crate::ciba_step_up::poll(state, realm, client, token_req, dpop_jkt, ip).await;
+        return crate::dpop::with_nonce_header(response, dpop_response_nonce.as_deref());
     }
 
     let response = match token_req.grant_type {
@@ -5186,397 +5256,7 @@ async fn token_handler_inner(
 
             token_response(resp)
         }
-        GrantType::Ciba => {
-            let auth_req_id = token_req.auth_req_id.as_deref().unwrap_or("");
-            let cache_key = issuerd_cluster::cache_keys::ciba_auth_req(auth_req_id);
-
-            let mut req_data: CibaAuthReqData = match state.cache.get(&cache_key).await {
-                Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        emit_ciba_poll_error(
-                            &state,
-                            &realm_id,
-                            &ip,
-                            &client,
-                            None,
-                            "expired_token",
-                        )
-                        .await;
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"error": "expired_token"})),
-                        )
-                            .into_response();
-                    }
-                },
-                _ => {
-                    emit_ciba_poll_error(&state, &realm_id, &ip, &client, None, "expired_token")
-                        .await;
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "expired_token"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Slow-down check: if polled too recently, return slow_down
-            let now = chrono::Utc::now();
-            if let Some(last_polled) = req_data.last_polled_at {
-                let interval = chrono::Duration::seconds(5);
-                if now - last_polled < interval {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "slow_down"})),
-                    )
-                        .into_response();
-                }
-            }
-            req_data.last_polled_at = Some(now);
-
-            // Absolute expiry: polling must not extend the request's lifetime.
-            let Some(remaining) = remaining_ttl(req_data.expires_at) else {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "expired_token",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "expired_token"})),
-                )
-                    .into_response();
-            };
-
-            // CIBA §7.1: only the client that initiated the backchannel
-            // request may redeem its auth_req_id.
-            if req_data.client_id != client.client_id.to_string() {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "invalid_grant",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "invalid_grant"})),
-                )
-                    .into_response();
-            }
-
-            // Update last_polled_at in cache, preserving the remaining TTL
-            let cache_value = serde_json::to_vec(&req_data).unwrap();
-            let _ = state.cache.set(&cache_key, cache_value, Some(remaining)).await;
-
-            if req_data.denied {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "access_denied",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "access_denied"})),
-                )
-                    .into_response();
-            }
-
-            // authorization_pending is normal protocol chatter, not an audit
-            // event — the decision was already recorded at the approve
-            // endpoint.
-            if !req_data.authorized {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "authorization_pending"})),
-                )
-                    .into_response();
-            }
-
-            // User authorized — issue tokens
-            let user_id = match req_data.user_id {
-                Some(ref uid) => match UserId::new(uid) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"error": "invalid_grant"})),
-                        )
-                            .into_response();
-                    }
-                },
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "invalid_grant"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            let user = match state.storage.get_user(&realm_id, &user_id).await {
-                Ok(Some(u)) if u.enabled => u,
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "invalid_grant"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            let ciba_client_id = match ClientIdentifier::new(&req_data.client_id) {
-                Ok(id) => id,
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "invalid_grant"})),
-                    )
-                        .into_response();
-                }
-            };
-            let ciba_client =
-                match state.storage.get_client_by_client_id(&realm_id, &ciba_client_id).await {
-                    Ok(Some(c)) => c,
-                    _ => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"error": "invalid_grant"})),
-                        )
-                            .into_response();
-                    }
-                };
-
-            // Atomic consume: an approved auth_req_id is single-use, so any
-            // poll that reaches this point burns it. Only the first
-            // concurrent consumer observes the entry; the rest get
-            // `expired_token`, matching an unknown/expired auth_req_id.
-            let consumed: Option<CibaAuthReqData> =
-                match state.cache.get_and_delete(&cache_key).await {
-                    Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
-                    _ => None,
-                };
-            let Some(consumed) = consumed else {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "expired_token",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "expired_token"})),
-                )
-                    .into_response();
-            };
-            // The consumed entry may not be the exact write this poller read
-            // (a concurrent approve/deny or pacing write can land between the
-            // read and the consume) — re-validate the payload before issuing:
-            // client binding, user binding, still authorized, not expired.
-            if consumed.client_id != client.client_id.to_string()
-                || consumed.user_id != req_data.user_id
-                || !consumed.authorized
-                || consumed.denied
-            {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "invalid_grant",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "invalid_grant"})),
-                )
-                    .into_response();
-            }
-            if remaining_ttl(consumed.expires_at).is_none() {
-                emit_ciba_poll_error(
-                    &state,
-                    &realm_id,
-                    &ip,
-                    &client,
-                    req_data.user_id.as_deref(),
-                    "expired_token",
-                )
-                .await;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "expired_token"})),
-                )
-                    .into_response();
-            }
-
-            let session_id = SessionId::new(issuerd_core::utils::generate_id()).unwrap();
-            let scope = consumed.scope.clone();
-            if scope.iter().any(|s| s == issuerd_core::MCP_SCOPE_STEP_UP) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(error_response(&IssuerdError::InvalidScope)),
-                )
-                    .into_response();
-            }
-            let offline = scope.iter().any(|s| s == issuerd_core::OFFLINE_ACCESS_SCOPE);
-
-            let session = issuerd_core::UserSession {
-                id: session_id.clone(),
-                realm_id: realm_id.clone(),
-                user_id: user.id.clone(),
-                login_username: user.username.clone(),
-                auth_method: AuthMethod::Ciba,
-                remember_me: false,
-                offline,
-                ip_address: ip,
-                started: chrono::Utc::now(),
-                last_session_refresh: chrono::Utc::now(),
-                auth_time: chrono::Utc::now(),
-                impersonator: None,
-                clients: vec![issuerd_core::ClientSession {
-                    id: issuerd_core::ClientSessionId::new(issuerd_core::utils::generate_id())
-                        .unwrap(),
-                    client_id: ciba_client.id.clone(),
-                    session_id: session_id.clone(),
-                    redirect_uri: None,
-                    state: None,
-                    auth_method: AuthMethod::Ciba,
-                    timestamp: chrono::Utc::now(),
-                }],
-            };
-            if let Err(resp) = persist_session(&state, &realm_id, &session, false).await {
-                return resp;
-            }
-
-            let overlay = crate::claims::build_claims_overlay(
-                &state,
-                &realm_id,
-                Some(&ciba_client),
-                &user,
-                scope.as_slice(),
-                issuerd_core::ClaimTarget::AccessToken,
-            )
-            .await
-            .unwrap_or_default();
-            // Bind the issued tokens to the DPoP proof key.
-            let overlay = crate::dpop::bind_cnf_overlay(Some(overlay), dpop_jkt.as_deref());
-
-            let access_token = match state
-                .token_manager
-                .issue_access_token_with_roles(
-                    &user,
-                    &ciba_client,
-                    &realm,
-                    scope.as_slice(),
-                    &session_id,
-                    None,
-                    None,
-                    overlay,
-                )
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response(&e)))
-                        .into_response();
-                }
-            };
-
-            let refresh_token = match state
-                .token_manager
-                .issue_refresh_token_with_resource(
-                    &user,
-                    &ciba_client,
-                    &realm,
-                    &session_id,
-                    &scope,
-                    offline,
-                    dpop_jkt.as_deref(),
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(t) => Some(t.token),
-                Err(e) => {
-                    warn!(realm = %realm_id, client_id = %ciba_client.client_id, error = %e, "refresh token issuance failed; omitting from response");
-                    None
-                }
-            };
-
-            let id_token = if scope.contains(&"openid".to_string()) {
-                match state
-                    .token_manager
-                    .issue_id_token(
-                        &user,
-                        &ciba_client,
-                        &realm,
-                        None,
-                        chrono::Utc::now(),
-                        &session_id,
-                        Some(&access_token),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(t) => Some(t.token),
-                    Err(e) => {
-                        warn!(realm = %realm_id, client_id = %ciba_client.client_id, error = %e, "ID token issuance failed; omitting from response");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let resp = TokenResponse {
-                access_token: access_token.token,
-                token_type: crate::dpop::token_type(dpop_jkt.is_some()),
-                expires_in: realm.access_token_lifespan.get(),
-                refresh_token,
-                id_token,
-                scope: Some(scope.join(" ")),
-                issued_token_type: None,
-                authorization_details: None,
-            };
-
-            // The user's out-of-band approval materializes into a session and
-            // tokens here — the same audit weight as a browser login.
-            let mut details = std::collections::HashMap::new();
-            details.insert("method".to_string(), "ciba".to_string());
-            details.insert("username".to_string(), user.username.to_string());
-            emit_oidc_event(
-                &state,
-                &realm_id,
-                EventType::Login,
-                &ip,
-                Some(ciba_client.id.clone()),
-                Some(user.id.clone()),
-                Some(session_id.clone()),
-                None,
-                details,
-            )
-            .await;
-
-            token_response(resp)
-        }
+        GrantType::Ciba => unreachable!("CIBA returned from the shared poll handler"),
         GrantType::TokenExchange => {
             crate::routes::token_exchange::token_exchange_grant(
                 &state,
@@ -10944,7 +10624,7 @@ mod tests {
             body,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let json = extract_json(response).await;
         assert_eq!(json["error"], "invalid_client");
     }
@@ -11081,6 +10761,7 @@ mod tests {
         )
         .await;
         assert_eq!(approve_resp.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         // Step 4: Poll token endpoint again — should succeed
         let success_resp = token_handler(
@@ -11108,7 +10789,7 @@ mod tests {
         .await;
         assert_eq!(consumed_resp.status(), StatusCode::BAD_REQUEST);
         let consumed_json = extract_json(consumed_resp).await;
-        assert_eq!(consumed_json["error"], "expired_token");
+        assert_eq!(consumed_json["error"], "invalid_grant");
     }
 
     #[tokio::test]
@@ -13281,6 +12962,14 @@ mod tests {
         // Seed a valid CIBA auth req in cache
         let auth_req_id = "test-ciba-req-1".to_string();
         let req_data = CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
             realm_id: "master".to_string(),
@@ -13757,7 +13446,7 @@ mod tests {
             body,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let json = extract_json(response).await;
         assert_eq!(json["error"], "invalid_client");
     }
@@ -13807,7 +13496,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = extract_json(response).await;
-        assert_eq!(json["error"], "expired_token");
+        assert_eq!(json["error"], "invalid_grant");
     }
 
     #[tokio::test]
@@ -13815,6 +13504,14 @@ mod tests {
         let state = setup_state().await;
         let auth_req_id = "test-req-mismatch".to_string();
         let req_data = CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
             realm_id: "other-realm".to_string(),
@@ -13855,6 +13552,14 @@ mod tests {
         let state = setup_state().await;
         let auth_req_id = "test-ciba-no-session".to_string();
         let req_data = CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
             realm_id: "master".to_string(),
@@ -13911,6 +13616,14 @@ mod tests {
 
         let auth_req_id = "test-ciba-wrong-user".to_string();
         let req_data = CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
             realm_id: "master".to_string(),
@@ -17168,7 +16881,7 @@ mod tests {
             "client_id=ciba-disabled&client_secret=s3cr3t&login_hint=admin&scope=openid",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(extract_json(resp).await["error"], "invalid_client");
     }
 
@@ -17199,6 +16912,14 @@ mod tests {
     async fn ciba_approve_handler_single_empty_field_rejected() {
         let state = setup_state().await;
         let req_data = CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: "ciba-req-1".to_string(),
             client_id: "admin-cli".to_string(),
             realm_id: "master".to_string(),
@@ -17300,13 +17021,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(extract_json(resp).await["error"], "expired_token");
+        assert_eq!(extract_json(resp).await["error"], "invalid_grant");
 
         let events = query_all_events(&state, "master").await;
         let poll_error = events
             .iter()
             .find(|e| {
-                e.event_type == EventType::LoginError && e.error.as_deref() == Some("expired_token")
+                e.event_type == EventType::LoginError && e.error.as_deref() == Some("invalid_grant")
             })
             .expect("failed CIBA polls must be audited as login_error");
         assert_eq!(
@@ -18065,6 +17786,24 @@ mod tests {
         ) -> Result<bool, IssuerdError> {
             self.inner.compare_and_swap(key, expected, new).await
         }
+        async fn compare_and_delete(
+            &self,
+            key: &str,
+            expected: Vec<u8>,
+        ) -> Result<bool, IssuerdError> {
+            if key == self.swap_key {
+                self.inner.set(key, self.swap_value.clone(), None).await?;
+            }
+            self.inner.compare_and_delete(key, expected).await
+        }
+        async fn create_if_absent(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<std::time::Duration>,
+        ) -> Result<bool, IssuerdError> {
+            self.inner.create_if_absent(key, value, ttl).await
+        }
         async fn publish(&self, channel: &str, message: Vec<u8>) -> Result<(), IssuerdError> {
             self.inner.publish(channel, message).await
         }
@@ -18137,6 +17876,14 @@ mod tests {
 
     fn approved_ciba_entry(auth_req_id: &str, client_identifier: &str) -> CibaAuthReqData {
         CibaAuthReqData {
+            resource: None,
+            operation: None,
+            requested_acr_values: None,
+            approval_id: None,
+            approval_auth_time: None,
+            approval_acr: None,
+            approval_amr: None,
+            poll_interval_secs: 5,
             auth_req_id: auth_req_id.to_string(),
             client_id: client_identifier.to_string(),
             realm_id: "master".to_string(),

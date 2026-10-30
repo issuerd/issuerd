@@ -118,7 +118,8 @@ impl McpHttpAdapter {
                     admin_state,
                     Arc::clone(&state),
                 ),
-            )),
+            ))
+            .with_step_up(state.config.mcp.step_up.enabled),
         );
         let service = issuerd_mcp::transport::streamable_http_service_with_json_response(
             Arc::clone(&executor),
@@ -187,6 +188,32 @@ impl McpHttpAdapter {
                 .await
             {
                 Ok(permit) => {
+                    let coordination = self
+                        .executor
+                        .coordinate_strict(
+                            &permit,
+                            validated.tool_arguments.clone(),
+                            resource.clone(),
+                            authenticated.context.claims.cnf.as_ref().map(|cnf| cnf.jkt.clone()),
+                            issuerd_core::utils::now_secs() as i64,
+                        )
+                        .await;
+                    match coordination {
+                        Ok(issuerd_mcp::executor::McpStrictCoordination::Pending(operation)) => {
+                            return finalize_response(
+                                step_up_required_response(&self.state, &target_realm, &operation),
+                                response_nonce.as_deref(),
+                            );
+                        }
+                        Ok(issuerd_mcp::executor::McpStrictCoordination::Complete(value)) => {
+                            parts.extensions.insert(issuerd_mcp::executor::McpStrictResult(value));
+                        }
+                        Ok(issuerd_mcp::executor::McpStrictCoordination::NotStrict) => {}
+                        Err(error) => {
+                            let response = strict_error_response(error, &metadata);
+                            return finalize_response(response, response_nonce.as_deref());
+                        }
+                    }
                     parts.extensions.insert(authenticated.context);
                     parts.extensions.insert(permit);
                 }
@@ -464,6 +491,83 @@ fn preflight_error_response(error: McpError, scheme: ChallengeScheme, metadata: 
     }
 }
 
+fn step_up_required_response(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    operation: &issuerd_mcp::step_up::PendingOperation,
+) -> Response {
+    let metadata = realm_mcp_metadata_url(&state.config.issuer_url, realm.name.as_str());
+    let backchannel = format!(
+        "{}/realms/{}/protocol/openid-connect/ext/ciba/auth",
+        state.config.issuer_url.trim_end_matches('/'),
+        realm.name
+    );
+    let algs = issuerd_core::Algorithm::DPOP_SIGNING_ALG_VALUES_SUPPORTED
+        .iter()
+        .map(|algorithm| algorithm.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let challenge = format!(
+        "DPoP error=\"insufficient_user_authentication\", resource_metadata=\"{metadata}\", algs=\"{algs}\""
+    );
+    let expires_in = operation.expires_at.saturating_sub(chrono::Utc::now().timestamp()).max(0);
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+        axum::Json(serde_json::json!({
+            "error": "step_up_required",
+            "operation_id": operation.operation_id,
+            "binding_message": operation.binding_message,
+            "backchannel_authentication_endpoint": backchannel,
+            "resource": operation.resource,
+            "required_scope": "openid mcp:step_up",
+            "expires_in": expires_in,
+        })),
+    )
+        .into_response()
+}
+
+fn strict_error_response(error: McpError, metadata: &str) -> Response {
+    match error {
+        McpError::OperationBindingMismatch => (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "operation_binding_mismatch"})),
+        )
+            .into_response(),
+        McpError::Conflict(message) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": "precondition_failed", "message": message})),
+        )
+            .into_response(),
+        McpError::NotFound(_) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": "precondition_failed"})),
+        )
+            .into_response(),
+        McpError::GrantExpired => invalid_token_challenge_for_scheme(
+            ChallengeScheme::Dpop,
+            metadata,
+            Some("step-up grant expired"),
+        ),
+        McpError::OutcomeUnknown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "outcome_unknown"})),
+        )
+            .into_response(),
+        McpError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid_request", "message": message})),
+        )
+            .into_response(),
+        McpError::Forbidden(message) => (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "access_denied", "message": message})),
+        )
+            .into_response(),
+        _ => service_unavailable(),
+    }
+}
+
 async fn resolve_target_realm(state: &Arc<ServerState>, uri: &Uri) -> Result<Realm, Box<Response>> {
     let Some(segment) = uri
         .path()
@@ -607,6 +711,7 @@ async fn read_post_body(body: Body) -> Result<Bytes, AdapterError> {
 struct ValidatedRequest {
     id: Option<RequestId>,
     tool_name: Option<String>,
+    tool_arguments: Option<rmcp::model::JsonObject>,
     modern: bool,
     body: Bytes,
 }
@@ -644,6 +749,7 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
     let mut meta_version = None;
     let mut missing_meta = Vec::new();
     let mut tool_name = None;
+    let mut tool_arguments = None;
     if let ClientJsonRpcMessage::Request(request) = &message {
         id = Some(request.id.clone());
         if let ClientRequest::InitializeRequest(request) = &request.request {
@@ -653,6 +759,7 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
         discover = matches!(request.request, ClientRequest::DiscoverRequest(_));
         if let ClientRequest::CallToolRequest(request) = &request.request {
             tool_name = Some(request.params.name.to_string());
+            tool_arguments = request.params.arguments.clone();
         }
         let meta = request.request.get_meta();
         meta_version = meta.protocol_version().map(|version| version.as_str().to_string());
@@ -671,6 +778,7 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
             )
         })?;
         tool_name = Some(parsed.name.to_string());
+        tool_arguments = parsed.arguments;
     }
 
     if initialize {
@@ -682,6 +790,7 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
         return Ok(ValidatedRequest {
             id,
             tool_name: None,
+            tool_arguments: None,
             modern: false,
             body,
         });
@@ -757,6 +866,7 @@ fn validate_post(headers: &HeaderMap, body: Bytes) -> Result<ValidatedRequest, A
     Ok(ValidatedRequest {
         id,
         tool_name,
+        tool_arguments,
         modern: meta_version.is_some() || discover,
         body,
     })

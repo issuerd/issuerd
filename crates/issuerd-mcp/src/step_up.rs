@@ -83,6 +83,30 @@ impl PendingOperation {
         })
     }
 
+    pub fn for_execution(
+        auth: &McpAuthContext,
+        resource: String,
+        tool: ToolName,
+        canonical_args_json: Value,
+        _mutation: McpStepUpMutation,
+        grant: &McpStepUpGrant,
+    ) -> Result<Self, McpError> {
+        let mut operation = Self::new(
+            auth,
+            resource,
+            tool,
+            canonical_args_json,
+            grant.mutation.clone(),
+            grant.dpop_jkt.clone(),
+            grant.issued_at,
+            u64::try_from(grant.expires_at.saturating_sub(grant.issued_at).max(0))
+                .unwrap_or(u64::MAX),
+        )?;
+        operation.operation_id = grant.operation_id.clone();
+        operation.origin_access_token_jti = grant.origin_access_token_jti.clone();
+        Ok(operation)
+    }
+
     pub fn arguments(&self) -> Result<Option<JsonObject>, McpError> {
         self.canonical_args_json
             .as_object()

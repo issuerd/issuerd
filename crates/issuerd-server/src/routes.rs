@@ -34,7 +34,7 @@ pub mod logout;
 mod mcp;
 pub(crate) mod oidc;
 mod par;
-mod protected_resource;
+pub(crate) mod protected_resource;
 mod registration;
 mod required_actions;
 mod reset_credentials;
@@ -187,6 +187,10 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .route(
             "/realms/{realm}/protocol/openid-connect/ext/ciba/approve",
             post(oidc::ciba_approve_handler),
+        )
+        .route(
+            "/realms/{realm}/protocol/openid-connect/ext/ciba/approval",
+            get(crate::ciba_approval::get_handler).post(crate::ciba_approval::post_handler),
         )
         .route("/realms/{realm}/protocol/openid-connect/ext/par", post(par::par_handler))
         .route(

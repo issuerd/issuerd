@@ -168,6 +168,31 @@ pub struct WebauthnDeleteArgs {
     pub id: String,
 }
 
+pub fn target_id(operation: &McpOperation, auth: &crate::auth::McpAuthContext) -> Option<String> {
+    let string = |name: &str| operation.arguments.get(name)?.as_str().map(str::to_string);
+    match operation.tool {
+        ToolName::RealmUpdateSettings
+        | ToolName::EventsConfigUpdate
+        | ToolName::PushNotBefore
+        | ToolName::RealmDelete => Some(auth.realm_id.to_string()),
+        ToolName::MeTotpDelete | ToolName::MeWebauthnDelete => Some(auth.user_id.to_string()),
+        ToolName::RolesDelete => string("name"),
+        ToolName::FlowsUpdateExecutions => string("alias"),
+        ToolName::UsersDelete
+        | ToolName::GroupsDelete
+        | ToolName::ClientsDelete
+        | ToolName::ClientsUpdateSecurity
+        | ToolName::IdpCreate
+        | ToolName::IdpUpdate
+        | ToolName::IdpDelete
+        | ToolName::UsersAssignRole
+        | ToolName::UsersUnassignRole
+        | ToolName::GroupsAssignRole
+        | ToolName::GroupsUnassignRole => string("id"),
+        _ => None,
+    }
+}
+
 pub fn is_strict(tool: ToolName) -> bool {
     tool.tier() == RiskTier::T3
 }

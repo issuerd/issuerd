@@ -582,10 +582,32 @@ async fn apply_mutation(
             let Some(current) = current else {
                 return Err(IssuerdError::Conflict);
             };
-            if redacted_flow(current.try_into()?) != expected {
+            let current: FlowConfig = current.try_into()?;
+            if redacted_flow(current.clone()) != expected {
                 return Err(IssuerdError::Conflict);
             }
-            let pg: PgFlowConfig = (&updated).try_into()?;
+            let mut effective = updated;
+            for current_stage in current.stages {
+                let Some(current_config) = current_stage.authenticator_config else {
+                    continue;
+                };
+                let Some(updated_stage) =
+                    effective.stages.iter_mut().find(|stage| stage.id == current_stage.id)
+                else {
+                    continue;
+                };
+                let updated_config =
+                    updated_stage.authenticator_config.get_or_insert_with(|| AuthenticatorConfig {
+                        alias: current_config.alias.clone(),
+                        config: serde_json::Map::new(),
+                    });
+                for (key, value) in current_config.config {
+                    if sensitive_key(&key) {
+                        updated_config.config.entry(key).or_insert(value);
+                    }
+                }
+            }
+            let pg: PgFlowConfig = (&effective).try_into()?;
             expect_one(
                 sqlx::query(
                     "UPDATE flow_configs SET stages = $3 WHERE realm_id = $1 AND alias = $2",
@@ -1186,5 +1208,441 @@ mod tests {
         grant_lifecycle(storage.as_ref()).await;
 
         concurrent_reconciliation(storage, 8).await;
+    }
+
+    async fn execute_variant(storage: &dyn Storage, subject: &User, mutation: McpStepUpMutation) {
+        let mut grant = test_grant(subject);
+        grant.tool = mutation.tool().into();
+        grant.mutation = mutation.clone();
+        storage.create_mcp_step_up_grant(&grant).await.unwrap();
+        let execution = storage
+            .execute_mcp_step_up(
+                &grant.token_jti,
+                &grant.operation_hash,
+                &mutation,
+                serde_json::json!({"status": "completed"}),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{} failed: {error:?}", grant.tool));
+        assert_eq!(execution.status, McpStepUpExecutionStatus::Succeeded);
+    }
+
+    fn test_group(realm: &Realm, name: &str) -> Group {
+        Group {
+            id: GroupId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            name: GroupName::new(name).unwrap(),
+            path: GroupPath::new(format!("/{name}")).unwrap(),
+            realm_id: realm.id.clone(),
+            parent_id: None,
+            sub_groups: Vec::new(),
+            attributes: HashMap::new(),
+            realm_roles: Vec::new(),
+            client_roles: HashMap::new(),
+        }
+    }
+
+    fn test_role(realm: &Realm, name: &str) -> Role {
+        Role {
+            id: RoleId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            name: RoleName::new(name).unwrap(),
+            description: None,
+            realm_id: realm.id.clone(),
+            client_role: false,
+            client_id: None,
+            composite: false,
+            composites: Vec::new(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn client(realm: &Realm, identifier: &str) -> Client {
+        Client {
+            id: ClientId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            realm_id: realm.id.clone(),
+            client_id: ClientIdentifier::new(identifier).unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: Some("must-survive".into()),
+            redirect_uris: Vec::new(),
+            web_origins: Vec::new(),
+            default_scopes: Scope::empty(),
+            optional_scopes: Scope::empty(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: Vec::new(),
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    async fn mutation_matrix(storage: &dyn Storage) {
+        let (realm, subject) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &subject).await.unwrap();
+        let subject = storage.get_user(&realm.id, &subject.id).await.unwrap().unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteUser {
+                expected: subject.clone(),
+            },
+        )
+        .await;
+        assert!(storage.get_user(&realm.id, &subject.id).await.unwrap().is_none());
+        storage.create_user(&realm.id, &subject).await.unwrap();
+
+        let group = test_group(&realm, "delete-group");
+        storage.create_group(&realm.id, &group).await.unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteGroup {
+                expected: group.clone(),
+            },
+        )
+        .await;
+        assert!(storage.get_group(&realm.id, &group.id).await.unwrap().is_none());
+
+        let role = test_role(&realm, "delete-role");
+        storage.create_role(&realm.id, &role).await.unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteRole {
+                expected: role.clone(),
+            },
+        )
+        .await;
+        assert!(storage.get_role(&realm.id, &role.id).await.unwrap().is_none());
+
+        let client = client(&realm, "security-client");
+        storage.create_client(&realm.id, &client).await.unwrap();
+        let mut updated = client.clone();
+        updated.redirect_uris = vec![RedirectUri::new("https://app.example/callback").unwrap()];
+        updated.web_origins = vec![WebOrigin::new("https://app.example").unwrap()];
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateClientSecurity {
+                expected: client.clone(),
+                updated: updated.clone(),
+            },
+        )
+        .await;
+        let secured = storage.get_client(&realm.id, &client.id).await.unwrap().unwrap();
+        assert_eq!(secured.secret.as_deref(), Some("must-survive"));
+        assert_eq!(secured.redirect_uris, updated.redirect_uris);
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteClient {
+                expected: secured.clone(),
+            },
+        )
+        .await;
+        assert!(storage.get_client(&realm.id, &client.id).await.unwrap().is_none());
+
+        let mut realm_settings = storage.get_realm(&realm.id).await.unwrap().unwrap();
+        let expected_realm = realm_settings.clone();
+        realm_settings.display_name = Some(DisplayName::new("After").unwrap());
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateRealmSettings {
+                expected: expected_realm,
+                updated: realm_settings,
+            },
+        )
+        .await;
+        assert_eq!(
+            storage
+                .get_realm(&realm.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name
+                .unwrap()
+                .as_str(),
+            "After"
+        );
+
+        let expected_realm = storage.get_realm(&realm.id).await.unwrap().unwrap();
+        let mut events = expected_realm.clone();
+        events.events_expiration_secs = 600;
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateEventsConfig {
+                expected: expected_realm,
+                updated: events,
+            },
+        )
+        .await;
+        assert_eq!(
+            storage.get_realm(&realm.id).await.unwrap().unwrap().events_expiration_secs,
+            600
+        );
+
+        let idp = IdentityProviderConfig {
+            id: IdentityProviderId::new(uuid::Uuid::new_v4()).unwrap(),
+            alias: Alias::new("strict-idp").unwrap(),
+            provider_id: ProviderId::new("oidc"),
+            enabled: false,
+            config: [("clientSecret".into(), "idp-secret".into())].into_iter().collect(),
+        };
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::CreateIdentityProvider {
+                realm_id: realm.id.clone(),
+                new: idp.clone(),
+            },
+        )
+        .await;
+        storage.update_identity_provider(&realm.id, &idp).await.unwrap();
+        let expected_idp =
+            storage.get_identity_provider(&realm.id, &idp.id).await.unwrap().unwrap();
+        let mut updated_idp = expected_idp.clone();
+        updated_idp.alias = Alias::new("strict-idp-renamed").unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateIdentityProvider {
+                realm_id: realm.id.clone(),
+                expected: expected_idp,
+                updated: updated_idp.clone(),
+            },
+        )
+        .await;
+        let renamed = storage.get_identity_provider(&realm.id, &idp.id).await.unwrap().unwrap();
+        assert_eq!(renamed.alias.as_str(), "strict-idp-renamed");
+        assert_eq!(renamed.config["clientSecret"], "idp-secret");
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteIdentityProvider {
+                realm_id: realm.id.clone(),
+                expected: renamed,
+            },
+        )
+        .await;
+
+        let stage_id = FlowStageId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let flow = FlowConfig {
+            alias: Alias::new("custom-flow").unwrap(),
+            realm_id: realm.id.clone(),
+            provider_id: "basic-flow".into(),
+            top_level: true,
+            built_in: false,
+            stages: vec![FlowStage {
+                id: stage_id,
+                requirement: Requirement::Required,
+                authenticator: Alias::new("auth-username-password").unwrap(),
+                priority: 1,
+                sub_flow_alias: None,
+                authenticator_config: Some(AuthenticatorConfig {
+                    alias: Alias::new("password-config").unwrap(),
+                    config: serde_json::Map::from_iter([
+                        ("secret".into(), Value::String("flow-secret".into())),
+                        ("mode".into(), Value::String("safe".into())),
+                    ]),
+                }),
+            }],
+        };
+        storage.create_flow_config(&realm.id, &flow).await.unwrap();
+        let mut updated_flow = flow.clone();
+        updated_flow.stages[0].requirement = Requirement::Alternative;
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateFlow {
+                expected: flow,
+                updated: updated_flow,
+            },
+        )
+        .await;
+        let flow = storage.get_flow_config(&realm.id, "custom-flow").await.unwrap().unwrap();
+        assert_eq!(flow.stages[0].requirement, Requirement::Alternative);
+        let config = flow.stages[0].authenticator_config.as_ref().unwrap();
+        assert_eq!(config.config["secret"], "flow-secret");
+        assert_eq!(config.config["mode"], "safe");
+
+        let expected_realm = storage.get_realm(&realm.id).await.unwrap().unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::PushNotBefore {
+                expected: expected_realm,
+                not_before: 123,
+            },
+        )
+        .await;
+        assert_eq!(storage.get_realm(&realm.id).await.unwrap().unwrap().not_before, 123);
+
+        let totp = Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type: CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"totp-secret".to_vec(),
+            credential_data: serde_json::json!({"temporary": false}),
+            priority: 0,
+        };
+        storage.create_credential(&realm.id, &subject.id, &totp).await.unwrap();
+        let expected = storage
+            .get_credentials(&realm.id, &subject.id, CredentialType::Totp)
+            .await
+            .unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteTotp {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected,
+            },
+        )
+        .await;
+        assert!(storage
+            .get_credentials(&realm.id, &subject.id, CredentialType::Totp)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let webauthn = Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type: CredentialType::WebAuthn,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"webauthn-secret".to_vec(),
+            credential_data: serde_json::json!({"temporary": false}),
+            priority: 0,
+        };
+        storage.create_credential(&realm.id, &subject.id, &webauthn).await.unwrap();
+        let expected = storage
+            .list_credentials(&realm.id, &subject.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == webauthn.id)
+            .unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteWebauthn {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected,
+            },
+        )
+        .await;
+
+        let mapped_role = test_role(&realm, "mapped-role");
+        storage.create_role(&realm.id, &mapped_role).await.unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UserRoleMapping {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected_role: mapped_role.clone(),
+                client_role: false,
+                assign: true,
+                expected_present: false,
+            },
+        )
+        .await;
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UserRoleMapping {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected_role: mapped_role.clone(),
+                client_role: false,
+                assign: false,
+                expected_present: true,
+            },
+        )
+        .await;
+
+        let mapped_group = test_group(&realm, "mapped-group");
+        storage.create_group(&realm.id, &mapped_group).await.unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::GroupRoleMapping {
+                expected: mapped_group.clone(),
+                expected_role: mapped_role.clone(),
+                client_id: None,
+                assign: true,
+            },
+        )
+        .await;
+        let mapped_group = storage.get_group(&realm.id, &mapped_group.id).await.unwrap().unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::GroupRoleMapping {
+                expected: mapped_group,
+                expected_role: mapped_role,
+                client_id: None,
+                assign: false,
+            },
+        )
+        .await;
+
+        let expected_realm = storage.get_realm(&realm.id).await.unwrap().unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteRealm {
+                expected: expected_realm,
+            },
+        )
+        .await;
+        assert!(storage.get_realm(&realm.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_supports_every_strict_mutation_variant() {
+        mutation_matrix(&InMemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_supports_every_strict_mutation_variant() {
+        if std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping PostgreSQL mutation matrix: Docker unavailable");
+            return;
+        }
+        let image = GenericImage::new("postgres", "15-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_DB", "test");
+        let container = image.start().await.unwrap();
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let storage =
+            PostgresStorage::connect(&format!("postgres://postgres:postgres@{host}:{port}/test"))
+                .await
+                .unwrap();
+        storage.run_migrations().await.unwrap();
+        mutation_matrix(&storage).await;
     }
 }

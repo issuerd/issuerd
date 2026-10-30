@@ -121,6 +121,13 @@ impl ServerHandler for IssuerdMcpServer {
                 Err(error) => return Ok(tool_error(error)),
             },
         };
+        if let Some(result) = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<crate::executor::McpStrictResult>())
+        {
+            return Ok(CallToolResult::structured(result.0.clone()).into());
+        }
         match self.executor.execute(&permit, request.arguments).await {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
             Err(error) if matches!(error, McpError::UnknownTool(_)) => Err(protocol_error(error)),

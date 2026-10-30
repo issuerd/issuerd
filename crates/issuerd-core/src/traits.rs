@@ -952,6 +952,16 @@ pub trait DistributedCache: Send + Sync {
         self.delete(key).await?;
         Ok(true)
     }
+    /// Atomically create a key with an optional TTL only when it is absent.
+    /// Security-critical pending state must not use a non-atomic existence check.
+    async fn create_if_absent(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<bool, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
     /// Atomically delete `claim_key` only when it equals `expected`, then
     /// create `create_key` with `create_value` and `create_ttl`. Used for
     /// pending-operation claims and TTL-preserving state transitions.

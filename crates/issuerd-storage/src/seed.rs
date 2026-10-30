@@ -22,7 +22,7 @@ const ALL: Pagination = Pagination {
     max: i32::MAX,
 };
 
-/// Seed the ten built-in client scopes into `realm_id` and wire the realm
+/// Seed the eleven built-in client scopes into `realm_id` and wire the realm
 /// default scope sets ([`DEFAULT_DEFAULT_SCOPES`] / [`DEFAULT_OPTIONAL_SCOPES`]).
 ///
 /// Scopes that already exist (matched by name) are left untouched; realm
@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_builtin_client_scopes_creates_all_ten_with_realm_defaults() {
+    async fn seed_builtin_client_scopes_creates_all_eleven_with_realm_defaults() {
         let storage = InMemoryStorage::new();
         let realm = realm_id();
         seed_builtin_client_scopes(&storage, &realm).await.unwrap();

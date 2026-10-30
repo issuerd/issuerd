@@ -1856,12 +1856,37 @@ impl InMemoryStorage {
                 self.delete_identity_provider(&realm_id, &expected.id).await
             }
             McpStepUpMutation::UpdateFlow { expected, updated } => {
-                let current =
-                    self.get_flow_config(&expected.realm_id, expected.alias.as_str()).await?;
-                if current.map(redacted_flow).as_ref() != Some(&expected) {
+                let current = self
+                    .get_flow_config(&expected.realm_id, expected.alias.as_str())
+                    .await?
+                    .ok_or(IssuerdError::Conflict)?;
+                if redacted_flow(current.clone()) != expected {
                     return Err(IssuerdError::Conflict);
                 }
-                self.update_flow_config(&expected.realm_id, &updated).await
+                let mut effective = updated;
+                for current_stage in current.stages {
+                    let Some(current_config) = current_stage.authenticator_config else {
+                        continue;
+                    };
+                    let Some(updated_stage) =
+                        effective.stages.iter_mut().find(|stage| stage.id == current_stage.id)
+                    else {
+                        continue;
+                    };
+                    let updated_config =
+                        updated_stage.authenticator_config.get_or_insert_with(|| {
+                            AuthenticatorConfig {
+                                alias: current_config.alias.clone(),
+                                config: serde_json::Map::new(),
+                            }
+                        });
+                    for (key, value) in current_config.config {
+                        if sensitive_key(&key) {
+                            updated_config.config.entry(key).or_insert(value);
+                        }
+                    }
+                }
+                self.update_flow_config(&expected.realm_id, &effective).await
             }
             McpStepUpMutation::PushNotBefore {
                 expected,
@@ -4176,14 +4201,14 @@ mod tests {
         let storage = InMemoryStorage::new();
         let realm = test_realm();
         storage.create_realm(&realm).await.unwrap();
-        // Realm creation seeded the 10 built-ins.
+        // Realm creation seeded the 11 built-ins.
         assert_eq!(
             storage
                 .list_client_scopes(&realm.id, &Pagination::default())
                 .await
                 .unwrap()
                 .len(),
-            10
+            11
         );
 
         let scope = test_client_scope("realm-1", "custom");
@@ -4273,6 +4298,7 @@ mod tests {
                 "address",
                 "email",
                 "mcp:read",
+                "mcp:step_up",
                 "mcp:write",
                 "offline_access",
                 "phone",
@@ -4660,7 +4686,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            10
+            11
         );
         assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);
         // email (optional) + roles (default) from the creation seeding.
@@ -4721,7 +4747,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            10
+            11
         );
         assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);
         assert_eq!(
@@ -4741,10 +4767,10 @@ mod tests {
         storage.create_realm(&realm).await.unwrap();
 
         // Simulate a snapshot written before the MCP scopes existed: every
-        // built-in except `mcp:read`/`mcp:write` is present.
+        // built-in except `mcp:read`/`mcp:step_up`/`mcp:write` is present.
         let scopes = storage.list_client_scopes(&realm.id, &Pagination::default()).await.unwrap();
-        assert_eq!(scopes.len(), 10);
-        for name in ["mcp:read", "mcp:write"] {
+        assert_eq!(scopes.len(), 11);
+        for name in ["mcp:read", "mcp:step_up", "mcp:write"] {
             let scope = scopes.iter().find(|s| s.name == name).unwrap();
             storage.delete_client_scope(&realm.id, &scope.id).await.unwrap();
         }
@@ -4761,12 +4787,12 @@ mod tests {
             8
         );
 
-        // The seeding backfill adds the two missing built-ins; the realm
+        // The seeding backfill adds the three missing built-ins; the realm
         // default sets are untouched (the MCP scopes never join them).
         crate::seed::seed_builtin_client_scopes(&storage2, &realm.id).await.unwrap();
         let scopes = storage2.list_client_scopes(&realm.id, &Pagination::default()).await.unwrap();
-        assert_eq!(scopes.len(), 10);
-        for name in ["mcp:read", "mcp:write"] {
+        assert_eq!(scopes.len(), 11);
+        for name in ["mcp:read", "mcp:step_up", "mcp:write"] {
             assert!(scopes.iter().any(|s| s.name == name));
         }
         assert_eq!(storage2.list_realm_default_client_scopes(&realm.id).await.unwrap().len(), 8);

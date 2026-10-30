@@ -183,6 +183,33 @@ impl DistributedCache for InMemoryCache {
         }
     }
 
+    async fn create_if_absent(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<bool, IssuerdError> {
+        self.maybe_sweep_expired();
+        match self.store.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                if Self::is_expired(occupied.get()) {
+                    occupied.remove();
+                } else {
+                    return Ok(false);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {}
+        }
+        let expiry = ttl.map(|duration| Instant::now() + duration);
+        match self.store.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert((value, expiry));
+                Ok(true)
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+        }
+    }
+
     async fn claim_and_create(
         &self,
         claim_key: &str,
@@ -227,7 +254,8 @@ impl DistributedCache for InMemoryCache {
                 let current = occupied.get().0.clone();
                 match expected {
                     Some(expected_value) if current == expected_value => {
-                        occupied.insert((new, None));
+                        let expiry = occupied.get().1;
+                        occupied.insert((new, expiry));
                         Ok(true)
                     }
                     _ => Ok(false),
@@ -372,6 +400,21 @@ mod tests {
             .unwrap();
         assert!(result2);
         assert_eq!(cache.get("key1").await.unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn cas_preserves_existing_ttl() {
+        let cache = InMemoryCache::new();
+        cache
+            .set("short-lived", b"old".to_vec(), Some(Duration::from_millis(80)))
+            .await
+            .unwrap();
+        assert!(cache
+            .compare_and_swap("short-lived", Some(b"old".to_vec()), b"new".to_vec())
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(cache.get("short-lived").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -864,6 +907,14 @@ mod tests {
             .unwrap());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(cache.get("request").await.unwrap(), None);
+        assert!(cache
+            .create_if_absent("created", b"first".to_vec(), Some(Duration::from_millis(25)))
+            .await
+            .unwrap());
+        assert!(!cache.create_if_absent("created", b"second".to_vec(), None).await.unwrap());
+        assert_eq!(cache.get("created").await.unwrap(), Some(b"first".to_vec()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.get("created").await.unwrap(), None);
     }
 
     #[test]

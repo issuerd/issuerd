@@ -97,4 +97,16 @@ impl McpApplicationService for ServerMcpApplicationService {
     ) -> Result<serde_json::Value, McpError> {
         crate::mcp_account::account(self.server_state.clone(), auth, operation).await
     }
+
+    async fn prepare_strict(
+        &self,
+        auth: &issuerd_mcp::McpAuthContext,
+        operation: issuerd_mcp::write_tools::McpOperation,
+    ) -> Result<Option<issuerd_core::McpStepUpMutation>, McpError> {
+        crate::mcp_strict::prepare(&self.admin_state, auth, operation).await
+    }
+
+    async fn strict_committed(&self, grant: &issuerd_core::McpStepUpGrant) {
+        crate::mcp_strict::committed(&self.admin_state, grant).await;
+    }
 }

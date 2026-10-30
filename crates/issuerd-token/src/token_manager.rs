@@ -224,6 +224,37 @@ impl<C: CryptoProvider> TokenManager<C> {
         .await
     }
 
+    /// Issue an access token with an externally supplied identifier. This is
+    /// reserved for idempotent backchannel flows that must reconcile a retry
+    /// without persisting the token itself.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue_access_token_with_roles_and_jti(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        realm_access: Option<issuerd_core::RealmAccess>,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        token_jti: &issuerd_core::JwtId,
+    ) -> Result<AccessToken, IssuerdError> {
+        self.issue_access_shaped_token_with_jti(
+            JwtType::Bearer,
+            user,
+            client,
+            realm,
+            scope,
+            session_id,
+            realm_access,
+            claims,
+            claims_overlay,
+            Some(token_jti),
+        )
+        .await
+    }
+
     /// Issue the browser SSO session cookie token (`typ: Serialized-ID`).
     ///
     /// Same claim shape and lifetime as an access token, but a distinct
@@ -268,9 +299,40 @@ impl<C: CryptoProvider> TokenManager<C> {
         claims: Option<serde_json::Value>,
         claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<AccessToken, IssuerdError> {
+        self.issue_access_shaped_token_with_jti(
+            typ,
+            user,
+            client,
+            realm,
+            scope,
+            session_id,
+            realm_access,
+            claims,
+            claims_overlay,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_access_shaped_token_with_jti(
+        &self,
+        typ: JwtType,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        realm_access: Option<issuerd_core::RealmAccess>,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        token_jti: Option<&issuerd_core::JwtId>,
+    ) -> Result<AccessToken, IssuerdError> {
         let now = Utc::now().timestamp();
         let claims = AccessTokenClaims {
-            jti: issuerd_core::JwtId::new(issuerd_core::utils::generate_id()).unwrap(),
+            jti: token_jti.cloned().unwrap_or_else(|| {
+                issuerd_core::JwtId::new(issuerd_core::utils::generate_id()).unwrap()
+            }),
             iss: self.issuer_for_realm(realm),
             // Pairwise clients get a sector-scoped subject.
             sub: crate::pairwise::effective_subject(user, client, realm)?,
@@ -1090,6 +1152,24 @@ pub trait TokenIssuer: Send + Sync {
         claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<AccessToken, IssuerdError>;
 
+    /// Optional deterministic-JTI variant used by idempotent backchannel
+    /// profiles. Unsupported issuers fail closed.
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_access_token_with_roles_and_jti(
+        &self,
+        _user: &User,
+        _client: &Client,
+        _realm: &Realm,
+        _scope: &[String],
+        _session_id: &SessionId,
+        _realm_access: Option<RealmAccess>,
+        _claims: Option<serde_json::Value>,
+        _claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        _token_jti: &issuerd_core::JwtId,
+    ) -> Result<AccessToken, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+
     /// Issue the browser SSO session cookie token (`typ: Serialized-ID`).
     /// The default fails closed for issuers that do not mint session cookies.
     async fn issue_sso_session_token(
@@ -1232,6 +1312,32 @@ impl<C: CryptoProvider + 'static> TokenIssuer for TokenManager<C> {
             realm_access,
             claims,
             claims_overlay,
+        )
+        .await
+    }
+
+    async fn issue_access_token_with_roles_and_jti(
+        &self,
+        user: &User,
+        client: &Client,
+        realm: &Realm,
+        scope: &[String],
+        session_id: &SessionId,
+        realm_access: Option<RealmAccess>,
+        claims: Option<serde_json::Value>,
+        claims_overlay: Option<serde_json::Map<String, serde_json::Value>>,
+        token_jti: &issuerd_core::JwtId,
+    ) -> Result<AccessToken, IssuerdError> {
+        self.issue_access_token_with_roles_and_jti(
+            user,
+            client,
+            realm,
+            scope,
+            session_id,
+            realm_access,
+            claims,
+            claims_overlay,
+            token_jti,
         )
         .await
     }
