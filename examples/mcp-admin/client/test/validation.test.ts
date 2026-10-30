@@ -7,11 +7,17 @@ import {
 } from "../src/validation.js";
 import { parseRealmIssuer, TOOL_NAMES } from "../src/config.js";
 
-test("acceptance inventory is ten unique tools in deterministic order", () => {
-  assert.equal(TOOL_NAMES.length, 10);
+test("acceptance inventory is fifteen unique tools in deterministic order", () => {
+  assert.equal(TOOL_NAMES.length, 15);
   assert.equal(new Set(TOOL_NAMES).size, TOOL_NAMES.length);
   assert.deepEqual([...TOOL_NAMES], [...TOOL_NAMES].sort());
-  for (const name of ["groups_get", "groups_list", "groups_members", "roles_get", "roles_list"]) {
+  for (const name of [
+    "attack_detection_status",
+    "users_get_credentials",
+    "users_get_groups",
+    "users_get_role_mappings",
+    "users_get_sessions",
+  ]) {
     assert.ok(TOOL_NAMES.includes(name as (typeof TOOL_NAMES)[number]));
   }
 });

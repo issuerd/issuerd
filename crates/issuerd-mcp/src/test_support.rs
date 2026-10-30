@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use issuerd_core::{
-    AccessTokenClaims, Audience, Client, ClientAuthenticatorType, ClientId, ClientIdentifier,
-    ClientProtocol, Email, Group, GroupId, GroupName, GroupPath, Issuer, JwtId, JwtType, Realm,
-    RealmAccess, RealmId, RealmName, RedirectUri, Role, RoleId, RoleName, Scope, SslRequired,
-    Storage, User, UserId, Username, WebOrigin,
+    AccessTokenClaims, Audience, AuthMethod, Client, ClientAuthenticatorType, ClientId,
+    ClientIdentifier, ClientProtocol, ClientSession, ClientSessionId, Credential, CredentialId,
+    CredentialType, Email, Group, GroupId, GroupName, GroupPath, Issuer, JwtId, JwtType, Realm,
+    RealmAccess, RealmId, RealmName, RedirectUri, Role, RoleId, RoleName, Scope, SessionId,
+    SslRequired, Storage, User, UserId, UserSession, Username, WebOrigin,
 };
 use issuerd_storage::InMemoryStorage;
 
@@ -34,6 +35,7 @@ pub const CLIENT_SECRET: &str = "CLIENT-CANARY-SECRET";
 pub const CLIENT_ATTRIBUTE_SECRET: &str = "CLIENT-ATTRIBUTE-CANARY-SECRET";
 pub const GROUP_SECRET: &str = "GROUP-ATTRIBUTE-CANARY-SECRET";
 pub const ROLE_SECRET: &str = "ROLE-ATTRIBUTE-CANARY-SECRET";
+pub const CREDENTIAL_SECRET: &str = "CREDENTIAL-CANARY-SECRET";
 
 pub fn auth(scope: &str, roles: &[&str]) -> McpAuthContext {
     auth_with("agent", "internal-user", scope, roles)
@@ -179,6 +181,54 @@ pub fn group(id: &str, name: &str, parent_id: Option<GroupId>) -> Group {
         attributes: HashMap::from([("password".into(), vec![GROUP_SECRET.into()])]),
         realm_roles: Vec::new(),
         client_roles: HashMap::new(),
+    }
+}
+
+pub fn credential(
+    id: &str,
+    credential_type: CredentialType,
+    priority: i32,
+    created_at: i64,
+) -> Credential {
+    Credential {
+        id: CredentialId::new(id).unwrap(),
+        credential_type,
+        user_label: Some("fixture credential".into()),
+        created_date: Utc.timestamp_opt(created_at, 0).unwrap(),
+        secret_data: CREDENTIAL_SECRET.as_bytes().to_vec(),
+        credential_data: serde_json::json!({
+            "temporary": true,
+            "secret": CREDENTIAL_SECRET,
+        }),
+        priority,
+    }
+}
+
+pub fn session(id: &str, user_id: &str, last_refresh: i64) -> UserSession {
+    let timestamp = Utc.timestamp_opt(last_refresh, 0).unwrap();
+    let id = SessionId::new(id).unwrap();
+    UserSession {
+        id: id.clone(),
+        realm_id: RealmId::new(REALM_ID).unwrap(),
+        user_id: UserId::new(user_id).unwrap(),
+        login_username: Username::new("alice").unwrap(),
+        ip_address: "127.0.0.1".parse().unwrap(),
+        auth_method: AuthMethod::Password,
+        remember_me: true,
+        offline: false,
+        started: timestamp,
+        last_session_refresh: timestamp,
+        auth_time: timestamp,
+        impersonator: Some(UserId::new(BOB_ID).unwrap()),
+        clients: vec![ClientSession {
+            id: ClientSessionId::new("client-session-fixture").unwrap(),
+            client_id: ClientId::new(ALPHA_CLIENT_ID).unwrap(),
+            session_id: id,
+            redirect_uri: Some(RedirectUri::new("https://secret.example/callback").unwrap()),
+            state: Some(CREDENTIAL_SECRET.into()),
+            auth_method: AuthMethod::Password,
+            timestamp,
+        }],
     }
 }
 
