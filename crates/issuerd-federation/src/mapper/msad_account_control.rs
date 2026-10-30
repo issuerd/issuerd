@@ -46,3 +46,62 @@ impl LdapMapper for MsadAccountControlMapper {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attrs(name: &str, values: &[&str]) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            name.to_string(),
+            values.iter().map(|value| (*value).to_string()).collect(),
+        )])
+    }
+
+    #[test]
+    fn pwd_last_set_zero_requires_password_update() {
+        let mapper = MsadAccountControlMapper;
+        let mut user = FederatedUser::default();
+        let mut ldap_attrs = attrs("pwdLastSet", &["0"]);
+        ldap_attrs.extend(attrs("userAccountControl", &["514"]));
+
+        mapper.map_user(&ldap_attrs, &mut user).unwrap();
+
+        assert!(!user.enabled);
+        assert_eq!(user.attributes.get("UPDATE_PASSWORD"), Some(&vec!["true".to_string()]));
+    }
+
+    #[test]
+    fn malformed_account_control_values_return_none() {
+        let mapper = MsadAccountControlMapper;
+        for value in ["", "not-a-number", "-1", "512.0", " 512", "4294967296"] {
+            assert_eq!(mapper.map_enabled(&attrs("userAccountControl", &[value])), None, "{value}");
+        }
+        assert_eq!(mapper.map_enabled(&attrs("userAccountControl", &[])), None);
+        assert_eq!(mapper.map_enabled(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn account_control_uses_the_first_value() {
+        let mapper = MsadAccountControlMapper;
+        assert_eq!(mapper.map_enabled(&attrs("userAccountControl", &["514", "512"])), Some(false));
+        assert_eq!(mapper.map_enabled(&attrs("userAccountControl", &["512", "514"])), Some(true));
+    }
+
+    #[test]
+    fn known_account_control_flags_keep_their_enabled_state() {
+        let mapper = MsadAccountControlMapper;
+        for (value, expected) in [
+            ("512", true),
+            ("514", false),
+            ("544", true),
+            ("66048", true),
+        ] {
+            assert_eq!(
+                mapper.map_enabled(&attrs("userAccountControl", &[value])),
+                Some(expected),
+                "{value}"
+            );
+        }
+    }
+}
