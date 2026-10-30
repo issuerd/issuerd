@@ -76,7 +76,7 @@ impl PostgresStorage {
         Ok(())
     }
 
-    fn pool(&self) -> &PgPool {
+    pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -2766,6 +2766,27 @@ impl Storage for PostgresStorage {
             return Err(IssuerdError::NotFound);
         }
         Ok(())
+    }
+
+    async fn get_mcp_step_up_grant(
+        &self,
+        token_jti: &JwtId,
+    ) -> Result<Option<McpStepUpGrant>, IssuerdError> {
+        crate::step_up::get_grant(self, token_jti).await
+    }
+
+    async fn create_mcp_step_up_grant(&self, grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
+        crate::step_up::create_grant(self, grant).await
+    }
+
+    async fn execute_mcp_step_up(
+        &self,
+        token_jti: &JwtId,
+        operation_hash: &str,
+        mutation: &McpStepUpMutation,
+        result_json: serde_json::Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
+        crate::step_up::execute_grant(self, token_jti, operation_hash, mutation, result_json).await
     }
 }
 

@@ -195,6 +195,57 @@ impl DistributedCache for RedisCache {
         Ok(result == 1)
     }
 
+    async fn claim_and_create(
+        &self,
+        claim_key: &str,
+        expected: Vec<u8>,
+        create_key: &str,
+        create_value: Vec<u8>,
+        create_ttl: Option<std::time::Duration>,
+    ) -> Result<bool, IssuerdError> {
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+                return 0
+            end
+            redis.call('DEL', KEYS[1])
+            if ARGV[3] ~= '' then
+                redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+            else
+                redis.call('SET', KEYS[2], ARGV[2])
+            end
+            return 1
+            "#,
+        );
+        let ttl = create_ttl.map(|duration| duration.as_millis().to_string()).unwrap_or_default();
+        let mut guard = self.conn.lock().await;
+        let result: i64 = match &mut *guard {
+            RedisConn::Single(conn) => script
+                .key(claim_key)
+                .key(create_key)
+                .arg(&expected)
+                .arg(&create_value)
+                .arg(ttl)
+                .invoke_async(conn)
+                .await
+                .map_err(|e| {
+                    IssuerdError::ServerError(format!("redis claim-create failed: {e}"))
+                })?,
+            RedisConn::Cluster(conn) => script
+                .key(claim_key)
+                .key(create_key)
+                .arg(&expected)
+                .arg(&create_value)
+                .arg(ttl)
+                .invoke_async(conn)
+                .await
+                .map_err(|e| {
+                    IssuerdError::ServerError(format!("redis cluster claim-create failed: {e}"))
+                })?,
+        };
+        Ok(result == 1)
+    }
+
     async fn compare_and_swap(
         &self,
         key: &str,
@@ -629,6 +680,36 @@ mod tests {
         assert!(cache.compare_and_delete("cd", b"old".to_vec()).await.unwrap());
         assert_eq!(cache.get("cd").await.unwrap(), None);
         assert!(!cache.compare_and_delete("cd", b"old".to_vec()).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn redis_claim_and_create_is_exact_single_use_and_applies_expiry() {
+        let (cache, _container) = setup_redis().await;
+        cache
+            .set("operation", b"pending".to_vec(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert!(!cache
+            .claim_and_create("operation", b"wrong".to_vec(), "request", b"value".to_vec(), None,)
+            .await
+            .unwrap());
+        assert_eq!(cache.get("operation").await.unwrap(), Some(b"pending".to_vec()));
+        assert_eq!(cache.get("request").await.unwrap(), None);
+        assert!(cache
+            .claim_and_create(
+                "operation",
+                b"pending".to_vec(),
+                "request",
+                b"value".to_vec(),
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .unwrap());
+        assert_eq!(cache.get("operation").await.unwrap(), None);
+        assert_eq!(cache.get("request").await.unwrap(), Some(b"value".to_vec()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.get("request").await.unwrap(), None);
     }
 
     #[tokio::test]

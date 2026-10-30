@@ -15,10 +15,12 @@ use crate::client_scope::ClientScope;
 use crate::error::IssuerdError;
 use crate::events::{AdminEvent, Event, EventType, OperationType, ResourceType};
 use crate::ids::{
-    ClientId, ClientScopeId, CredentialId, GroupId, IdentityProviderId, KeyId, RealmId, RoleId,
-    SessionId, UserId,
+    ClientId, ClientScopeId, CredentialId, GroupId, IdentityProviderId, JwtId, KeyId, RealmId,
+    RoleId, SessionId, UserId,
 };
+use crate::mcp_step_up::{McpStepUpExecution, McpStepUpGrant, McpStepUpMutation};
 use crate::models::*;
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Pagination & Queries
@@ -689,6 +691,33 @@ pub trait Storage: Send + Sync {
     /// (key rotation/disable). Returns [`IssuerdError::NotFound`] when no
     /// key with that `kid` exists.
     async fn update_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError>;
+
+    // Operation-bound MCP step-up grants
+    /// Load a durable grant by the CIBA-issued access-token `jti`.
+    /// Unsupported backends fail closed rather than treating the grant as absent.
+    async fn get_mcp_step_up_grant(
+        &self,
+        _token_jti: &JwtId,
+    ) -> Result<Option<McpStepUpGrant>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    /// Create a durable grant only when both its token `jti` and operation id
+    /// are absent. Duplicate attempts return `Conflict` without replacing state.
+    async fn create_mcp_step_up_grant(&self, _grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    /// Atomically consume a grant, apply its exact conditional mutation, and
+    /// commit the execution outcome. Retried succeeded calls reconcile the
+    /// recorded result without re-executing the mutation.
+    async fn execute_mcp_step_up(
+        &self,
+        _token_jti: &JwtId,
+        _operation_hash: &str,
+        _mutation: &McpStepUpMutation,
+        _result_json: Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +951,20 @@ pub trait DistributedCache: Send + Sync {
         }
         self.delete(key).await?;
         Ok(true)
+    }
+    /// Atomically delete `claim_key` only when it equals `expected`, then
+    /// create `create_key` with `create_value` and `create_ttl`. Used for
+    /// pending-operation claims and TTL-preserving state transitions.
+    /// Backends without a multi-key atomic primitive fail closed.
+    async fn claim_and_create(
+        &self,
+        _claim_key: &str,
+        _expected: Vec<u8>,
+        _create_key: &str,
+        _create_value: Vec<u8>,
+        _create_ttl: Option<Duration>,
+    ) -> Result<bool, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
     }
     /// Atomically increment the integer counter stored at `key` and return the
     /// new value. A missing key is created with value `1`; when `ttl` is

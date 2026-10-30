@@ -25,6 +25,7 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 ring = { workspace = true }
 zeroize = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

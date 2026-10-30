@@ -1039,6 +1039,33 @@ impl Storage for JsonFileStorage {
         self.inner.update_signing_key(key).await?;
         self.persist()
     }
+
+    async fn get_mcp_step_up_grant(
+        &self,
+        token_jti: &JwtId,
+    ) -> Result<Option<McpStepUpGrant>, IssuerdError> {
+        self.inner.get_mcp_step_up_grant(token_jti).await
+    }
+
+    async fn create_mcp_step_up_grant(&self, grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
+        self.inner.create_mcp_step_up_grant(grant).await?;
+        self.persist()
+    }
+
+    async fn execute_mcp_step_up(
+        &self,
+        token_jti: &JwtId,
+        operation_hash: &str,
+        mutation: &McpStepUpMutation,
+        result_json: serde_json::Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
+        let execution = self
+            .inner
+            .execute_mcp_step_up(token_jti, operation_hash, mutation, result_json)
+            .await;
+        self.persist()?;
+        execution
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ pub mod memory;
 pub mod migration;
 pub mod postgres;
 pub mod seed;
+pub mod step_up;
 
 pub use json::JsonFileStorage;
 pub use key_encryption::Aes256GcmKekProvider;

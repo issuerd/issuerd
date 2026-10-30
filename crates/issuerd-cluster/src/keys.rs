@@ -122,6 +122,22 @@ pub mod cache_keys {
         format!("ciba:{auth_req_id}")
     }
 
+    /// `mcp:op:{realm}:{operation_id}` — pending exact operation. The realm
+    /// hash tag keeps multi-key claim/approval/issuance transitions in one slot.
+    pub fn mcp_operation(realm: &str, operation_id: &str) -> String {
+        format!("mcp:op:{{{realm}}}:{operation_id}")
+    }
+
+    /// `mcp:approval:{realm}:{approval_id}` — browser approval state.
+    pub fn mcp_approval(realm: &str, approval_id: &str) -> String {
+        format!("mcp:approval:{{{realm}}}:{approval_id}")
+    }
+
+    /// `mcp:ciba:{realm}:{auth_req_id}` — operation-bound CIBA request.
+    pub fn mcp_ciba_auth_req(realm: &str, auth_req_id: &str) -> String {
+        format!("mcp:ciba:{{{realm}}}:{auth_req_id}")
+    }
+
     /// `device:{device_code}`
     pub fn device_code(device_code: &str) -> String {
         format!("device:{device_code}")

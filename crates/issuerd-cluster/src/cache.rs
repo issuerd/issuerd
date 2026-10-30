@@ -29,6 +29,7 @@ pub struct InMemoryCache {
     /// Milliseconds after `created` at which the last sweep started.
     last_sweep_ms: AtomicU64,
     sweep_interval: Duration,
+    multi_key_lock: tokio::sync::Mutex<()>,
 }
 
 impl InMemoryCache {
@@ -43,6 +44,7 @@ impl InMemoryCache {
             created: Instant::now(),
             last_sweep_ms: AtomicU64::new(0),
             sweep_interval,
+            multi_key_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -179,6 +181,29 @@ impl DistributedCache for InMemoryCache {
             }
             dashmap::mapref::entry::Entry::Vacant(_) => Ok(false),
         }
+    }
+
+    async fn claim_and_create(
+        &self,
+        claim_key: &str,
+        expected: Vec<u8>,
+        create_key: &str,
+        create_value: Vec<u8>,
+        create_ttl: Option<std::time::Duration>,
+    ) -> Result<bool, IssuerdError> {
+        let _guard = self.multi_key_lock.lock().await;
+        self.maybe_sweep_expired();
+        let matches = self
+            .store
+            .get(claim_key)
+            .is_some_and(|entry| !Self::is_expired(&entry) && entry.0.as_slice() == expected);
+        if !matches {
+            return Ok(false);
+        }
+        self.store.remove(claim_key);
+        let expiry = create_ttl.map(|duration| Instant::now() + duration);
+        self.store.insert(create_key.to_string(), (create_value, expiry));
+        Ok(true)
     }
 
     async fn compare_and_swap(
@@ -805,6 +830,40 @@ mod tests {
         cache.sweep_interval = Duration::ZERO;
         cache.set("b", b"v".to_vec(), None).await.unwrap();
         assert_eq!(sorted(cache.store.iter().map(|e| e.key().clone()).collect()), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn claim_and_create_is_exact_single_use_and_applies_expiry() {
+        let cache = InMemoryCache::new();
+        cache
+            .set("operation", b"pending".to_vec(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert!(!cache
+            .claim_and_create("operation", b"wrong".to_vec(), "request", b"value".to_vec(), None,)
+            .await
+            .unwrap());
+        assert_eq!(cache.get("operation").await.unwrap(), Some(b"pending".to_vec()));
+        assert_eq!(cache.get("request").await.unwrap(), None);
+
+        assert!(cache
+            .claim_and_create(
+                "operation",
+                b"pending".to_vec(),
+                "request",
+                b"value".to_vec(),
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .unwrap());
+        assert_eq!(cache.get("operation").await.unwrap(), None);
+        assert_eq!(cache.get("request").await.unwrap(), Some(b"value".to_vec()));
+        assert!(!cache
+            .claim_and_create("operation", b"pending".to_vec(), "other", b"value".to_vec(), None,)
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.get("request").await.unwrap(), None);
     }
 
     #[test]

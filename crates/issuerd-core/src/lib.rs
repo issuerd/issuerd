@@ -13,6 +13,7 @@ pub mod federation;
 pub mod flows;
 pub mod i18n;
 pub mod ids;
+pub mod mcp_step_up;
 pub mod models;
 pub mod pairwise;
 pub mod password;
@@ -48,6 +49,9 @@ pub use federation::{
 pub use ids::{
     ClientId, ClientScopeId, ClientSessionId, CredentialId, EventId, FlowStageId, GroupId,
     IdentityProviderId, JwtId, KeyId, MapperId, RealmId, RoleId, SessionId, UserId,
+};
+pub use mcp_step_up::{
+    McpStepUpExecution, McpStepUpExecutionStatus, McpStepUpGrant, McpStepUpMutation,
 };
 pub use models::{
     Alias, ClaimName, ClientIdentifier, DisplayName, LogoutToken, LogoutTokenClaims, ProviderId,

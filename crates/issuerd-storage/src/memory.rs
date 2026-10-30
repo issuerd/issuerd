@@ -35,6 +35,8 @@ pub struct InMemoryStorage {
     realm_default_client_scopes: DashMap<RealmId, Vec<(ClientScopeId, bool)>>,
     provision_markers: DashMap<String, String>,
     signing_keys: DashMap<String, StoredSigningKey>,
+    mcp_step_up_grants: DashMap<String, McpStepUpGrant>,
+    step_up_lock: tokio::sync::Mutex<()>,
 }
 
 impl InMemoryStorage {
@@ -61,6 +63,8 @@ impl InMemoryStorage {
             realm_default_client_scopes: DashMap::new(),
             provision_markers: DashMap::new(),
             signing_keys: DashMap::new(),
+            mcp_step_up_grants: DashMap::new(),
+            step_up_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -110,6 +114,8 @@ pub(crate) struct StorageSnapshot {
     pub user_client_roles: Vec<((RealmId, UserId), Vec<RoleId>)>,
     pub provision_markers: Vec<(String, String)>,
     pub signing_keys: Vec<StoredSigningKey>,
+    #[serde(default)]
+    pub mcp_step_up_grants: Vec<McpStepUpGrant>,
 }
 
 impl InMemoryStorage {
@@ -172,6 +178,7 @@ impl InMemoryStorage {
                 .map(|e| (e.key().clone(), e.value().clone()))
                 .collect(),
             signing_keys: self.signing_keys.iter().map(|k| k.clone()).collect(),
+            mcp_step_up_grants: self.mcp_step_up_grants.iter().map(|grant| grant.clone()).collect(),
         }
     }
 
@@ -272,6 +279,11 @@ impl InMemoryStorage {
         self.signing_keys.clear();
         for k in snapshot.signing_keys {
             self.signing_keys.insert(k.kid.to_string(), k);
+        }
+
+        self.mcp_step_up_grants.clear();
+        for grant in snapshot.mcp_step_up_grants {
+            self.mcp_step_up_grants.insert(grant.token_jti.to_string(), grant);
         }
     }
 }
@@ -1655,6 +1667,393 @@ impl Storage for InMemoryStorage {
             None => Err(IssuerdError::NotFound),
         }
     }
+
+    async fn get_mcp_step_up_grant(
+        &self,
+        token_jti: &JwtId,
+    ) -> Result<Option<McpStepUpGrant>, IssuerdError> {
+        Ok(self.mcp_step_up_grants.get(token_jti.as_ref()).map(|grant| grant.clone()))
+    }
+
+    async fn create_mcp_step_up_grant(&self, grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
+        let _guard = self.step_up_lock.lock().await;
+        if self.mcp_step_up_grants.contains_key(grant.token_jti.as_ref())
+            || self
+                .mcp_step_up_grants
+                .iter()
+                .any(|entry| entry.operation_id == grant.operation_id)
+        {
+            return Err(IssuerdError::Conflict);
+        }
+        let mut grant = grant.clone();
+        grant.mutation = grant.mutation.redacted();
+        self.mcp_step_up_grants.insert(grant.token_jti.to_string(), grant);
+        Ok(())
+    }
+
+    async fn execute_mcp_step_up(
+        &self,
+        token_jti: &JwtId,
+        operation_hash: &str,
+        mutation: &McpStepUpMutation,
+        result_json: serde_json::Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
+        let _guard = self.step_up_lock.lock().await;
+        let mut grant = self
+            .mcp_step_up_grants
+            .get(token_jti.as_ref())
+            .ok_or(IssuerdError::InvalidGrant)?
+            .clone();
+        if grant.operation_hash != operation_hash || grant.mutation != mutation.redacted() {
+            return Err(IssuerdError::AccessDenied);
+        }
+        match grant.status {
+            McpStepUpExecutionStatus::Succeeded => {
+                return Ok(McpStepUpExecution {
+                    status: grant.status,
+                    result_json: grant.result_json,
+                })
+            }
+            McpStepUpExecutionStatus::FailedDefinite => return Err(IssuerdError::Conflict),
+            McpStepUpExecutionStatus::Executing | McpStepUpExecutionStatus::OutcomeUnknown => {
+                return Err(IssuerdError::TemporarilyUnavailable)
+            }
+            McpStepUpExecutionStatus::Active => {}
+        }
+        if grant.expires_at <= chrono::Utc::now().timestamp() {
+            return Err(IssuerdError::InvalidGrant);
+        }
+        grant.status = McpStepUpExecutionStatus::Executing;
+        grant.updated_at = chrono::Utc::now().timestamp();
+        self.mcp_step_up_grants.insert(token_jti.to_string(), grant.clone());
+
+        if let Err(error) = self.apply_mcp_step_up_mutation(mutation).await {
+            if error == IssuerdError::Conflict {
+                grant.status = McpStepUpExecutionStatus::FailedDefinite;
+            } else {
+                grant.status = McpStepUpExecutionStatus::Active;
+            }
+            grant.updated_at = chrono::Utc::now().timestamp();
+            self.mcp_step_up_grants.insert(token_jti.to_string(), grant);
+            return Err(error);
+        }
+
+        grant.status = McpStepUpExecutionStatus::Succeeded;
+        grant.result_json = Some(result_json);
+        grant.updated_at = chrono::Utc::now().timestamp();
+        self.mcp_step_up_grants.insert(token_jti.to_string(), grant.clone());
+        Ok(McpStepUpExecution {
+            status: grant.status,
+            result_json: grant.result_json,
+        })
+    }
+}
+
+impl InMemoryStorage {
+    async fn apply_mcp_step_up_mutation(
+        &self,
+        mutation: &McpStepUpMutation,
+    ) -> Result<(), IssuerdError> {
+        let mutation = mutation.redacted();
+        match mutation {
+            McpStepUpMutation::DeleteUser { expected } => {
+                let current = self.get_user(&expected.realm_id, &expected.id).await?;
+                if current.map(redacted_user).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_user(&expected.realm_id, &expected.id).await
+            }
+            McpStepUpMutation::DeleteGroup { expected } => {
+                let current = self.get_group(&expected.realm_id, &expected.id).await?;
+                if current.map(redacted_group).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_group(&expected.realm_id, &expected.id).await
+            }
+            McpStepUpMutation::DeleteRole { expected } => {
+                let current = self.get_role(&expected.realm_id, &expected.id).await?;
+                if current.map(redacted_role).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_role(&expected.realm_id, &expected.id).await
+            }
+            McpStepUpMutation::DeleteClient { expected } => {
+                let current = self.get_client(&expected.realm_id, &expected.id).await?;
+                if current.map(redacted_client).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_client(&expected.realm_id, &expected.id).await
+            }
+            McpStepUpMutation::UpdateClientSecurity { expected, updated } => {
+                let current = self.get_client(&expected.realm_id, &expected.id).await?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_client(current.clone()) != expected {
+                    return Err(IssuerdError::Conflict);
+                }
+                let mut effective = updated;
+                effective.secret = current.secret;
+                for (key, value) in current.attributes {
+                    if sensitive_key(&key) {
+                        effective.attributes.entry(key).or_insert(value);
+                    }
+                }
+                self.update_client(&expected.realm_id, &effective).await
+            }
+            McpStepUpMutation::UpdateRealmSettings { expected, updated }
+            | McpStepUpMutation::UpdateEventsConfig { expected, updated } => {
+                let current = self.get_realm(&expected.id).await?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_realm(current.clone()) != expected {
+                    return Err(IssuerdError::Conflict);
+                }
+                let mut effective = updated;
+                for (key, value) in current.attributes {
+                    if sensitive_key(&key) {
+                        effective.attributes.entry(key).or_insert(value);
+                    }
+                }
+                self.update_realm(&effective).await
+            }
+            McpStepUpMutation::CreateIdentityProvider { realm_id, new } => {
+                if self
+                    .get_identity_provider_by_alias(&realm_id, new.alias.as_str())
+                    .await?
+                    .is_some()
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.create_identity_provider(&realm_id, &new).await
+            }
+            McpStepUpMutation::UpdateIdentityProvider {
+                realm_id,
+                expected,
+                updated,
+            } => {
+                let current = self.get_identity_provider(&realm_id, &expected.id).await?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_idp(current.clone()) != expected {
+                    return Err(IssuerdError::Conflict);
+                }
+                let mut effective = updated;
+                for (key, value) in current.config {
+                    if sensitive_key(&key) {
+                        effective.config.entry(key).or_insert(value);
+                    }
+                }
+                self.update_identity_provider(&realm_id, &effective).await
+            }
+            McpStepUpMutation::DeleteIdentityProvider { realm_id, expected } => {
+                let current = self.get_identity_provider(&realm_id, &expected.id).await?;
+                if current.map(redacted_idp).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_identity_provider(&realm_id, &expected.id).await
+            }
+            McpStepUpMutation::UpdateFlow { expected, updated } => {
+                let current =
+                    self.get_flow_config(&expected.realm_id, expected.alias.as_str()).await?;
+                if current.map(redacted_flow).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.update_flow_config(&expected.realm_id, &updated).await
+            }
+            McpStepUpMutation::PushNotBefore {
+                expected,
+                not_before,
+            } => {
+                let current = self.get_realm(&expected.id).await?;
+                if current.map(redacted_realm).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                let mut updated = expected;
+                updated.not_before = not_before;
+                self.update_realm(&updated).await
+            }
+            McpStepUpMutation::DeleteRealm { expected } => {
+                let current = self.get_realm(&expected.id).await?;
+                if current.map(redacted_realm).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_realm(&expected.id).await
+            }
+            McpStepUpMutation::DeleteTotp {
+                realm_id,
+                user_id,
+                expected,
+            } => {
+                let current =
+                    self.get_credentials(&realm_id, &user_id, CredentialType::Totp).await?;
+                if !same_credentials(current, expected.clone()) {
+                    return Err(IssuerdError::Conflict);
+                }
+                for credential in expected {
+                    self.delete_credential(&realm_id, &user_id, &credential.id).await?;
+                }
+                Ok(())
+            }
+            McpStepUpMutation::DeleteWebauthn {
+                realm_id,
+                user_id,
+                expected,
+            } => {
+                let current = self
+                    .get_credentials(&realm_id, &user_id, expected.credential_type.clone())
+                    .await?
+                    .into_iter()
+                    .find(|credential| credential.id == expected.id);
+                if current.map(redacted_credential).as_ref() != Some(&expected) {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_credential(&realm_id, &user_id, &expected.id).await
+            }
+            McpStepUpMutation::UserRoleMapping {
+                realm_id,
+                user_id,
+                expected_role,
+                client_role,
+                assign,
+                expected_present,
+            } => {
+                let current_role = self.get_role(&realm_id, &expected_role.id).await?;
+                if current_role.map(redacted_role).as_ref() != Some(&expected_role)
+                    || self.get_user(&realm_id, &user_id).await?.is_none()
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                let role_id = expected_role.id.clone();
+                let present = if client_role {
+                    self.list_user_client_roles(&realm_id, &user_id).await?.contains(&role_id)
+                } else {
+                    self.list_user_realm_roles(&realm_id, &user_id).await?.contains(&role_id)
+                };
+                if present != expected_present {
+                    return Err(IssuerdError::Conflict);
+                }
+                match (client_role, assign) {
+                    (true, true) => self.add_user_client_role(&realm_id, &user_id, &role_id).await,
+                    (true, false) => {
+                        self.remove_user_client_role(&realm_id, &user_id, &role_id).await
+                    }
+                    (false, true) => self.add_user_realm_role(&realm_id, &user_id, &role_id).await,
+                    (false, false) => {
+                        self.remove_user_realm_role(&realm_id, &user_id, &role_id).await
+                    }
+                }
+            }
+            McpStepUpMutation::GroupRoleMapping {
+                expected,
+                expected_role,
+                client_id,
+                assign,
+            } => {
+                let current = self.get_group(&expected.realm_id, &expected.id).await?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_group(current.clone()) != expected
+                    || self
+                        .get_role(&expected.realm_id, &expected_role.id)
+                        .await?
+                        .map(redacted_role)
+                        .as_ref()
+                        != Some(&expected_role)
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                let realm_id = expected.realm_id.clone();
+                let mut updated = expected;
+                if let Some(client_id) = client_id {
+                    let names = updated.client_roles.entry(client_id).or_default();
+                    if assign && !names.contains(&expected_role.name) {
+                        names.push(expected_role.name.clone());
+                    } else if !assign {
+                        names.retain(|name| name != &expected_role.name);
+                    }
+                } else if assign && !updated.realm_roles.contains(&expected_role.name) {
+                    updated.realm_roles.push(expected_role.name.clone());
+                } else if !assign {
+                    updated.realm_roles.retain(|name| name != &expected_role.name);
+                }
+                for (key, value) in current.attributes {
+                    if sensitive_key(&key) {
+                        updated.attributes.entry(key).or_insert(value);
+                    }
+                }
+                self.update_group(&realm_id, &updated).await
+            }
+        }
+    }
+}
+
+fn redacted_user(mut value: User) -> User {
+    value.attributes.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_client(mut value: Client) -> Client {
+    value.secret = None;
+    value.attributes.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_realm(mut value: Realm) -> Realm {
+    value.attributes.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_group(mut value: Group) -> Group {
+    value.attributes.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_role(mut value: Role) -> Role {
+    value.attributes.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_idp(mut value: IdentityProviderConfig) -> IdentityProviderConfig {
+    value.config.retain(|key, _| !sensitive_key(key));
+    value
+}
+
+fn redacted_flow(mut value: FlowConfig) -> FlowConfig {
+    for stage in &mut value.stages {
+        if let Some(config) = &mut stage.authenticator_config {
+            config.config.retain(|key, _| !sensitive_key(key));
+        }
+    }
+    value
+}
+
+fn redacted_credential(mut value: Credential) -> Credential {
+    value.secret_data.clear();
+    value.credential_data = serde_json::Value::Null;
+    value
+}
+
+fn same_credentials(mut left: Vec<Credential>, mut right: Vec<Credential>) -> bool {
+    left = left.into_iter().map(redacted_credential).collect();
+    right = right.into_iter().map(redacted_credential).collect();
+    left.sort_by(|a, b| a.id.cmp(&b.id));
+    right.sort_by(|a, b| a.id.cmp(&b.id));
+    left == right
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    ["secret", "password", "credential", "privatekey", "token"]
+        .iter()
+        .any(|fragment| normalized.contains(fragment))
 }
 
 #[cfg(test)]
