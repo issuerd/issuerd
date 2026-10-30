@@ -2,6 +2,7 @@ export const MCP_SCOPE = "openid mcp:read";
 export const MODERN_VERSION = "2026-07-28";
 export const LEGACY_VERSIONS = ["2025-06-18", "2025-11-25"] as const;
 export const TOOL_NAMES = [
+  "attack_detection_status",
   "clients_get",
   "clients_list",
   "groups_get",
@@ -11,6 +12,10 @@ export const TOOL_NAMES = [
   "roles_get",
   "roles_list",
   "users_get",
+  "users_get_credentials",
+  "users_get_groups",
+  "users_get_role_mappings",
+  "users_get_sessions",
   "users_search",
 ] as const;
 

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use issuerd_core::{
-    ClientId, ClientIdentifier, GroupId, Pagination, RealmId, RealmName, RoleName, Storage, UserId,
+    escape_scan_pattern, expand_composites, list_all_roles, ClientId, ClientIdentifier, GroupId,
+    Pagination, RealmId, RealmName, Role, RoleName, Storage, User, UserId,
 };
 use rmcp::model::JsonObject;
 use serde::de::DeserializeOwned;
@@ -17,11 +19,12 @@ use crate::{
     policy::{self, PolicyDecision, PolicyDeny, ToolName, ToolPolicy},
     rate_limit::McpRateLimiter,
     tools::{
-        ClientGetArgs, ClientOutput, ClientsListArgs, ClientsOutput, GroupGetArgs,
-        GroupMembersArgs, GroupOutput, GroupsListArgs, GroupsOutput, NoArgs, RealmOutput,
-        RoleGetArgs, RoleOutput, RolesListArgs, RolesOutput, UserDetailsOutput, UserGetArgs,
-        UserOutput, UsersOutput, UsersSearchArgs, DEFAULT_PAGE_SIZE, MAX_INPUT_STRING_BYTES,
-        MAX_PAGE_SIZE,
+        AttackDetectionStatusOutput, ClientGetArgs, ClientOutput, ClientRoleMappingsOutput,
+        ClientsListArgs, ClientsOutput, CredentialOutput, GroupGetArgs, GroupMembersArgs,
+        GroupOutput, GroupsListArgs, GroupsOutput, NoArgs, RealmOutput, RoleGetArgs, RoleOutput,
+        RolesListArgs, RolesOutput, UserCredentialsOutput, UserDetailsOutput, UserGetArgs,
+        UserOutput, UserRoleMappingsOutput, UserSessionOutput, UserSessionsOutput, UsersOutput,
+        UsersSearchArgs, DEFAULT_PAGE_SIZE, MAX_INPUT_STRING_BYTES, MAX_PAGE_SIZE,
     },
 };
 
@@ -84,9 +87,16 @@ impl McpToolExecutor {
     ) -> Result<Value, McpError> {
         deny_to_error(policy::decide(permit.policy, &permit.auth))?;
         match permit.tool {
+            ToolName::AttackDetectionStatus => {
+                self.attack_detection_status(permit, arguments).await
+            }
             ToolName::RealmGet => self.realm_get(permit, arguments).await,
             ToolName::UsersSearch => self.users_search(permit, arguments).await,
             ToolName::UsersGet => self.users_get(permit, arguments).await,
+            ToolName::UsersGetGroups => self.users_get_groups(permit, arguments).await,
+            ToolName::UsersGetRoleMappings => self.users_get_role_mappings(permit, arguments).await,
+            ToolName::UsersGetSessions => self.users_get_sessions(permit, arguments).await,
+            ToolName::UsersGetCredentials => self.users_get_credentials(permit, arguments).await,
             ToolName::ClientsList => self.clients_list(permit, arguments).await,
             ToolName::ClientsGet => self.clients_get(permit, arguments).await,
             ToolName::GroupsList => self.groups_list(permit, arguments).await,
@@ -188,6 +198,236 @@ impl McpToolExecutor {
             realm_roles,
             groups,
         })
+    }
+
+    async fn load_user(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<(User, UserId), McpError> {
+        let args: UserGetArgs = decode(arguments)?;
+        let id = required_id(&args.id, "id")?;
+        let uuid = uuid::Uuid::parse_str(id)
+            .map_err(|_| McpError::InvalidInput("id must be a user UUID".into()))?;
+        let user_id = UserId::new(uuid.to_string())
+            .map_err(|error| McpError::InvalidInput(error.to_string()))?;
+        let user = self
+            .storage
+            .get_user(&permit.target.realm_id, &user_id)
+            .await?
+            .ok_or(McpError::NotFound("user"))?;
+        Ok((user, user_id))
+    }
+
+    async fn users_get_groups(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let (_, user_id) = self.load_user(permit, arguments).await?;
+        let group_ids = self.storage.list_user_groups(&permit.target.realm_id, &user_id).await?;
+        let mut groups = self.storage.get_groups_batch(&permit.target.realm_id, &group_ids).await?;
+        groups.sort_by(|left, right| {
+            left.name.as_str().cmp(right.name.as_str()).then_with(|| left.id.cmp(&right.id))
+        });
+        output(GroupsOutput {
+            groups: groups.iter().map(GroupOutput::from).collect(),
+        })
+    }
+
+    async fn users_get_role_mappings(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let (_, user_id) = self.load_user(permit, arguments).await?;
+        let all_roles = list_all_roles(self.storage.as_ref(), &permit.target.realm_id).await?;
+        let direct_realm_ids: HashSet<_> = self
+            .storage
+            .list_user_realm_roles(&permit.target.realm_id, &user_id)
+            .await?
+            .into_iter()
+            .collect();
+        let direct_client_ids: HashSet<_> = self
+            .storage
+            .list_user_client_roles(&permit.target.realm_id, &user_id)
+            .await?
+            .into_iter()
+            .collect();
+        let group_ids = self.storage.list_user_groups(&permit.target.realm_id, &user_id).await?;
+        let groups = self.storage.get_groups_batch(&permit.target.realm_id, &group_ids).await?;
+        let mut seeds: Vec<_> = all_roles
+            .iter()
+            .filter(|role| {
+                direct_realm_ids.contains(&role.id) || direct_client_ids.contains(&role.id)
+            })
+            .cloned()
+            .collect();
+        for group in groups {
+            seeds.extend(
+                all_roles
+                    .iter()
+                    .filter(|role| {
+                        if role.client_role {
+                            role.client_id
+                                .as_ref()
+                                .and_then(|client_id| group.client_roles.get(client_id))
+                                .is_some_and(|names| names.contains(&role.name))
+                        } else {
+                            group.realm_roles.contains(&role.name)
+                        }
+                    })
+                    .cloned(),
+            );
+        }
+        let effective = expand_composites(seeds, &all_roles);
+        let effective_ids: HashSet<_> = effective.iter().map(|role| role.id.clone()).collect();
+
+        let realm_mappings = role_outputs(
+            all_roles
+                .iter()
+                .filter(|role| !role.client_role && direct_realm_ids.contains(&role.id)),
+        );
+        let available_realm_mappings = role_outputs(
+            all_roles
+                .iter()
+                .filter(|role| !role.client_role && !effective_ids.contains(&role.id)),
+        );
+        let effective_realm_mappings =
+            role_outputs(effective.iter().filter(|role| !role.client_role));
+
+        let clients = self
+            .storage
+            .list_clients(
+                &permit.target.realm_id,
+                &Pagination {
+                    first: 0,
+                    max: i32::MAX,
+                },
+            )
+            .await?;
+        let mut client_mappings = BTreeMap::new();
+        for client in clients {
+            if !all_roles
+                .iter()
+                .any(|role| role.client_role && role.client_id.as_ref() == Some(&client.id))
+            {
+                continue;
+            }
+            let mappings = role_outputs(all_roles.iter().filter(|role| {
+                role.client_role
+                    && role.client_id.as_ref() == Some(&client.id)
+                    && direct_client_ids.contains(&role.id)
+            }));
+            let available_mappings = role_outputs(all_roles.iter().filter(|role| {
+                role.client_role
+                    && role.client_id.as_ref() == Some(&client.id)
+                    && !effective_ids.contains(&role.id)
+            }));
+            let effective_mappings =
+                role_outputs(effective.iter().filter(|role| {
+                    role.client_role && role.client_id.as_ref() == Some(&client.id)
+                }));
+            client_mappings.insert(
+                client.client_id.to_string(),
+                ClientRoleMappingsOutput {
+                    id: client.id.to_string(),
+                    client: client.client_id.to_string(),
+                    mappings,
+                    available_mappings,
+                    effective_mappings,
+                },
+            );
+        }
+        output(UserRoleMappingsOutput {
+            realm_mappings,
+            available_realm_mappings,
+            effective_realm_mappings,
+            client_mappings,
+        })
+    }
+
+    async fn users_get_sessions(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let (_, user_id) = self.load_user(permit, arguments).await?;
+        let mut sessions = self
+            .storage
+            .list_sessions(&permit.target.realm_id, Some(user_id), &Pagination::default())
+            .await?;
+        sessions.sort_by(|left, right| {
+            right
+                .last_session_refresh
+                .cmp(&left.last_session_refresh)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        output(UserSessionsOutput {
+            sessions: sessions.iter().map(UserSessionOutput::from).collect(),
+        })
+    }
+
+    async fn users_get_credentials(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let (_, user_id) = self.load_user(permit, arguments).await?;
+        let mut credentials =
+            self.storage.list_credentials(&permit.target.realm_id, &user_id).await?;
+        credentials.sort_by(|left, right| {
+            (left.priority, left.created_date)
+                .cmp(&(right.priority, right.created_date))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        output(UserCredentialsOutput {
+            credentials: credentials.iter().map(CredentialOutput::from).collect(),
+        })
+    }
+
+    async fn attack_detection_status(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+    ) -> Result<Value, McpError> {
+        let (user, _) = self.load_user(permit, arguments).await?;
+        let mut num_failures = 0_u32;
+        for key in self
+            .user_cache_keys("login-failure", &permit.target.realm_id, user.username.as_str())
+            .await?
+        {
+            if let Some(raw) = self.limiter.cache().get(&key).await? {
+                let count = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
+                num_failures = num_failures.saturating_add(count);
+            }
+        }
+        let locked = !self
+            .user_cache_keys("login-lockout", &permit.target.realm_id, user.username.as_str())
+            .await?
+            .is_empty();
+        output(AttackDetectionStatusOutput {
+            user_id: user.id.to_string(),
+            username: user.username.to_string(),
+            num_failures,
+            locked,
+        })
+    }
+
+    async fn user_cache_keys(
+        &self,
+        family: &str,
+        realm_id: &RealmId,
+        username: &str,
+    ) -> Result<Vec<String>, McpError> {
+        let prefix = format!("{family}:{realm_id}:{username}:");
+        let pattern = format!("{}*", escape_scan_pattern(&prefix));
+        let mut keys = self.limiter.cache().scan_keys(&pattern).await?;
+        keys.retain(|key| key.starts_with(&prefix));
+        Ok(keys)
     }
 
     async fn clients_list(
@@ -366,6 +606,14 @@ impl McpToolExecutor {
     }
 }
 
+fn role_outputs<'a>(roles: impl IntoIterator<Item = &'a Role>) -> Vec<RoleOutput> {
+    let mut roles: Vec<_> = roles.into_iter().cloned().collect();
+    roles.sort_by(|left, right| {
+        left.name.as_str().cmp(right.name.as_str()).then_with(|| left.id.cmp(&right.id))
+    });
+    roles.iter().map(RoleOutput::from).collect()
+}
+
 fn deny_to_error(decision: PolicyDecision) -> Result<(), McpError> {
     match decision {
         PolicyDecision::Allow => Ok(()),
@@ -449,7 +697,7 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use issuerd_cluster::InMemoryCache;
-    use issuerd_core::{IssuerdError, MockStorage};
+    use issuerd_core::{CredentialType, DistributedCache, IssuerdError, MockStorage};
     use serde_json::json;
 
     const NOW: u64 = 120;
@@ -468,12 +716,19 @@ mod tests {
 
     async fn permit(executor: &McpToolExecutor, tool: ToolName) -> McpToolPermit {
         let role = match tool {
+            ToolName::AttackDetectionStatus => "manage-users",
             ToolName::RealmGet
             | ToolName::GroupsGet
             | ToolName::GroupsList
             | ToolName::RolesGet
             | ToolName::RolesList => "view-realm",
-            ToolName::UsersGet | ToolName::UsersSearch | ToolName::GroupsMembers => "view-users",
+            ToolName::UsersGet
+            | ToolName::UsersGetCredentials
+            | ToolName::UsersGetGroups
+            | ToolName::UsersGetRoleMappings
+            | ToolName::UsersGetSessions
+            | ToolName::UsersSearch
+            | ToolName::GroupsMembers => "view-users",
             ToolName::ClientsGet | ToolName::ClientsList => "view-clients",
         };
         executor.preflight(tool.as_str(), auth("mcp:read", &[role]), NOW).await.unwrap()
@@ -891,13 +1146,242 @@ mod tests {
         );
     }
 
+    fn role_names(value: &Value) -> Vec<&str> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|role| role["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn users_get_groups_returns_curated_direct_memberships() {
+        let executor = executor(storage().await);
+        let result = execute(&executor, ToolName::UsersGetGroups, json!({"id": ALICE_ID}))
+            .await
+            .unwrap();
+        let names: Vec<_> = result["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alpha-group", "zeta-group"]);
+        assert_eq!(result["groups"][1]["parentId"], ALPHA_GROUP_ID);
+        assert!(!result.to_string().contains(GROUP_SECRET));
+        assert!(result["groups"][0].get("attributes").is_none());
+    }
+
+    #[tokio::test]
+    async fn users_get_role_mappings_distinguishes_direct_available_and_effective_roles() {
+        let storage = storage().await;
+        let realm = realm();
+        let alice = UserId::new(ALICE_ID).unwrap();
+        storage
+            .add_user_client_role(
+                &realm.id,
+                &alice,
+                &issuerd_core::RoleId::new(CLIENT_ROLE_ID).unwrap(),
+            )
+            .await
+            .unwrap();
+        for (id, name, client_role) in [
+            ("40000000-0000-4000-8000-000000000004", "available-realm-role", false),
+            ("40000000-0000-4000-8000-000000000005", "group-realm-role", false),
+            ("40000000-0000-4000-8000-000000000006", "client-available-role", true),
+            ("40000000-0000-4000-8000-000000000007", "client-group-role", true),
+        ] {
+            let mut role = role(id, name);
+            role.client_role = client_role;
+            role.client_id = client_role.then(|| ClientId::new(ALPHA_CLIENT_ID).unwrap());
+            storage.create_role(&realm.id, &role).await.unwrap();
+        }
+        let mut alpha_group = storage
+            .get_group(&realm.id, &GroupId::new(ALPHA_GROUP_ID).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        alpha_group.realm_roles = vec![RoleName::new("group-realm-role").unwrap()];
+        alpha_group.client_roles.insert(
+            ClientId::new(ALPHA_CLIENT_ID).unwrap(),
+            vec![RoleName::new("client-group-role").unwrap()],
+        );
+        storage.update_group(&realm.id, &alpha_group).await.unwrap();
+        let executor = executor(storage);
+
+        let result = execute(&executor, ToolName::UsersGetRoleMappings, json!({"id": ALICE_ID}))
+            .await
+            .unwrap();
+        assert_eq!(role_names(&result["realmMappings"]), ["alpha-role", "zeta-role"]);
+        assert_eq!(role_names(&result["availableRealmMappings"]), ["available-realm-role"]);
+        assert_eq!(
+            role_names(&result["effectiveRealmMappings"]),
+            ["alpha-role", "group-realm-role", "zeta-role"]
+        );
+        let client = &result["clientMappings"]["alpha-client"];
+        assert_eq!(client["id"], ALPHA_CLIENT_ID);
+        assert_eq!(client["client"], "alpha-client");
+        assert_eq!(role_names(&client["mappings"]), ["client-only-role"]);
+        assert_eq!(role_names(&client["availableMappings"]), ["client-available-role"]);
+        assert_eq!(
+            role_names(&client["effectiveMappings"]),
+            ["client-group-role", "client-only-role"]
+        );
+        assert!(result["clientMappings"].get("beta-client").is_none());
+        assert!(!result.to_string().contains(ROLE_SECRET));
+        assert!(client["mappings"][0].get("attributes").is_none());
+    }
+
+    #[tokio::test]
+    async fn users_get_role_mappings_does_not_hide_group_storage_failures() {
+        let expected_user = user(ALICE_ID, "alice", "alice@example.com");
+        let mut mock = MockStorage::new();
+        mock.expect_get_user().returning(move |_, _| Ok(Some(expected_user.clone())));
+        mock.expect_list_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_realm_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_client_roles().returning(|_, _| Ok(Vec::new()));
+        mock.expect_list_user_groups()
+            .returning(|_, _| Err(IssuerdError::TemporarilyUnavailable));
+        mock.expect_list_clients().returning(|_, _| Ok(Vec::new()));
+        let executor = executor(Arc::new(mock));
+
+        assert_eq!(
+            execute(&executor, ToolName::UsersGetRoleMappings, json!({"id": ALICE_ID})).await,
+            Err(McpError::Backend(IssuerdError::TemporarilyUnavailable))
+        );
+    }
+
+    #[tokio::test]
+    async fn users_get_sessions_returns_sorted_admin_fields_only() {
+        let storage = storage().await;
+        let realm = realm();
+        for (id, refresh) in [
+            ("session-old", 1_700_000_000),
+            ("session-new", 1_800_000_000),
+        ] {
+            storage
+                .create_user_session(&realm.id, &session(id, ALICE_ID, refresh))
+                .await
+                .unwrap();
+        }
+        let executor = executor(storage);
+        let result = execute(&executor, ToolName::UsersGetSessions, json!({"id": ALICE_ID}))
+            .await
+            .unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["id"], "session-new");
+        assert_eq!(sessions[0]["userId"], ALICE_ID);
+        assert_eq!(sessions[0]["username"], "alice");
+        assert_eq!(sessions[0]["ipAddress"], "127.0.0.1");
+        assert_eq!(sessions[0]["started"], 1_800_000_000_i64);
+        assert_eq!(sessions[0]["lastAccess"], 1_800_000_000_i64);
+        assert_eq!(sessions[0]["offline"], false);
+        assert_eq!(sessions[0]["clients"][ALPHA_CLIENT_ID], "password");
+        for field in [
+            "rememberMe",
+            "authTime",
+            "impersonator",
+            "redirectUri",
+            "state",
+            "authMethod",
+        ] {
+            assert!(sessions[0].get(field).is_none(), "exposed {field}");
+        }
+        assert!(!result.to_string().contains(CREDENTIAL_SECRET));
+    }
+
+    #[tokio::test]
+    async fn users_get_credentials_returns_sorted_scalar_metadata_without_payloads() {
+        let storage = storage().await;
+        let realm = realm();
+        let alice = UserId::new(ALICE_ID).unwrap();
+        for fixture in [
+            credential("credential-later", CredentialType::Password, 20, 1_800_000_000),
+            credential("credential-first", CredentialType::Totp, 10, 1_700_000_000),
+        ] {
+            storage.create_credential(&realm.id, &alice, &fixture).await.unwrap();
+        }
+        let executor = executor(storage);
+        let result = execute(&executor, ToolName::UsersGetCredentials, json!({"id": ALICE_ID}))
+            .await
+            .unwrap();
+        let credentials = result["credentials"].as_array().unwrap();
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials[0]["id"], "credential-first");
+        assert_eq!(credentials[0]["type"], "totp");
+        assert_eq!(credentials[0]["createdDate"], 1_700_000_000_000_i64);
+        assert_eq!(credentials[0]["priority"], 10);
+        assert_eq!(credentials[0]["temporary"], true);
+        assert_eq!(credentials[1]["type"], "password");
+        for credential in credentials {
+            for field in ["secretData", "credentialData", "value"] {
+                assert!(credential.get(field).is_none(), "exposed {field}");
+            }
+        }
+        assert!(!result.to_string().contains(CREDENTIAL_SECRET));
+    }
+
+    #[tokio::test]
+    async fn attack_detection_status_aggregates_only_the_target_users_cache_entries() {
+        let cache = Arc::new(InMemoryCache::new());
+        for (key, value) in [
+            (format!("login-failure:{REALM_ID}:alice:192.0.2.1"), "2"),
+            (format!("login-failure:{REALM_ID}:alice:192.0.2.2"), "3"),
+            (format!("login-failure:{REALM_ID}:alice:192.0.2.3"), "invalid"),
+            (format!("login-failure:{REALM_ID}:alicia:192.0.2.4"), "100"),
+        ] {
+            cache.set(&key, value.as_bytes().to_vec(), None).await.unwrap();
+        }
+        cache
+            .set(&format!("login-lockout:{REALM_ID}:alice:192.0.2.1"), b"1".to_vec(), None)
+            .await
+            .unwrap();
+        let executor = McpToolExecutor::new(storage().await, McpRateLimiter::new(cache, 1_000));
+        let result = execute(&executor, ToolName::AttackDetectionStatus, json!({"id": ALICE_ID}))
+            .await
+            .unwrap();
+        assert_eq!(result["userId"], ALICE_ID);
+        assert_eq!(result["username"], "alice");
+        assert_eq!(result["numFailures"], 5);
+        assert_eq!(result["locked"], true);
+    }
+
+    #[tokio::test]
+    async fn all_user_detail_tools_validate_ids_and_require_an_existing_user() {
+        let executor = executor(storage().await);
+        for tool in [
+            ToolName::AttackDetectionStatus,
+            ToolName::UsersGetCredentials,
+            ToolName::UsersGetGroups,
+            ToolName::UsersGetRoleMappings,
+            ToolName::UsersGetSessions,
+        ] {
+            assert!(matches!(
+                execute(&executor, tool, json!({"id": "not-a-uuid"})).await,
+                Err(McpError::InvalidInput(_))
+            ));
+            assert_eq!(
+                execute(&executor, tool, json!({"id": "99999999-9999-4999-8999-999999999999"}))
+                    .await,
+                Err(McpError::NotFound("user"))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn every_successful_result_conforms_to_its_output_schema() {
         let executor = executor(storage().await);
         let cases = [
+            (ToolName::AttackDetectionStatus, json!({"id": ALICE_ID})),
             (ToolName::RealmGet, json!({})),
             (ToolName::UsersSearch, json!({"search": "ali"})),
             (ToolName::UsersGet, json!({"id": ALICE_ID})),
+            (ToolName::UsersGetCredentials, json!({"id": ALICE_ID})),
+            (ToolName::UsersGetGroups, json!({"id": ALICE_ID})),
+            (ToolName::UsersGetRoleMappings, json!({"id": ALICE_ID})),
+            (ToolName::UsersGetSessions, json!({"id": ALICE_ID})),
             (ToolName::ClientsList, json!({})),
             (ToolName::ClientsGet, json!({"id": ALPHA_CLIENT_ID})),
             (ToolName::GroupsList, json!({})),

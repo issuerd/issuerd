@@ -13,6 +13,7 @@ const CLIENT_ROLES: &[&str] = &["view-clients", "manage-clients"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
+    AttackDetectionStatus,
     ClientsGet,
     ClientsList,
     GroupsGet,
@@ -22,11 +23,16 @@ pub enum ToolName {
     RolesGet,
     RolesList,
     UsersGet,
+    UsersGetCredentials,
+    UsersGetGroups,
+    UsersGetRoleMappings,
+    UsersGetSessions,
     UsersSearch,
 }
 
 impl ToolName {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 15] = [
+        Self::AttackDetectionStatus,
         Self::ClientsGet,
         Self::ClientsList,
         Self::GroupsGet,
@@ -36,11 +42,16 @@ impl ToolName {
         Self::RolesGet,
         Self::RolesList,
         Self::UsersGet,
+        Self::UsersGetCredentials,
+        Self::UsersGetGroups,
+        Self::UsersGetRoleMappings,
+        Self::UsersGetSessions,
         Self::UsersSearch,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AttackDetectionStatus => "attack_detection_status",
             Self::ClientsGet => "clients_get",
             Self::ClientsList => "clients_list",
             Self::GroupsGet => "groups_get",
@@ -50,6 +61,10 @@ impl ToolName {
             Self::RolesGet => "roles_get",
             Self::RolesList => "roles_list",
             Self::UsersGet => "users_get",
+            Self::UsersGetCredentials => "users_get_credentials",
+            Self::UsersGetGroups => "users_get_groups",
+            Self::UsersGetRoleMappings => "users_get_role_mappings",
+            Self::UsersGetSessions => "users_get_sessions",
             Self::UsersSearch => "users_search",
         }
     }
@@ -72,7 +87,12 @@ pub struct ToolPolicy {
     pub any_realm_roles: &'static [&'static str],
 }
 
-pub const POLICIES: [ToolPolicy; 10] = [
+pub const POLICIES: [ToolPolicy; 15] = [
+    ToolPolicy {
+        tool: ToolName::AttackDetectionStatus,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: &["manage-users"],
+    },
     ToolPolicy {
         tool: ToolName::ClientsGet,
         required_scope: MCP_SCOPE_READ,
@@ -119,6 +139,26 @@ pub const POLICIES: [ToolPolicy; 10] = [
         any_realm_roles: USER_ROLES,
     },
     ToolPolicy {
+        tool: ToolName::UsersGetCredentials,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: USER_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::UsersGetGroups,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: USER_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::UsersGetRoleMappings,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: USER_ROLES,
+    },
+    ToolPolicy {
+        tool: ToolName::UsersGetSessions,
+        required_scope: MCP_SCOPE_READ,
+        any_realm_roles: USER_ROLES,
+    },
+    ToolPolicy {
         tool: ToolName::UsersSearch,
         required_scope: MCP_SCOPE_READ,
         any_realm_roles: USER_ROLES,
@@ -146,7 +186,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 10] {
+pub fn policies() -> &'static [ToolPolicy; 15] {
     &POLICIES
 }
 
@@ -219,7 +259,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 10);
+        assert_eq!(unique.len(), 15);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -268,8 +308,13 @@ mod tests {
     #[test]
     fn roles_are_not_interchangeable_between_tools() {
         let cases = [
+            (ToolName::AttackDetectionStatus, "view-users"),
             (ToolName::RealmGet, "view-users"),
             (ToolName::UsersGet, "view-clients"),
+            (ToolName::UsersGetCredentials, "view-realm"),
+            (ToolName::UsersGetGroups, "manage-realm"),
+            (ToolName::UsersGetRoleMappings, "view-clients"),
+            (ToolName::UsersGetSessions, "manage-clients"),
             (ToolName::UsersSearch, "manage-realm"),
             (ToolName::ClientsGet, "manage-users"),
             (ToolName::ClientsList, "view-realm"),
