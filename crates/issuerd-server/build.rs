@@ -40,8 +40,11 @@ fn main() {
         manifest_dir.join("..").join("..").join("webclientsrc").join("dist"),
     ];
 
+    for candidate in &candidates {
+        println!("cargo:rerun-if-changed={}", candidate.display());
+    }
+
     if let Some(dist_path) = candidates.iter().find(|p| populated(p)) {
-        println!("cargo:rerun-if-changed={}", dist_path.display());
         println!("cargo:rustc-env=ISSUERD_WEB_DIST={}", dist_path.display());
         println!("cargo:rustc-cfg=webclient_present");
     } else {
