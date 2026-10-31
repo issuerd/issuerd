@@ -111,6 +111,8 @@ struct ClientRegistrationResponse {
     client_name: Option<String>,
     /// OIDC registration §2: defaults to `["authorization_code", "implicit"]`.
     grant_types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backchannel_authentication_delivery_mode: Option<String>,
     /// OIDC registration §2: defaults to `["code"]`.
     response_types: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,9 +244,10 @@ fn parse_client_representation(body: &serde_json::Value) -> Result<ClientReprese
 /// RFC 7591 request field names the translation layer consumes. A body
 /// carrying none of them takes the pre-existing (Keycloak-shaped) path
 /// bit-for-bit.
-const RFC7591_REQUEST_FIELDS: [&str; 23] = [
+const RFC7591_REQUEST_FIELDS: [&str; 24] = [
     "client_name",
     "grant_types",
+    "backchannel_authentication_delivery_mode",
     "response_types",
     "token_endpoint_auth_method",
     "scope",
@@ -457,6 +460,15 @@ fn translate_rfc7591_request(mut body: serde_json::Value) -> Result<serde_json::
             client_metadata::ATTR_DCR_GRANT_TYPES,
             serde_json::Value::String(encoded),
         )?;
+    }
+
+    if let Some(value) = obj.remove("backchannel_authentication_delivery_mode") {
+        if value.as_str() != Some("poll") {
+            return Err(invalid_metadata(
+                "backchannel_authentication_delivery_mode must be poll".to_string(),
+            ));
+        }
+        insert_body_attribute(obj, client_metadata::ATTR_CIBA_DELIVERY_MODE, value)?;
     }
 
     // response_types: validated and stored as the client's response-type
@@ -1257,6 +1269,9 @@ fn build_registration_response(
             client_secret_expires_at: secret.map(|_| 0),
             client_name: client.name.as_ref().map(|n| n.to_string()),
             grant_types,
+            backchannel_authentication_delivery_mode: attribute_str(
+                client_metadata::ATTR_CIBA_DELIVERY_MODE,
+            ),
             response_types,
             token_endpoint_auth_method: client_metadata::token_endpoint_auth_method(&client)
                 .map(str::to_string),

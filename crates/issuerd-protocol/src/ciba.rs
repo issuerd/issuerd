@@ -48,7 +48,7 @@ impl CibaRequest {
     /// let error = CibaRequest::parse(&HashMap::new()).unwrap_err();
     /// assert_eq!(
     ///     error,
-    ///     IssuerdError::InvalidRequest("at least one hint must be provided".into())
+    ///     IssuerdError::InvalidRequest("exactly one hint must be provided".into())
     /// );
     /// # Ok::<(), IssuerdError>(())
     /// ```
@@ -80,36 +80,53 @@ impl CibaRequest {
     }
 
     pub fn validate(&self) -> Result<(), IssuerdError> {
-        if self.operation_id.is_some() {
-            return Err(IssuerdError::InvalidRequest(
-                "operation_id is not supported for CIBA".into(),
-            ));
-        }
-        if self.resource.is_some() {
-            return Err(IssuerdError::InvalidRequest("resource is not supported for CIBA".into()));
-        }
-
-        if self.login_hint.is_none()
-            && self.login_hint_token.is_none()
-            && self.id_token_hint.is_none()
-        {
-            return Err(IssuerdError::InvalidRequest("at least one hint must be provided".into()));
+        let hints = usize::from(self.login_hint.is_some())
+            + usize::from(self.login_hint_token.is_some())
+            + usize::from(self.id_token_hint.is_some());
+        if hints != 1 {
+            return Err(IssuerdError::InvalidRequest("exactly one hint must be provided".into()));
         }
 
         if let Some(binding_message) = &self.binding_message {
-            if binding_message.len() > 100 {
-                return Err(IssuerdError::InvalidRequest(
-                    "binding_message must be <= 100 characters".into(),
+            if binding_message.is_empty()
+                || binding_message.chars().count() > 100
+                || binding_message.chars().any(char::is_control)
+                || binding_message.trim() != binding_message
+            {
+                return Err(IssuerdError::InvalidBindingMessage(
+                    "binding_message must be 1..=100 Unicode scalar values of plain text without controls".into(),
                 ));
             }
         }
 
+        if self.operation_id.is_some()
+            && (self.scope.len() != 2
+                || !self.scope.contains("openid")
+                || !self.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP))
+        {
+            return Err(IssuerdError::InvalidScope);
+        }
         if let Some(requested_expiry) = self.requested_expiry {
             if requested_expiry == 0 {
                 return Err(IssuerdError::InvalidRequest("requested_expiry must be > 0".into()));
             }
         }
 
+        Ok(())
+    }
+
+    /// Scope rule for a validated operation-bound request. Ordinary CIBA uses
+    /// `validate_scope_with_mcp`, which deliberately rejects this scope.
+    pub fn validate_step_up_scope(
+        &self,
+        client: &issuerd_core::Client,
+    ) -> Result<(), IssuerdError> {
+        if client.public_client
+            || client.default_scopes.contains(issuerd_core::MCP_SCOPE_STEP_UP)
+            || !client.optional_scopes.contains(issuerd_core::MCP_SCOPE_STEP_UP)
+        {
+            return Err(IssuerdError::UnauthorizedClient);
+        }
         Ok(())
     }
 
@@ -144,6 +161,7 @@ mod tests {
     fn ciba_parse_with_login_hint() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
 
         let req = CibaRequest::parse(&body).unwrap();
         assert_eq!(req.login_hint, Some("user@example.com".to_string()));
@@ -153,6 +171,7 @@ mod tests {
     fn ciba_parse_with_login_hint_token() {
         let mut body = HashMap::new();
         body.insert("login_hint_token".to_string(), "jwt_token".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
 
         let req = CibaRequest::parse(&body).unwrap();
         assert_eq!(req.login_hint_token, Some("jwt_token".to_string()));
@@ -162,6 +181,7 @@ mod tests {
     fn ciba_parse_with_id_token_hint() {
         let mut body = HashMap::new();
         body.insert("id_token_hint".to_string(), "id_jwt".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
 
         let req = CibaRequest::parse(&body).unwrap();
         assert_eq!(req.id_token_hint, Some("id_jwt".to_string()));
@@ -171,13 +191,12 @@ mod tests {
     fn ciba_parse_with_multiple_hints() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("id_token_hint".to_string(), "id_jwt".to_string());
         body.insert("scope".to_string(), "openid profile".to_string());
         body.insert("acr_values".to_string(), "1 2".to_string());
 
-        let req = CibaRequest::parse(&body).unwrap();
-        assert_eq!(req.scope, Scope::parse("openid profile"));
-        assert_eq!(req.acr_values, vec!["1", "2"]);
+        assert!(CibaRequest::parse(&body).is_err());
     }
 
     #[test]
@@ -190,6 +209,7 @@ mod tests {
     fn ciba_binding_message_too_long() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("binding_message".to_string(), "a".repeat(101));
 
         assert!(CibaRequest::parse(&body).is_err());
@@ -199,6 +219,7 @@ mod tests {
     fn ciba_binding_message_exactly_100() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("binding_message".to_string(), "a".repeat(100));
 
         assert!(CibaRequest::parse(&body).is_ok());
@@ -208,6 +229,7 @@ mod tests {
     fn ciba_requested_expiry_zero() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("requested_expiry".to_string(), "0".to_string());
 
         assert!(CibaRequest::parse(&body).is_err());
@@ -217,6 +239,7 @@ mod tests {
     fn ciba_requested_expiry_malformed() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("requested_expiry".to_string(), "abc".to_string());
 
         assert!(CibaRequest::parse(&body).is_err());
@@ -226,6 +249,7 @@ mod tests {
     fn ciba_requested_expiry_valid() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid".to_string());
         body.insert("requested_expiry".to_string(), "3600".to_string());
 
         let req = CibaRequest::parse(&body).unwrap();
@@ -233,24 +257,32 @@ mod tests {
     }
 
     #[test]
-    fn ciba_forward_fields_are_captured_but_rejected_as_unsupported() {
-        for (name, value) in [
-            ("operation_id", "op-1"),
-            ("resource", "https://issuer.example.com/realms/demo/mcp"),
-        ] {
-            let mut body = HashMap::new();
-            body.insert("login_hint".to_string(), "user@example.com".to_string());
-            body.insert(name.to_string(), value.to_string());
-            let err = CibaRequest::parse(&body).unwrap_err();
-            assert!(matches!(err, IssuerdError::InvalidRequest(_)));
-            assert!(err.to_string().contains(name), "{err}");
-        }
-
+    fn operation_fields_are_captured_for_server_side_profile_validation() {
         let mut body = HashMap::new();
         body.insert("login_hint".to_string(), "user@example.com".to_string());
+        body.insert("scope".to_string(), "openid mcp:step_up".to_string());
+        body.insert("operation_id".to_string(), "op-1".to_string());
+        body.insert(
+            "resource".to_string(),
+            "https://issuer.example.com/realms/demo/mcp".to_string(),
+        );
         let req = CibaRequest::parse(&body).unwrap();
-        assert_eq!(req.operation_id, None);
-        assert_eq!(req.resource, None);
+        assert_eq!(req.operation_id.as_deref(), Some("op-1"));
+        assert_eq!(req.resource.as_deref(), Some("https://issuer.example.com/realms/demo/mcp"));
+
+        body.insert("scope".to_string(), "openid".to_string());
+        assert_eq!(CibaRequest::parse(&body).unwrap_err(), IssuerdError::InvalidScope);
+    }
+
+    #[test]
+    fn openid_is_required_only_for_operation_bound_requests() {
+        let mut legacy = HashMap::new();
+        legacy.insert("login_hint".to_string(), "user@example.com".to_string());
+        legacy.insert("scope".to_string(), "mcp:read".to_string());
+        assert!(CibaRequest::parse(&legacy).is_ok());
+
+        legacy.insert("operation_id".to_string(), "op-1".to_string());
+        assert_eq!(CibaRequest::parse(&legacy).unwrap_err(), IssuerdError::InvalidScope);
     }
 
     fn make_test_client() -> issuerd_core::Client {
@@ -285,6 +317,7 @@ mod tests {
         let parse = |scope: &str| {
             let mut body = HashMap::new();
             body.insert("login_hint".to_string(), "user@example.com".to_string());
+            body.insert("scope".to_string(), "openid".to_string());
             body.insert("scope".to_string(), scope.to_string());
             CibaRequest::parse(&body).unwrap()
         };
@@ -294,7 +327,7 @@ mod tests {
 
         // A scope the client does not have assigned is rejected.
         assert!(matches!(
-            parse("admin").validate_scope(&client),
+            parse("openid admin").validate_scope(&client),
             Err(IssuerdError::InvalidScope)
         ));
 
@@ -303,7 +336,7 @@ mod tests {
         legacy.optional_scopes = Scope::parse(issuerd_core::MCP_SCOPE_STEP_UP);
         for mcp_enabled in [false, true] {
             assert!(matches!(
-                parse(issuerd_core::MCP_SCOPE_STEP_UP)
+                parse(&format!("openid {}", issuerd_core::MCP_SCOPE_STEP_UP))
                     .validate_scope_with_mcp(&legacy, mcp_enabled),
                 Err(IssuerdError::InvalidScope)
             ));

@@ -2,7 +2,7 @@
   "name": "issuerd-mcp-admin-acceptance",
   "version": "0.0.0",
   "private": true,
-  "description": "External read-only MCP and DPoP acceptance client for Issuerd lab rigs",
+  "description": "External MCP, DPoP, and operation-bound CIBA acceptance clients for Issuerd lab rigs",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -15,7 +15,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
     "setup": "node dist/src/setup.js",
-    "start": "node dist/src/cli.js"
+    "start": "node dist/src/cli.js",
+    "step-up": "node dist/src/step-up.js"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.4.0"

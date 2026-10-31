@@ -79,6 +79,9 @@ pub const ATTR_REQUEST_URIS: &str = "request_uris";
 /// signed with (`request_object_signing_alg`). Stored and echoed.
 pub const ATTR_REQUEST_OBJECT_SIGNING_ALG: &str = "request_object_signing_alg";
 
+/// OpenID CIBA registration: `backchannel_authentication_delivery_mode`.
+pub const ATTR_CIBA_DELIVERY_MODE: &str = "backchannel_authentication_delivery_mode";
+
 /// Registration bookkeeping (not an RFC field): the `grant_types` list the
 /// client registered, stored as a JSON array of strings.
 pub const ATTR_DCR_GRANT_TYPES: &str = "dcr.grant_types";

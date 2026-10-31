@@ -9,13 +9,19 @@ use rmcp::model::{Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::policy::ToolName;
+use crate::{
+    policy::ToolName,
+    read_inventory::{
+        ClientScopesOutput, EventsOutput, EventsSearchArgs, FlowsOutput, IdpsOutput, KeysOutput,
+        ServerInfoOutput, SessionsListArgs, SessionsOutput,
+    },
+};
 
 pub const DEFAULT_PAGE_SIZE: u32 = 20;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_INPUT_STRING_BYTES: usize = 255;
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
@@ -469,10 +475,35 @@ fn read_only_annotations() -> ToolAnnotations {
 }
 
 pub fn definition(name: ToolName) -> Tool {
+    if let Some(tool) = crate::strict_tools::definition(name) {
+        return tool;
+    }
+    if let Some(tool) = crate::account_tools::definition(name) {
+        return tool;
+    }
+    if let Some(tool) = crate::write_tools::definition(name) {
+        return tool;
+    }
     let description = match name {
         ToolName::AttackDetectionStatus => {
             "Return a user's aggregated brute-force failure count and lockout state."
         }
+        ToolName::ClientScopesList => {
+            "List client scopes with safe mapper types and claim-target summaries."
+        }
+        ToolName::EventsSearch => {
+            "Search user or admin audit events with filters, retention clamps, and totals."
+        }
+        ToolName::FlowsList => {
+            "List authentication flows and stages without arbitrary authenticator configuration."
+        }
+        ToolName::IdpGet => {
+            "Return an identity provider with credentials and private keys omitted."
+        }
+        ToolName::IdpList => "List identity providers with credentials and private keys omitted.",
+        ToolName::KeysList => "List public signing-key metadata without private key material.",
+        ToolName::ServerinfoGet => "Return dynamic server capabilities and enum metadata.",
+        ToolName::SessionsList => "List active realm sessions with a matching total count.",
         ToolName::RealmGet => "Return the current realm's curated, non-secret configuration.",
         ToolName::UsersSearch => {
             "Search users by exact username, exact email, or a username/email substring."
@@ -499,12 +530,33 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::RolesGet => {
             "Return a role by name using Admin lookup precedence, without arbitrary attributes."
         }
+        _ => unreachable!("admin writes have separate definitions"),
     };
     let tool = Tool::new(name.as_str(), description, std::sync::Arc::new(serde_json::Map::new()));
     let tool = match name {
         ToolName::AttackDetectionStatus => tool
             .with_input_schema::<UserGetArgs>()
             .with_output_schema::<AttackDetectionStatusOutput>(),
+        ToolName::ClientScopesList => tool
+            .with_input_schema::<SessionsListArgs>()
+            .with_output_schema::<ClientScopesOutput>(),
+        ToolName::EventsSearch => tool
+            .with_input_schema::<EventsSearchArgs>()
+            .with_output_schema::<EventsOutput>(),
+        ToolName::FlowsList => {
+            tool.with_input_schema::<NoArgs>().with_output_schema::<FlowsOutput>()
+        }
+        ToolName::IdpGet => tool
+            .with_input_schema::<RoleGetArgs>()
+            .with_output_schema::<crate::read_inventory::IdpOutput>(),
+        ToolName::IdpList => tool.with_input_schema::<NoArgs>().with_output_schema::<IdpsOutput>(),
+        ToolName::KeysList => tool.with_input_schema::<NoArgs>().with_output_schema::<KeysOutput>(),
+        ToolName::ServerinfoGet => {
+            tool.with_input_schema::<NoArgs>().with_output_schema::<ServerInfoOutput>()
+        }
+        ToolName::SessionsList => tool
+            .with_input_schema::<SessionsListArgs>()
+            .with_output_schema::<SessionsOutput>(),
         ToolName::RealmGet => {
             tool.with_input_schema::<NoArgs>().with_output_schema::<RealmOutput>()
         }
@@ -547,6 +599,7 @@ pub fn definition(name: ToolName) -> Tool {
         ToolName::RolesGet => {
             tool.with_input_schema::<RoleGetArgs>().with_output_schema::<RoleOutput>()
         }
+        _ => unreachable!("admin writes have separate definitions"),
     };
     tool.with_annotations(read_only_annotations())
 }
@@ -565,32 +618,41 @@ mod tests {
     fn definitions_are_sorted_fully_annotated_and_have_strict_schemas() {
         let definitions = definitions();
         let names: Vec<_> = definitions.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "attack_detection_status",
-                "clients_get",
-                "clients_list",
-                "groups_get",
-                "groups_list",
-                "groups_members",
-                "realm_get",
-                "roles_get",
-                "roles_list",
-                "users_get",
-                "users_get_credentials",
-                "users_get_groups",
-                "users_get_role_mappings",
-                "users_get_sessions",
-                "users_search"
-            ]
-        );
+        let expected: Vec<_> = ToolName::ALL.iter().map(|tool| tool.as_str()).collect();
+        assert_eq!(names, expected);
         for tool in definitions {
+            let name = ToolName::parse(tool.name.as_ref()).unwrap();
+            let create = matches!(
+                name,
+                ToolName::UsersCreate
+                    | ToolName::GroupsCreate
+                    | ToolName::GroupsAddChild
+                    | ToolName::RolesCreate
+                    | ToolName::ClientsCreate
+            );
+            let external = name == ToolName::UsersSendActionsEmail;
+            let read_only = name.tier() == crate::policy::RiskTier::T0
+                || matches!(
+                    name,
+                    ToolName::MeGetProfile
+                        | ToolName::MeSessionsList
+                        | ToolName::MeConsentsList
+                        | ToolName::MeLinkedAccountsList
+                );
             let annotations = tool.annotations.unwrap();
-            assert_eq!(annotations.read_only_hint, Some(true));
-            assert_eq!(annotations.destructive_hint, Some(false));
-            assert_eq!(annotations.idempotent_hint, Some(true));
-            assert_eq!(annotations.open_world_hint, Some(false));
+            assert_eq!(annotations.read_only_hint, Some(read_only));
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(name.tier() == crate::policy::RiskTier::T3)
+            );
+            assert_eq!(
+                annotations.idempotent_hint,
+                Some(
+                    name.tier() != crate::policy::RiskTier::T3
+                        && (read_only || (!create && !external))
+                )
+            );
+            assert_eq!(annotations.open_world_hint, Some(external));
             assert_eq!(tool.input_schema["type"], "object");
             assert_eq!(tool.input_schema["additionalProperties"], false);
             assert_eq!(tool.output_schema.as_ref().unwrap()["type"], "object");

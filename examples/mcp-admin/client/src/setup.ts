@@ -8,6 +8,8 @@ interface SetupOptions {
   adminUsername: string;
   adminPassword: string;
   clientId: string;
+  confidentialClientId: string;
+  confidentialClientSecret: string;
   userPassword: string;
 }
 
@@ -27,6 +29,8 @@ function options(env: NodeJS.ProcessEnv): SetupOptions {
     adminUsername: env.ADMIN_USERNAME ?? "admin",
     adminPassword: env.ADMIN_PASSWORD ?? "admin",
     clientId: env.MCP_CLIENT_ID ?? "mcp-admin-native",
+    confidentialClientId: env.MCP_CONFIDENTIAL_CLIENT_ID ?? "mcp-admin-confidential",
+    confidentialClientSecret: env.MCP_CLIENT_SECRET ?? "mcp-step-up-secret",
     userPassword: env.MCP_PASSWORD ?? "Password123!",
   };
 }
@@ -137,27 +141,41 @@ class AdminApi {
     return object(created, "created role");
   }
 
-  async ensureClient(token: string, clientId: string, native: boolean): Promise<JsonObject> {
+  async ensureClient(
+    token: string,
+    clientId: string,
+    native: boolean,
+    confidentialSecret?: string,
+  ): Promise<JsonObject> {
     const list = objects(
       await this.expect(`/admin/realms/${encodeURIComponent(this.config.realm)}/clients?max=100`, { token }),
       "clients",
     );
     const existing = list.find((entry) => entry.client_id === clientId || entry.clientId === clientId);
+    const confidential = confidentialSecret !== undefined;
     const desired: JsonObject = {
       client_id: clientId,
-      name: native ? "MCP read-only native acceptance" : "MCP reporting fixture",
-      description: native ? "Public native CLI; authorization code, PKCE, DPoP" : "Read-only list/get fixture",
+      name: confidential ? "MCP confidential step-up acceptance" : native ? "MCP read-only native acceptance" : "MCP reporting fixture",
+      description: confidential
+        ? "Confidential native CLI; authorization code, PKCE, DPoP, operation-bound CIBA"
+        : native ? "Public native CLI; authorization code, PKCE, DPoP" : "Read-only list/get fixture",
       enabled: true,
       protocol: "openid-connect",
-      public_client: true,
+      public_client: !confidential,
       bearer_only: false,
+      client_authenticator_type: "client-secret",
+      secret: confidentialSecret,
       redirect_uris: native ? [REGISTERED_REDIRECT] : [],
       web_origins: [],
       default_scopes: ["openid"],
-      optional_scopes: native ? ["mcp:read"] : [],
+      optional_scopes: native
+        ? confidential ? ["mcp:read", "mcp:write", "mcp:step_up"] : ["mcp:read"]
+        : [],
       consent_required: false,
       full_scope_allowed: true,
-      attributes: native ? { token_endpoint_auth_method: "none", application_type: "native" } : {},
+      attributes: native
+        ? { token_endpoint_auth_method: confidential ? "client_secret_basic" : "none", application_type: "native" }
+        : {},
     };
     if (!existing) {
       const created = await this.expect(
@@ -225,6 +243,34 @@ class AdminApi {
       }, [200, 204]);
     }
     return group;
+  }
+
+  async ensureIdentityProvider(token: string, alias: string): Promise<JsonObject> {
+    const base = `/admin/realms/${encodeURIComponent(this.config.realm)}/identity-provider/instances`;
+    const path = `${base}/${encodeURIComponent(alias)}`;
+    const existing = await this.request(path, { token });
+    if (existing.status === 200) return object(existing.json, "identity provider");
+    if (existing.status !== 404) throw new Error(`identity provider lookup returned HTTP ${existing.status}`);
+    return object(
+      await this.expect(
+        base,
+        {
+          method: "POST",
+          token,
+          body: {
+            alias,
+            provider_id: "oidc",
+            enabled: true,
+            config: {
+              clientId: "mcp-acceptance-broker",
+              clientSecret: "lab-only-mcp-acceptance-secret",
+            },
+          },
+        },
+        [201],
+      ),
+      "created identity provider",
+    );
   }
 
   async ensureUser(
@@ -300,10 +346,18 @@ async function main(): Promise<void> {
     const roles = new Map<string, JsonObject>();
     for (const role of READ_ROLES) roles.set(role, await api.ensureRole(token, role));
     const native = await api.ensureClient(token, config.clientId, true);
+    const confidential = await api.ensureClient(
+      token,
+      config.confidentialClientId,
+      true,
+      config.confidentialClientSecret,
+    );
     const reporting = await api.ensureClient(token, "mcp-reporting", false);
     const admin = await api.ensureUser(token, "mcp-admin", READ_ROLES, roles);
     const observer = await api.ensureUser(token, "mcp-observer", ["view-users"], roles);
+    const target = await api.ensureUser(token, "mcp-step-up-target", [], roles);
     const group = await api.ensureGroup(token, "mcp-acceptance", id(observer));
+    const identityProvider = await api.ensureIdentityProvider(token, "mcp-acceptance-idp");
     process.stdout.write(`${JSON.stringify({
       ok: true,
       issuer: `${config.baseUrl}/realms/${config.realm}`,
@@ -317,13 +371,24 @@ async function main(): Promise<void> {
         optionalScopes: ["mcp:read"],
         redirectUris: [REGISTERED_REDIRECT],
       },
+      confidentialClient: {
+        id: id(confidential),
+        clientId: config.confidentialClientId,
+        public: false,
+        tokenEndpointAuthMethod: "client_secret_basic",
+        applicationType: "native",
+        optionalScopes: ["mcp:read", "mcp:write", "mcp:step_up"],
+        redirectUris: [REGISTERED_REDIRECT],
+      },
       fixtures: {
         users: [
           { id: id(admin), username: "mcp-admin", roles: READ_ROLES },
           { id: id(observer), username: "mcp-observer", roles: ["view-users"] },
+          { id: id(target), username: "mcp-step-up-target", roles: [] },
         ],
         clients: [{ id: id(reporting), clientId: "mcp-reporting" }],
         groups: [{ id: id(group), name: "mcp-acceptance", member: "mcp-observer" }],
+        identityProviders: [{ alias: identityProvider.alias }],
         roles: READ_ROLES,
       },
     }, null, 2)}\n`);

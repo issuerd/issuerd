@@ -232,9 +232,9 @@ pub const MCP_SCOPE_READ: &str = "mcp:read";
 /// as [`MCP_SCOPE_READ`].
 pub const MCP_SCOPE_WRITE: &str = "mcp:write";
 
-/// Reserved single-purpose scope for the operation-bound CIBA step-up path.
-/// It is deliberately not a built-in seeded scope and is rejected by every
-/// ordinary flow until that separate path is implemented.
+/// Single-purpose scope for operation-bound CIBA step-up. It is seeded for
+/// explicit optional administrator assignment, never default assignment, and
+/// remains unavailable to ordinary authorization flows.
 pub const MCP_SCOPE_STEP_UP: &str = "mcp:step_up";
 
 /// Client attribute marking an anonymously registered client.
@@ -254,6 +254,7 @@ pub const BUILTIN_SCOPE_NAMES: &[&str] = &[
     "acr",
     MCP_SCOPE_READ,
     MCP_SCOPE_WRITE,
+    MCP_SCOPE_STEP_UP,
 ];
 
 /// Built-in scopes assigned as *default* scopes to every realm (and mirrored
@@ -555,6 +556,12 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
         ),
         ..scope(realm_id, MCP_SCOPE_WRITE, vec![])
     };
+    let mcp_step_up = ClientScope {
+        description: Some(
+            "Single-use operation authority issued only by operation-bound CIBA".to_string(),
+        ),
+        ..scope(realm_id, MCP_SCOPE_STEP_UP, vec![])
+    };
 
     vec![
         profile,
@@ -567,6 +574,7 @@ pub fn builtin_client_scopes(realm_id: &RealmId) -> Vec<ClientScope> {
         acr,
         mcp_read,
         mcp_write,
+        mcp_step_up,
     ]
 }
 
@@ -663,7 +671,8 @@ mod tests {
                 "web-origins",
                 "acr",
                 "mcp:read",
-                "mcp:write"
+                "mcp:write",
+                "mcp:step_up"
             ]
         );
         for s in &scopes {
@@ -676,7 +685,7 @@ mod tests {
     fn mcp_scopes_are_mapperless_and_never_default_assigned() {
         let realm = RealmId::new("r1").unwrap();
         let scopes = builtin_client_scopes(&realm);
-        for name in ["mcp:read", "mcp:write"] {
+        for name in ["mcp:read", "mcp:write", MCP_SCOPE_STEP_UP] {
             let scope = scopes.iter().find(|s| s.name == name).unwrap();
             // Pure authorization gates: they emit no claims and carry no role
             // subsetting.
@@ -692,10 +701,10 @@ mod tests {
         }
 
         assert!(is_mcp_scope_name(MCP_SCOPE_STEP_UP));
-        assert!(!is_builtin_scope_name(MCP_SCOPE_STEP_UP));
+        assert!(is_builtin_scope_name(MCP_SCOPE_STEP_UP));
         assert!(!DEFAULT_DEFAULT_SCOPES.contains(&MCP_SCOPE_STEP_UP));
         assert!(!DEFAULT_OPTIONAL_SCOPES.contains(&MCP_SCOPE_STEP_UP));
-        assert!(!scopes.iter().any(|scope| scope.name == MCP_SCOPE_STEP_UP));
+        assert!(scopes.iter().any(|scope| scope.name == MCP_SCOPE_STEP_UP));
     }
 
     #[test]

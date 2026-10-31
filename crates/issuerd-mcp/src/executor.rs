@@ -42,19 +42,218 @@ pub struct McpToolPermit {
     pub auth: McpAuthContext,
 }
 
+#[derive(Debug, Clone)]
+pub struct McpStrictResult(pub Value);
+
+#[derive(Debug)]
+pub enum McpStrictCoordination {
+    NotStrict,
+    Pending(Box<crate::step_up::PendingOperation>),
+    Complete(Value),
+}
+
 #[derive(Clone)]
 pub struct McpToolExecutor {
-    storage: Arc<dyn Storage>,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) application: Option<Arc<dyn crate::services::McpApplicationService>>,
     limiter: McpRateLimiter,
+    step_up_enabled: bool,
 }
 
 impl McpToolExecutor {
     pub fn new(storage: Arc<dyn Storage>, limiter: McpRateLimiter) -> Self {
-        Self { storage, limiter }
+        Self {
+            storage,
+            application: None,
+            limiter,
+            step_up_enabled: false,
+        }
+    }
+
+    pub fn with_step_up(mut self, enabled: bool) -> Self {
+        self.step_up_enabled = enabled;
+        self
+    }
+
+    pub fn step_up_enabled(&self) -> bool {
+        self.step_up_enabled
+    }
+
+    pub fn with_application_service(
+        mut self,
+        application: Arc<dyn crate::services::McpApplicationService>,
+    ) -> Self {
+        self.application = Some(application);
+        self
     }
 
     pub fn limiter(&self) -> &McpRateLimiter {
         &self.limiter
+    }
+
+    pub async fn coordinate_strict(
+        &self,
+        permit: &McpToolPermit,
+        arguments: Option<JsonObject>,
+        resource: String,
+        dpop_jkt: Option<String>,
+        now: i64,
+    ) -> Result<McpStrictCoordination, McpError> {
+        let operation = if crate::strict_tools::is_strict(permit.tool) {
+            crate::strict_tools::parse_operation(permit.tool, arguments)?
+        } else if crate::policy::is_strict_self_service(permit.tool) {
+            crate::account_tools::parse_operation(permit.tool, arguments)?
+        } else if crate::write_tools::is_admin_write(permit.tool) {
+            crate::write_tools::parse_operation(permit.tool, arguments)?
+        } else {
+            return Ok(McpStrictCoordination::NotStrict);
+        };
+        let application = self.application.as_ref().ok_or_else(|| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                "MCP application service is not configured".into(),
+            ))
+        })?;
+        if !self.step_up_enabled {
+            if application.prepare_strict(&permit.auth, operation).await?.is_some() {
+                return Err(McpError::UnknownTool(permit.tool.to_string()));
+            }
+            return Ok(McpStrictCoordination::NotStrict);
+        }
+        if permit.auth.has_scope(issuerd_core::MCP_SCOPE_STEP_UP) {
+            let Some(dpop_jkt) = dpop_jkt.clone() else {
+                return Err(McpError::Forbidden("strict operations require DPoP"));
+            };
+            if let Some(grant) = self.storage.get_mcp_step_up_grant(&permit.auth.claims.jti).await?
+            {
+                if grant.tool != permit.tool.as_str()
+                    || grant.realm_id != permit.auth.realm_id
+                    || grant.client_id != permit.auth.azp
+                    || grant.subject_user_id != permit.auth.user_id
+                    || grant.resource != resource
+                    || crate::strict_tools::target_id(&operation, &permit.auth)
+                        != Some(grant.mutation.target_id())
+                {
+                    return Err(McpError::OperationBindingMismatch);
+                }
+                if grant.status != issuerd_core::McpStepUpExecutionStatus::Active {
+                    return self
+                        .execute_strict(permit, operation, grant.mutation, resource, dpop_jkt, now)
+                        .await;
+                }
+            }
+        }
+        let Some(mutation) = application.prepare_strict(&permit.auth, operation.clone()).await?
+        else {
+            return Ok(McpStrictCoordination::NotStrict);
+        };
+        let Some(dpop_jkt) = dpop_jkt else {
+            return Err(McpError::Forbidden("strict operations require DPoP"));
+        };
+        if permit.auth.has_scope(issuerd_core::MCP_SCOPE_STEP_UP) {
+            return self.execute_strict(permit, operation, mutation, resource, dpop_jkt, now).await;
+        }
+
+        let pending = crate::step_up::PendingOperation::new(
+            &permit.auth,
+            resource,
+            permit.tool,
+            operation.arguments,
+            mutation,
+            dpop_jkt,
+            now,
+            crate::step_up::DEFAULT_OPERATION_TTL_SECS,
+        )?;
+        let bytes = serde_json::to_vec(&pending).map_err(|error| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(format!(
+                "pending operation serialization failed: {error}"
+            )))
+        })?;
+        let key = pending_operation_key(&pending.realm_id, &pending.operation_id);
+        let created = self
+            .limiter
+            .cache()
+            .create_if_absent(
+                &key,
+                bytes,
+                Some(std::time::Duration::from_secs(
+                    u64::try_from(pending.expires_at.saturating_sub(now).max(1))
+                        .unwrap_or(u64::MAX),
+                )),
+            )
+            .await?;
+        if !created {
+            return Err(McpError::Conflict("operation identifier already exists"));
+        }
+        Ok(McpStrictCoordination::Pending(Box::new(pending)))
+    }
+
+    async fn execute_strict(
+        &self,
+        permit: &McpToolPermit,
+        operation: crate::write_tools::McpOperation,
+        mutation: issuerd_core::McpStepUpMutation,
+        resource: String,
+        dpop_jkt: String,
+        now: i64,
+    ) -> Result<McpStrictCoordination, McpError> {
+        let grant = self
+            .storage
+            .get_mcp_step_up_grant(&permit.auth.claims.jti)
+            .await?
+            .ok_or(McpError::OperationBindingMismatch)?;
+        let reconciled = grant.status == issuerd_core::McpStepUpExecutionStatus::Succeeded;
+        let target_id = grant.mutation.target_id();
+        let pending = crate::step_up::PendingOperation::for_execution(
+            &permit.auth,
+            resource,
+            permit.tool,
+            operation.arguments,
+            mutation,
+            &grant,
+        )?;
+        crate::step_up::verify_grant(&permit.auth, &grant, &pending, &dpop_jkt, now)?;
+        let result = serde_json::to_value(crate::write_tools::WriteOutput::completed(
+            permit.tool,
+            Some(target_id),
+        ))
+        .map_err(|error| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(format!(
+                "strict result serialization failed: {error}"
+            )))
+        })?;
+        let execution = self
+            .storage
+            .execute_mcp_step_up(
+                &permit.auth.claims.jti,
+                &pending.operation_hash,
+                &pending.mutation,
+                result,
+            )
+            .await
+            .map_err(|error| match error {
+                issuerd_core::IssuerdError::AccessDenied => McpError::OperationBindingMismatch,
+                issuerd_core::IssuerdError::InvalidGrant => McpError::GrantExpired,
+                issuerd_core::IssuerdError::Conflict => {
+                    McpError::Conflict("step-up target preconditions changed")
+                }
+                other => McpError::Backend(other),
+            })?;
+        if execution.status != issuerd_core::McpStepUpExecutionStatus::Succeeded {
+            return Err(McpError::OutcomeUnknown);
+        }
+        let application = self.application.as_ref().ok_or_else(|| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                "MCP application service is not configured".into(),
+            ))
+        })?;
+        if !reconciled {
+            application.strict_committed(&grant).await;
+        }
+        execution.result_json.map(McpStrictCoordination::Complete).ok_or_else(|| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                "committed strict result is missing".into(),
+            ))
+        })
     }
 
     pub async fn preflight(
@@ -66,6 +265,9 @@ impl McpToolExecutor {
         self.limiter.acquire(&auth, now).await?;
         let tool = ToolName::parse(tool_name)
             .ok_or_else(|| McpError::UnknownTool(tool_name.to_string()))?;
+        if crate::strict_tools::requires_step_up(tool) && !self.step_up_enabled {
+            return Err(McpError::UnknownTool(tool_name.to_string()));
+        }
         let tool_policy = policy::policy_for(tool);
         deny_to_error(policy::decide(tool_policy, &auth))?;
         let target = McpTarget {
@@ -86,9 +288,37 @@ impl McpToolExecutor {
         arguments: Option<JsonObject>,
     ) -> Result<Value, McpError> {
         deny_to_error(policy::decide(permit.policy, &permit.auth))?;
+        if crate::account_tools::is_account_tool(permit.tool) {
+            let operation = crate::account_tools::parse_operation(permit.tool, arguments)?;
+            let application = self.application.as_ref().ok_or_else(|| {
+                McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                    "MCP application service is not configured".into(),
+                ))
+            })?;
+            return application.account(&permit.auth, operation).await;
+        }
+        if crate::write_tools::is_admin_write(permit.tool) {
+            let operation = crate::write_tools::parse_operation(permit.tool, arguments)?;
+            let application = self.application.as_ref().ok_or_else(|| {
+                McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                    "MCP application service is not configured".into(),
+                ))
+            })?;
+            return application.write(&permit.auth, operation).await;
+        }
         match permit.tool {
             ToolName::AttackDetectionStatus => {
                 self.attack_detection_status(permit, arguments).await
+            }
+            ToolName::ClientScopesList
+            | ToolName::EventsSearch
+            | ToolName::FlowsList
+            | ToolName::IdpGet
+            | ToolName::IdpList
+            | ToolName::KeysList
+            | ToolName::ServerinfoGet
+            | ToolName::SessionsList => {
+                crate::read_inventory::execute(self, permit, arguments).await
             }
             ToolName::RealmGet => self.realm_get(permit, arguments).await,
             ToolName::UsersSearch => self.users_search(permit, arguments).await,
@@ -104,6 +334,7 @@ impl McpToolExecutor {
             ToolName::GroupsMembers => self.groups_members(permit, arguments).await,
             ToolName::RolesList => self.roles_list(permit, arguments).await,
             ToolName::RolesGet => self.roles_get(permit, arguments).await,
+            _ => unreachable!("admin writes use the application service"),
         }
     }
 
@@ -606,6 +837,10 @@ impl McpToolExecutor {
     }
 }
 
+pub fn pending_operation_key(realm_id: &RealmId, operation_id: &str) -> String {
+    format!("mcp:op:{{{realm_id}}}:{operation_id}")
+}
+
 fn role_outputs<'a>(roles: impl IntoIterator<Item = &'a Role>) -> Vec<RoleOutput> {
     let mut roles: Vec<_> = roles.into_iter().cloned().collect();
     roles.sort_by(|left, right| {
@@ -624,12 +859,12 @@ fn deny_to_error(decision: PolicyDecision) -> Result<(), McpError> {
     }
 }
 
-fn decode<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
+pub(crate) fn decode<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
         .map_err(|error| McpError::InvalidInput(error.to_string()))
 }
 
-fn output(value: impl Serialize) -> Result<Value, McpError> {
+pub(crate) fn output(value: impl Serialize) -> Result<Value, McpError> {
     serde_json::to_value(value).map_err(|_| {
         McpError::Backend(issuerd_core::IssuerdError::ServerError(
             "tool result serialization failed".into(),
@@ -672,7 +907,7 @@ fn validate_bounded(value: &str, field: &str, maximum_bytes: usize) -> Result<()
     Ok(())
 }
 
-fn pagination(first: Option<u32>, max: Option<u32>) -> Result<Pagination, McpError> {
+pub(crate) fn pagination(first: Option<u32>, max: Option<u32>) -> Result<Pagination, McpError> {
     let first = first.unwrap_or(0);
     let max = max.unwrap_or(DEFAULT_PAGE_SIZE);
     if max > MAX_PAGE_SIZE {
@@ -718,10 +953,17 @@ mod tests {
         let role = match tool {
             ToolName::AttackDetectionStatus => "manage-users",
             ToolName::RealmGet
+            | ToolName::EventsSearch
+            | ToolName::FlowsList
             | ToolName::GroupsGet
             | ToolName::GroupsList
+            | ToolName::IdpGet
+            | ToolName::IdpList
+            | ToolName::KeysList
             | ToolName::RolesGet
-            | ToolName::RolesList => "view-realm",
+            | ToolName::RolesList
+            | ToolName::ServerinfoGet
+            | ToolName::SessionsList => "view-realm",
             ToolName::UsersGet
             | ToolName::UsersGetCredentials
             | ToolName::UsersGetGroups
@@ -729,9 +971,17 @@ mod tests {
             | ToolName::UsersGetSessions
             | ToolName::UsersSearch
             | ToolName::GroupsMembers => "view-users",
-            ToolName::ClientsGet | ToolName::ClientsList => "view-clients",
+            ToolName::ClientScopesList | ToolName::ClientsGet | ToolName::ClientsList => {
+                "view-clients"
+            }
+            _ => "manage-realm",
         };
-        executor.preflight(tool.as_str(), auth("mcp:read", &[role]), NOW).await.unwrap()
+        let scope = if tool.tier() == crate::policy::RiskTier::T0 {
+            "mcp:read"
+        } else {
+            "mcp:write"
+        };
+        executor.preflight(tool.as_str(), auth(scope, &[role]), NOW).await.unwrap()
     }
 
     async fn execute(

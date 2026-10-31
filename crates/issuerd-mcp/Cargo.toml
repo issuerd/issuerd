@@ -7,12 +7,15 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Read-only Model Context Protocol tools, policy, and transport primitives for the Issuerd IAM server"
+description = "Curated Model Context Protocol tools, policy, and transport primitives for the Issuerd IAM server"
 keywords = ["oidc", "oauth2", "iam", "mcp"]
 categories = ["authentication", "web-programming"]
 
 [dependencies]
 issuerd-core = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
 http = "1"
 http-body = "1"
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

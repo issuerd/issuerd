@@ -714,7 +714,7 @@ fn themes(names: &[String]) -> Vec<EnumValueRepresentation> {
         .collect()
 }
 
-async fn build_server_info(state: &AdminApiState) -> ServerInfoRepresentation {
+pub async fn build_server_info(state: &AdminApiState) -> ServerInfoRepresentation {
     ServerInfoRepresentation {
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocols: protocols(),

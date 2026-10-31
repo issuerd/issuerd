@@ -1,0 +1,122 @@
+name: issuerd-mcp-step-up-cluster
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: issuerd
+      POSTGRES_PASSWORD: issuerd_secret
+      POSTGRES_DB: issuerd
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuerd -d issuerd"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  issuerd-1: &issuerd-node
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: issuerd:mcp-admin-local
+    volumes:
+      - ./issuerd.step-up-node.toml:/etc/issuerd/issuerd.toml:ro
+      - ./provision.yaml:/etc/issuerd/provision.yaml:ro
+    environment:
+      ISSUERD_PROVISION: /etc/issuerd/provision.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: &issuerd-healthcheck
+      test: ["CMD", "issuerd", "healthcheck", "--url", "http://127.0.0.1:8080/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  issuerd-2:
+    <<: *issuerd-node
+    volumes:
+      - ./issuerd.step-up-node.toml:/etc/issuerd/issuerd.toml:ro
+    environment: {}
+
+  issuerd-3:
+    <<: *issuerd-node
+    volumes:
+      - ./issuerd.step-up-node.toml:/etc/issuerd/issuerd.toml:ro
+    environment: {}
+
+  gateway:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.step-up.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18091:8080"
+    depends_on:
+      issuerd-1:
+        condition: service_healthy
+      issuerd-2:
+        condition: service_healthy
+      issuerd-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  setup:
+    build: ./client
+    image: issuerd-mcp-admin-client:local
+    network_mode: service:gateway
+    restart: "no"
+    environment:
+      ISSUERD_BASE_URL: http://127.0.0.1:8080
+      REALM: mcp-demo
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin
+      MCP_CLIENT_ID: mcp-admin-native
+      MCP_CONFIDENTIAL_CLIENT_ID: mcp-admin-confidential
+      MCP_CLIENT_SECRET: mcp-step-up-secret
+      MCP_PASSWORD: Password123!
+    command: ["node", "dist/src/setup.js"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  step-up-client:
+    build: ./client
+    image: issuerd-mcp-admin-client:local
+    network_mode: service:gateway
+    restart: "no"
+    environment:
+      ISSUERD_ISSUER: http://127.0.0.1:8080/realms/mcp-demo
+      MCP_CONFIDENTIAL_CLIENT_ID: mcp-admin-confidential
+      MCP_CLIENT_SECRET: mcp-step-up-secret
+      MCP_USERNAME: mcp-admin
+      MCP_PASSWORD: Password123!
+      MCP_MULTI_NODE: "1"
+    command: ["node", "dist/src/step-up.js"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+    driver: local

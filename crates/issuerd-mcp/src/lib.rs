@@ -3,15 +3,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_tools;
 pub mod auth;
 pub mod error;
 pub mod executor;
 pub mod json;
 pub mod policy;
 pub mod rate_limit;
+pub mod read_inventory;
+pub mod resources;
 pub mod server;
+pub mod services;
+pub mod step_up;
+pub mod strict_tools;
 pub mod tools;
 pub mod transport;
+pub mod write_tools;
 
 #[cfg(test)]
 mod test_support;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
-use issuerd_core::MCP_SCOPE_READ;
+use issuerd_core::{MCP_SCOPE_READ, MCP_SCOPE_STEP_UP, MCP_SCOPE_WRITE};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::McpAuthContext;
@@ -9,63 +9,286 @@ use crate::auth::McpAuthContext;
 const REALM_ROLES: &[&str] = &["view-realm", "manage-realm"];
 const USER_ROLES: &[&str] = &["view-users", "manage-users"];
 const CLIENT_ROLES: &[&str] = &["view-clients", "manage-clients"];
+const MANAGE_REALM: &[&str] = &["manage-realm"];
+const MANAGE_USERS: &[&str] = &["manage-users"];
+const MANAGE_CLIENTS: &[&str] = &["manage-clients"];
+const REVOKE_SESSION_ROLES: &[&str] = &["manage-users", "manage-realm"];
+const NO_ROLES: &[&str] = &[];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskTier {
+    T0,
+    T1,
+    T2,
+    T3,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
     AttackDetectionStatus,
+    ClientScopesList,
+    ClientsCreate,
+    ClientsDelete,
     ClientsGet,
     ClientsList,
+    ClientsSetDefaultScopes,
+    ClientsUpdateProfile,
+    ClientsUpdateSecurity,
+    EventsConfigUpdate,
+    EventsSearch,
+    FlowsList,
+    FlowsUpdateExecutions,
+    GroupsAddChild,
+    GroupsAssignRole,
+    GroupsCreate,
+    GroupsDelete,
     GroupsGet,
     GroupsList,
     GroupsMembers,
+    GroupsUnassignRole,
+    GroupsUpdate,
+    IdpCreate,
+    IdpDelete,
+    IdpGet,
+    IdpList,
+    IdpUpdate,
+    KeysList,
+    MeConsentsList,
+    MeConsentsRevoke,
+    MeGetProfile,
+    MeLinkedAccountsList,
+    MeLinkedAccountsUnlink,
+    MeSessionsList,
+    MeSessionsLogout,
+    MeTotpDelete,
+    MeTotpEnroll,
+    MeUpdateProfile,
+    MeWebauthnDelete,
+    MeWebauthnRegister,
+    PushNotBefore,
+    RealmDelete,
     RealmGet,
+    RealmUpdateSettings,
+    RolesCreate,
+    RolesDelete,
     RolesGet,
     RolesList,
+    RolesUpdate,
+    ServerinfoGet,
+    SessionsList,
+    UsersAddToGroup,
+    UsersAssignRole,
+    UsersCreate,
+    UsersDelete,
     UsersGet,
     UsersGetCredentials,
     UsersGetGroups,
     UsersGetRoleMappings,
     UsersGetSessions,
+    UsersRemoveFromGroup,
+    UsersRevokeSessions,
     UsersSearch,
+    UsersSendActionsEmail,
+    UsersSetEnabled,
+    UsersUnassignRole,
+    UsersUpdate,
 }
 
 impl ToolName {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 67] = [
         Self::AttackDetectionStatus,
+        Self::ClientScopesList,
+        Self::ClientsCreate,
+        Self::ClientsDelete,
         Self::ClientsGet,
         Self::ClientsList,
+        Self::ClientsSetDefaultScopes,
+        Self::ClientsUpdateProfile,
+        Self::ClientsUpdateSecurity,
+        Self::EventsConfigUpdate,
+        Self::EventsSearch,
+        Self::FlowsList,
+        Self::FlowsUpdateExecutions,
+        Self::GroupsAddChild,
+        Self::GroupsAssignRole,
+        Self::GroupsCreate,
+        Self::GroupsDelete,
         Self::GroupsGet,
         Self::GroupsList,
         Self::GroupsMembers,
+        Self::GroupsUnassignRole,
+        Self::GroupsUpdate,
+        Self::IdpCreate,
+        Self::IdpDelete,
+        Self::IdpGet,
+        Self::IdpList,
+        Self::IdpUpdate,
+        Self::KeysList,
+        Self::MeConsentsList,
+        Self::MeConsentsRevoke,
+        Self::MeGetProfile,
+        Self::MeLinkedAccountsList,
+        Self::MeLinkedAccountsUnlink,
+        Self::MeSessionsList,
+        Self::MeSessionsLogout,
+        Self::MeTotpDelete,
+        Self::MeTotpEnroll,
+        Self::MeUpdateProfile,
+        Self::MeWebauthnDelete,
+        Self::MeWebauthnRegister,
+        Self::PushNotBefore,
+        Self::RealmDelete,
         Self::RealmGet,
+        Self::RealmUpdateSettings,
+        Self::RolesCreate,
+        Self::RolesDelete,
         Self::RolesGet,
         Self::RolesList,
+        Self::RolesUpdate,
+        Self::ServerinfoGet,
+        Self::SessionsList,
+        Self::UsersAddToGroup,
+        Self::UsersAssignRole,
+        Self::UsersCreate,
+        Self::UsersDelete,
         Self::UsersGet,
         Self::UsersGetCredentials,
         Self::UsersGetGroups,
         Self::UsersGetRoleMappings,
         Self::UsersGetSessions,
+        Self::UsersRemoveFromGroup,
+        Self::UsersRevokeSessions,
         Self::UsersSearch,
+        Self::UsersSendActionsEmail,
+        Self::UsersSetEnabled,
+        Self::UsersUnassignRole,
+        Self::UsersUpdate,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AttackDetectionStatus => "attack_detection_status",
+            Self::ClientScopesList => "client_scopes_list",
+            Self::ClientsCreate => "clients_create",
+            Self::ClientsDelete => "clients_delete",
             Self::ClientsGet => "clients_get",
             Self::ClientsList => "clients_list",
+            Self::ClientsSetDefaultScopes => "clients_set_default_scopes",
+            Self::ClientsUpdateProfile => "clients_update_profile",
+            Self::ClientsUpdateSecurity => "clients_update_security",
+            Self::EventsConfigUpdate => "events_config_update",
+            Self::EventsSearch => "events_search",
+            Self::FlowsList => "flows_list",
+            Self::FlowsUpdateExecutions => "flows_update_executions",
+            Self::GroupsAddChild => "groups_add_child",
+            Self::GroupsAssignRole => "groups_assign_role",
+            Self::GroupsCreate => "groups_create",
+            Self::GroupsDelete => "groups_delete",
             Self::GroupsGet => "groups_get",
             Self::GroupsList => "groups_list",
             Self::GroupsMembers => "groups_members",
+            Self::GroupsUnassignRole => "groups_unassign_role",
+            Self::GroupsUpdate => "groups_update",
+            Self::IdpCreate => "idp_create",
+            Self::IdpDelete => "idp_delete",
+            Self::IdpGet => "idp_get",
+            Self::IdpList => "idp_list",
+            Self::IdpUpdate => "idp_update",
+            Self::KeysList => "keys_list",
+            Self::MeConsentsList => "me_consents_list",
+            Self::MeConsentsRevoke => "me_consents_revoke",
+            Self::MeGetProfile => "me_get_profile",
+            Self::MeLinkedAccountsList => "me_linked_accounts_list",
+            Self::MeLinkedAccountsUnlink => "me_linked_accounts_unlink",
+            Self::MeSessionsList => "me_sessions_list",
+            Self::MeSessionsLogout => "me_sessions_logout",
+            Self::MeTotpDelete => "me_totp_delete",
+            Self::MeTotpEnroll => "me_totp_enroll",
+            Self::MeUpdateProfile => "me_update_profile",
+            Self::MeWebauthnDelete => "me_webauthn_delete",
+            Self::MeWebauthnRegister => "me_webauthn_register",
+            Self::PushNotBefore => "push_not_before",
+            Self::RealmDelete => "realm_delete",
             Self::RealmGet => "realm_get",
+            Self::RealmUpdateSettings => "realm_update_settings",
+            Self::RolesCreate => "roles_create",
+            Self::RolesDelete => "roles_delete",
             Self::RolesGet => "roles_get",
             Self::RolesList => "roles_list",
+            Self::RolesUpdate => "roles_update",
+            Self::ServerinfoGet => "serverinfo_get",
+            Self::SessionsList => "sessions_list",
+            Self::UsersAddToGroup => "users_add_to_group",
+            Self::UsersAssignRole => "users_assign_role",
+            Self::UsersCreate => "users_create",
+            Self::UsersDelete => "users_delete",
             Self::UsersGet => "users_get",
             Self::UsersGetCredentials => "users_get_credentials",
             Self::UsersGetGroups => "users_get_groups",
             Self::UsersGetRoleMappings => "users_get_role_mappings",
             Self::UsersGetSessions => "users_get_sessions",
+            Self::UsersRemoveFromGroup => "users_remove_from_group",
+            Self::UsersRevokeSessions => "users_revoke_sessions",
             Self::UsersSearch => "users_search",
+            Self::UsersSendActionsEmail => "users_send_actions_email",
+            Self::UsersSetEnabled => "users_set_enabled",
+            Self::UsersUnassignRole => "users_unassign_role",
+            Self::UsersUpdate => "users_update",
+        }
+    }
+
+    pub const fn tier(self) -> RiskTier {
+        match self {
+            Self::AttackDetectionStatus
+            | Self::ClientScopesList
+            | Self::ClientsGet
+            | Self::ClientsList
+            | Self::EventsSearch
+            | Self::FlowsList
+            | Self::GroupsGet
+            | Self::GroupsList
+            | Self::GroupsMembers
+            | Self::IdpGet
+            | Self::IdpList
+            | Self::KeysList
+            | Self::RealmGet
+            | Self::RolesGet
+            | Self::RolesList
+            | Self::ServerinfoGet
+            | Self::SessionsList
+            | Self::UsersGet
+            | Self::UsersGetCredentials
+            | Self::UsersGetGroups
+            | Self::UsersGetRoleMappings
+            | Self::UsersGetSessions
+            | Self::UsersSearch => RiskTier::T0,
+            Self::MeConsentsList
+            | Self::MeConsentsRevoke
+            | Self::MeGetProfile
+            | Self::MeLinkedAccountsList
+            | Self::MeLinkedAccountsUnlink
+            | Self::MeSessionsList
+            | Self::MeSessionsLogout
+            | Self::MeTotpEnroll
+            | Self::MeUpdateProfile
+            | Self::MeWebauthnRegister => RiskTier::T1,
+            Self::ClientsDelete
+            | Self::ClientsUpdateSecurity
+            | Self::EventsConfigUpdate
+            | Self::FlowsUpdateExecutions
+            | Self::GroupsDelete
+            | Self::IdpCreate
+            | Self::IdpDelete
+            | Self::IdpUpdate
+            | Self::MeTotpDelete
+            | Self::MeWebauthnDelete
+            | Self::PushNotBefore
+            | Self::RealmDelete
+            | Self::RealmUpdateSettings
+            | Self::RolesDelete
+            | Self::UsersDelete => RiskTier::T3,
+            _ => RiskTier::T2,
         }
     }
 
@@ -87,82 +310,84 @@ pub struct ToolPolicy {
     pub any_realm_roles: &'static [&'static str],
 }
 
-pub const POLICIES: [ToolPolicy; 15] = [
-    ToolPolicy {
-        tool: ToolName::AttackDetectionStatus,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: &["manage-users"],
-    },
-    ToolPolicy {
-        tool: ToolName::ClientsGet,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: CLIENT_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::ClientsList,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: CLIENT_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::GroupsGet,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: REALM_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::GroupsList,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: REALM_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::GroupsMembers,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::RealmGet,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: REALM_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::RolesGet,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: REALM_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::RolesList,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: REALM_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersGet,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersGetCredentials,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersGetGroups,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersGetRoleMappings,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersGetSessions,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
-    ToolPolicy {
-        tool: ToolName::UsersSearch,
-        required_scope: MCP_SCOPE_READ,
-        any_realm_roles: USER_ROLES,
-    },
+macro_rules! policy {
+    ($tool:ident, $scope:expr, $roles:expr) => {
+        ToolPolicy {
+            tool: ToolName::$tool,
+            required_scope: $scope,
+            any_realm_roles: $roles,
+        }
+    };
+}
+
+pub const POLICIES: [ToolPolicy; 67] = [
+    policy!(AttackDetectionStatus, MCP_SCOPE_READ, MANAGE_USERS),
+    policy!(ClientScopesList, MCP_SCOPE_READ, CLIENT_ROLES),
+    policy!(ClientsCreate, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
+    policy!(ClientsDelete, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
+    policy!(ClientsGet, MCP_SCOPE_READ, CLIENT_ROLES),
+    policy!(ClientsList, MCP_SCOPE_READ, CLIENT_ROLES),
+    policy!(ClientsSetDefaultScopes, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
+    policy!(ClientsUpdateProfile, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
+    policy!(ClientsUpdateSecurity, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
+    policy!(EventsConfigUpdate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(EventsSearch, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(FlowsList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(FlowsUpdateExecutions, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsAddChild, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsAssignRole, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsCreate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsDelete, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsGet, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(GroupsList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(GroupsMembers, MCP_SCOPE_READ, USER_ROLES),
+    policy!(GroupsUnassignRole, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(GroupsUpdate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(IdpCreate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(IdpDelete, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(IdpGet, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(IdpList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(IdpUpdate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(KeysList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(MeConsentsList, "openid", NO_ROLES),
+    policy!(MeConsentsRevoke, "openid", NO_ROLES),
+    policy!(MeGetProfile, "openid", NO_ROLES),
+    policy!(MeLinkedAccountsList, "openid", NO_ROLES),
+    policy!(MeLinkedAccountsUnlink, "openid", NO_ROLES),
+    policy!(MeSessionsList, "openid", NO_ROLES),
+    policy!(MeSessionsLogout, "openid", NO_ROLES),
+    policy!(MeTotpDelete, "openid", NO_ROLES),
+    policy!(MeTotpEnroll, "openid", NO_ROLES),
+    policy!(MeUpdateProfile, "openid", NO_ROLES),
+    policy!(MeWebauthnDelete, "openid", NO_ROLES),
+    policy!(MeWebauthnRegister, "openid", NO_ROLES),
+    policy!(PushNotBefore, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(RealmDelete, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(RealmGet, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(RealmUpdateSettings, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(RolesCreate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(RolesDelete, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(RolesGet, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(RolesList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(RolesUpdate, MCP_SCOPE_WRITE, MANAGE_REALM),
+    policy!(ServerinfoGet, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(SessionsList, MCP_SCOPE_READ, REALM_ROLES),
+    policy!(UsersAddToGroup, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersAssignRole, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersCreate, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersDelete, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersGet, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersGetCredentials, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersGetGroups, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersGetRoleMappings, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersGetSessions, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersRemoveFromGroup, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersRevokeSessions, MCP_SCOPE_WRITE, REVOKE_SESSION_ROLES),
+    policy!(UsersSearch, MCP_SCOPE_READ, USER_ROLES),
+    policy!(UsersSendActionsEmail, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersSetEnabled, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersUnassignRole, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersUpdate, MCP_SCOPE_WRITE, MANAGE_USERS),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +411,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 15] {
+pub fn policies() -> &'static [ToolPolicy; 67] {
     &POLICIES
 }
 
@@ -198,11 +423,32 @@ pub fn policy_for(tool: ToolName) -> &'static ToolPolicy {
     &POLICIES[index]
 }
 
+pub fn is_strict_self_service(tool: ToolName) -> bool {
+    matches!(tool, ToolName::MeTotpDelete | ToolName::MeWebauthnDelete)
+}
+
 pub fn decide(policy: &ToolPolicy, auth: &McpAuthContext) -> PolicyDecision {
-    if !auth.has_scope(policy.required_scope) {
+    let strict_self_service = is_strict_self_service(policy.tool);
+    if auth.has_scope(MCP_SCOPE_STEP_UP)
+        && policy.tool.tier() != RiskTier::T3
+        && !strict_self_service
+    {
         return PolicyDecision::Deny(PolicyDeny::MissingScope(policy.required_scope));
     }
-    if !auth.has_any_realm_role(policy.any_realm_roles) {
+    if !(policy.tool.tier() == RiskTier::T3 && auth.has_scope(MCP_SCOPE_STEP_UP))
+        && !auth.has_scope(policy.required_scope)
+    {
+        return PolicyDecision::Deny(PolicyDeny::MissingScope(policy.required_scope));
+    }
+    if policy.tool.tier() == RiskTier::T1 || strict_self_service {
+        return PolicyDecision::Allow;
+    }
+    let role_allowed = if policy.tool == ToolName::UsersRevokeSessions {
+        auth.has_realm_role("manage-users") && auth.has_realm_role("manage-realm")
+    } else {
+        auth.has_any_realm_role(policy.any_realm_roles)
+    };
+    if !role_allowed {
         return PolicyDecision::Deny(PolicyDeny::MissingRole {
             tool: policy.tool,
             roles: policy.any_realm_roles,
@@ -259,7 +505,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 15);
+        assert_eq!(unique.len(), 67);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -268,29 +514,67 @@ mod tests {
             assert_eq!(policy_for(tool).tool, tool);
             assert_eq!(ToolName::parse(tool.as_str()), Some(tool));
         }
-        assert_eq!(ToolName::parse("realm_delete"), None);
+        assert_eq!(ToolName::parse("realm_create"), None);
     }
 
     #[test]
     fn every_policy_enforces_its_scope_and_either_accepted_role() {
         for policy in policies() {
+            let scope = if is_strict_self_service(policy.tool) {
+                "openid"
+            } else {
+                match policy.tool.tier() {
+                    RiskTier::T0 => "mcp:read",
+                    RiskTier::T1 => "openid",
+                    _ => "mcp:write",
+                }
+            };
+            if policy.any_realm_roles.is_empty() {
+                assert!(
+                    decide(policy, &auth(scope, &[])).is_allowed(),
+                    "self-service policy {} must not require an admin role",
+                    policy.tool
+                );
+            }
             for role in policy.any_realm_roles {
-                assert!(decide(policy, &auth("mcp:read", &[*role])).is_allowed());
+                let roles = if policy.tool == ToolName::UsersRevokeSessions {
+                    vec![
+                        *role,
+                        if *role == "manage-users" {
+                            "manage-realm"
+                        } else {
+                            "manage-users"
+                        },
+                    ]
+                } else {
+                    vec![*role]
+                };
+                assert!(decide(policy, &auth(scope, &roles)).is_allowed());
+            }
+            let without_scope =
+                if policy.tool.tier() == RiskTier::T1 || is_strict_self_service(policy.tool) {
+                    "profile"
+                } else {
+                    "openid"
+                };
+            assert_eq!(
+                decide(policy, &auth(without_scope, policy.any_realm_roles)),
+                PolicyDecision::Deny(PolicyDeny::MissingScope(scope))
+            );
+            if policy.tool.tier() == RiskTier::T1 || is_strict_self_service(policy.tool) {
+                assert!(decide(policy, &auth(scope, &["unrelated"])).is_allowed());
+            } else {
+                assert_eq!(
+                    decide(policy, &auth(scope, &["unrelated"])),
+                    PolicyDecision::Deny(PolicyDeny::MissingRole {
+                        tool: policy.tool,
+                        roles: policy.any_realm_roles,
+                    })
+                );
             }
             assert_eq!(
-                decide(policy, &auth("openid", policy.any_realm_roles)),
-                PolicyDecision::Deny(PolicyDeny::MissingScope("mcp:read"))
-            );
-            assert_eq!(
-                decide(policy, &auth("mcp:read", &["unrelated"])),
-                PolicyDecision::Deny(PolicyDeny::MissingRole {
-                    tool: policy.tool,
-                    roles: policy.any_realm_roles,
-                })
-            );
-            assert_eq!(
-                decide(policy, &auth("openid", &["unrelated"])),
-                PolicyDecision::Deny(PolicyDeny::MissingScope("mcp:read")),
+                decide(policy, &auth(without_scope, &["unrelated"])),
+                PolicyDecision::Deny(PolicyDeny::MissingScope(scope)),
                 "scope denial precedes role denial"
             );
         }
@@ -299,10 +583,23 @@ mod tests {
     #[test]
     fn no_other_scope_grants_read_authority() {
         for scope in ["mcp:write", "mcp:step_up", "openid mcp:write", "admin"] {
-            for policy in policies() {
+            for policy in policies().iter().filter(|policy| policy.tool.tier() == RiskTier::T0) {
                 assert!(!decide(policy, &auth(scope, policy.any_realm_roles)).is_allowed());
             }
         }
+    }
+
+    #[test]
+    fn session_revocation_requires_both_manage_roles() {
+        let policy = policy_for(ToolName::UsersRevokeSessions);
+        for roles in [
+            &["manage-users"][..],
+            &["manage-realm"][..],
+            &["unrelated"][..],
+        ] {
+            assert!(!decide(policy, &auth("mcp:write", roles)).is_allowed());
+        }
+        assert!(decide(policy, &auth("mcp:write", &["manage-users", "manage-realm"])).is_allowed());
     }
 
     #[test]

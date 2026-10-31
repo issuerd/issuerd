@@ -17,5 +17,8 @@ level = "info"
 [mcp]
 enabled = true
 
+[mcp.step_up]
+enabled = true
+
 [dpop.nonce]
 mode = "required"

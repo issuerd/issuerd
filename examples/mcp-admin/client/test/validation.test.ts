@@ -7,8 +7,8 @@ import {
 } from "../src/validation.js";
 import { parseRealmIssuer, TOOL_NAMES } from "../src/config.js";
 
-test("acceptance inventory is fifteen unique tools in deterministic order", () => {
-  assert.equal(TOOL_NAMES.length, 15);
+test("acceptance inventory is 23 unique tools in deterministic order", () => {
+  assert.equal(TOOL_NAMES.length, 23);
   assert.equal(new Set(TOOL_NAMES).size, TOOL_NAMES.length);
   assert.deepEqual([...TOOL_NAMES], [...TOOL_NAMES].sort());
   for (const name of [

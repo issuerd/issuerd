@@ -170,6 +170,7 @@ async fn realm_creation_seeds_builtin_client_scopes() {
             "address",
             "email",
             "mcp:read",
+            "mcp:step_up",
             "mcp:write",
             "offline_access",
             "phone",

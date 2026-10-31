@@ -5,9 +5,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
-    Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerConfig, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
+    Implementation, ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -42,16 +43,16 @@ impl IssuerdMcpServer {
 
 impl ServerHandler for IssuerdMcpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_server_info(
                 Implementation::new("issuerd", env!("CARGO_PKG_VERSION"))
                     .with_title("Issuerd")
-                    .with_description("Issuerd read-only realm administration MCP tools")
+                    .with_description("Issuerd realm administration MCP tools and resources")
                     .with_website_url("https://issuerd.org"),
             )
             .with_instructions(
-                "Read-only realm tools. Scope and realm-role policy is evaluated per request.",
+                "Curated realm tools and resources. Scope and realm-role policy is evaluated per request.",
             )
     }
 
@@ -60,7 +61,10 @@ impl ServerHandler for IssuerdMcpServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        crate::policy::ToolName::parse(name).map(crate::tools::definition)
+        crate::policy::ToolName::parse(name).and_then(|tool| {
+            (self.executor.step_up_enabled() || !crate::strict_tools::requires_step_up(tool))
+                .then(|| crate::tools::definition(tool))
+        })
     }
 
     async fn list_tools(
@@ -72,11 +76,51 @@ impl ServerHandler for IssuerdMcpServer {
         let tools = crate::tools::definitions()
             .into_iter()
             .filter(|tool| {
-                crate::policy::ToolName::parse(tool.name.as_ref())
-                    .is_some_and(|name| policy::decide_for(name, &auth).is_allowed())
+                crate::policy::ToolName::parse(tool.name.as_ref()).is_some_and(|name| {
+                    (self.executor.step_up_enabled()
+                        || !crate::strict_tools::requires_step_up(name))
+                        && policy::decide_for(name, &auth).is_allowed()
+                })
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let auth = auth_from_context(&context).map_err(protocol_error)?;
+        Ok(ListResourcesResult::with_all_items(crate::resources::definitions(&auth))
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let auth = auth_from_context(&context).map_err(protocol_error)?;
+        let (uri, value) = crate::resources::read(
+            &self.executor,
+            auth,
+            &request.uri,
+            issuerd_core::utils::now_secs(),
+        )
+        .await
+        .map_err(|error| match error {
+            McpError::NotFound(_) => ErrorData::resource_not_found("resource not found", None),
+            other => protocol_error(other),
+        })?;
+        let text = serde_json::to_string(&value)
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let contents = ResourceContents::text(text, uri).with_mime_type("application/json");
+        Ok(ReadResourceResult::new(vec![contents])
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)
+            .into())
     }
 
     async fn call_tool(
@@ -116,6 +160,13 @@ impl ServerHandler for IssuerdMcpServer {
                 Err(error) => return Ok(tool_error(error)),
             },
         };
+        if let Some(result) = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<crate::executor::McpStrictResult>())
+        {
+            return Ok(CallToolResult::structured(result.0.clone()).into());
+        }
         match self.executor.execute(&permit, request.arguments).await {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
             Err(error) if matches!(error, McpError::UnknownTool(_)) => Err(protocol_error(error)),
@@ -139,6 +190,9 @@ fn protocol_error(error: McpError) -> ErrorData {
         McpError::MissingAuthenticationContext => {
             ErrorData::internal_error("missing MCP authentication context", None)
         }
+        error @ (McpError::MissingScope(_)
+        | McpError::MissingRole { .. }
+        | McpError::Forbidden(_)) => ErrorData::invalid_request(error.public_tool_message(), None),
         other => ErrorData::internal_error(other.public_tool_message(), None),
     }
 }
@@ -189,13 +243,27 @@ mod tests {
         assert_eq!(info.server_info.name, "issuerd");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.capabilities.tools.as_ref().unwrap().list_changed, None);
-        assert!(info.capabilities.resources.is_none());
+        let resources = info.capabilities.resources.as_ref().unwrap();
+        assert_eq!(resources.list_changed, None);
+        assert_eq!(resources.subscribe, None);
         assert!(info.capabilities.prompts.is_none());
         let supported = server.supported_protocol_versions();
         let versions: Vec<_> = supported.iter().map(ProtocolVersion::as_str).collect();
         assert_eq!(versions, ["2025-06-18", "2025-11-25", "2026-07-28"]);
         assert!(server.get_tool("realm_get").is_some());
         assert!(server.get_tool("tools/get").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_step_up_hides_and_rejects_destructive_self_service() {
+        let server = server();
+        for tool in ["me_totp_delete", "me_webauthn_delete"] {
+            assert!(server.get_tool(tool).is_none());
+            assert!(matches!(
+                server.executor.preflight(tool, auth("openid", &[]), 100).await,
+                Err(McpError::UnknownTool(_))
+            ));
+        }
     }
 
     struct TestService {
@@ -270,11 +338,18 @@ mod tests {
         assert_eq!(
             names,
             [
+                "events_search",
+                "flows_list",
                 "groups_get",
                 "groups_list",
+                "idp_get",
+                "idp_list",
+                "keys_list",
                 "realm_get",
                 "roles_get",
-                "roles_list"
+                "roles_list",
+                "serverinfo_get",
+                "sessions_list"
             ]
         );
         assert!(tools.iter().all(|tool| tool["outputSchema"].is_object()));
@@ -296,6 +371,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "client_scopes_list",
                 "clients_get",
                 "clients_list",
                 "groups_members",
@@ -465,5 +541,89 @@ mod tests {
         for task in tasks {
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn resources_are_listed_read_and_policy_checked_over_json_rpc() {
+        let mut service = service(60).await.service;
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({"jsonrpc":"2.0","id":30,"method":"resources/list","params":{}}),
+                auth("mcp:read", &["view-realm", "view-clients"]),
+                None,
+            ),
+        )
+        .await;
+        let resources = response["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 3);
+        assert!(resources.iter().all(|resource| resource["mimeType"] == "application/json"));
+        assert_eq!(response["result"]["ttlMs"], 0);
+        assert_eq!(response["result"]["cacheScope"], "private");
+
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({"jsonrpc":"2.0","id":31,"method":"resources/list","params":{}}),
+                auth("mcp:read", &["view-clients"]),
+                None,
+            ),
+        )
+        .await;
+        let resources = response["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "issuerd://realm/demo/clients");
+
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({
+                    "jsonrpc":"2.0","id":32,"method":"resources/read",
+                    "params":{"uri":"issuerd://realm/demo/clients"}
+                }),
+                auth("mcp:read", &["view-clients"]),
+                None,
+            ),
+        )
+        .await;
+        let content = &response["result"]["contents"][0];
+        assert_eq!(content["uri"], "issuerd://realm/demo/clients");
+        assert_eq!(content["mimeType"], "application/json");
+        let payload: Value = serde_json::from_str(content["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["clients"].as_array().unwrap().len(), 3);
+        assert!(!content["text"].as_str().unwrap().contains(CLIENT_SECRET));
+
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({
+                    "jsonrpc":"2.0","id":33,"method":"resources/read",
+                    "params":{"uri":"issuerd://realm/demo/roles"}
+                }),
+                auth("mcp:read", &["view-clients"]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32600);
+
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({
+                    "jsonrpc":"2.0","id":34,"method":"resources/read",
+                    "params":{"uri":"issuerd://realm/other/clients"}
+                }),
+                auth("mcp:read", &["view-clients"]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32002);
     }
 }

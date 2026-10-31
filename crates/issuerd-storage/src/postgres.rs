@@ -76,7 +76,7 @@ impl PostgresStorage {
         Ok(())
     }
 
-    fn pool(&self) -> &PgPool {
+    pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -2767,6 +2767,27 @@ impl Storage for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn get_mcp_step_up_grant(
+        &self,
+        token_jti: &JwtId,
+    ) -> Result<Option<McpStepUpGrant>, IssuerdError> {
+        crate::step_up::get_grant(self, token_jti).await
+    }
+
+    async fn create_mcp_step_up_grant(&self, grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
+        crate::step_up::create_grant(self, grant).await
+    }
+
+    async fn execute_mcp_step_up(
+        &self,
+        token_jti: &JwtId,
+        operation_hash: &str,
+        mutation: &McpStepUpMutation,
+        result_json: serde_json::Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
+        crate::step_up::execute_grant(self, token_jti, operation_hash, mutation, result_json).await
+    }
 }
 
 #[cfg(test)]
@@ -4002,7 +4023,7 @@ mod tests {
             .list_client_scopes(&realm.id, &Pagination::new(0, i32::MAX))
             .await
             .unwrap();
-        assert_eq!(scopes.len(), 10);
+        assert_eq!(scopes.len(), 11);
     }
 
     #[tokio::test]

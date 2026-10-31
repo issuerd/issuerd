@@ -34,7 +34,7 @@ pub mod logout;
 mod mcp;
 pub(crate) mod oidc;
 mod par;
-mod protected_resource;
+pub(crate) mod protected_resource;
 mod registration;
 mod required_actions;
 mod reset_credentials;
@@ -132,38 +132,8 @@ fn cors_layer(config: &crate::config::CorsConfig) -> CorsLayer {
 /// Build the complete application router.
 pub fn app_router(state: Arc<ServerState>) -> Router {
     let cors = cors_layer(&state.config.cors);
-    let admin_state = Arc::new(issuerd_admin_api::state::AdminApiState {
-        storage: state.storage.clone(),
-        token_service: state.token_service.clone(),
-        crypto: state.crypto.clone(),
-        federation_manager: state.federation_manager.clone(),
-        plugin_registry: state.plugin_registry.clone(),
-        cache: state.cache.clone(),
-        email_sender: state.email_sender.clone(),
-        broker_client: state.broker_client.clone(),
-        logout_notifier: state.logout_notifier.clone(),
-        available_themes: theme::available_themes(&state.config.themes.dir),
-        available_locales: theme::available_locales(&state.config.themes.dir),
-        token_issuer: state.token_manager.clone(),
-        signing_key_reload: state.signing_key_reload.clone(),
-        mcp_enabled: state.config.mcp.enabled,
-        base_url: state.config.issuer_url.trim_end_matches('/').to_string(),
-        // Per-recipient locale bundle for outbound admin email copy: the
-        // recipient's `locale` attribute (then the realm default) selects the
-        // language, the realm's email theme supplies the override layer.
-        email_bundle: {
-            let themes_dir = state.config.themes.dir.clone();
-            let resolver = move |realm: &issuerd_core::Realm, user: &issuerd_core::User| {
-                crate::i18n::message_bundle(
-                    Some(themes_dir.as_path()),
-                    realm.email_theme.as_ref().map(|t| t.as_str()),
-                    &crate::i18n::user_locale(realm, user),
-                )
-            };
-            Some(Arc::new(resolver) as issuerd_admin_api::state::EmailBundleResolver)
-        },
-    });
-    let admin_routes = issuerd_admin_api::routes::admin_routes(admin_state)
+    let admin_state = crate::mcp_service::admin_state(&state);
+    let admin_routes = issuerd_admin_api::routes::admin_routes(admin_state.clone())
         .fallback(web_ui::admin_console_handler);
 
     // `/admin` serves two things: the REST Admin API (explicit routes) and,
@@ -217,6 +187,10 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .route(
             "/realms/{realm}/protocol/openid-connect/ext/ciba/approve",
             post(oidc::ciba_approve_handler),
+        )
+        .route(
+            "/realms/{realm}/protocol/openid-connect/ext/ciba/approval",
+            get(crate::ciba_approval::get_handler).post(crate::ciba_approval::post_handler),
         )
         .route("/realms/{realm}/protocol/openid-connect/ext/par", post(par::par_handler))
         .route(
@@ -362,7 +336,7 @@ pub fn app_router(state: Arc<ServerState>) -> Router {
         .merge(swagger)
         .route("/{*path}", get(web_ui::static_handler))
         .route("/", get(|| async { Redirect::temporary(web_ui::ADMIN_CONSOLE_PREFIX) }));
-    let router = mcp::mount(router, &state);
+    let router = mcp::mount(router, &state, admin_state);
     router
         .layer(
             TraceLayer::new_for_http()

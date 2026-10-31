@@ -123,6 +123,8 @@ pub struct DiscoveryResponse {
     pub check_session_iframe: Url,
     pub device_authorization_endpoint: Url,
     pub backchannel_authentication_endpoint: Url,
+    /// OpenID CIBA delivery modes implemented by this server. Poll only.
+    pub backchannel_token_delivery_modes_supported: Vec<String>,
     /// PAR endpoint per RFC 9126 §5.
     pub pushed_authorization_request_endpoint: Url,
     /// Dynamic client registration endpoint (RFC 7591 §3).
@@ -242,6 +244,7 @@ impl DiscoveryResponse {
                 "ciba",
                 "auth",
             ]),
+            backchannel_token_delivery_modes_supported: vec!["poll".into()],
             pushed_authorization_request_endpoint: urls.path(&[
                 "protocol",
                 "openid-connect",
@@ -723,6 +726,8 @@ mod tests {
         assert!(json.contains("\"response_types_supported\""));
         assert!(json.contains("\"response_modes_supported\""));
         assert!(json.contains("\"grant_types_supported\""));
+        assert!(json.contains("\"backchannel_token_delivery_modes_supported\":[\"poll\"]"));
+        assert!(!json.contains("\"backchannel_authentication_delivery_modes_supported\""));
         assert!(json.contains("\"acr_values_supported\""));
         assert!(json.contains("\"subject_types_supported\""));
         assert!(json.contains("\"id_token_signing_alg_values_supported\""));

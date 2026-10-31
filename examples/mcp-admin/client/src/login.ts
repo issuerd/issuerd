@@ -63,14 +63,14 @@ export class LoopbackCallback {
   }
 }
 
-function cookies(response: Response): string[] {
+export function cookies(response: Response): string[] {
   return response.headers
     .getSetCookie()
     .map((value) => value.split(";", 1)[0])
     .filter((value): value is string => Boolean(value?.includes("=")));
 }
 
-function redirectLocation(response: Response, base: URL): URL {
+export function redirectLocation(response: Response, base: URL): URL {
   const location = response.headers.get("location");
   if (response.status !== 303 || !location) {
     throw new Error(`expected an authorization redirect, received HTTP ${response.status}`);
