@@ -15,13 +15,17 @@ cp "$SCRIPT_DIR/upstream-package-lock.json" "$HARNESS/package-lock.json"
 
 daemon_pid=""
 proxy_pid=""
+authorization_pid=""
+scenario_pid=""
 cleanup() {
   status=$?
   trap - EXIT INT TERM
-  if [[ -n "$proxy_pid" ]]; then kill "$proxy_pid" 2>/dev/null || true; fi
-  if [[ -n "$daemon_pid" ]]; then kill "$daemon_pid" 2>/dev/null || true; fi
-  if [[ -n "$proxy_pid" ]]; then wait "$proxy_pid" 2>/dev/null || true; fi
-  if [[ -n "$daemon_pid" ]]; then wait "$daemon_pid" 2>/dev/null || true; fi
+  for pid in "$scenario_pid" "$authorization_pid" "$proxy_pid" "$daemon_pid"; do
+    if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+  done
+  for pid in "$scenario_pid" "$authorization_pid" "$proxy_pid" "$daemon_pid"; do
+    if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
+  done
   exit "$status"
 }
 trap cleanup EXIT
@@ -60,8 +64,13 @@ for attempt in {1..60}; do
 done
 curl -fsS "$ISSUERD_ISSUER/.well-known/openid-configuration" >/dev/null
 
+node --test tests/mcp-conformance/authorization-lifecycle.test.mjs
+
 CONFORMANCE_BIN="$HARNESS/dist/index.js" CONFORMANCE_RESULTS="$RESULTS/authorization" \
-  node tests/mcp-conformance/authorization.mjs
+  node tests/mcp-conformance/authorization.mjs &
+authorization_pid=$!
+wait "$authorization_pid"
+authorization_pid=""
 
 for scenario in \
   server-initialize \
@@ -72,5 +81,8 @@ for scenario in \
   "$HARNESS/dist/index.js" server \
     --url "$ISSUERD_ISSUER/mcp" \
     --scenario "$scenario" \
-    -o "$RESULTS/$scenario"
+    -o "$RESULTS/$scenario" &
+  scenario_pid=$!
+  wait "$scenario_pid"
+  scenario_pid=""
 done

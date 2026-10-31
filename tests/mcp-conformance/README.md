@@ -96,11 +96,13 @@ Then run the finite rig from the repository root:
 
 The script clones the pinned harness if it is missing, installs the reviewed
 `upstream-package-lock.json` override (production dependency audit clean),
-builds the official harness and Issuerd clients, provisions the realm, starts
-the daemon and proxy, runs all selected scenarios, and cleans up both processes. Results go to ignored `tests/mcp-conformance/results/` and local
-logs to `.runtime/`. Tokens and proxy authorization headers are never written to
-tracked files or printed by the proxy. The pinned browser dependency is
-`playwright` 1.63.0, installed by `npm ci` in this directory.
+builds the official harness and Issuerd clients, provisions the realm, and starts
+the daemon and proxy. It runs lifecycle regressions and all selected scenarios,
+then cleans up the daemon, proxy, and harness processes on success, failure, or
+interruption. Results and local logs go to ignored
+`tests/mcp-conformance/results/`. Tokens and proxy authorization headers are
+never written to tracked files or printed by the proxy. The pinned browser
+dependency is `playwright` 1.63.0, installed by `npm ci` in this directory.
 
 ## CI integration point
 

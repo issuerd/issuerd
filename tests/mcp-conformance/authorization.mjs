@@ -20,6 +20,8 @@ const args = [
 ];
 if (clientSecret) args.push('--client-secret', clientSecret);
 
+const callbackTimeoutMs = Number(process.env.MCP_BROWSER_CALLBACK_TIMEOUT_MS ?? 30_000);
+const browsers = new Set();
 const child = spawn(process.execPath, args, {
   env: { ...process.env },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -31,22 +33,28 @@ let successfulSummary = false;
 async function authorizeInBrowser(authorizationUrl) {
   console.error('authorization browser login started');
   const browser = await chromium.launch({ headless: true });
+  browsers.add(browser);
+  let page;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     await page.goto(authorizationUrl, { waitUntil: 'domcontentloaded' });
     await page.locator('input[name="username"]').fill(username);
     await page.locator('input[name="password"]').fill(password);
     await Promise.all([
-      page.waitForURL((url) => url.pathname === '/callback', { timeout: 30_000 }),
+      page.waitForURL((url) => url.pathname === '/callback', { timeout: callbackTimeoutMs }),
       page.locator('button[type="submit"]').click(),
     ]);
     console.error('authorization form submitted');
   } catch (error) {
-    const body = await page.locator('body').innerText().catch(() => '');
+    const body = page ? await page.locator('body').innerText().catch(() => '') : '';
     console.error(`authorization page did not reach callback: ${body}`);
     throw error;
   } finally {
-    await browser.close();
+    try {
+      await browser.close();
+    } finally {
+      browsers.delete(browser);
+    }
   }
 }
 function inspect(chunk) {
@@ -70,10 +78,22 @@ function inspect(chunk) {
 }
 child.stdout.on('data', inspect);
 child.stderr.on('data', inspect);
+let rejectCompletion;
 const completion = new Promise((resolve, reject) => {
+  rejectCompletion = reject;
   child.once('error', reject);
   child.once('close', resolve);
 });
+const onSigint = () => {
+  child.kill('SIGTERM');
+  rejectCompletion(new Error('authorization conformance interrupted by SIGINT'));
+};
+const onSigterm = () => {
+  child.kill('SIGTERM');
+  rejectCompletion(new Error('authorization conformance interrupted by SIGTERM'));
+};
+process.once('SIGINT', onSigint);
+process.once('SIGTERM', onSigterm);
 const timeout = new Promise((_, reject) => {
   setTimeout(() => {
     child.kill('SIGTERM');
@@ -84,8 +104,15 @@ try {
   const status = await Promise.race([completion, timeout]);
   await Promise.all([codeGrantLogin, dpopLogin]);
   process.stdout.write(output);
-  process.exitCode = successfulSummary ? 0 : status;
+  process.exitCode = successfulSummary ? 0 : (status ?? 1);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n${output}`);
   process.exitCode = 1;
+} finally {
+  process.removeListener('SIGINT', onSigint);
+  process.removeListener('SIGTERM', onSigterm);
+  child.kill('SIGTERM');
+  await Promise.allSettled([completion, codeGrantLogin, dpopLogin]);
+  await Promise.allSettled([...browsers].map((browser) => browser.close()));
+  browsers.clear();
 }
