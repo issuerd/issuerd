@@ -118,9 +118,11 @@ The flow binds approval to an exact typed operation, not just a scope:
    server displays the exact escaped arguments and expected mutation, checks
    preconditions on GET and POST, and accepts one CSRF-protected decision. The
    legacy JSON approval endpoint cannot be used as a bypass.
-4. The client polls with the original DPoP key and exact resource. It receives
-   only an `openid mcp:step_up` DPoP token, never a refresh token. The durable
-   grant lasts at most two minutes and cannot outlive the pending operation.
+4. The client polls with the original DPoP key and exact resource. Approval and
+   polling share a per-request serialization lock, so the decision cannot erase
+   polling history or reset the pacing interval. The client receives only an
+   `openid mcp:step_up` DPoP token, never a refresh token. The durable grant
+   lasts at most two minutes and cannot outlive the pending operation.
 5. The client repeats the exact tool call. Issuerd atomically consumes the grant,
    checks current-state preconditions, commits the mutation, and stores the
    redacted result. Changed arguments are rejected. A changed precondition is a

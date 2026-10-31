@@ -5681,8 +5681,8 @@ pub(crate) async fn enforce_token_validity(
     };
 
     // Operation-bound step-up tokens are not general bearer credentials.
-    // Until their dedicated MCP execution path exists, no non-MCP API may
-    // accept the reserved scope, including from legacy token data.
+    // Only the dedicated MCP execution path may accept the reserved scope,
+    // including from legacy token data.
     if claims.scope.contains(issuerd_core::MCP_SCOPE_STEP_UP) {
         return Err(invalid());
     }

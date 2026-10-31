@@ -8,6 +8,10 @@ use dashmap::DashMap;
 use issuerd_core::*;
 use serde::{Deserialize, Serialize};
 
+tokio::task_local! {
+    pub(crate) static MCP_STEP_UP: ();
+}
+
 /// In-memory storage implementation for testing.
 pub struct InMemoryStorage {
     realms: DashMap<RealmId, Realm>,
@@ -36,7 +40,7 @@ pub struct InMemoryStorage {
     provision_markers: DashMap<String, String>,
     signing_keys: DashMap<String, StoredSigningKey>,
     mcp_step_up_grants: DashMap<String, McpStepUpGrant>,
-    step_up_lock: tokio::sync::Mutex<()>,
+    pub(crate) step_up_lock: tokio::sync::Mutex<()>,
 }
 
 impl InMemoryStorage {
@@ -339,27 +343,33 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_realm(&self, realm: &Realm) -> Result<(), IssuerdError> {
-        if self
-            .realms
-            .iter()
-            .any(|r| r.value().name == realm.name && r.value().id != realm.id)
-        {
-            return Err(IssuerdError::InvalidRequest("realm name already exists".into()));
-        }
-        let mut realm = realm.clone();
-        // Every realm carries a pairwise sector key from birth.
-        crate::seed::ensure_realm_pairwise_sector_key(&mut realm);
-        self.realms.insert(realm.id.clone(), realm.clone());
-        // Every realm carries the built-in client scopes (and the
-        // realm default scope sets) from birth, on every backend.
-        crate::seed::seed_builtin_client_scopes(self, &realm.id).await?;
-        // Every realm also carries the built-in browser and
-        // registration flows from birth (idempotent).
-        crate::seed::seed_builtin_flows(self, &realm.id).await?;
-        Ok(())
+        let _guard = self.mutation_lock().await;
+        MCP_STEP_UP
+            .scope((), async {
+                if self
+                    .realms
+                    .iter()
+                    .any(|r| r.value().name == realm.name && r.value().id != realm.id)
+                {
+                    return Err(IssuerdError::InvalidRequest("realm name already exists".into()));
+                }
+                let mut realm = realm.clone();
+                // Every realm carries a pairwise sector key from birth.
+                crate::seed::ensure_realm_pairwise_sector_key(&mut realm);
+                self.realms.insert(realm.id.clone(), realm.clone());
+                // Every realm carries the built-in client scopes (and the
+                // realm default scope sets) from birth, on every backend.
+                crate::seed::seed_builtin_client_scopes(self, &realm.id).await?;
+                // Every realm also carries the built-in browser and
+                // registration flows from birth (idempotent).
+                crate::seed::seed_builtin_flows(self, &realm.id).await?;
+                Ok(())
+            })
+            .await
     }
 
     async fn update_realm(&self, realm: &Realm) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.realms.contains_key(&realm.id) {
             return Err(IssuerdError::NotFound);
         }
@@ -368,6 +378,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_realm(&self, id: &RealmId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.realms.remove(id);
 
         // Cascade: remove all realm-scoped entities.
@@ -485,6 +496,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_user(&self, realm: &RealmId, user: &User) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if self
             .users
             .iter()
@@ -499,6 +511,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn update_user(&self, realm: &RealmId, user: &User) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.users.contains_key(&(realm.clone(), user.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -509,6 +522,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_user(&self, realm: &RealmId, id: &UserId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.users.remove(&(realm.clone(), id.clone()));
         // Cascade: delete credentials and sessions for this user.
         self.credentials.retain(|k, _| k.0 != *realm || k.1 != *id);
@@ -566,21 +580,27 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_client(&self, realm: &RealmId, client: &Client) -> Result<(), IssuerdError> {
-        if self
-            .clients
-            .iter()
-            .any(|c| c.value().realm_id == *realm && c.value().client_id == client.client_id)
-        {
-            return Err(IssuerdError::InvalidRequest("client_id already exists in realm".into()));
-        }
-        self.clients.insert((realm.clone(), client.id.clone()), client.clone());
-        // Seed scope assignments from the client's legacy
-        // default/optional scope string lists (plus the `roles` carve-out).
-        crate::seed::seed_client_scope_assignments(self, realm, client).await?;
-        Ok(())
+        let _guard = self.mutation_lock().await;
+        MCP_STEP_UP
+            .scope((), async {
+                if self.clients.iter().any(|c| {
+                    c.value().realm_id == *realm && c.value().client_id == client.client_id
+                }) {
+                    return Err(IssuerdError::InvalidRequest(
+                        "client_id already exists in realm".into(),
+                    ));
+                }
+                self.clients.insert((realm.clone(), client.id.clone()), client.clone());
+                // Seed scope assignments from the client's legacy
+                // default/optional scope string lists (plus the `roles` carve-out).
+                crate::seed::seed_client_scope_assignments(self, realm, client).await?;
+                Ok(())
+            })
+            .await
     }
 
     async fn update_client(&self, realm: &RealmId, client: &Client) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.clients.contains_key(&(realm.clone(), client.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -589,6 +609,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_client(&self, realm: &RealmId, id: &ClientId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.clients.remove(&(realm.clone(), id.clone()));
         // Cascade (mirrors the Postgres ON DELETE CASCADE FKs): the client's
         // scope assignments, its own roles, and those roles' user mappings.
@@ -651,6 +672,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         cred: &Credential,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let type_key = serde_json::to_string(&cred.credential_type).unwrap_or_default();
         let key = (realm.clone(), user.clone(), type_key);
         let mut entry = self.credentials.entry(key).or_default();
@@ -664,6 +686,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         cred: &Credential,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let type_key = serde_json::to_string(&cred.credential_type).unwrap_or_default();
         let key = (realm.clone(), user.clone(), type_key);
         if let Some(mut list) = self.credentials.get_mut(&key) {
@@ -681,6 +704,7 @@ impl Storage for InMemoryStorage {
         credential_id: &CredentialId,
         matched_step: u64,
     ) -> Result<bool, IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let type_key = serde_json::to_string(&CredentialType::Totp).unwrap_or_default();
         let key = (realm.clone(), user.clone(), type_key);
         let Some(mut list) = self.credentials.get_mut(&key) else {
@@ -706,6 +730,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         cred_id: &CredentialId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         for mut entry in self.credentials.iter_mut() {
             let key = entry.key();
             if key.0 == *realm && key.1 == *user {
@@ -767,6 +792,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         session: &UserSession,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.sessions.insert((realm.clone(), session.id.clone()), session.clone());
         Ok(())
     }
@@ -776,6 +802,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         session: &UserSession,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.sessions.contains_key(&(realm.clone(), session.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -788,6 +815,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         id: &SessionId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.sessions.remove(&(realm.clone(), id.clone()));
         Ok(())
     }
@@ -843,6 +871,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_role(&self, realm: &RealmId, role: &Role) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         // Uniqueness is per owning client (realm roles have `client_id =
         // None`), mirroring the `roles_realm_client_name_key` index: a realm
         // role and a client role (or roles of two different clients) may
@@ -859,6 +888,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn update_role(&self, realm: &RealmId, role: &Role) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.roles.contains_key(&(realm.clone(), role.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -867,6 +897,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_role(&self, realm: &RealmId, id: &RoleId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.roles.remove(&(realm.clone(), id.clone()));
         // Remove role from all users
         for mut entry in self.user_realm_roles.iter_mut() {
@@ -967,6 +998,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         scope: &ClientScope,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         // UNIQUE(realm_id, name) in Postgres; Conflict mirrors sqlx_err.
         if self
             .client_scopes
@@ -984,6 +1016,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         scope: &ClientScope,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.client_scopes.contains_key(&(realm.clone(), scope.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -996,6 +1029,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         id: &ClientScopeId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.client_scopes.remove(&(realm.clone(), id.clone()));
         // Cascade (mirrors the Postgres ON DELETE CASCADE FKs): client
         // assignments and realm-default rows referencing the scope.
@@ -1020,6 +1054,7 @@ impl Storage for InMemoryStorage {
         scope: &ClientScopeId,
         is_default: bool,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mut entry = self
             .client_scope_assignments
             .entry((realm.clone(), client.clone()))
@@ -1038,6 +1073,7 @@ impl Storage for InMemoryStorage {
         client: &ClientId,
         scope: &ClientScopeId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(mut entry) =
             self.client_scope_assignments.get_mut(&(realm.clone(), client.clone()))
         {
@@ -1078,6 +1114,7 @@ impl Storage for InMemoryStorage {
         scope: &ClientScopeId,
         is_default: bool,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mut entry = self.realm_default_client_scopes.entry(realm.clone()).or_default();
         if let Some(existing) = entry.iter_mut().find(|(s, _)| s == scope) {
             existing.1 = is_default;
@@ -1092,6 +1129,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         scope: &ClientScopeId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(mut entry) = self.realm_default_client_scopes.get_mut(realm) {
             entry.retain(|(s, _)| s != scope);
         }
@@ -1143,6 +1181,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_group(&self, realm: &RealmId, group: &Group) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if self
             .groups
             .iter()
@@ -1155,6 +1194,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn update_group(&self, realm: &RealmId, group: &Group) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.groups.contains_key(&(realm.clone(), group.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -1163,6 +1203,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_group(&self, realm: &RealmId, id: &GroupId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.groups.remove(&(realm.clone(), id.clone()));
         // Remove group from all users
         for mut entry in self.user_groups.iter_mut() {
@@ -1182,6 +1223,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         role_id: &RoleId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mut entry = self.user_realm_roles.entry((realm.clone(), user.clone())).or_default();
         if !entry.contains(role_id) {
             entry.push(role_id.clone());
@@ -1195,6 +1237,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         role_id: &RoleId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(mut entry) = self.user_realm_roles.get_mut(&(realm.clone(), user.clone())) {
             entry.retain(|r| r != role_id);
         }
@@ -1222,6 +1265,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         role_id: &RoleId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mut entry = self.user_client_roles.entry((realm.clone(), user.clone())).or_default();
         if !entry.contains(role_id) {
             entry.push(role_id.clone());
@@ -1235,6 +1279,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         role_id: &RoleId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(mut entry) = self.user_client_roles.get_mut(&(realm.clone(), user.clone())) {
             entry.retain(|r| r != role_id);
         }
@@ -1262,6 +1307,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         group_id: &GroupId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mut entry = self.user_groups.entry((realm.clone(), user.clone())).or_default();
         if !entry.contains(group_id) {
             entry.push(group_id.clone());
@@ -1275,6 +1321,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         group_id: &GroupId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(mut entry) = self.user_groups.get_mut(&(realm.clone(), user.clone())) {
             entry.retain(|g| g != group_id);
         }
@@ -1332,6 +1379,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_consent(&self, realm: &RealmId, consent: &Consent) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.consents.insert(
             (realm.clone(), consent.user_id.clone(), consent.client_id.clone()),
             consent.clone(),
@@ -1345,6 +1393,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         client_id: &ClientId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.consents.remove(&(realm.clone(), user.clone(), client_id.clone()));
         Ok(())
     }
@@ -1390,6 +1439,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         idp: &IdentityProviderConfig,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.identity_providers.insert((realm.clone(), idp.id.clone()), idp.clone());
         Ok(())
     }
@@ -1399,6 +1449,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         idp: &IdentityProviderConfig,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.identity_providers.contains_key(&(realm.clone(), idp.id.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -1411,6 +1462,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         id: &IdentityProviderId,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if let Some(idp) = self.identity_providers.get(&(realm.clone(), id.clone())) {
             // Cascade: account links into the deleted provider go with it.
             let alias = idp.alias.to_string();
@@ -1467,6 +1519,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         link: &IdentityProviderLink,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         // One external subject maps to exactly one local user; one user holds
         // at most one link per provider alias.
         let clash = self.identity_provider_links.iter().any(|e| {
@@ -1490,6 +1543,7 @@ impl Storage for InMemoryStorage {
         user: &UserId,
         alias: &str,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.identity_provider_links
             .retain(|k, v| !(k.0 == *realm && k.1 == alias && v.user_id == *user));
         Ok(())
@@ -1511,6 +1565,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         config: &FlowConfig,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.flow_configs.insert((realm.clone(), config.alias.clone()), config.clone());
         Ok(())
     }
@@ -1520,6 +1575,7 @@ impl Storage for InMemoryStorage {
         realm: &RealmId,
         config: &FlowConfig,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         if !self.flow_configs.contains_key(&(realm.clone(), config.alias.clone())) {
             return Err(IssuerdError::NotFound);
         }
@@ -1528,6 +1584,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_flow_config(&self, realm: &RealmId, alias: &str) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.flow_configs.remove(&(realm.clone(), Alias::new(alias).unwrap()));
         Ok(())
     }
@@ -1547,6 +1604,7 @@ impl Storage for InMemoryStorage {
     // Events
     // ------------------------------------------------------------------
     async fn save_event(&self, _realm: &RealmId, event: &Event) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.events.write().unwrap().push(event.clone());
         Ok(())
     }
@@ -1572,11 +1630,13 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_events(&self, realm: &RealmId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.events.write().unwrap().retain(|e| e.realm_id != *realm);
         Ok(())
     }
 
     async fn save_admin_event(&self, event: &AdminEvent) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.admin_events.write().unwrap().push(event.clone());
         Ok(())
     }
@@ -1609,6 +1669,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn delete_admin_events(&self, realm: &RealmId) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.admin_events.write().unwrap().retain(|e| e.realm_id != *realm);
         Ok(())
     }
@@ -1618,16 +1679,19 @@ impl Storage for InMemoryStorage {
     }
 
     async fn set_provision_marker(&self, name: &str, value: &str) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.provision_markers.insert(name.to_string(), value.to_string());
         Ok(())
     }
 
     async fn delete_provision_marker(&self, name: &str) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         self.provision_markers.remove(name);
         Ok(())
     }
 
     async fn claim_provision_marker(&self, name: &str, value: &str) -> Result<bool, IssuerdError> {
+        let _guard = self.mutation_lock().await;
         match self.provision_markers.entry(name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -1647,6 +1711,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         match self.signing_keys.entry(key.kid.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 Err(IssuerdError::InvalidRequest("signing key kid already exists".into()))
@@ -1659,6 +1724,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn update_signing_key(&self, key: &StoredSigningKey) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         match self.signing_keys.get_mut(&key.kid.to_string()) {
             Some(mut slot) => {
                 slot.active = key.active;
@@ -1676,7 +1742,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn create_mcp_step_up_grant(&self, grant: &McpStepUpGrant) -> Result<(), IssuerdError> {
-        let _guard = self.step_up_lock.lock().await;
+        let _guard = self.mutation_lock().await;
         if self.mcp_step_up_grants.contains_key(grant.token_jti.as_ref())
             || self
                 .mcp_step_up_grants
@@ -1699,6 +1765,23 @@ impl Storage for InMemoryStorage {
         result_json: serde_json::Value,
     ) -> Result<McpStepUpExecution, IssuerdError> {
         let _guard = self.step_up_lock.lock().await;
+        MCP_STEP_UP
+            .scope(
+                (),
+                self.execute_mcp_step_up_locked(token_jti, operation_hash, mutation, result_json),
+            )
+            .await
+    }
+}
+
+impl InMemoryStorage {
+    pub(crate) async fn execute_mcp_step_up_locked(
+        &self,
+        token_jti: &JwtId,
+        operation_hash: &str,
+        mutation: &McpStepUpMutation,
+        result_json: serde_json::Value,
+    ) -> Result<McpStepUpExecution, IssuerdError> {
         let mut grant = self
             .mcp_step_up_grants
             .get(token_jti.as_ref())
@@ -1750,10 +1833,19 @@ impl Storage for InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    async fn mutation_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if MCP_STEP_UP.try_with(|_| ()).is_ok() {
+            None
+        } else {
+            Some(self.step_up_lock.lock().await)
+        }
+    }
+
     async fn apply_mcp_step_up_mutation(
         &self,
         mutation: &McpStepUpMutation,
     ) -> Result<(), IssuerdError> {
+        let _guard = self.mutation_lock().await;
         let mutation = mutation.redacted();
         match mutation {
             McpStepUpMutation::DeleteUser { expected } => {
@@ -1893,10 +1985,18 @@ impl InMemoryStorage {
                 not_before,
             } => {
                 let current = self.get_realm(&expected.id).await?;
-                if current.map(redacted_realm).as_ref() != Some(&expected) {
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_realm(current.clone()) != expected {
                     return Err(IssuerdError::Conflict);
                 }
                 let mut updated = expected;
+                for (key, value) in current.attributes {
+                    if sensitive_key(&key) {
+                        updated.attributes.entry(key).or_insert(value);
+                    }
+                }
                 updated.not_before = not_before;
                 self.update_realm(&updated).await
             }
@@ -2012,6 +2112,53 @@ impl InMemoryStorage {
                 }
                 self.update_group(&realm_id, &updated).await
             }
+            McpStepUpMutation::UpdateRole { expected, updated } => {
+                let current = self.get_role(&expected.realm_id, &expected.id).await?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_role(current.clone()) != expected {
+                    return Err(IssuerdError::Conflict);
+                }
+                let mut effective = updated;
+                for (key, value) in current.attributes {
+                    if sensitive_key(&key) {
+                        effective.attributes.entry(key).or_insert(value);
+                    }
+                }
+                self.update_role(&expected.realm_id, &effective).await
+            }
+            McpStepUpMutation::UserGroupMembership {
+                realm_id,
+                user_id,
+                expected_group,
+                expected_roles,
+                assign,
+                expected_present,
+            } => {
+                let current = self.get_group(&realm_id, &expected_group.id).await?;
+                if current.map(redacted_group).as_ref() != Some(&expected_group)
+                    || self.get_user(&realm_id, &user_id).await?.is_none()
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                for expected_role in expected_roles {
+                    let role = self.get_role(&realm_id, &expected_role.id).await?;
+                    if role.map(redacted_role).as_ref() != Some(&expected_role) {
+                        return Err(IssuerdError::Conflict);
+                    }
+                }
+                let present =
+                    self.list_user_groups(&realm_id, &user_id).await?.contains(&expected_group.id);
+                if present != expected_present {
+                    return Err(IssuerdError::Conflict);
+                }
+                if assign {
+                    self.add_user_group(&realm_id, &user_id, &expected_group.id).await
+                } else {
+                    self.remove_user_group(&realm_id, &user_id, &expected_group.id).await
+                }
+            }
         }
     }
 }
@@ -2076,9 +2223,16 @@ fn sensitive_key(key: &str) -> bool {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect();
-    ["secret", "password", "credential", "privatekey", "token"]
-        .iter()
-        .any(|fragment| normalized.contains(fragment))
+    [
+        "secret",
+        "password",
+        "credential",
+        "privatekey",
+        "token",
+        "clientassertion",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment))
 }
 
 #[cfg(test)]

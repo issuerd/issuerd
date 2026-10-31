@@ -188,7 +188,10 @@ pub fn target_id(operation: &McpOperation, auth: &crate::auth::McpAuthContext) -
         | ToolName::UsersAssignRole
         | ToolName::UsersUnassignRole
         | ToolName::GroupsAssignRole
-        | ToolName::GroupsUnassignRole => string("id"),
+        | ToolName::GroupsUnassignRole
+        | ToolName::UsersAddToGroup
+        | ToolName::UsersRemoveFromGroup => string("id"),
+        ToolName::RolesUpdate => string("name"),
         _ => None,
     }
 }
@@ -331,6 +334,21 @@ mod tests {
         ] {
             assert!(parse_operation(tool, Some(value.as_object().unwrap().clone())).is_err());
         }
+    }
+
+    #[test]
+    fn dynamic_strict_targets_use_the_immutable_approved_identifier() {
+        let auth = crate::test_support::auth("mcp:write", &["manage-users"]);
+        let role_update = McpOperation {
+            tool: ToolName::RolesUpdate,
+            arguments: json!({"name":"delegated","composites":["impersonation"]}),
+        };
+        assert_eq!(target_id(&role_update, &auth).as_deref(), Some("delegated"));
+        let membership = McpOperation {
+            tool: ToolName::UsersAddToGroup,
+            arguments: json!({"id":"target-user","groupId":"privileged-group"}),
+        };
+        assert_eq!(target_id(&membership, &auth).as_deref(), Some("target-user"));
     }
 
     #[test]

@@ -129,7 +129,7 @@ pub async fn post_handler(
     if !matches!(action.as_str(), "approve" | "deny") {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
-    let (approval, mut req_data) = match load(&state, &realm, &approval_id).await {
+    let (approval, req_data) = match load(&state, &realm, &approval_id).await {
         Ok(loaded) => loaded,
         Err(response) => return response,
     };
@@ -145,6 +145,63 @@ pub async fn post_handler(
     }
     if let Err(response) = preconditions(&state, &realm, &req_data).await {
         return response;
+    }
+    decide_with_poll_lock(&state, &realm, &approval, &approval_id, &session, &action, ip).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_with_poll_lock(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    approval: &McpApprovalData,
+    approval_id: &str,
+    session: &UserSession,
+    action: &str,
+    ip: std::net::IpAddr,
+) -> Response {
+    let lock_key = crate::ciba_step_up::poll_lock_key(&realm.id, &approval.auth_req_id);
+    match state
+        .cache
+        .create_if_absent(&lock_key, vec![1], Some(std::time::Duration::from_secs(30)))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return temporary(&IssuerdError::TemporarilyUnavailable),
+        Err(error) => return temporary(&error),
+    }
+    let response = decide(state, realm, approval, approval_id, session, action, ip).await;
+    if let Err(error) = state.cache.delete(&lock_key).await {
+        tracing::warn!(error = %error, "operation-bound approval poll lock release failed");
+    }
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    state: &Arc<ServerState>,
+    realm: &Realm,
+    approval: &McpApprovalData,
+    approval_id: &str,
+    session: &UserSession,
+    action: &str,
+    ip: std::net::IpAddr,
+) -> Response {
+    let request_cache_key = request_key(&realm.id, &approval.auth_req_id);
+    let latest = match state.cache.get(&request_cache_key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return error(StatusCode::BAD_REQUEST, "expired_token"),
+        Err(error) => return temporary(&error),
+    };
+    let mut req_data: CibaAuthReqData = match serde_json::from_slice(&latest) {
+        Ok(data) => data,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_grant"),
+    };
+    if req_data.operation.is_none()
+        || req_data.realm_id != realm.id.0
+        || req_data.authorized
+        || req_data.denied
+    {
+        return error(StatusCode::CONFLICT, "invalid_request");
     }
     if action == "approve" {
         if req_data
@@ -169,7 +226,7 @@ pub async fn post_handler(
         }
     }
     .into()]);
-    let approval_bytes = match state.cache.get(&approval_key(&realm.id, &approval_id)).await {
+    let approval_bytes = match state.cache.get(&approval_key(&realm.id, approval_id)).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return error(StatusCode::BAD_REQUEST, "invalid_request"),
         Err(error) => return temporary(&error),
@@ -184,9 +241,9 @@ pub async fn post_handler(
     let decided = match state
         .cache
         .claim_and_create(
-            &approval_key(&realm.id, &approval_id),
+            &approval_key(&realm.id, approval_id),
             approval_bytes,
-            &request_key(&realm.id, &req_data.auth_req_id),
+            &request_cache_key,
             req_bytes,
             Some(ttl),
         )
@@ -213,7 +270,7 @@ pub async fn post_handler(
         details.insert("operation_id".into(), operation.operation_id.clone());
     }
     crate::routes::oidc::emit_oidc_event(
-        &state,
+        state,
         &realm.id,
         if action == "approve" {
             EventType::CibaApprove

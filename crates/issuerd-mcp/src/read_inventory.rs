@@ -527,6 +527,7 @@ fn sensitive_config_key(key: &str) -> bool {
         "privatekey",
         "accesstoken",
         "refreshtoken",
+        "clientassertion",
     ]
     .iter()
     .any(|fragment| normalized.contains(fragment))
@@ -627,6 +628,7 @@ mod tests {
                 ("clientSecret".into(), "secret-canary".into()),
                 ("bindCredential".into(), "bind-canary".into()),
                 ("private_key".into(), "key-canary".into()),
+                ("clientAssertion".into(), "assertion-canary".into()),
                 ("displayName".into(), "Broker".into()),
             ]
             .into_iter()
@@ -635,7 +637,14 @@ mod tests {
         let value = serde_json::to_value(idp_output(&idp)).unwrap();
         assert_eq!(value["config"]["clientId"], "public-client");
         assert_eq!(value["displayName"], "Broker");
-        for canary in ["secret-canary", "bind-canary", "key-canary", "clientSecret"] {
+        for canary in [
+            "secret-canary",
+            "bind-canary",
+            "key-canary",
+            "assertion-canary",
+            "clientSecret",
+            "clientAssertion",
+        ] {
             assert!(!value.to_string().contains(canary));
         }
     }

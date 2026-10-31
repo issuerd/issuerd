@@ -163,35 +163,17 @@ pub async fn write(
                 .get_user(&realm_id, &user_id)
                 .await?
                 .ok_or(McpError::NotFound("user"))?;
-            let sessions = match args.session_id {
-                Some(session_id) => {
-                    let session_id = canonical_uuid(&session_id, "sessionId")?;
-                    let session_id = SessionId::new(session_id)?;
-                    let session = state
-                        .storage
-                        .get_user_session(&realm_id, &session_id)
-                        .await?
-                        .ok_or(McpError::NotFound("session"))?;
-                    if session.user_id != user_id {
-                        return Err(McpError::Forbidden(
-                            "session does not belong to the target user",
-                        ));
-                    }
-                    vec![session]
+            let count = if let Some(session_id) = args.session_id {
+                let session_id = canonical_uuid(&session_id, "sessionId")?;
+                let session_id = SessionId::new(session_id)?;
+                let session = state
+                    .storage
+                    .get_user_session(&realm_id, &session_id)
+                    .await?
+                    .ok_or(McpError::NotFound("session"))?;
+                if session.user_id != user_id {
+                    return Err(McpError::Forbidden("session does not belong to the target user"));
                 }
-                None => {
-                    state
-                        .storage
-                        .list_sessions(
-                            &realm_id,
-                            Some(user_id),
-                            &issuerd_core::Pagination::default(),
-                        )
-                        .await?
-                }
-            };
-            let count = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
-            for session in sessions {
                 issuerd_admin_api::sessions::delete_session(
                     axum::extract::State(state.clone()),
                     Extension(admin.clone()),
@@ -199,7 +181,34 @@ pub async fn write(
                 )
                 .await
                 .map_err(admin_error)?;
-            }
+                1
+            } else {
+                let mut count = 0_u32;
+                loop {
+                    let sessions = state
+                        .storage
+                        .list_sessions(
+                            &realm_id,
+                            Some(user_id.clone()),
+                            &issuerd_core::Pagination { first: 0, max: 100 },
+                        )
+                        .await?;
+                    if sessions.is_empty() {
+                        break;
+                    }
+                    for session in sessions {
+                        issuerd_admin_api::sessions::delete_session(
+                            axum::extract::State(state.clone()),
+                            Extension(admin.clone()),
+                            axum::extract::Path((realm.clone(), session.id.to_string())),
+                        )
+                        .await
+                        .map_err(admin_error)?;
+                        count = count.saturating_add(1);
+                    }
+                }
+                count
+            };
             WriteOutput::completed_count(tool, Some(id), count)
         }
         ToolName::UsersAddToGroup | ToolName::UsersRemoveFromGroup => {
@@ -781,13 +790,19 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with_email(true).await
+    }
+
+    async fn fixture_with_email(expect_email: bool) -> Fixture {
         let mut state =
             crate::state::ServerState::from_config(&crate::config::ServerConfig::with_test_admin())
                 .await
                 .unwrap();
-        let mut email = issuerd_core::MockEmailSender::new();
-        email.expect_send().times(1).returning(|_, _, _, _, _| Ok(()));
-        state.email_sender = Arc::new(email);
+        if expect_email {
+            let mut email = issuerd_core::MockEmailSender::new();
+            email.expect_send().times(1).returning(|_, _, _, _, _| Ok(()));
+            state.email_sender = Arc::new(email);
+        }
         let state = Arc::new(state);
         let realm = state.storage.get_realm_by_name("master").await.unwrap().unwrap();
         let realm_id = realm.id.clone();
@@ -1187,5 +1202,50 @@ mod tests {
             .await
             .unwrap();
         assert!(count >= 19, "expected mutation audit events, got {count}");
+    }
+
+    #[tokio::test]
+    async fn revoke_all_sessions_drains_every_page() {
+        let fixture = fixture_with_email(false).await;
+        let realm = &fixture.realm_id;
+        let user_id =
+            id(
+                &call(&fixture, ToolName::UsersCreate, json!({"username": "paged-session-user"}))
+                    .await
+                    .unwrap(),
+            );
+        let user_uuid = UserId::new(&user_id).unwrap();
+        let now = Utc::now();
+        for _ in 0..105 {
+            fixture
+                .state
+                .storage
+                .create_user_session(
+                    realm,
+                    &UserSession {
+                        id: issuerd_core::SessionId::new(issuerd_core::utils::generate_id())
+                            .unwrap(),
+                        realm_id: realm.clone(),
+                        user_id: user_uuid.clone(),
+                        login_username: issuerd_core::Username::new("paged-session-user").unwrap(),
+                        ip_address: "127.0.0.1".parse().unwrap(),
+                        auth_method: AuthMethod::Password,
+                        remember_me: false,
+                        offline: false,
+                        started: now,
+                        last_session_refresh: now,
+                        auth_time: now,
+                        impersonator: None,
+                        clients: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let revoked = call(&fixture, ToolName::UsersRevokeSessions, json!({"id": user_id}))
+            .await
+            .unwrap();
+        assert_eq!(revoked["count"], 105);
+        assert_eq!(fixture.state.storage.count_sessions(realm, Some(user_uuid)).await.unwrap(), 0);
     }
 }

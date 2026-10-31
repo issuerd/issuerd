@@ -418,6 +418,10 @@ pub async fn issue(
     })
 }
 
+pub fn poll_lock_key(realm_id: &RealmId, auth_req_id: &str) -> String {
+    format!("mcp:ciba-poll:{{{realm_id}}}:{auth_req_id}")
+}
+
 pub async fn poll(
     state: Arc<ServerState>,
     realm: Realm,
@@ -468,7 +472,7 @@ pub async fn poll(
     if req_data.operation.is_some() && dpop_jkt.is_none() {
         return error(StatusCode::BAD_REQUEST, "invalid_dpop_proof");
     }
-    let lock_key = format!("mcp:ciba-poll:{{{realm_id}}}:{auth_req_id}");
+    let lock_key = poll_lock_key(&realm_id, auth_req_id);
     match state
         .cache
         .create_if_absent(&lock_key, vec![1], Some(std::time::Duration::from_secs(30)))
@@ -994,6 +998,163 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn disabled_step_up_rejects_only_dynamic_admin_role_mapping() {
+        let fixture = fixture().await;
+        let target = user(&fixture.realm, "disabled-role-target");
+        fixture.state.storage.create_user(&fixture.realm.id, &target).await.unwrap();
+        let admin_role = Role {
+            id: RoleId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            name: RoleName::new("manage-realm").unwrap(),
+            description: None,
+            realm_id: fixture.realm.id.clone(),
+            client_role: false,
+            client_id: None,
+            composite: false,
+            composites: Vec::new(),
+            attributes: Default::default(),
+        };
+        if fixture
+            .state
+            .storage
+            .get_role_by_name(&fixture.realm.id, "manage-realm")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            fixture.state.storage.create_role(&fixture.realm.id, &admin_role).await.unwrap();
+        }
+        let executor = fixture.executor.clone().with_step_up(false);
+        let permit = executor
+            .preflight("users_assign_role", auth(&fixture, "openid mcp:write", "origin-jkt"), 100)
+            .await
+            .unwrap();
+        let result = executor
+            .coordinate_strict(
+                &permit,
+                Some(
+                    json!({"id": target.id.to_string(), "role": "manage-realm"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+                fixture.resource.clone(),
+                Some("origin-jkt".into()),
+                100,
+            )
+            .await;
+        assert!(matches!(result, Err(issuerd_mcp::McpError::UnknownTool(_))), "{result:?}");
+
+        let ordinary = Role {
+            id: RoleId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            name: RoleName::new("ordinary-role").unwrap(),
+            description: None,
+            realm_id: fixture.realm.id.clone(),
+            client_role: false,
+            client_id: None,
+            composite: false,
+            composites: Vec::new(),
+            attributes: Default::default(),
+        };
+        fixture.state.storage.create_role(&fixture.realm.id, &ordinary).await.unwrap();
+        let permit = executor
+            .preflight("users_assign_role", auth(&fixture, "openid mcp:write", "origin-jkt"), 100)
+            .await
+            .unwrap();
+        let result = executor
+            .coordinate_strict(
+                &permit,
+                Some(
+                    json!({"id": target.id.to_string(), "role": "ordinary-role"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+                fixture.resource.clone(),
+                Some("origin-jkt".into()),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, McpStrictCoordination::NotStrict));
+    }
+
+    #[tokio::test]
+    async fn approval_preserves_poll_history_and_slow_down_interval() {
+        let fixture = fixture().await;
+        let target = user(&fixture.realm, "poll-history-target");
+        fixture.state.storage.create_user(&fixture.realm.id, &target).await.unwrap();
+        let (pending, _) = pending_operation(&fixture, &target).await;
+        let initiation = response_json(begin_ciba(&fixture, &pending).await).await;
+        let auth_req_id = initiation["auth_req_id"].as_str().unwrap().to_string();
+        let approval_id = initiation["approval_url"]
+            .as_str()
+            .unwrap()
+            .split("approval_id=")
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let request = || {
+            issuerd_protocol::token::TokenRequest::parse(&HashMap::from([
+                ("grant_type".into(), GrantType::Ciba.as_str().into()),
+                ("auth_req_id".into(), auth_req_id.clone()),
+                ("resource".into(), fixture.resource.clone()),
+            ]))
+            .unwrap()
+        };
+        let first = poll(
+            fixture.state.clone(),
+            fixture.realm.clone(),
+            fixture.client.clone(),
+            request(),
+            Some("origin-jkt".into()),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(response_json(first).await["error"], "authorization_pending");
+        let second = poll(
+            fixture.state.clone(),
+            fixture.realm.clone(),
+            fixture.client.clone(),
+            request(),
+            Some("origin-jkt".into()),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(response_json(second).await["error"], "slow_down");
+
+        let headers = sso_headers(&fixture).await;
+        let html = response_text(
+            ciba_approval::get_handler(
+                State(fixture.state.clone()),
+                axum::extract::Extension(ResolvedRealm(Some("master".into()))),
+                headers.clone(),
+                RawQuery(Some(format!("approval_id={approval_id}"))),
+            )
+            .await,
+        )
+        .await;
+        let approved = ciba_approval::post_handler(
+            State(fixture.state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".into()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            approval_form(&approval_id, proof_from_html(&html), "approve"),
+        )
+        .await;
+        assert_eq!(approved.status(), StatusCode::OK);
+        let cached = fixture
+            .state
+            .cache
+            .get(&request_key(&fixture.realm.id, &auth_req_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let data: CibaAuthReqData = serde_json::from_slice(&cached).unwrap();
+        assert!(data.last_polled_at.is_some());
+        assert_eq!(data.poll_interval_secs, 10);
     }
 
     #[tokio::test]

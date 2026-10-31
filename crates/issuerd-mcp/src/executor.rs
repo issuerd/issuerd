@@ -99,9 +99,6 @@ impl McpToolExecutor {
         dpop_jkt: Option<String>,
         now: i64,
     ) -> Result<McpStrictCoordination, McpError> {
-        if !self.step_up_enabled {
-            return Ok(McpStrictCoordination::NotStrict);
-        }
         let operation = if crate::strict_tools::is_strict(permit.tool) {
             crate::strict_tools::parse_operation(permit.tool, arguments)?
         } else if crate::policy::is_strict_self_service(permit.tool) {
@@ -111,6 +108,17 @@ impl McpToolExecutor {
         } else {
             return Ok(McpStrictCoordination::NotStrict);
         };
+        let application = self.application.as_ref().ok_or_else(|| {
+            McpError::Backend(issuerd_core::IssuerdError::ServerError(
+                "MCP application service is not configured".into(),
+            ))
+        })?;
+        if !self.step_up_enabled {
+            if application.prepare_strict(&permit.auth, operation).await?.is_some() {
+                return Err(McpError::UnknownTool(permit.tool.to_string()));
+            }
+            return Ok(McpStrictCoordination::NotStrict);
+        }
         if permit.auth.has_scope(issuerd_core::MCP_SCOPE_STEP_UP) {
             let Some(dpop_jkt) = dpop_jkt.clone() else {
                 return Err(McpError::Forbidden("strict operations require DPoP"));
@@ -134,11 +142,6 @@ impl McpToolExecutor {
                 }
             }
         }
-        let application = self.application.as_ref().ok_or_else(|| {
-            McpError::Backend(issuerd_core::IssuerdError::ServerError(
-                "MCP application service is not configured".into(),
-            ))
-        })?;
         let Some(mutation) = application.prepare_strict(&permit.auth, operation.clone()).await?
         else {
             return Ok(McpStrictCoordination::NotStrict);

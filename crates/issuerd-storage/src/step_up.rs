@@ -897,6 +897,120 @@ async fn apply_mutation(
                     .rows_affected(),
             )
         }
+        McpStepUpMutation::UpdateRole { expected, updated } => {
+            let current: Option<PgRole> =
+                sqlx::query_as("SELECT * FROM roles WHERE realm_id = $1 AND id = $2 FOR UPDATE")
+                    .bind(uuid(expected.realm_id.as_ref())?)
+                    .bind(uuid(expected.id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let Some(current) = current else {
+                return Err(IssuerdError::Conflict);
+            };
+            let current: Role = current.try_into()?;
+            if redacted_role(current.clone()) != expected {
+                return Err(IssuerdError::Conflict);
+            }
+            let mut effective = updated;
+            for (key, value) in current.attributes {
+                if sensitive_key(&key) {
+                    effective.attributes.entry(key).or_insert(value);
+                }
+            }
+            let pg: PgRole = (&effective).try_into()?;
+            expect_one(
+                sqlx::query(
+                    r#"UPDATE roles SET name = $3, description = $4, client_role = $5,
+                        client_id = $6, composite = $7, composites = $8, attributes = $9
+                        WHERE realm_id = $1 AND id = $2"#,
+                )
+                .bind(pg.realm_id)
+                .bind(pg.id)
+                .bind(&pg.name)
+                .bind(&pg.description)
+                .bind(pg.client_role)
+                .bind(pg.client_id)
+                .bind(pg.composite)
+                .bind(&pg.composites)
+                .bind(&pg.attributes)
+                .execute(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .rows_affected(),
+            )
+        }
+        McpStepUpMutation::UserGroupMembership {
+            realm_id,
+            user_id,
+            expected_group,
+            expected_roles,
+            assign,
+            expected_present,
+        } => {
+            sqlx::query("SELECT id FROM users WHERE realm_id = $1 AND id = $2 FOR UPDATE")
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(user_id.as_ref())?)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .ok_or(IssuerdError::Conflict)?;
+            let current: Option<PgGroup> =
+                sqlx::query_as("SELECT * FROM groups WHERE realm_id = $1 AND id = $2 FOR UPDATE")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .bind(uuid(expected_group.id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let Some(current) = current else {
+                return Err(IssuerdError::Conflict);
+            };
+            if redacted_group(current.try_into()?) != expected_group {
+                return Err(IssuerdError::Conflict);
+            }
+            for expected_role in expected_roles {
+                let current: Option<PgRole> = sqlx::query_as(
+                    "SELECT * FROM roles WHERE realm_id = $1 AND id = $2 FOR UPDATE",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(expected_role.id.as_ref())?)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(sqlx_error)?;
+                let Some(current) = current else {
+                    return Err(IssuerdError::Conflict);
+                };
+                if redacted_role(current.try_into()?) != expected_role {
+                    return Err(IssuerdError::Conflict);
+                }
+            }
+            let present: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM user_groups WHERE realm_id = $1 AND user_id = $2 AND group_id = $3)",
+            )
+            .bind(uuid(realm_id.as_ref())?)
+            .bind(uuid(user_id.as_ref())?)
+            .bind(uuid(expected_group.id.as_ref())?)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(sqlx_error)?;
+            if present != expected_present {
+                return Err(IssuerdError::Conflict);
+            }
+            if assign {
+                sqlx::query(
+                    "INSERT INTO user_groups (realm_id, user_id, group_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                )
+            } else {
+                sqlx::query("DELETE FROM user_groups WHERE realm_id = $1 AND user_id = $2 AND group_id = $3")
+            }
+            .bind(uuid(realm_id.as_ref())?)
+            .bind(uuid(user_id.as_ref())?)
+            .bind(uuid(expected_group.id.as_ref())?)
+            .execute(&mut **tx)
+            .await
+            .map_err(sqlx_error)?;
+            Ok(())
+        }
     }
 }
 
@@ -941,9 +1055,16 @@ fn sensitive_key(key: &str) -> bool {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect();
-    ["secret", "password", "credential", "privatekey", "token"]
-        .iter()
-        .any(|fragment| normalized.contains(fragment))
+    [
+        "secret",
+        "password",
+        "credential",
+        "privatekey",
+        "token",
+        "clientassertion",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment))
 }
 
 fn redacted_user(mut value: User) -> User {
@@ -1187,6 +1308,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_external_writes_are_serialized_with_step_up_execution() {
+        let storage = Arc::new(InMemoryStorage::new());
+        for _ in 0..32 {
+            let (realm, user) = realm_and_user();
+            storage.create_realm(&realm).await.unwrap();
+            storage.create_user(&realm.id, &user).await.unwrap();
+            let user = storage.get_user(&realm.id, &user.id).await.unwrap().unwrap();
+            let grant = test_grant(&user);
+            storage.create_mcp_step_up_grant(&grant).await.unwrap();
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let execution_storage = Arc::clone(&storage);
+            let execution_grant = grant.clone();
+            let execution_start = Arc::clone(&start);
+            let execution = tokio::spawn(async move {
+                execution_start.wait().await;
+                execution_storage
+                    .execute_mcp_step_up(
+                        &execution_grant.token_jti,
+                        &execution_grant.operation_hash,
+                        &execution_grant.mutation,
+                        Value::Null,
+                    )
+                    .await
+            });
+            let mut changed = user.clone();
+            changed.first_name = Some(DisplayName::new("Changed").unwrap());
+            start.wait().await;
+            let write_result = storage.update_user(&realm.id, &changed).await;
+            let execution = execution.await.unwrap();
+            match execution {
+                Ok(result) => {
+                    assert_eq!(result.status, McpStepUpExecutionStatus::Succeeded);
+                    assert!(storage.get_user(&realm.id, &user.id).await.unwrap().is_none());
+                    assert!(write_result.is_ok() || write_result == Err(IssuerdError::NotFound));
+                }
+                Err(IssuerdError::Conflict) => {
+                    assert!(write_result.is_ok());
+                    assert!(storage.get_user(&realm.id, &user.id).await.unwrap().is_some());
+                    let stored =
+                        storage.get_mcp_step_up_grant(&grant.token_jti).await.unwrap().unwrap();
+                    assert_eq!(stored.status, McpStepUpExecutionStatus::FailedDefinite);
+                }
+                other => panic!("unexpected execution result: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn json_snapshot_roundtrip_preserves_execution_outcome() {
         let path = std::env::temp_dir()
             .join(format!("issuerd-step-up-test-{}.json", uuid::Uuid::new_v4()));
@@ -1215,6 +1384,46 @@ mod tests {
             assert!(storage.get_user(&realm.id, &user.id).await.unwrap().is_none());
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_persist_failure_restores_the_previous_snapshot() {
+        let root = std::env::temp_dir().join(format!("issuerd-step-up-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("step-up.json");
+        let backup = root.join("backup.json");
+        let storage = JsonFileStorage::new(&path).unwrap();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let user = storage.get_user(&realm.id, &user.id).await.unwrap().unwrap();
+        let grant = test_grant(&user);
+        storage.create_mcp_step_up_grant(&grant).await.unwrap();
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let error = storage
+            .execute_mcp_step_up(
+                &grant.token_jti,
+                &grant.operation_hash,
+                &grant.mutation,
+                Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IssuerdError::ServerError(_)));
+        assert!(storage.get_user(&realm.id, &user.id).await.unwrap().is_some());
+        let current = storage.get_mcp_step_up_grant(&grant.token_jti).await.unwrap().unwrap();
+        assert_eq!(current.status, McpStepUpExecutionStatus::Active);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        let reloaded = JsonFileStorage::new(&path).unwrap();
+        assert!(reloaded.get_user(&realm.id, &user.id).await.unwrap().is_some());
+        let stored = reloaded.get_mcp_step_up_grant(&grant.token_jti).await.unwrap().unwrap();
+        assert_eq!(stored.status, McpStepUpExecutionStatus::Active);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1325,7 +1534,9 @@ mod tests {
     }
 
     async fn mutation_matrix(storage: &dyn Storage) {
-        let (realm, subject) = realm_and_user();
+        let (mut realm, subject) = realm_and_user();
+        realm.attributes.insert("smtp.password".into(), "mail-secret".into());
+        realm.attributes.insert("pairwise_sector_key".into(), "sector-secret".into());
         storage.create_realm(&realm).await.unwrap();
         storage.create_user(&realm.id, &subject).await.unwrap();
         let subject = storage.get_user(&realm.id, &subject.id).await.unwrap().unwrap();
@@ -1536,7 +1747,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(storage.get_realm(&realm.id).await.unwrap().unwrap().not_before, 123);
+        let pushed = storage.get_realm(&realm.id).await.unwrap().unwrap();
+        assert_eq!(pushed.not_before, 123);
+        assert_eq!(pushed.attributes["smtp.password"], "mail-secret");
+        assert_eq!(pushed.attributes["pairwise_sector_key"], "sector-secret");
 
         let totp = Credential {
             id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
@@ -1596,8 +1810,23 @@ mod tests {
         )
         .await;
 
-        let mapped_role = test_role(&realm, "mapped-role");
+        let mut mapped_role = test_role(&realm, "mapped-role");
+        mapped_role.attributes.insert("api_secret".into(), vec!["role-secret".into()]);
         storage.create_role(&realm.id, &mapped_role).await.unwrap();
+        let mut updated_role = mapped_role.clone();
+        updated_role.description = Some("updated role".into());
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UpdateRole {
+                expected: mapped_role.clone(),
+                updated: updated_role,
+            },
+        )
+        .await;
+        let mapped_role = storage.get_role(&realm.id, &mapped_role.id).await.unwrap().unwrap();
+        assert_eq!(mapped_role.description.as_deref(), Some("updated role"));
+        assert_eq!(mapped_role.attributes["api_secret"], ["role-secret"]);
         execute_variant(
             storage,
             &subject,
@@ -1643,13 +1872,51 @@ mod tests {
             storage,
             &subject,
             McpStepUpMutation::GroupRoleMapping {
-                expected: mapped_group,
-                expected_role: mapped_role,
+                expected: mapped_group.clone(),
+                expected_role: mapped_role.clone(),
                 client_id: None,
                 assign: false,
             },
         )
         .await;
+
+        let mapped_group = storage.get_group(&realm.id, &mapped_group.id).await.unwrap().unwrap();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UserGroupMembership {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected_group: mapped_group.clone(),
+                expected_roles: vec![mapped_role.clone()],
+                assign: true,
+                expected_present: false,
+            },
+        )
+        .await;
+        assert!(storage
+            .list_user_groups(&realm.id, &subject.id)
+            .await
+            .unwrap()
+            .contains(&mapped_group.id));
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::UserGroupMembership {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected_group: mapped_group.clone(),
+                expected_roles: vec![mapped_role],
+                assign: false,
+                expected_present: true,
+            },
+        )
+        .await;
+        assert!(!storage
+            .list_user_groups(&realm.id, &subject.id)
+            .await
+            .unwrap()
+            .contains(&mapped_group.id));
 
         let expected_realm = storage.get_realm(&realm.id).await.unwrap().unwrap();
         execute_variant(

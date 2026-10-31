@@ -96,6 +96,18 @@ pub enum McpStepUpMutation {
         client_id: Option<ClientId>,
         assign: bool,
     },
+    UpdateRole {
+        expected: Role,
+        updated: Role,
+    },
+    UserGroupMembership {
+        realm_id: RealmId,
+        user_id: UserId,
+        expected_group: Group,
+        expected_roles: Vec<Role>,
+        assign: bool,
+        expected_present: bool,
+    },
 }
 
 impl McpStepUpMutation {
@@ -128,6 +140,14 @@ impl McpStepUpMutation {
                     "groups_assign_role"
                 } else {
                     "groups_unassign_role"
+                }
+            }
+            Self::UpdateRole { .. } => "roles_update",
+            Self::UserGroupMembership { assign, .. } => {
+                if *assign {
+                    "users_add_to_group"
+                } else {
+                    "users_remove_from_group"
                 }
             }
         }
@@ -181,6 +201,20 @@ impl McpStepUpMutation {
                 redact_group(expected);
                 redact_role(expected_role);
             }
+            Self::UpdateRole { expected, updated } => {
+                redact_role(expected);
+                redact_role(updated);
+            }
+            Self::UserGroupMembership {
+                expected_group,
+                expected_roles,
+                ..
+            } => {
+                redact_group(expected_group);
+                for role in expected_roles {
+                    redact_role(role);
+                }
+            }
         }
         redacted
     }
@@ -205,8 +239,11 @@ impl McpStepUpMutation {
             Self::DeleteTotp { user_id, .. } | Self::DeleteWebauthn { user_id, .. } => {
                 user_id.to_string()
             }
-            Self::UserRoleMapping { user_id, .. } => user_id.to_string(),
+            Self::UserRoleMapping { user_id, .. } | Self::UserGroupMembership { user_id, .. } => {
+                user_id.to_string()
+            }
             Self::GroupRoleMapping { expected, .. } => expected.id.to_string(),
+            Self::UpdateRole { expected, .. } => expected.name.to_string(),
         }
     }
 }
@@ -217,9 +254,16 @@ fn sensitive_key(key: &str) -> bool {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect();
-    ["secret", "password", "credential", "privatekey", "token"]
-        .iter()
-        .any(|fragment| normalized.contains(fragment))
+    [
+        "secret",
+        "password",
+        "credential",
+        "privatekey",
+        "token",
+        "clientassertion",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment))
 }
 
 fn redact_user(user: &mut User) {

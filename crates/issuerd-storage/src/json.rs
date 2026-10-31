@@ -1059,11 +1059,23 @@ impl Storage for JsonFileStorage {
         mutation: &McpStepUpMutation,
         result_json: serde_json::Value,
     ) -> Result<McpStepUpExecution, IssuerdError> {
-        let execution = self
-            .inner
-            .execute_mcp_step_up(token_jti, operation_hash, mutation, result_json)
+        let _guard = self.inner.step_up_lock.lock().await;
+        let before = self.inner.to_snapshot();
+        let execution = crate::memory::MCP_STEP_UP
+            .scope(
+                (),
+                self.inner.execute_mcp_step_up_locked(
+                    token_jti,
+                    operation_hash,
+                    mutation,
+                    result_json,
+                ),
+            )
             .await;
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.inner.load_snapshot(before);
+            return Err(error);
+        }
         execution
     }
 }

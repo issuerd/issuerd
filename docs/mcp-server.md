@@ -118,8 +118,13 @@ or invocation allowance.
 
 User/group role assignment and unassignment remain ordinary T2 writes for
 non-administrative roles. They become strict operations whenever the target
-role's composite closure contains a view/manage administrative role or
-`realm-admin`.
+role's composite closure contains a view/manage administrative role,
+`realm-admin`, or `impersonation`. `roles_update` follows the same rule when
+its composites change or when it renames a role to or from an administrative
+name; other name/description-only updates stay T2. Adding or
+removing a user from a group with an administrative effective closure is also
+strict. With `[mcp.step_up].enabled=false`, these privileged operations are
+rejected while their non-administrative counterparts remain available.
 
 Assign `mcp:read` explicitly as an **optional** client scope. It is not implied
 by `mcp:write` or `mcp:step_up`, and it is not accepted as a default scope or

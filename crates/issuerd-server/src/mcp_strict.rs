@@ -25,6 +25,7 @@ const ADMIN_ROLES: &[&str] = &[
     "manage-users",
     "manage-clients",
     "realm-admin",
+    "impersonation",
 ];
 
 pub async fn prepare(
@@ -310,6 +311,14 @@ pub async fn prepare(
                 expected,
             }
         }
+        ToolName::RolesUpdate => {
+            let args: issuerd_mcp::write_tools::RoleUpdateArgs = decode(&operation)?;
+            return role_update(state, realm_id, args).await;
+        }
+        ToolName::UsersAddToGroup | ToolName::UsersRemoveFromGroup => {
+            let args: issuerd_mcp::write_tools::UserGroupArgs = decode(&operation)?;
+            return group_membership(state, auth, tool, args).await;
+        }
         ToolName::UsersAssignRole
         | ToolName::UsersUnassignRole
         | ToolName::GroupsAssignRole
@@ -324,6 +333,100 @@ pub async fn prepare(
     };
     debug_assert_eq!(mutation.tool(), tool.as_str());
     Ok(Some(mutation))
+}
+
+async fn role_update(
+    state: &Arc<AdminApiState>,
+    realm_id: &RealmId,
+    args: issuerd_mcp::write_tools::RoleUpdateArgs,
+) -> Result<Option<McpStepUpMutation>, McpError> {
+    let expected = state
+        .storage
+        .get_role_by_name(realm_id, &args.name)
+        .await?
+        .filter(|role| !role.client_role)
+        .ok_or(McpError::NotFound("role"))?;
+    let name_changed = args.new_name.as_ref().is_some_and(|name| name != expected.name.as_str());
+    if args.composites.is_none() && !name_changed {
+        return Ok(None);
+    }
+    let mut updated = expected.clone();
+    if let Some(name) = args.new_name {
+        bounded_text(&name, "newName")?;
+        updated.name = RoleName::new(name)?;
+    }
+    if let Some(description) = args.description {
+        if description.len() > 1024 || description.chars().any(char::is_control) {
+            return Err(McpError::InvalidInput("description is invalid".into()));
+        }
+        updated.description = Some(description);
+    }
+    if let Some(composites) = args.composites {
+        updated.composites = composites
+            .into_iter()
+            .map(|name| {
+                bounded_text(&name, "composites")?;
+                Ok(RoleName::new(name)?)
+            })
+            .collect::<Result<Vec<_>, McpError>>()?;
+        updated.composite = !updated.composites.is_empty();
+    }
+    let all_roles = list_all_roles(state.storage.as_ref(), realm_id).await?;
+    let evaluated: Vec<_> = all_roles
+        .iter()
+        .map(|role| {
+            if role.id == expected.id {
+                updated.clone()
+            } else {
+                role.clone()
+            }
+        })
+        .collect();
+    let before = expand_composites(vec![expected.clone()], &all_roles);
+    let after = expand_composites(vec![updated.clone()], &evaluated);
+    if !has_admin_role(&before) && !has_admin_role(&after) {
+        return Ok(None);
+    }
+    Ok(Some(McpStepUpMutation::UpdateRole { expected, updated }))
+}
+
+async fn group_membership(
+    state: &Arc<AdminApiState>,
+    auth: &McpAuthContext,
+    tool: ToolName,
+    args: issuerd_mcp::write_tools::UserGroupArgs,
+) -> Result<Option<McpStepUpMutation>, McpError> {
+    let realm_id = &auth.realm_id;
+    let user_id = UserId::new(uuid(&args.id, "id")?)?;
+    let group_id = GroupId::new(uuid(&args.group_id, "groupId")?)?;
+    let expected_group = state
+        .storage
+        .get_group(realm_id, &group_id)
+        .await?
+        .ok_or(McpError::NotFound("group"))?;
+    let mut expected_roles =
+        effective_group_roles(state.storage.as_ref(), realm_id, &group_id).await?;
+    if !has_admin_role(&expected_roles) {
+        return Ok(None);
+    }
+    if state.storage.get_user(realm_id, &user_id).await?.is_none() {
+        return Err(McpError::NotFound("user"));
+    }
+    expected_roles.sort_by(|left, right| left.id.cmp(&right.id));
+    let expected_present =
+        state.storage.list_user_groups(realm_id, &user_id).await?.contains(&group_id);
+    Ok(Some(McpStepUpMutation::UserGroupMembership {
+        realm_id: realm_id.clone(),
+        user_id,
+        expected_group,
+        expected_roles,
+        assign: tool == ToolName::UsersAddToGroup,
+        expected_present,
+    }))
+}
+
+fn has_admin_role(roles: &[Role]) -> bool {
+    roles.iter().any(|role| ADMIN_ROLES.contains(&role.name.as_str()))
 }
 
 async fn role_mapping(
@@ -445,8 +548,7 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
         }
         McpStepUpMutation::UpdateRealmSettings { .. }
         | McpStepUpMutation::UpdateEventsConfig { .. }
-        | McpStepUpMutation::PushNotBefore { .. }
-        | McpStepUpMutation::DeleteRealm { .. } => {
+        | McpStepUpMutation::PushNotBefore { .. } => {
             let name = realm_name(state, realm_id).await;
             if let Some(name) = name {
                 issuerd_cluster::invalidate::delete_best_effort(
@@ -456,6 +558,14 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
                 )
                 .await;
             }
+        }
+        McpStepUpMutation::DeleteRealm { expected } => {
+            issuerd_cluster::invalidate::delete_best_effort(
+                state.cache.as_ref(),
+                realm_id,
+                &issuerd_cluster::cache_keys::realm_by_name(expected.name.as_str()),
+            )
+            .await;
         }
         _ => {
             issuerd_cluster::invalidate::bump_claims_epoch(state.cache.as_ref(), realm_id).await;
@@ -505,11 +615,14 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
         McpStepUpMutation::DeleteUser { .. }
         | McpStepUpMutation::DeleteTotp { .. }
         | McpStepUpMutation::DeleteWebauthn { .. }
-        | McpStepUpMutation::UserRoleMapping { .. } => ResourceType::User,
+        | McpStepUpMutation::UserRoleMapping { .. }
+        | McpStepUpMutation::UserGroupMembership { .. } => ResourceType::User,
         McpStepUpMutation::DeleteGroup { .. } | McpStepUpMutation::GroupRoleMapping { .. } => {
             ResourceType::Group
         }
-        McpStepUpMutation::DeleteRole { .. } => ResourceType::Role,
+        McpStepUpMutation::DeleteRole { .. } | McpStepUpMutation::UpdateRole { .. } => {
+            ResourceType::Role
+        }
         McpStepUpMutation::DeleteClient { .. } | McpStepUpMutation::UpdateClientSecurity { .. } => {
             ResourceType::Client
         }
@@ -1092,5 +1205,120 @@ mod tests {
             .unwrap(),
             None
         );
+
+        let impersonation = test_role(realm, "impersonation");
+        create_role_if_missing(&fixture.state, realm, &impersonation).await;
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::UsersAssignRole,
+                json!({"id": user.id.to_string(), "role": "impersonation"}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::UserRoleMapping { .. })
+        ));
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::RolesUpdate,
+                json!({"name": "ordinary-role", "composites": ["impersonation"]}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::UpdateRole { .. })
+        ));
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::RolesUpdate,
+                json!({"name": "ordinary-role", "newName": "impersonation"}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::UpdateRole { .. })
+        ));
+        assert_eq!(
+            call(
+                &fixture,
+                ToolName::RolesUpdate,
+                json!({"name": "builder-role", "composites": ["ordinary-role"]}),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let mut privileged_group = self::tests::group(realm, "privileged-group");
+        privileged_group.realm_roles = vec![RoleName::new("manage-realm").unwrap()];
+        fixture.state.storage.create_group(&realm.id, &privileged_group).await.unwrap();
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::UsersAddToGroup,
+                json!({"id": user.id.to_string(), "groupId": privileged_group.id.to_string()}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::UserGroupMembership { .. })
+        ));
+        let mut ordinary_group = self::tests::group(realm, "ordinary-group");
+        ordinary_group.realm_roles = vec![RoleName::new("ordinary-role").unwrap()];
+        fixture.state.storage.create_group(&realm.id, &ordinary_group).await.unwrap();
+        assert_eq!(
+            call(
+                &fixture,
+                ToolName::UsersAddToGroup,
+                json!({"id": user.id.to_string(), "groupId": ordinary_group.id.to_string()}),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_realm_cache_uses_the_approved_realm_name() {
+        let fixture = fixture().await;
+        let realm = Realm {
+            id: RealmId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            name: RealmName::new("deleted-realm").unwrap(),
+            ..Realm::default()
+        };
+        fixture.state.storage.create_realm(&realm).await.unwrap();
+        let cache_key = issuerd_cluster::cache_keys::realm_by_name(realm.name.as_str());
+        fixture
+            .state
+            .cache
+            .set(&cache_key, serde_json::to_vec(&realm).unwrap(), None)
+            .await
+            .unwrap();
+        fixture.state.storage.delete_realm(&realm.id).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let grant = McpStepUpGrant {
+            version: 1,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            operation_hash: "hash".into(),
+            canonicalization_version: 1,
+            realm_id: realm.id.clone(),
+            client_id: ClientIdentifier::new("admin-cli").unwrap(),
+            subject_user_id: fixture.user.id.clone(),
+            resource: "https://issuer.example/realms/deleted-realm/mcp".into(),
+            tool: "realm_delete".into(),
+            mutation: McpStepUpMutation::DeleteRealm { expected: realm },
+            origin_access_token_jti: "origin".into(),
+            token_jti: JwtId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            dpop_jkt: "jkt".into(),
+            approval_auth_time: now,
+            approval_acr: None,
+            approval_amr: vec!["pwd".into()],
+            status: McpStepUpExecutionStatus::Succeeded,
+            result_json: None,
+            issued_at: now,
+            expires_at: now + 120,
+            updated_at: now,
+        };
+        committed(&fixture.state, &grant).await;
+        assert!(fixture.state.cache.get(&cache_key).await.unwrap().is_none());
     }
 }

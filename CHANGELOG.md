@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP privilege approval and state consistency.** Administrative role assignment, `impersonation`, admin-changing role composites or renames, and privileged group membership now require exact-operation approval; disabling step-up rejects all of them instead of falling back to ordinary writes. In-memory/JSON strict execution excludes ordinary writers and rolls back failed JSON snapshots, `push_not_before` preserves secret realm attributes, realm deletion invalidates cached names, and IdP `clientAssertion` values are redacted. Revoke-all-sessions now drains every page, and operation approval preserves CIBA polling history.
 - **Concurrent MCP step-up reconciliation.** PostgreSQL serialization aborts now retry only the uncommitted transaction, allowing concurrent exact retries to reconcile the single committed mutation and result instead of surfacing an internal database error.
 - **CIBA discovery metadata.** The discovery document now advertises poll delivery under the standard `backchannel_token_delivery_modes_supported` field name, eliminating conformance metadata warnings without changing the client-registration field.
 - **Strict MCP backend parity and approval preconditions.** PostgreSQL now persists every approved client security flag, and approval compares redacted expected state on both sides so secret-bearing clients and attributes no longer fail unconditionally without exposing those secrets.
