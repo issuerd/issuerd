@@ -96,8 +96,9 @@ Then run the finite rig from the repository root:
 
 The script clones the pinned harness if it is missing, installs the reviewed
 `upstream-package-lock.json` override (production dependency audit clean),
-builds the official harness and Issuerd clients, provisions the realm, and starts
-the daemon and proxy. It runs lifecycle regressions and all selected scenarios,
+builds the official harness, Issuerd clients, and embedded login assets, then
+provisions the realm and starts the daemon and proxy. It runs lifecycle
+regressions and all selected scenarios,
 then cleans up the daemon, proxy, and harness processes on success, failure, or
 interruption. Results and local logs go to ignored
 `tests/mcp-conformance/results/`. Tokens and proxy authorization headers are

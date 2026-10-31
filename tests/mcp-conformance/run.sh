@@ -41,6 +41,10 @@ npx playwright install chromium
 cd "$ROOT/examples/mcp-admin/client"
 npm ci
 npm run build
+cd "$ROOT/webclientsrc"
+npm ci
+npm run generate-api
+npm run build
 cd "$ROOT"
 
 cargo run --bin issuerd -- daemon -c tests/mcp-conformance/issuerd.conformance.toml >"$RESULTS/issuerd.log" 2>&1 &
