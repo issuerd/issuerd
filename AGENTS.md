@@ -61,7 +61,7 @@ issuerd/
 ├── docker-compose.cluster.yml # Two-node cluster demo (nginx LB + Postgres + Redis)
 ├── cluster/                 # Cluster demo stack config (issuerd.toml, nginx.conf, provision.yaml)
 ├── dns/bind9/               # Bind9 zone config for the integration stack
-├── examples/                # Example server/provision configs + local demo config (*.demo.*) + runnable examples (agentic-mcp/; mcp-admin/ — external TypeScript DPoP acceptance client and read-only rigs)
+├── examples/                # Example server/provision configs + local demo config (*.demo.*) + runnable examples (agentic-mcp/; mcp-admin/ — external TypeScript DPoP read/write/step-up acceptance clients and rigs)
 ├── docs/                    # Operations documentation set (index: docs/README.md) + CLUSTERING.md, PERFORMANCE.md, crate graph
 ├── themes/                  # Login theme(s) served at /realms/{realm}/theme/{*path}
 │                            # (the default `issuerd` login.css is also compiled into the
