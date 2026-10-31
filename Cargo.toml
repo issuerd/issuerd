@@ -168,7 +168,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-log = "0.2"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 # Config (YAML support comes from the workspace `serde-saphyr` dependency via a
 # custom figment `Format` in issuerd-server — figment's built-in `yaml` feature
