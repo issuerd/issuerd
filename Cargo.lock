@@ -1471,7 +1471,7 @@ dependencies = [
 [[package]]
 name = "flux-attrs"
 version = "0.1.0"
-source = "git+https://github.com/flux-rs/flux.git#849ef7c31ce06ec92e211050ac2f5bc8c543896d"
+source = "git+https://github.com/flux-rs/flux.git#bd5de273235457a5922280cc180c4a6a2990418a"
 dependencies = [
  "flux-attrs-impl",
 ]
@@ -1479,7 +1479,7 @@ dependencies = [
 [[package]]
 name = "flux-attrs-impl"
 version = "0.1.0"
-source = "git+https://github.com/flux-rs/flux.git#849ef7c31ce06ec92e211050ac2f5bc8c543896d"
+source = "git+https://github.com/flux-rs/flux.git#bd5de273235457a5922280cc180c4a6a2990418a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1489,7 +1489,7 @@ dependencies = [
 [[package]]
 name = "flux-rs"
 version = "0.1.0"
-source = "git+https://github.com/flux-rs/flux.git#849ef7c31ce06ec92e211050ac2f5bc8c543896d"
+source = "git+https://github.com/flux-rs/flux.git#bd5de273235457a5922280cc180c4a6a2990418a"
 dependencies = [
  "flux-attrs",
 ]
