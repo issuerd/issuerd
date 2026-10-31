@@ -168,7 +168,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-log = "0.2"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 # Config (YAML support comes from the workspace `serde-saphyr` dependency via a
 # custom figment `Format` in issuerd-server — figment's built-in `yaml` feature
@@ -176,8 +176,8 @@ metrics-exporter-prometheus = "0.16"
 figment = { version = "0.10", features = ["env", "toml", "json"] }
 
 # Testing
-mockall = "0.13"
-rstest = "0.23"
+mockall = "0.15"
+rstest = "0.28"
 proptest = "1.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
@@ -233,7 +233,7 @@ include_dir = "0.7"
 mime_guess = "2.0"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 enable-ansi-support = "0.3"
-sd-notify = "0.4"
+sd-notify = "0.5"
 tracing-journald = "0.3"
 
 # QR code generation (TOTP enrollment)

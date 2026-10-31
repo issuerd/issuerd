@@ -26,7 +26,7 @@ pub async fn run(
     let addr = SocketAddr::new(ip, config.port);
 
     #[cfg(target_os = "linux")]
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Status("Starting Issuerd...")]);
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Status("Starting Issuerd...")]);
 
     debug!(bind = %config.bind, port = %config.port, tls = config.tls.is_some(), "server configuration");
 
@@ -82,7 +82,7 @@ pub async fn run(
     }
 
     #[cfg(target_os = "linux")]
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
     info!("Server shutdown complete");
     Ok(())
