@@ -375,7 +375,7 @@ async fn preconditions(
         crate::mcp_strict::prepare(&crate::mcp_service::admin_state(state), &auth, operation_input)
             .await;
     match prepared {
-        Ok(Some(mutation)) if mutation == operation.mutation.redacted() => Ok(()),
+        Ok(Some(mutation)) if mutation.redacted() == operation.mutation.redacted() => Ok(()),
         Ok(_) => Err(error(StatusCode::CONFLICT, "precondition_failed")),
         Err(_) => Err(error(StatusCode::CONFLICT, "precondition_failed")),
     }

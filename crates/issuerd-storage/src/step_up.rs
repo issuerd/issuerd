@@ -385,13 +385,21 @@ async fn apply_mutation(
             let pg: PgClient = (&effective).try_into()?;
             expect_one(
                 sqlx::query(
-                    "UPDATE clients SET redirect_uris = $3, web_origins = $4, attributes = $5 WHERE realm_id = $1 AND id = $2",
+                    r#"UPDATE clients SET redirect_uris = $3, web_origins = $4, attributes = $5,
+                        public_client = $6, bearer_only = $7, consent_required = $8,
+                        full_scope_allowed = $9, service_accounts_enabled = $10
+                        WHERE realm_id = $1 AND id = $2"#,
                 )
                 .bind(uuid(expected.realm_id.as_ref())?)
                 .bind(pg.id)
                 .bind(&pg.redirect_uris)
                 .bind(&pg.web_origins)
                 .bind(&pg.attributes)
+                .bind(pg.public_client)
+                .bind(pg.bearer_only)
+                .bind(pg.consent_required)
+                .bind(pg.full_scope_allowed)
+                .bind(pg.service_accounts_enabled)
                 .execute(&mut **tx)
                 .await
                 .map_err(sqlx_error)?
@@ -1326,6 +1334,11 @@ mod tests {
         let mut updated = client.clone();
         updated.redirect_uris = vec![RedirectUri::new("https://app.example/callback").unwrap()];
         updated.web_origins = vec![WebOrigin::new("https://app.example").unwrap()];
+        updated.public_client = true;
+        updated.bearer_only = true;
+        updated.consent_required = true;
+        updated.full_scope_allowed = false;
+        updated.service_accounts_enabled = true;
         execute_variant(
             storage,
             &subject,
@@ -1338,6 +1351,11 @@ mod tests {
         let secured = storage.get_client(&realm.id, &client.id).await.unwrap().unwrap();
         assert_eq!(secured.secret.as_deref(), Some("must-survive"));
         assert_eq!(secured.redirect_uris, updated.redirect_uris);
+        assert!(secured.public_client);
+        assert!(secured.bearer_only);
+        assert!(secured.consent_required);
+        assert!(!secured.full_scope_allowed);
+        assert!(secured.service_accounts_enabled);
         execute_variant(
             storage,
             &subject,

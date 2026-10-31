@@ -1383,6 +1383,55 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn secret_bearing_client_preconditions_pass_without_rendering_secret() {
+        let fixture = fixture().await;
+        let permit = fixture
+            .executor
+            .preflight("clients_delete", auth(&fixture, "openid mcp:write", "origin-jkt"), 100)
+            .await
+            .unwrap();
+        let arguments = json!({
+            "id": fixture.client.id.to_string(),
+            "confirmation": fixture.client.client_id.as_str(),
+        })
+        .as_object()
+        .cloned();
+        let pending = match fixture
+            .executor
+            .coordinate_strict(
+                &permit,
+                arguments,
+                fixture.resource.clone(),
+                Some("origin-jkt".into()),
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap()
+        {
+            McpStrictCoordination::Pending(operation) => *operation,
+            _ => panic!("secret-bearing client must create a pending operation"),
+        };
+        let initiation = response_json(begin_ciba(&fixture, &pending).await).await;
+        let approval_id = initiation["approval_url"]
+            .as_str()
+            .unwrap()
+            .split("approval_id=")
+            .nth(1)
+            .unwrap();
+        let approval = ciba_approval::get_handler(
+            State(fixture.state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".into()))),
+            sso_headers(&fixture).await,
+            RawQuery(Some(format!("approval_id={approval_id}"))),
+        )
+        .await;
+        assert_eq!(approval.status(), StatusCode::OK);
+        let html = response_text(approval).await;
+        assert!(html.contains("clients_delete"));
+        assert!(!html.contains("test-secret"));
+    }
+
     #[test]
     fn persisted_ciba_ids_are_stable_distinct_uuids() {
         let realm = RealmId::new("10000000-0000-4000-8000-000000000001").unwrap();

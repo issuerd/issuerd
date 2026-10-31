@@ -197,6 +197,10 @@ pub fn is_strict(tool: ToolName) -> bool {
     tool.tier() == RiskTier::T3
 }
 
+pub fn requires_step_up(tool: ToolName) -> bool {
+    is_strict(tool) || crate::policy::is_strict_self_service(tool)
+}
+
 pub fn parse_operation(
     tool: ToolName,
     arguments: Option<JsonObject>,

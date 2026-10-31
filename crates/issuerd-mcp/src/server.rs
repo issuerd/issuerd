@@ -62,7 +62,7 @@ impl ServerHandler for IssuerdMcpServer {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         crate::policy::ToolName::parse(name).and_then(|tool| {
-            (self.executor.step_up_enabled() || !crate::strict_tools::is_strict(tool))
+            (self.executor.step_up_enabled() || !crate::strict_tools::requires_step_up(tool))
                 .then(|| crate::tools::definition(tool))
         })
     }
@@ -77,7 +77,8 @@ impl ServerHandler for IssuerdMcpServer {
             .into_iter()
             .filter(|tool| {
                 crate::policy::ToolName::parse(tool.name.as_ref()).is_some_and(|name| {
-                    (self.executor.step_up_enabled() || !crate::strict_tools::is_strict(name))
+                    (self.executor.step_up_enabled()
+                        || !crate::strict_tools::requires_step_up(name))
                         && policy::decide_for(name, &auth).is_allowed()
                 })
             })
@@ -251,6 +252,18 @@ mod tests {
         assert_eq!(versions, ["2025-06-18", "2025-11-25", "2026-07-28"]);
         assert!(server.get_tool("realm_get").is_some());
         assert!(server.get_tool("tools/get").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_step_up_hides_and_rejects_destructive_self_service() {
+        let server = server();
+        for tool in ["me_totp_delete", "me_webauthn_delete"] {
+            assert!(server.get_tool(tool).is_none());
+            assert!(matches!(
+                server.executor.preflight(tool, auth("openid", &[]), 100).await,
+                Err(McpError::UnknownTool(_))
+            ));
+        }
     }
 
     struct TestService {

@@ -262,7 +262,7 @@ impl McpToolExecutor {
         self.limiter.acquire(&auth, now).await?;
         let tool = ToolName::parse(tool_name)
             .ok_or_else(|| McpError::UnknownTool(tool_name.to_string()))?;
-        if crate::strict_tools::is_strict(tool) && !self.step_up_enabled {
+        if crate::strict_tools::requires_step_up(tool) && !self.step_up_enabled {
             return Err(McpError::UnknownTool(tool_name.to_string()));
         }
         let tool_policy = policy::policy_for(tool);

@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Strict MCP backend parity and approval preconditions.** PostgreSQL now persists every approved client security flag, and approval compares redacted expected state on both sides so secret-bearing clients and attributes no longer fail unconditionally without exposing those secrets.
+- **Destructive self-service rollout gate.** `[mcp.step_up].enabled=false` now hides and rejects TOTP/WebAuthn deletion as well as T3 operations, preventing credential deletion without the required exact-operation approval.
 - **Operation-bound CIBA on PostgreSQL and clustered nodes.** Deterministic user/client session IDs are now stable UUIDs derived from the realm, request ID, and ID kind, so approved grants persist identically across retries and nodes instead of failing PostgreSQL UUID validation. Approval authentication methods are preserved, session-store failures remain retryable, and CAS updates preserve existing cache TTLs in memory and Redis.
 - **Phase 1C MCP read correctness.** `users_get_role_mappings` now returns a tool error instead of incomplete direct/available/effective mappings when group role reads fail. The `attack_detection_status` output schema covers the full unsigned 32-bit failure-counter range while remaining compatible with the official TypeScript validator.
 
