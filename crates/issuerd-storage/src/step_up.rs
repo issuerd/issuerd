@@ -161,6 +161,26 @@ pub(crate) async fn execute_grant(
     mutation: &McpStepUpMutation,
     result_json: Value,
 ) -> Result<McpStepUpExecution, IssuerdError> {
+    const MAX_SERIALIZATION_ATTEMPTS: usize = 8;
+
+    for _ in 0..MAX_SERIALIZATION_ATTEMPTS {
+        match execute_grant_once(storage, token_jti, operation_hash, mutation, result_json.clone())
+            .await
+        {
+            Err(error) if is_serialization_failure(&error) => {}
+            result => return result,
+        }
+    }
+    Err(IssuerdError::TemporarilyUnavailable)
+}
+
+async fn execute_grant_once(
+    storage: &PostgresStorage,
+    token_jti: &JwtId,
+    operation_hash: &str,
+    mutation: &McpStepUpMutation,
+    result_json: Value,
+) -> Result<McpStepUpExecution, IssuerdError> {
     let mut tx = storage.pool().begin().await.map_err(sqlx_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .execute(&mut *tx)
@@ -892,8 +912,18 @@ fn uuid(value: &str) -> Result<uuid::Uuid, IssuerdError> {
     uuid::Uuid::parse_str(value).map_err(|error| IssuerdError::InvalidRequest(error.to_string()))
 }
 
+const SERIALIZATION_FAILURE: &str =
+    "MCP step-up transaction serialization failure (SQLSTATE 40001)";
+
+fn is_serialization_failure(error: &IssuerdError) -> bool {
+    matches!(error, IssuerdError::ServerError(message) if message == SERIALIZATION_FAILURE)
+}
+
 fn sqlx_error(error: sqlx::Error) -> IssuerdError {
     match error {
+        sqlx::Error::Database(ref db) if db.code().as_deref() == Some("40001") => {
+            IssuerdError::ServerError(SERIALIZATION_FAILURE.into())
+        }
         sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23505") => {
             IssuerdError::Conflict
         }
@@ -1117,11 +1147,14 @@ mod tests {
         let user = storage.get_user(&realm.id, &user.id).await.unwrap().unwrap();
         let grant = test_grant(&user);
         storage.create_mcp_step_up_grant(&grant).await.unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(calls));
         let mut tasks = tokio::task::JoinSet::new();
         for attempt in 0..calls {
             let storage = Arc::clone(&storage);
             let grant = grant.clone();
+            let start = Arc::clone(&start);
             tasks.spawn(async move {
+                start.wait().await;
                 storage
                     .execute_mcp_step_up(
                         &grant.token_jti,
@@ -1215,7 +1248,9 @@ mod tests {
         storage.run_migrations().await.unwrap();
         grant_lifecycle(storage.as_ref()).await;
 
-        concurrent_reconciliation(storage, 8).await;
+        for _ in 0..4 {
+            concurrent_reconciliation(Arc::clone(&storage), 16).await;
+        }
     }
 
     async fn execute_variant(storage: &dyn Storage, subject: &User, mutation: McpStepUpMutation) {

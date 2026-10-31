@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Concurrent MCP step-up reconciliation.** PostgreSQL serialization aborts now retry only the uncommitted transaction, allowing concurrent exact retries to reconcile the single committed mutation and result instead of surfacing an internal database error.
+- **CIBA discovery metadata.** The discovery document now advertises poll delivery under the standard `backchannel_token_delivery_modes_supported` field name, eliminating conformance metadata warnings without changing the client-registration field.
 - **Strict MCP backend parity and approval preconditions.** PostgreSQL now persists every approved client security flag, and approval compares redacted expected state on both sides so secret-bearing clients and attributes no longer fail unconditionally without exposing those secrets.
 - **Destructive self-service rollout gate.** `[mcp.step_up].enabled=false` now hides and rejects TOTP/WebAuthn deletion as well as T3 operations, preventing credential deletion without the required exact-operation approval.
 - **Operation-bound CIBA on PostgreSQL and clustered nodes.** Deterministic user/client session IDs are now stable UUIDs derived from the realm, request ID, and ID kind, so approved grants persist identically across retries and nodes instead of failing PostgreSQL UUID validation. Approval authentication methods are preserved, session-store failures remain retryable, and CAS updates preserve existing cache TTLs in memory and Redis.
