@@ -233,7 +233,7 @@ include_dir = "0.7"
 mime_guess = "2.0"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 enable-ansi-support = "0.3"
-sd-notify = "0.4"
+sd-notify = "0.5"
 tracing-journald = "0.3"
 
 # QR code generation (TOTP enrollment)
