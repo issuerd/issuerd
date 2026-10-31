@@ -23,7 +23,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if gh pr diff "$PR_NUMBER" --name-only | grep -qx 'CHANGELOG.md'; then
+          if gh api "repos/$GH_REPO/pulls/$PR_NUMBER/files?per_page=100" --paginate --jq '.[].filename' | grep -qx 'CHANGELOG.md'; then
             echo "CHANGELOG.md updated — OK."
           else
             echo "::error::This PR does not update CHANGELOG.md. Add an entry under '## [Unreleased]' or apply the 'no-changelog' label."

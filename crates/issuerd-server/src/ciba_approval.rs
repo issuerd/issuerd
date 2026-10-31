@@ -42,17 +42,17 @@ pub async fn get_handler(
     };
     let (approval, req_data) = match load(&state, &realm, &approval_id).await {
         Ok(loaded) => loaded,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let session = match authenticate(&state, &headers, &realm, &req_data).await {
         Ok(Some(session)) => session,
         Ok(None) => {
             return begin_login(&state, &realm, &approval_id, &req_data).await;
         }
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) = preconditions(&state, &realm, &req_data).await {
-        return response;
+        return *response;
     }
     let Some(operation) = req_data.operation.as_ref() else {
         return error(StatusCode::NOT_FOUND, "invalid_request");
@@ -131,12 +131,12 @@ pub async fn post_handler(
     }
     let (approval, req_data) = match load(&state, &realm, &approval_id).await {
         Ok(loaded) => loaded,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let session = match authenticate(&state, &headers, &realm, &req_data).await {
         Ok(Some(session)) => session,
         Ok(None) => return error(StatusCode::UNAUTHORIZED, "login_required"),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let expected = csrf_proof(&approval, &session);
     let matches: bool = subtle::ConstantTimeEq::ct_eq(expected.as_bytes(), proof.as_bytes()).into();
@@ -144,7 +144,7 @@ pub async fn post_handler(
         return error(StatusCode::FORBIDDEN, "access_denied");
     }
     if let Err(response) = preconditions(&state, &realm, &req_data).await {
-        return response;
+        return *response;
     }
     decide_with_poll_lock(&state, &realm, &approval, &approval_id, &session, &action, ip).await
 }
@@ -298,33 +298,37 @@ async fn load(
     state: &Arc<ServerState>,
     realm: &Realm,
     approval_id: &str,
-) -> Result<(McpApprovalData, CibaAuthReqData), Response> {
+) -> Result<(McpApprovalData, CibaAuthReqData), Box<Response>> {
     if !state.config.mcp.enabled || !state.config.mcp.step_up.enabled {
-        return Err(error(StatusCode::NOT_FOUND, "invalid_request"));
+        return Err(Box::new(error(StatusCode::NOT_FOUND, "invalid_request")));
     }
     let approval: McpApprovalData =
         match state.cache.get(&approval_key(&realm.id, approval_id)).await {
             Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
                 Ok(data) => data,
-                Err(_) => return Err(error(StatusCode::BAD_REQUEST, "invalid_request")),
+                Err(_) => {
+                    return Err(Box::new(error(StatusCode::BAD_REQUEST, "invalid_request")));
+                }
             },
-            Ok(None) => return Err(error(StatusCode::NOT_FOUND, "invalid_request")),
-            Err(error) => return Err(temporary(&error)),
+            Ok(None) => return Err(Box::new(error(StatusCode::NOT_FOUND, "invalid_request"))),
+            Err(error) => return Err(Box::new(temporary(&error))),
         };
     let req_data: CibaAuthReqData =
         match state.cache.get(&request_key(&realm.id, &approval.auth_req_id)).await {
             Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
                 Ok(data) => data,
-                Err(_) => return Err(error(StatusCode::BAD_REQUEST, "invalid_request")),
+                Err(_) => {
+                    return Err(Box::new(error(StatusCode::BAD_REQUEST, "invalid_request")));
+                }
             },
-            Ok(None) => return Err(error(StatusCode::BAD_REQUEST, "expired_token")),
-            Err(error) => return Err(temporary(&error)),
+            Ok(None) => return Err(Box::new(error(StatusCode::BAD_REQUEST, "expired_token"))),
+            Err(error) => return Err(Box::new(temporary(&error))),
         };
     if req_data.operation.is_none()
         || req_data.realm_id != realm.id.0
         || req_data.expires_at <= chrono::Utc::now()
     {
-        return Err(error(StatusCode::BAD_REQUEST, "expired_token"));
+        return Err(Box::new(error(StatusCode::BAD_REQUEST, "expired_token")));
     }
     Ok((approval, req_data))
 }
@@ -334,20 +338,20 @@ async fn authenticate(
     headers: &HeaderMap,
     realm: &Realm,
     req_data: &CibaAuthReqData,
-) -> Result<Option<UserSession>, Response> {
+) -> Result<Option<UserSession>, Box<Response>> {
     let session = crate::routes::oidc::resolve_session_from_cookie(state, headers, realm).await;
     let Some(session) = session else {
         return Ok(None);
     };
     if req_data.user_id.as_deref() != Some(session.user_id.as_ref()) {
-        return Err(error(StatusCode::UNAUTHORIZED, "access_denied"));
+        return Err(Box::new(error(StatusCode::UNAUTHORIZED, "access_denied")));
     }
     let age = chrono::Utc::now().timestamp().saturating_sub(session.auth_time.timestamp());
     if !(0..=300).contains(&age) {
         return Ok(None);
     }
     if matches!(session.auth_method, AuthMethod::Ciba | AuthMethod::Impersonation) {
-        return Err(error(StatusCode::FORBIDDEN, "access_denied"));
+        return Err(Box::new(error(StatusCode::FORBIDDEN, "access_denied")));
     }
     Ok(Some(session))
 }
@@ -419,9 +423,9 @@ async fn preconditions(
     state: &Arc<ServerState>,
     realm: &Realm,
     req_data: &CibaAuthReqData,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let Some(operation) = req_data.operation.as_ref() else {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid_grant"));
+        return Err(Box::new(error(StatusCode::BAD_REQUEST, "invalid_grant")));
     };
     let auth = operation_auth(operation, realm);
     let operation_input = McpOperation {
@@ -433,8 +437,8 @@ async fn preconditions(
             .await;
     match prepared {
         Ok(Some(mutation)) if mutation.redacted() == operation.mutation.redacted() => Ok(()),
-        Ok(_) => Err(error(StatusCode::CONFLICT, "precondition_failed")),
-        Err(_) => Err(error(StatusCode::CONFLICT, "precondition_failed")),
+        Ok(_) => Err(Box::new(error(StatusCode::CONFLICT, "precondition_failed"))),
+        Err(_) => Err(Box::new(error(StatusCode::CONFLICT, "precondition_failed"))),
     }
 }
 
