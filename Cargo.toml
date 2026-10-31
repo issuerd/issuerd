@@ -177,7 +177,7 @@ figment = { version = "0.10", features = ["env", "toml", "json"] }
 
 # Testing
 mockall = "0.15"
-rstest = "0.23"
+rstest = "0.28"
 proptest = "1.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
