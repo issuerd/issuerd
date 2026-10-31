@@ -41,6 +41,10 @@ certs
 
 # Embedded build artifacts (own git repos / extracted suites)
 tests/conformance/conformance-suite/
+tests/mcp-conformance/conformance/
+tests/mcp-conformance/results/
+tests/mcp-conformance/.runtime/
+tests/mcp-conformance/node_modules/
 
 # Local tools (mailpit.exe etc.)
 /tools/
