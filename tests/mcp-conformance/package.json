@@ -1,0 +1,8 @@
+{
+  "name": "issuerd-mcp-conformance-rig",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

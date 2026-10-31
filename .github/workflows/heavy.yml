@@ -104,7 +104,9 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: examples/mcp-admin/client/package-lock.json
+          cache-dependency-path: |
+            examples/mcp-admin/client/package-lock.json
+            tests/mcp-conformance/package-lock.json
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System dependencies (libgssapi, openssl)
@@ -118,6 +120,8 @@ jobs:
         run: ./examples/mcp-admin/scripts/e2e-compose.sh
       - name: Three-node operation-bound CIBA acceptance (PostgreSQL + Redis)
         run: ./examples/mcp-admin/scripts/e2e-step-up-cluster.sh
+      - name: Official MCP conformance scenarios
+        run: ./tests/mcp-conformance/run.sh
       - name: Redis-backed cross-node invocation limiting
         run: cargo test --locked --test integration invocation_limit_is_atomic_across_two_nodes_with_redis
 
