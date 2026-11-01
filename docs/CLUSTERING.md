@@ -39,9 +39,10 @@ live in the `signing_keys` table in PostgreSQL:
 - At boot a node loads the full key set. On first boot (empty table) it
   generates the initial pair — an EdDSA key (the signing default) and an
   active RS256 key (OIDC Core §15.1 mandatory-to-implement, advertised in
-  discovery) — and persists them. A concurrent first boot may persist a
-  second pair — benign: all are published in JWKS and validate; all nodes
-  sign with the newest active key of the resolved algorithm.
+  discovery) — and persists them. Cluster nodes serialize initialization
+  through a short-lived Redis lock, so concurrently starting nodes all load
+  the same pair before serving requests and can validate each other's tokens
+  immediately.
 - Keys survive restarts, so outstanding tokens stay valid across deploys.
 - Each node polls the table every `cluster.jwks_refresh_interval_secs` and
   reloads its keystore + JWKS snapshot when the set changes — keys added by a
