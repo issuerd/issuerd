@@ -1,9 +1,12 @@
 #!/bin/bash
 set -e
 
-REALM="TEST.ISSUERD.LOCAL"
-DOMAIN="ISSUERD"
-ADMIN_PASSWORD="AdminPass123!"
+REALM="${REALM:-TEST.ISSUERD.LOCAL}"
+DOMAIN="${DOMAIN:-ISSUERD}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-AdminPass123!}"
+TEST_USER_PASSWORD="${TEST_USER_PASSWORD:-Password123!}"
+SPN_PASSWORD="${SPN_PASSWORD:-SPNPass123!}"
+DC_NAME="$(printf '%s' "$REALM" | tr '[:upper:]' '[:lower:]' | sed 's/\./,DC=/g; s/^/DC=/')"
 
 PROV_FLAG="/var/lib/samba/private/provisioned.ok"
 PROV_SMB="/var/lib/samba/private/smb.conf"
@@ -31,12 +34,12 @@ if [ ! -f "$PROV_FLAG" ]; then
     sed -i '/^\[global\]$/a \\t tls enabled = yes\n\t tls keyfile = /var/lib/samba/private/tls/key.pem\n\t tls certfile = /var/lib/samba/private/tls/cert.pem\n\t ldap server require strong auth = no' /etc/samba/smb.conf
 
     # Create test users.
-    samba-tool user create testuser Password123! || true
-    samba-tool user create testuser2 Password123! || true
+    samba-tool user create testuser "$TEST_USER_PASSWORD" || true
+    samba-tool user create testuser2 "$TEST_USER_PASSWORD" || true
 
     # Populate additional AD attributes (givenName, sn, mail) via ldbmodify.
-    cat > /tmp/testuser-attrs.ldif << 'EOF'
-dn: CN=testuser,CN=Users,DC=test,DC=issuerd,DC=local
+    cat > /tmp/testuser-attrs.ldif << EOF
+dn: CN=testuser,CN=Users,$DC_NAME
 changetype: modify
 replace: givenName
 givenName: Test
@@ -49,8 +52,8 @@ mail: testuser@test.issuerd.local
 EOF
     ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/testuser-attrs.ldif || true
 
-    cat > /tmp/testuser2-attrs.ldif << 'EOF'
-dn: CN=testuser2,CN=Users,DC=test,DC=issuerd,DC=local
+    cat > /tmp/testuser2-attrs.ldif << EOF
+dn: CN=testuser2,CN=Users,$DC_NAME
 changetype: modify
 replace: givenName
 givenName: Test2
@@ -68,7 +71,7 @@ EOF
     samba-tool group addmembers developers testuser || true
 
     # Create a service account for the Issuerd HTTP SPN and export a keytab.
-    samba-tool user create issuerd-spn SPNPass123! || true
+    samba-tool user create issuerd-spn "$SPN_PASSWORD" || true
     samba-tool spn add HTTP/issuerd.test.issuerd.local issuerd-spn || true
     samba-tool domain exportkeytab /shared/issuerd.keytab \
         --principal=HTTP/issuerd.test.issuerd.local || true
