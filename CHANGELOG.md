@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Concurrent cluster first boot.** Signing-key initialization is now serialized through Redis, so nodes starting against an empty database load one shared EdDSA/RS256 pair instead of issuing tokens that peers cannot validate until the next JWKS refresh.
 - **MCP privilege approval and state consistency.** Administrative role assignment, `impersonation`, admin-changing role composites or renames, and privileged group membership now require exact-operation approval; disabling step-up rejects all of them instead of falling back to ordinary writes. In-memory/JSON strict execution excludes ordinary writers and rolls back failed JSON snapshots, `push_not_before` preserves secret realm attributes, realm deletion invalidates cached names, and IdP `clientAssertion` values are redacted. Revoke-all-sessions now drains every page, and operation approval preserves CIBA polling history.
 - **Concurrent MCP step-up reconciliation.** PostgreSQL serialization aborts now retry only the uncommitted transaction, allowing concurrent exact retries to reconcile the single committed mutation and result instead of surfacing an internal database error.
 - **CIBA discovery metadata.** The discovery document now advertises poll delivery under the standard `backchannel_token_delivery_modes_supported` field name, eliminating conformance metadata warnings without changing the client-registration field.

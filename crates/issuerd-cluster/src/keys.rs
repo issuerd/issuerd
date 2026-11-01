@@ -168,6 +168,11 @@ pub mod cache_keys {
         format!("dpop-nonce:{realm}:{nonce}")
     }
 
+    /// `cluster:signing-key-bootstrap` — short-lived first-boot initialization lock.
+    pub fn signing_key_bootstrap() -> &'static str {
+        "cluster:signing-key-bootstrap"
+    }
+
     /// `events:{realm}`
     pub fn event_channel(realm: &str) -> String {
         format!("events:{realm}")

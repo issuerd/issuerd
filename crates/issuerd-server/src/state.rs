@@ -389,7 +389,9 @@ impl ServerState {
     ) -> Result<Self, IssuerdError> {
         // Crypto: load the shared signing-key set from storage so every node
         // signs with the same active key and validates its peers' tokens.
-        let (crypto, initial_keys) = bootstrap_crypto_provider(storage.as_ref()).await?;
+        let (crypto, initial_keys) =
+            bootstrap_crypto_provider(storage.as_ref(), cache.as_ref(), config.cluster.enabled)
+                .await?;
         let jwks = crypto.get_public_keys().await?;
 
         // TokenService. The default signing algorithm matches the bootstrapped
@@ -664,6 +666,9 @@ impl ServerState {
     }
 }
 
+const SIGNING_KEY_BOOTSTRAP_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const SIGNING_KEY_BOOTSTRAP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+
 /// Build the crypto provider from the shared signing-key set in storage.
 ///
 /// On first boot (empty key set) the initial key set is generated and
@@ -672,18 +677,68 @@ impl ServerState {
 /// default for realms without a `default_signature_algorithm` attribute) and
 /// an active RS256 key — OIDC Core §15.1 makes RS256 mandatory-to-implement,
 /// so discovery must advertise it from the start and realms explicitly pinned
-/// to RS256 work without a rotation. A concurrent first boot may persist a
-/// second pair; that is benign: all keys are published in JWKS, all validate,
-/// and all nodes sign with the newest active key of the resolved algorithm.
-/// Deployments upgrading with an existing key set keep their stored keys
-/// untouched.
+/// to RS256 work without a rotation. Cluster nodes serialize the complete
+/// load/generate/reload sequence through the shared cache, so no node can
+/// initialize its provider from a different first-boot key set. Deployments
+/// upgrading with an existing key set keep their stored keys untouched.
 async fn bootstrap_crypto_provider(
     storage: &dyn Storage,
+    cache: &dyn DistributedCache,
+    coordinate_cluster_boot: bool,
 ) -> Result<
     (Arc<issuerd_token::RingCryptoProvider>, Vec<issuerd_core::StoredSigningKey>),
     IssuerdError,
 > {
+    let lock_owner = if coordinate_cluster_boot {
+        Some(acquire_signing_key_bootstrap_lock(cache).await?)
+    } else {
+        None
+    };
     let crypto_config = issuerd_token::CryptoConfig::default();
+    let keys = load_or_create_signing_keys(storage, &crypto_config).await;
+    if let Some(owner) = lock_owner {
+        match cache
+            .compare_and_delete(issuerd_cluster::cache_keys::signing_key_bootstrap(), owner)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("signing-key bootstrap lock expired before release"),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to release signing-key bootstrap lock")
+            }
+        }
+    }
+    let keys = keys?;
+    let provider = issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys)?;
+    Ok((Arc::new(provider), keys))
+}
+
+async fn acquire_signing_key_bootstrap_lock(
+    cache: &dyn DistributedCache,
+) -> Result<Vec<u8>, IssuerdError> {
+    let key = issuerd_cluster::cache_keys::signing_key_bootstrap();
+    let owner = issuerd_core::utils::generate_id().into_bytes();
+    let deadline = tokio::time::Instant::now() + SIGNING_KEY_BOOTSTRAP_LOCK_TIMEOUT;
+    loop {
+        if cache
+            .create_if_absent(key, owner.clone(), Some(SIGNING_KEY_BOOTSTRAP_LOCK_TTL))
+            .await?
+        {
+            return Ok(owner);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(IssuerdError::ServerError(
+                "timed out waiting for the cluster signing-key bootstrap lock".to_string(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn load_or_create_signing_keys(
+    storage: &dyn Storage,
+    crypto_config: &issuerd_token::CryptoConfig,
+) -> Result<Vec<issuerd_core::StoredSigningKey>, IssuerdError> {
     let mut keys = storage.list_signing_keys().await?;
     if keys.is_empty() {
         for generated in issuerd_token::KeyStore::generate_initial_key_set(
@@ -694,11 +749,9 @@ async fn bootstrap_crypto_provider(
             storage.create_signing_key(&stored).await?;
             info!(kid = %stored.kid, alg = %stored.alg, "generated and persisted initial signing key");
         }
-        // Re-list so keys persisted by a concurrently booting node are picked up.
         keys = storage.list_signing_keys().await?;
     }
-    let provider = issuerd_token::RingCryptoProvider::from_signing_keys(crypto_config, &keys)?;
-    Ok((Arc::new(provider), keys))
+    Ok(keys)
 }
 
 type SharedSigningKeyFingerprint = Arc<tokio::sync::Mutex<[u8; 32]>>;
@@ -1349,6 +1402,60 @@ mod tests {
         // The published JWKS must contain the same keys.
         let jwks = state.crypto.get_public_keys().await.unwrap();
         assert!(keys.iter().all(|k| jwks.keys.iter().any(|j| j.kid == k.kid)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_cluster_boot_uses_one_shared_signing_key_set() {
+        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut storage = issuerd_core::MockStorage::new();
+        let list_keys = Arc::clone(&stored);
+        storage.expect_list_signing_keys().returning(move || {
+            let keys = list_keys.lock().unwrap().clone();
+            if keys.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(keys)
+        });
+        let create_key = Arc::clone(&stored);
+        storage.expect_create_signing_key().returning(move |key| {
+            create_key.lock().unwrap().push(key.clone());
+            Ok(())
+        });
+        storage.expect_list_realms().returning(|_| Ok(Vec::new()));
+
+        let storage: Arc<dyn issuerd_core::Storage> = Arc::new(storage);
+        let cache: Arc<dyn issuerd_core::DistributedCache> =
+            Arc::new(issuerd_cluster::InMemoryCache::new());
+        let config = ServerConfig {
+            storage: crate::config::StorageConfig::Postgres {
+                url: "postgres://unused.invalid/issuerd".to_string(),
+            },
+            cluster: crate::config::ClusterConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut boots = Vec::new();
+        for _ in 0..3 {
+            let config = config.clone();
+            let storage = Arc::clone(&storage);
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            boots.push(tokio::spawn(async move {
+                barrier.wait().await;
+                ServerState::from_components(&config, storage, cache).await.unwrap()
+            }));
+        }
+
+        let mut node_jwks = Vec::new();
+        for boot in boots {
+            let state = boot.await.unwrap();
+            node_jwks.push(state.crypto.get_public_keys().await.unwrap());
+        }
+        assert_eq!(stored.lock().unwrap().len(), 2);
+        assert!(node_jwks.iter().all(|keys| keys == &node_jwks[0]));
     }
 
     #[tokio::test]
