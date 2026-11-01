@@ -1758,7 +1758,8 @@ async fn seed_master_realm(storage: &Arc<dyn issuerd_core::Storage>) {
 /// Key rotation on one node must reach a peer node within one JWKS refresh
 /// interval. Real cross-node propagation only exists on PostgreSQL (the
 /// polling task is Postgres-only), so this test boots two in-process nodes
-/// over a testcontainers Postgres and skips gracefully without Docker.
+/// over a testcontainers Postgres and skips gracefully when Docker or the
+/// PostgreSQL container is unavailable.
 #[tokio::test]
 async fn keys_rotation_propagates_to_peer_node() {
     let docker = std::process::Command::new("docker")
@@ -1782,7 +1783,13 @@ async fn keys_rotation_propagates_to_peer_node() {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_DB", "test");
-    let container = img.start().await.expect("postgres container start");
+    let container = match img.start().await {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("skipping keys_rotation_propagates_to_peer_node: {error}");
+            return;
+        }
+    };
     let host = container.get_host().await.expect("container host");
     let port = container.get_host_port_ipv4(5432).await.expect("container port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/test");
