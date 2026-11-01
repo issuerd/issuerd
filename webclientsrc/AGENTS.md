@@ -29,7 +29,8 @@ webclientsrc/
 ├── index.html                 # Admin console entry (served under /admin/console)
 ├── account.html               # Account console entry (served at /realms/{realm}/account)
 ├── public/
-│   ├── login.html             # Static login page (OIDC entry point)
+│   ├── login.html             # Static login page shell (OIDC entry point)
+│   ├── login.js               # Static login behavior (PKCE, context, callback; unit-tested)
 │   ├── brand/                 # Issuerd logo SVGs (wordmark + square mark, black/white)
 │   └── fonts/                 # Vendored Google Fonts (woff2 + fonts.css, scripts/fetch-fonts.mjs)
 ├── src/
@@ -141,7 +142,7 @@ node scripts/fetch-fonts.mjs
 
 The TypeScript SDK is **auto-generated** from `openapi.json` (produced by the Rust backend). The spec covers the Admin API **and** the account-console, public protocol, and internal SPA endpoints (merged via `issuerd_server::openapi::full_openapi()`).
 
-**Generated-SDK rule:** every API request the UI makes must go through a generated SDK function. Hand-written endpoint layers (custom clients with URL strings, raw `fetch` against backend routes) are not allowed — `public/login.html` is the only exception. If an endpoint is missing from the spec, add it to the backend first (admin endpoints: utoipa-annotated `issuerd-admin-api` handlers; account/protocol endpoints: utoipa-annotated `issuerd-server` route handlers), then export the spec and regenerate.
+**Generated-SDK rule:** every API request the UI makes must go through a generated SDK function. Hand-written endpoint layers (custom clients with URL strings, raw `fetch` against backend routes) are not allowed — the static `public/login.html` + `public/login.js` login surface is the only exception. If an endpoint is missing from the spec, add it to the backend first (admin endpoints: utoipa-annotated `issuerd-admin-api` handlers; account/protocol endpoints: utoipa-annotated `issuerd-server` route handlers), then export the spec and regenerate.
 
 **Workflow when backend APIs change:**
 1. Backend team exports new OpenAPI spec:
@@ -340,14 +341,14 @@ If a form uses `useServerInfo`, you **must also mock** `../../api/hooks/useServe
 
 - ### Login Architecture
 
-There is **one unified login page**: `public/login.html` (static HTML, not a React component).
+There is **one unified login page**: `public/login.html` plus its static `public/login.js` behavior (no React component).
 
-**Why static HTML?** The Issuerd OIDC auth endpoint (`/realms/{realm}/protocol/openid-connect/auth`) redirects unauthenticated users to `/login.html?execution_id=...&realm=...`. This page must work for:
+**Why static assets?** The Issuerd OIDC auth endpoint (`/realms/{realm}/protocol/openid-connect/auth`) redirects unauthenticated users to `/login.html?execution_id=...&realm=...`. This page must work for:
 - The React admin SPA
 - External OIDC clients
 - The OIDC conformance suite browser automation
 
-Because the page is served as a static file, it is deterministic and loads instantly — no React bundle hydration required.
+Because the page and its script are served as static files, it is deterministic and loads instantly — no React bundle hydration required.
 
 **Console mount:** the SPA is served by the daemon only below `/admin/console` (`web_ui::admin_console_handler`, mounted as the fallback of the nested `/admin` router). `/` and bare `/admin` redirect there. The REST admin API owns the remaining `/admin/*` paths directly — an unmatched API path answers JSON 404, never the SPA shell. Unknown client-side routes under `/admin/console` render the SPA's own `NotFoundPage`. React Router runs with `basename="/admin/console"` (`CONSOLE_BASENAME` in `src/config.ts`), so `useLocation().pathname` is basename-stripped and every `navigate()`/`Link` target must be basename-relative (`/users`, not `/admin/console/users`); raw anchors/`window.location` need the full path (`consoleHref()`).
 
