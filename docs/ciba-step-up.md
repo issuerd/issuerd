@@ -135,6 +135,21 @@ second mutation. `acr_values=0` is supported; other requested contexts are
 rejected explicitly. Bearer compatibility cannot create or execute strict
 operations.
 
+### Returning to the client after approval
+
+A confidential client may include an optional `return_to` in operation-bound
+CIBA initiation. It must exactly match one of the client's registered
+`redirect_uris`; arbitrary or merely same-origin URLs are rejected with
+`invalid_request`. After approval or denial, Issuerd answers HTTP 303 to that
+registered URI, while clients without `return_to` keep the existing static
+decision page. The destination is checked again at decision time, so changing
+the client registration cannot turn this into an open redirect.
+
+This preserves the five-minute pending-operation and fresh-authentication
+windows and the at-most-two-minute execution grant. It also supports a same-tab
+approval flow without hidden iframes, `window.close()`, or moving the trusted
+exact-operation approval page into an untrusted agent application.
+
 Run the real TypeScript confidential profile and three-node approval flow:
 
 ```bash

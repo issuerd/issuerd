@@ -278,13 +278,22 @@ async fn decide(
             EventType::CibaDeny
         },
         &ip,
-        client.map(|client| client.id),
+        client.as_ref().map(|client| client.id.clone()),
         Some(session.user_id.clone()),
         Some(session.id.clone()),
         None,
         details,
     )
     .await;
+    if let Some(return_to) = req_data.return_to.as_deref() {
+        let Some(client) = client else {
+            return error(StatusCode::BAD_REQUEST, "invalid_grant");
+        };
+        if !client.redirect_uris.iter().any(|uri| uri == return_to) {
+            return error(StatusCode::FORBIDDEN, "access_denied");
+        }
+        return axum::response::Redirect::to(return_to).into_response();
+    }
     html_response(
         StatusCode::OK,
         format!(
