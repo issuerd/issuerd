@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Web client build dependencies.** The development-only transitive `minimatch` package is pinned to 11.0.1 through npm `overrides`, addressing the glob-pattern denial-of-service advisory GHSA-g3hv-75wg-m249 without adding it to the application bundle.
+
 ### Added
 
 - **Official MCP conformance rig.** `tests/mcp-conformance` adds a finite heavy-workflow runner for selected official MCP server scenarios plus the full authorization/metadata/DPoP trio, using real authorization-code + PKCE tokens and a streaming Bearer-injection proxy. The pinned harness and reviewed dependency lockfile are reproducible; results are reported as engineering evidence rather than an OIDF-MCP certification. ([#39](https://github.com/issuerd/issuerd/issues/39))
