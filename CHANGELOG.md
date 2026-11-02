@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Web client build dependencies.** The development-only transitive `minimatch` package is pinned to 11.0.1 through npm `overrides`, addressing the glob-pattern denial-of-service advisory GHSA-g3hv-75wg-m249 without adding it to the application bundle.
+
 ### Added
 
 - **Client return after operation-bound approval.** Strict CIBA accepts an optional `return_to` only when it exactly matches one of the client's registered `redirect_uris`; initiation rejects unregistered destinations, and approval or denial returns HTTP 303 to the registered client URI. Existing clients without `return_to` retain the static decision page, preserving backward compatibility and preventing open redirects.
