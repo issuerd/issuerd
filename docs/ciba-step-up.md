@@ -143,7 +143,11 @@ CIBA initiation. It must exactly match one of the client's registered
 `invalid_request`. After approval or denial, Issuerd answers HTTP 303 to that
 registered URI, while clients without `return_to` keep the existing static
 decision page. The destination is checked again at decision time, so changing
-the client registration cannot turn this into an open redirect.
+the client registration cannot turn this into an open redirect. The approval
+page adds only that validated destination's origin to CSP `form-action`, rather
+than blocking a registered cross-origin return or allowing arbitrary sources.
+The remaining `default-src 'none'`, `frame-ancestors 'none'`, and `base-uri
+'none'` restrictions are unchanged.
 
 This preserves the five-minute pending-operation and fresh-authentication
 windows and the at-most-two-minute execution grant. It also supports a same-tab

@@ -1342,7 +1342,12 @@ mod tests {
             .is_none());
     }
 
-    async fn decide_return_to(fixture: &Fixture, initiation: Response, action: &str) -> Response {
+    async fn decide_return_to(
+        fixture: &Fixture,
+        initiation: Response,
+        action: &str,
+        expected_origin: &str,
+    ) -> Response {
         let initiation = response_json(initiation).await;
         let approval_id = initiation["approval_url"]
             .as_str()
@@ -1359,6 +1364,8 @@ mod tests {
         )
         .await;
         assert_eq!(approval.status(), StatusCode::OK);
+        let csp = approval.headers().get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains(&format!("form-action 'self' {expected_origin};")));
         let html = response_text(approval).await;
         ciba_approval::post_handler(
             State(fixture.state.clone()),
@@ -1399,7 +1406,8 @@ mod tests {
         let initiation =
             begin_ciba_with_return_to(&fixture, &pending, &client, Some(return_to.into())).await;
         assert_eq!(initiation.status(), StatusCode::OK);
-        let approved = decide_return_to(&fixture, initiation, "approve").await;
+        let approved =
+            decide_return_to(&fixture, initiation, "approve", "https://client.example").await;
         assert_eq!(approved.status(), StatusCode::SEE_OTHER);
         assert_eq!(approved.headers().get(header::LOCATION).unwrap().to_str().unwrap(), return_to);
 
@@ -1417,7 +1425,8 @@ mod tests {
             .update_client(&fixture.realm.id, &removed_client)
             .await
             .unwrap();
-        let rejected = decide_return_to(&fixture, initiation, "approve").await;
+        let rejected =
+            decide_return_to(&fixture, initiation, "approve", "https://client.example").await;
         assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
         assert!(rejected.headers().get(header::LOCATION).is_none());
 
@@ -1428,7 +1437,7 @@ mod tests {
         let initiation =
             begin_ciba_with_return_to(&fixture, &pending, &client, Some(return_to.into())).await;
         assert_eq!(initiation.status(), StatusCode::OK);
-        let denied = decide_return_to(&fixture, initiation, "deny").await;
+        let denied = decide_return_to(&fixture, initiation, "deny", "https://client.example").await;
         assert_eq!(denied.status(), StatusCode::SEE_OTHER);
         assert_eq!(denied.headers().get(header::LOCATION).unwrap().to_str().unwrap(), return_to);
     }

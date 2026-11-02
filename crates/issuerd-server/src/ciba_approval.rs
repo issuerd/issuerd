@@ -87,7 +87,7 @@ pub async fn get_handler(
 <button type="submit" name="action" value="approve">Approve exactly once</button>
 <button type="submit" name="action" value="deny" class="deny">Deny</button></form></body></html>"#
     );
-    html_response(StatusCode::OK, html)
+    html_response_with_return_to(StatusCode::OK, html, req_data.return_to.as_deref())
 }
 
 pub async fn post_handler(
@@ -531,14 +531,41 @@ fn approval_id(query: Option<&str>) -> Option<String> {
     Some(first)
 }
 
+fn form_action_source(return_to: &str) -> Option<String> {
+    let url = url::Url::parse(return_to).ok()?;
+    if matches!(url.scheme(), "javascript" | "data" | "vbscript") {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        Some(format!("{}:", url.scheme()))
+    } else {
+        Some(origin)
+    }
+}
+
 fn html_response(status: StatusCode, html: String) -> Response {
+    html_response_with_return_to(status, html, None)
+}
+
+fn html_response_with_return_to(
+    status: StatusCode,
+    html: String,
+    return_to: Option<&str>,
+) -> Response {
+    let form_action = return_to
+        .and_then(form_action_source)
+        .map_or_else(|| "'self'".to_string(), |origin| format!("'self' {origin}"));
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::PRAGMA, "no-cache")
         .header(header::REFERRER_POLICY, "no-referrer")
-        .header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        .header(
+            "content-security-policy",
+            format!("default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none'; base-uri 'none'"),
+        )
         .header("x-frame-options", "DENY")
         .body(Body::from(html))
         .expect("valid approval response")
@@ -572,6 +599,48 @@ mod tests {
     use http_body_util::BodyExt;
 
     use super::*;
+
+    #[test]
+    fn form_action_source_uses_registered_origin() {
+        assert_eq!(
+            form_action_source("https://client.example/callback?query=value"),
+            Some("https://client.example".into())
+        );
+        assert_eq!(
+            form_action_source("http://127.0.0.1:5111/"),
+            Some("http://127.0.0.1:5111".into())
+        );
+        assert_eq!(
+            form_action_source("com.example.app:/callback"),
+            Some("com.example.app:".into())
+        );
+    }
+
+    #[test]
+    fn form_action_source_rejects_active_content_and_invalid_uris() {
+        for input in [
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "vbscript:msgbox(1)",
+            "not a uri",
+        ] {
+            assert!(form_action_source(input).is_none());
+        }
+    }
+
+    #[test]
+    fn approval_csp_allows_only_the_return_origin() {
+        let response = html_response_with_return_to(
+            StatusCode::OK,
+            "test".into(),
+            Some("https://client.example/callback"),
+        );
+        let csp = response.headers().get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("form-action 'self' https://client.example;"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+    }
 
     #[tokio::test]
     async fn errors_keep_their_protocol_code() {
