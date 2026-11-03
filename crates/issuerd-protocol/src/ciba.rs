@@ -25,6 +25,9 @@ pub struct CibaRequest {
     /// Reserved for the same operation-bound profile, never generic CIBA
     /// resource issuance.
     pub resource: Option<String>,
+    /// Optional post-approval redirect, accepted only when it exactly matches
+    /// one of the client's registered redirect URIs.
+    pub return_to: Option<String>,
 }
 
 impl CibaRequest {
@@ -73,6 +76,7 @@ impl CibaRequest {
             requested_expiry,
             operation_id: body.get("operation_id").cloned(),
             resource: body.get("resource").cloned(),
+            return_to: body.get("return_to").cloned(),
         };
 
         req.validate()?;

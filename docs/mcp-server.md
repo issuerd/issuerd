@@ -209,6 +209,14 @@ mutation. Repeating the exact call returns the recorded successful result
 without repeating audit, invalidation, or mutation. A new approval is never a
 substitute for reconciling an unknown outcome.
 
+After approval or denial, an optional `return_to` returns HTTP 303 to one of the
+client's registered `redirect_uris`. The URI must match exactly at initiation
+and at decision time; unregistered destinations are rejected, and omitting it
+preserves the static decision page. The approval page's CSP `form-action` adds
+only the validated destination's origin; all other restrictions stay in place.
+This enables a same-tab return to the agent without an open redirect or hidden
+iframe.
+
 ## Read-only resources
 
 The endpoint advertises resources without `listChanged` or subscriptions:

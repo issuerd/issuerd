@@ -72,6 +72,11 @@ pub async fn initiate(
     let Some(operation_id) = request.operation_id.as_deref() else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     };
+    if let Some(return_to) = request.return_to.as_deref() {
+        if !client.redirect_uris.iter().any(|uri| uri == return_to) {
+            return error(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+    }
     let realm_id = realm.id.clone();
     let key = pending_operation_key(&realm_id, operation_id);
     let pending_bytes = match state.cache.get(&key).await {
@@ -136,6 +141,7 @@ pub async fn initiate(
         approval_auth_time: None,
         approval_acr: None,
         approval_amr: None,
+        return_to: request.return_to.clone(),
         poll_interval_secs: 5,
     };
     let approval = McpApprovalData {
@@ -977,11 +983,16 @@ mod tests {
         }
     }
 
-    async fn begin_ciba(fixture: &Fixture, pending: &PendingOperation) -> Response {
+    async fn begin_ciba_with_return_to(
+        fixture: &Fixture,
+        pending: &PendingOperation,
+        client: &Client,
+        return_to: Option<String>,
+    ) -> Response {
         initiate(
             fixture.state.clone(),
             fixture.realm.clone(),
-            fixture.client.clone(),
+            client.clone(),
             CibaRequest {
                 scope: Scope::parse("openid mcp:step_up"),
                 client_notification_token: None,
@@ -994,10 +1005,15 @@ mod tests {
                 requested_expiry: None,
                 operation_id: Some(pending.operation_id.clone()),
                 resource: Some(fixture.resource.clone()),
+                return_to,
             },
             "127.0.0.1".parse().unwrap(),
         )
         .await
+    }
+
+    async fn begin_ciba(fixture: &Fixture, pending: &PendingOperation) -> Response {
+        begin_ciba_with_return_to(fixture, pending, &fixture.client, None).await
     }
 
     #[tokio::test]
@@ -1326,6 +1342,106 @@ mod tests {
             .is_none());
     }
 
+    async fn decide_return_to(
+        fixture: &Fixture,
+        initiation: Response,
+        action: &str,
+        expected_origin: &str,
+    ) -> Response {
+        let initiation = response_json(initiation).await;
+        let approval_id = initiation["approval_url"]
+            .as_str()
+            .unwrap()
+            .split("approval_id=")
+            .nth(1)
+            .unwrap();
+        let headers = sso_headers(fixture).await;
+        let approval = ciba_approval::get_handler(
+            State(fixture.state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".into()))),
+            headers.clone(),
+            RawQuery(Some(format!("approval_id={approval_id}"))),
+        )
+        .await;
+        assert_eq!(approval.status(), StatusCode::OK);
+        let csp = approval.headers().get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains(&format!("form-action 'self' {expected_origin};")));
+        let html = response_text(approval).await;
+        ciba_approval::post_handler(
+            State(fixture.state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".into()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            headers,
+            approval_form(approval_id, proof_from_html(&html), action),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn return_to_redirects_only_to_registered_uri() {
+        let fixture = fixture().await;
+        let target = user(&fixture.realm, "return-to-target");
+        fixture.state.storage.create_user(&fixture.realm.id, &target).await.unwrap();
+        let (pending, _) = pending_operation(&fixture, &target).await;
+        let rejected = begin_ciba_with_return_to(
+            &fixture,
+            &pending,
+            &fixture.client,
+            Some("https://evil.example/callback".into()),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture
+            .state
+            .cache
+            .get(&pending_operation_key(&fixture.realm.id, &pending.operation_id))
+            .await
+            .unwrap()
+            .is_some());
+
+        let return_to = "https://client.example/callback";
+        let mut client = fixture.client.clone();
+        client.redirect_uris = vec![RedirectUri::new(return_to).unwrap()];
+        fixture.state.storage.update_client(&fixture.realm.id, &client).await.unwrap();
+        let initiation =
+            begin_ciba_with_return_to(&fixture, &pending, &client, Some(return_to.into())).await;
+        assert_eq!(initiation.status(), StatusCode::OK);
+        let approved =
+            decide_return_to(&fixture, initiation, "approve", "https://client.example").await;
+        assert_eq!(approved.status(), StatusCode::SEE_OTHER);
+        assert_eq!(approved.headers().get(header::LOCATION).unwrap().to_str().unwrap(), return_to);
+
+        let target = user(&fixture.realm, "return-to-revoked-target");
+        fixture.state.storage.create_user(&fixture.realm.id, &target).await.unwrap();
+        let (pending, _) = pending_operation(&fixture, &target).await;
+        let initiation =
+            begin_ciba_with_return_to(&fixture, &pending, &client, Some(return_to.into())).await;
+        assert_eq!(initiation.status(), StatusCode::OK);
+        let mut removed_client = client.clone();
+        removed_client.redirect_uris.clear();
+        fixture
+            .state
+            .storage
+            .update_client(&fixture.realm.id, &removed_client)
+            .await
+            .unwrap();
+        let rejected =
+            decide_return_to(&fixture, initiation, "approve", "https://client.example").await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(rejected.headers().get(header::LOCATION).is_none());
+
+        let target = user(&fixture.realm, "return-to-denied-target");
+        fixture.state.storage.create_user(&fixture.realm.id, &target).await.unwrap();
+        let (pending, _) = pending_operation(&fixture, &target).await;
+        fixture.state.storage.update_client(&fixture.realm.id, &client).await.unwrap();
+        let initiation =
+            begin_ciba_with_return_to(&fixture, &pending, &client, Some(return_to.into())).await;
+        assert_eq!(initiation.status(), StatusCode::OK);
+        let denied = decide_return_to(&fixture, initiation, "deny", "https://client.example").await;
+        assert_eq!(denied.status(), StatusCode::SEE_OTHER);
+        assert_eq!(denied.headers().get(header::LOCATION).unwrap().to_str().unwrap(), return_to);
+    }
+
     #[tokio::test]
     async fn changed_preconditions_fail_definitely_without_mutation_or_reuse() {
         let fixture = fixture().await;
@@ -1529,6 +1645,7 @@ mod tests {
                 requested_expiry: None,
                 operation_id: Some(pending.operation_id.clone()),
                 resource: Some(fixture.resource.clone()),
+                return_to: None,
             },
             "127.0.0.1".parse().unwrap(),
         )

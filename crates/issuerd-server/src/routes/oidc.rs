@@ -623,6 +623,8 @@ pub struct CibaAuthReqData {
     pub approval_acr: Option<String>,
     #[serde(default)]
     pub approval_amr: Option<Vec<String>>,
+    #[serde(default)]
+    pub return_to: Option<String>,
     #[serde(default = "default_ciba_poll_interval")]
     pub poll_interval_secs: u64,
 }
@@ -2610,7 +2612,7 @@ pub async fn ciba_auth_handler(
 ) -> Response {
     // Detect forward-field multiplicity before form deserialization collapses
     // repeated keys. Operation-bound requests are validated and dispatched below.
-    for field in ["operation_id", "resource"] {
+    for field in ["operation_id", "resource", "return_to"] {
         let count = url::form_urlencoded::parse(body.as_bytes())
             .filter(|(name, _)| name == field)
             .count();
@@ -2871,6 +2873,7 @@ pub async fn ciba_auth_handler(
         approval_auth_time: None,
         approval_acr: None,
         approval_amr: None,
+        return_to: None,
         poll_interval_secs: interval,
     };
 
@@ -11777,6 +11780,11 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
             ),
+            (
+                "login_hint=admin&return_to=https%3A%2F%2Fa.example&return_to=https%3A%2F%2Fb.example",
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
         ] {
             let response = ciba_auth_handler(
                 State(state.clone()),
@@ -12993,6 +13001,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
@@ -13535,6 +13544,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
@@ -13583,6 +13593,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
@@ -13647,6 +13658,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: auth_req_id.clone(),
             client_id: "admin-cli".to_string(),
@@ -16943,6 +16955,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: "ciba-req-1".to_string(),
             client_id: "admin-cli".to_string(),
@@ -17907,6 +17920,7 @@ mod tests {
             approval_auth_time: None,
             approval_acr: None,
             approval_amr: None,
+            return_to: None,
             poll_interval_secs: 5,
             auth_req_id: auth_req_id.to_string(),
             client_id: client_identifier.to_string(),
