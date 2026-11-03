@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
 ### Security
 
 - **Web client build dependencies.** The development-only transitive `minimatch` package is pinned to 11.0.1 through npm `overrides`, addressing the glob-pattern denial-of-service advisory GHSA-g3hv-75wg-m249 without adding it to the application bundle.
