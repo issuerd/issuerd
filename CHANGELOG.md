@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-03
+
+### Fixed
+
+- **Windows ARM64 release build.** Use the pinned Strawberry Perl 5.42.3.1 portable archive with an explicit SHA-256 check instead of the Chocolatey MSI that fails on the current ARM64 runner image. This changes only release infrastructure; product code and runtime behavior are unchanged from 0.2.0.
+
 ## [0.2.0] - 2026-11-03
 
 ### Security

@@ -690,11 +690,21 @@ jobs:
         name: Build the web client
         working-directory: webclientsrc
         run: npm ci && npm run generate-api && npm run build
-      # Vendored openssl (WebAuthn) needs a native perl on PATH; the committed
-      # .cargo/config.toml points at a dev-host path, so override via env.
+      # Vendored openssl (WebAuthn) needs a native perl on PATH. The MSI fails
+      # on the current ARM64 runner, so use the pinned portable x64 archive.
       - if: ${{ env.ACT != 'true' }}
-        name: Strawberry Perl (vendored openssl build)
-        run: choco install strawberryperl --version=5.42.3.1 --require-checksums --no-progress -y
+        name: Strawberry Perl portable (vendored openssl build)
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/strawberry-perl-5.42.3.1-64bit-portable.zip"
+          destination="$RUNNER_TEMP/strawberry-perl"
+          curl -fsSL --retry 3 -o "$archive" https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases/download/SP_54231_64bit/strawberry-perl-5.42.3.1-64bit-portable.zip
+          echo "6a081a811781c30aca51dbc036afd93092af91e3297901f02c17043795a10690  $archive" | sha256sum -c -
+          mkdir -p "$destination"
+          powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w "$archive")' -DestinationPath '$(cygpath -w "$destination")'"
+          rm "$archive"
+          "$destination/perl/bin/perl.exe" -e 'print "$^V\n"'
+          echo "OPENSSL_SRC_PERL=$(cygpath -w "$destination/perl/bin/perl.exe")" >> "$GITHUB_ENV"
       - if: ${{ env.ACT != 'true' }}
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - if: ${{ env.ACT != 'true' }}
@@ -705,8 +715,6 @@ jobs:
         uses: taiki-e/install-action@f6d2da492bc023ecc4c78229b5041ff8870ea3bc # cargo-auditable
       - if: ${{ env.ACT != 'true' }}
         name: Build the release binary
-        env:
-          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
         run: cargo auditable build --locked --release --bin issuerd
       - if: ${{ env.ACT != 'true' }}
         name: Smoke-run the binary
