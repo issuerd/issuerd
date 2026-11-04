@@ -9,6 +9,7 @@ pub mod built_in;
 pub mod email_code;
 pub mod executor;
 pub mod login_failures;
+pub mod password_verify;
 pub mod plugin_registry;
 pub mod totp;
 pub mod typestate;

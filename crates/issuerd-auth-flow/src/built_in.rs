@@ -6327,4 +6327,236 @@ mod tests {
         assert!(stored.email.is_none());
         assert!(!stored.email_verified, "cleared email must reset verification");
     }
+
+    // -----------------------------------------------------------------------
+    // Keycloak-format password rows
+    // -----------------------------------------------------------------------
+
+    async fn storage_with_alice_row(cred: &Credential) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        storage.create_credential(&user.realm_id, &user.id, cred).await.unwrap();
+        storage
+    }
+
+    fn history_type() -> CredentialType {
+        CredentialType::Custom(PASSWORD_HISTORY_CREDENTIAL_TYPE.to_string())
+    }
+
+    #[tokio::test]
+    async fn password_login_accepts_each_keycloak_format_without_dummy() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let auth = UsernamePasswordAuthenticator::new(storage);
+            let mut ctx = test_context();
+            ctx.parameters.insert("username".to_string(), vec!["alice".to_string()]);
+            ctx.parameters.insert("password".to_string(), vec![password.to_string()]);
+            let before = DUMMY_VERIFY_CALLS.with(|c| c.get());
+            assert_auth_success(auth.authenticate(&mut ctx).await);
+            assert_eq!(DUMMY_VERIFY_CALLS.with(|c| c.get()), before, "{password}");
+            assert_eq!(ctx.user_id, Some(UserId::new("alice").unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn password_login_wrong_password_on_keycloak_row_runs_no_dummy() {
+        for (_, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let auth = UsernamePasswordAuthenticator::new(storage);
+            let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            assert_eq!(dummy, 0, "a real verify ran");
+        }
+    }
+
+    #[tokio::test]
+    async fn password_login_unverifiable_rows_run_dummy() {
+        for cred in crate::password_verify::tests::unverifiable_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let auth = UsernamePasswordAuthenticator::new(storage);
+            let (result, dummy) = login_counting_dummy_verifies(
+                &auth,
+                "alice",
+                crate::password_verify::tests::PASSWORD,
+            )
+            .await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            assert_eq!(dummy, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn password_login_mixed_format_realm_needs_no_reset() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let rows = crate::password_verify::tests::keycloak_rows();
+        let usernames = ["alice", "bob", "carol"];
+        for (username, (_, cred)) in usernames.iter().zip(&rows) {
+            let mut user = test_user();
+            user.id = UserId::new(*username).unwrap();
+            user.username = Username::new(*username).unwrap();
+            user.email = None;
+            storage.create_user(&user.realm_id, &user).await.unwrap();
+            storage.create_credential(&user.realm_id, &user.id, cred).await.unwrap();
+        }
+
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        for (username, (password, _)) in usernames.iter().zip(&rows) {
+            let (result, dummy) = login_counting_dummy_verifies(&auth, username, password).await;
+            assert_auth_success(result);
+            assert_eq!(dummy, 0, "{username}");
+        }
+    }
+
+    #[tokio::test]
+    async fn password_login_leaves_keycloak_row_untouched() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let auth = UsernamePasswordAuthenticator::new(storage.clone());
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", password).await;
+            assert_auth_success(result);
+
+            let user = test_user();
+            let stored = storage
+                .get_credentials(&user.realm_id, &user.id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].secret_data, cred.secret_data);
+            assert_eq!(stored[0].credential_data, cred.credential_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn password_login_keycloak_row_keeps_brute_force_semantics() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = Arc::new(InMemoryStorage::new());
+            let mut realm = test_realm();
+            realm.brute_force_protected = true;
+            realm.max_login_failures = 2;
+            realm.wait_increment_secs = 0;
+            realm.lockout_duration_secs = 900;
+            storage.create_realm(&realm).await.unwrap();
+            let user = test_user();
+            storage.create_user(&user.realm_id, &user).await.unwrap();
+            storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+            let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+            let auth = UsernamePasswordAuthenticator::with_tracker(
+                storage,
+                Arc::new(LoginFailureTracker::new()),
+                cache,
+            );
+
+            // A success resets the counter, so one more failure does not lock.
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", password).await;
+            assert_auth_success(result);
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", password).await;
+            assert_auth_success(result);
+
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+            assert_auth_failure(result, IssuerdError::InvalidGrant);
+            let (result, _) = login_counting_dummy_verifies(&auth, "alice", password).await;
+            assert_auth_failure(result, IssuerdError::AccessDenied);
+        }
+    }
+
+    #[test]
+    fn verify_password_hash_handles_keycloak_rows() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            assert!(verify_password_hash(password, &cred), "{password}");
+            assert!(!verify_password_hash("wrong", &cred), "{password}");
+        }
+        for cred in crate::password_verify::tests::unverifiable_rows() {
+            assert!(!verify_password_hash(crate::password_verify::tests::PASSWORD, &cred));
+        }
+    }
+
+    #[tokio::test]
+    async fn set_user_password_rejects_reuse_of_current_keycloak_row() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let user = test_user();
+            let err =
+                set_user_password(storage.as_ref(), &user.realm_id, &user.id, password, 3, false)
+                    .await
+                    .unwrap_err();
+            assert!(err.to_string().contains("password_history"), "{err}");
+
+            let stored = storage
+                .get_credentials(&user.realm_id, &user.id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].secret_data, cred.secret_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_user_password_rejects_reuse_of_keycloak_history_row() {
+        for (password, mut cred) in crate::password_verify::tests::keycloak_rows() {
+            cred.credential_type = history_type();
+            let storage = storage_with_alice_row(&cred).await;
+            let user = test_user();
+            let err =
+                set_user_password(storage.as_ref(), &user.realm_id, &user.id, password, 3, false)
+                    .await
+                    .unwrap_err();
+            assert!(err.to_string().contains("password_history"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_user_password_upgrades_keycloak_row_to_argon2id() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let user = test_user();
+            set_user_password(storage.as_ref(), &user.realm_id, &user.id, "Fresh!pass1", 3, false)
+                .await
+                .unwrap();
+
+            let current = storage
+                .get_credentials(&user.realm_id, &user.id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(current.len(), 1);
+            assert!(current[0].secret_data.starts_with(b"$argon2id$"));
+            assert!(verify_password_hash("Fresh!pass1", &current[0]));
+            assert!(!verify_password_hash(password, &current[0]));
+
+            let history =
+                storage.get_credentials(&user.realm_id, &user.id, history_type()).await.unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].secret_data, cred.secret_data);
+            assert_eq!(history[0].credential_data, cred.credential_data);
+            assert!(verify_password_hash(password, &history[0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn set_user_password_history_disabled_replaces_keycloak_row() {
+        for (password, cred) in crate::password_verify::tests::keycloak_rows() {
+            let storage = storage_with_alice_row(&cred).await;
+            let user = test_user();
+            set_user_password(storage.as_ref(), &user.realm_id, &user.id, password, 0, false)
+                .await
+                .unwrap();
+
+            let current = storage
+                .get_credentials(&user.realm_id, &user.id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(current.len(), 1);
+            assert!(current[0].secret_data.starts_with(b"$argon2id$"));
+            assert!(verify_password_hash(password, &current[0]));
+            let history =
+                storage.get_credentials(&user.realm_id, &user.id, history_type()).await.unwrap();
+            assert!(history.is_empty());
+        }
+    }
 }
