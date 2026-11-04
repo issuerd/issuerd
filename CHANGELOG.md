@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docker builds.** Update the pinned `rustup-init.sh` SHA-256 to match the current upstream installer, restoring canonical and glibc-2.28 image builds after the upstream artifact changed.
+
 ## [0.2.1] - 2026-11-03
 
 ### Fixed

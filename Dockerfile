@@ -29,7 +29,7 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821c
 FROM ${BUILDER_IMAGE} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-ARG RUSTUP_INSTALLER_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0
+ARG RUSTUP_INSTALLER_SHA256=d890e2fef6fa991b19cde2e608199bc1dca4e37f41f884edf8849ff693048de6
 
 # System build dependencies (libkrb5 for the Kerberos federation provider,
 # libclang for bindgen) and the pinned Rust toolchain with a verified installer.
