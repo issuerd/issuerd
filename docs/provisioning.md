@@ -70,7 +70,7 @@ provision = "provision.yaml"   # relative paths resolve against the working dire
 
 During startup (in `ServerState::from_config`, `crates/issuerd-server/src/state.rs`),
 after storage initialization and after the automatic master-realm bootstrap (for the
-in-memory/JSON backends), the daemon loads and applies the file once. On subsequent
+in-memory/JSON/SQLite backends), the daemon loads and applies the file once. On subsequent
 restarts an `applied` marker causes the file to be ignored entirely — leaving
 the `provision` key in place is harmless. Failed attempts clear their in-progress
 marker and are eligible to run again after the error is fixed.
@@ -91,8 +91,8 @@ issuerd provision -c issuerd.toml --file provision.yaml
 The command reads the server configuration only to learn which storage to connect
 to (`-c` defaults to `issuerd.toml` in the working directory), then:
 
-1. Connects to the configured storage — for PostgreSQL it also runs pending schema
-   migrations first (`src/main.rs`).
+1. Connects to the configured storage — for PostgreSQL and SQLite it also runs pending
+   schema migrations first (`src/main.rs`).
 2. Applies the provision file exactly once (same marker mechanism as the daemon).
 3. Exits. Unlike the daemon, errors propagate: the process exits non-zero, so it is
    safe to gate deployments on it in scripts and CI.
@@ -460,7 +460,7 @@ config) use the Admin API.
 
 The automatic master-realm bootstrap (`bootstrap_master_realm` in
 `crates/issuerd-server/src/state.rs`) runs at daemon startup **only** when the storage
-backend is in-memory or JSON-file **and** no realms exist yet. It creates:
+backend is in-memory, JSON-file, or SQLite **and** no realms exist yet. It creates:
 
 - the `master` realm with user `admin`, password `bootstrap_admin_password` from the
   server config (or `ISSUERD_BOOTSTRAP_ADMIN_PASSWORD`) — unset or empty ⇒ a random
@@ -470,7 +470,7 @@ backend is in-memory or JSON-file **and** no realms exist yet. It creates:
   `admin`,
 - the built-in `admin-cli` and `account-console` clients.
 
-It runs **before** the provisioner, so with the in-memory/JSON backends a provision
+It runs **before** the provisioner, so with the in-memory/JSON/SQLite backends a provision
 file that also defines `master` finds the realm (and possibly the `admin` user)
 already present and skips those entries, while still applying any remaining roles,
 clients, and users from the file.
@@ -488,10 +488,10 @@ If the daemon is already running against such a database, fix it out-of-band wit
 ## Re-runs and idempotency
 
 The `marker:` key (default `"default"`) names a record in storage that tracks
-whether the file has been applied. With PostgreSQL the marker lives in the
-`provision_markers` table (`crates/issuerd-storage/migrations/004_provision_markers.sql`);
-with JSON-file storage it is part of the snapshot; with in-memory storage it lives
-and dies with the process.
+whether the file has been applied. PostgreSQL and SQLite keep it in the
+`provision_markers` table (their respective `004_provision_markers.sql` migrations),
+with an atomic insert-if-absent claim; with JSON-file storage it is part of the
+snapshot; with in-memory storage it lives and dies with the process.
 
 - **Marker claimed before applying, completed only after success.** The provisioner
   atomically claims an `in_progress` marker, then applies the entities and records

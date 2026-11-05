@@ -76,7 +76,7 @@ impl ServerState {
     /// so a broken explicit binding or storage read cannot select a weaker flow.
     ///
     /// The flow set is loaded from storage per call — one indexed query on
-    /// Postgres, trivial on the in-memory/json backends, and deliberately
+    /// SQL backends, trivial on the in-memory/json backends, and deliberately
     /// uncached so admin flow edits take effect immediately. The realm's binding
     /// field (`bound`, `None` → `default_alias`) picks the top-level flow; when
     /// the read fails (logged) or the alias is not in storage, the `fallback`
@@ -257,6 +257,7 @@ impl ServerState {
             crate::config::StorageConfig::InMemory => "in-memory",
             crate::config::StorageConfig::Postgres { .. } => "postgres",
             crate::config::StorageConfig::JsonFile { .. } => "json-file",
+            crate::config::StorageConfig::Sqlite { .. } => "sqlite",
         };
         debug!(
             storage = storage_kind,
@@ -335,6 +336,18 @@ impl ServerState {
                     );
                 }
                 Arc::new(issuerd_storage::JsonFileStorage::new(path)?)
+            }
+            crate::config::StorageConfig::Sqlite { path } => {
+                if kek.is_some() {
+                    tracing::warn!(
+                        "[crypto.key_encryption] is only supported with PostgreSQL storage; \
+                         ignoring it for the SQLite backend (protect the database file at the \
+                         filesystem level)"
+                    );
+                }
+                let sqlite = issuerd_storage::SqliteStorage::connect(path).await?;
+                sqlite.run_migrations().await?;
+                Arc::new(sqlite)
             }
         };
 
@@ -611,11 +624,12 @@ impl ServerState {
             event_listeners,
         };
 
-        // Pre-populate master realm for in-memory/json storage if no realms exist
+        // Pre-populate the master realm for self-contained backends.
         #[allow(clippy::match_like_matches_macro)]
         let storage_is_bootstrapable = match config.storage {
             crate::config::StorageConfig::InMemory
-            | crate::config::StorageConfig::JsonFile { .. } => true,
+            | crate::config::StorageConfig::JsonFile { .. }
+            | crate::config::StorageConfig::Sqlite { .. } => true,
             _ => false,
         };
         let no_realms = state
@@ -827,11 +841,22 @@ fn spawn_jwks_refresh_task(
 
 async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError> {
     // Use the configured issuer_url as the base for built-in client redirect URIs
-    // so in-memory/json bootstraps match the actual server URL (e.g. https).
+    // so self-contained bootstraps match the actual server URL (e.g. https).
     let base_url = state.config.issuer_url.trim_end_matches('/').to_string();
 
+    let sql_uuids = matches!(state.config.storage, crate::config::StorageConfig::Sqlite { .. });
+    let realm_id = if sql_uuids {
+        RealmId::new(issuerd_core::utils::generate_id()).unwrap()
+    } else {
+        RealmId::new("master").unwrap()
+    };
+    let admin_user_id = if sql_uuids {
+        UserId::new(issuerd_core::utils::generate_id()).unwrap()
+    } else {
+        UserId::new("admin").unwrap()
+    };
     let realm = Realm {
-        id: RealmId::new("master").unwrap(),
+        id: realm_id,
         name: issuerd_core::RealmName::new("master").unwrap(),
         display_name: Some(DisplayName::new("Master").unwrap()),
         enabled: true,
@@ -840,8 +865,8 @@ async fn bootstrap_master_realm(state: &ServerState) -> Result<(), IssuerdError>
     state.storage.create_realm(&realm).await?;
 
     let admin_user = User {
-        id: UserId::new("admin").unwrap(),
-        realm_id: RealmId::new("master").unwrap(),
+        id: admin_user_id,
+        realm_id: realm.id.clone(),
         username: Username::new("admin").expect("admin username must be valid"),
         email: Some(Email::new("admin@localhost.local").expect("admin email must be valid")),
         email_verified: true,
@@ -1195,6 +1220,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn server_state_sqlite_bootstraps_and_survives_restart() {
+        let dir = std::env::temp_dir()
+            .join(format!("issuerd_server_sqlite_test_{}", issuerd_core::utils::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = ServerConfig {
+            storage: crate::config::StorageConfig::Sqlite {
+                path: dir.join("issuerd.db"),
+            },
+            bootstrap_admin_password: Some("test-admin-password".into()),
+            ..Default::default()
+        };
+
+        let first = ServerState::from_config(&cfg).await.unwrap();
+        let realm = first.storage.get_realm_by_name("master").await.unwrap().unwrap();
+        let admin = first.storage.get_user_by_username(&realm.id, "admin").await.unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(realm.id.as_ref()).is_ok());
+        assert!(uuid::Uuid::parse_str(admin.id.as_ref()).is_ok());
+        assert_eq!(first.storage.list_signing_keys().await.unwrap().len(), 2);
+        let realm_id = realm.id.clone();
+        let admin_id = admin.id.clone();
+        drop(first);
+
+        let second = ServerState::from_config(&cfg).await.unwrap();
+        assert_eq!(second.storage.count_realms().await.unwrap(), 1);
+        assert_eq!(second.storage.get_realm(&realm_id).await.unwrap().unwrap().name, "master");
+        assert!(second.storage.get_user(&realm_id, &admin_id).await.unwrap().is_some());
+        assert_eq!(
+            second
+                .storage
+                .get_credentials(&realm_id, &admin_id, issuerd_core::CredentialType::Password)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(second.storage.list_signing_keys().await.unwrap().len(), 2);
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn simple_plugin_registry_default() {
         let reg = SimplePluginRegistry::default();
@@ -1347,6 +1413,23 @@ mod tests {
         let result = ServerState::from_config(&cfg).await;
         let msg = format!("{}", result.err().unwrap());
         assert!(msg.contains("cluster.enabled"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn cluster_enabled_rejects_sqlite_before_connecting() {
+        let cfg = ServerConfig {
+            storage: crate::config::StorageConfig::Sqlite {
+                path: std::path::PathBuf::from("unused.db"),
+            },
+            redis: Some("redis://invalid_host:6379".into()),
+            cluster: crate::config::ClusterConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = ServerState::from_config(&cfg).await.err().unwrap();
+        assert!(error.to_string().contains("requires PostgreSQL storage"));
     }
 
     #[tokio::test]

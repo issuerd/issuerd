@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Embedded SQLite storage.** `[storage.sqlite] path = "/var/lib/issuerd/issuerd.db"` adds a durable production single-node backend with no external database service, automatic migrations and master-realm bootstrap, WAL with full synchronous durability, atomic provisioning and MCP step-up transactions, and real-file conformance tests. UUID-backed identifiers are validated and stored as typed 16-byte blobs; Unicode-normalized search matches the other backends, busy writes retry a bounded number of times, and Unix DB/WAL/SHM files are maintained with owner-only `0600` permissions. Existing PostgreSQL, in-memory, and JSON behavior is unchanged. SQLite remains single-node, and signing-key envelope encryption remains PostgreSQL-only.
+
 ### Fixed
 
 - **Docker builds.** Update the pinned `rustup-init.sh` SHA-256 to match the current upstream installer, restoring canonical and glibc-2.28 image builds after the upstream artifact changed.

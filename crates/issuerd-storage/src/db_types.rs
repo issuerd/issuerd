@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 //
-// Row types and JSON/UUID conversion helpers for the PostgreSQL adapter.
+// Row types and JSON/UUID conversion helpers shared by the SQL adapters.
 
 use chrono::{DateTime, Utc};
 use issuerd_core::*;
@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::FromRow;
 use std::collections::HashMap;
 
-fn to_uuid(id: &str) -> Result<uuid::Uuid, IssuerdError> {
+pub(crate) fn to_uuid(id: &str) -> Result<uuid::Uuid, IssuerdError> {
     uuid::Uuid::parse_str(id).map_err(|e| IssuerdError::ServerError(format!("invalid uuid: {e}")))
 }
 

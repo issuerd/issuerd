@@ -30,6 +30,8 @@ Issuerd scales horizontally: run N identical nodes behind a load balancer with
 | Access/ID/refresh tokens | Nowhere — self-contained JWTs | Validated statelessly by every node against the shared JWKS |
 | Metrics (`/metrics`) | Per node | No — scrape each node (or the LB if you only need a sample) |
 
+SQLite is intentionally outside this topology: it is a single-node embedded backend. `cluster.enabled = true` rejects `[storage.sqlite]` even when Redis is configured; use PostgreSQL for every multi-node deployment.
+
 ### Signing keys
 
 The critical cluster invariant: every node must sign with the same active key
@@ -171,9 +173,9 @@ list; the static two-node setup is the documented, deterministic default.
 ## Operational notes & limitations
 
 - **Restarts no longer invalidate tokens**: the boot path persists the generated
-  signing key into whatever storage backend is configured, and the JSON-file
-  snapshot includes `signing_keys` (loaded again at boot), so both PostgreSQL
-  and JSON-file deployments keep keys across restarts. Only pure in-memory mode
+  signing key into whatever storage backend is configured: PostgreSQL and SQLite
+  use `signing_keys`, while the JSON-file snapshot includes the same model.
+  Every durable backend reloads those keys at boot. Only pure in-memory mode
   regenerates keys per boot (a single-node mode).
 - **Redis is ephemeral** by design: wiping it loses in-flight login flows
   (users retry) and the revocation blocklist entries for tokens that would

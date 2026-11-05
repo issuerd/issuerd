@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Storage backends (PostgreSQL via sqlx, in-memory, JSON file) for the Issuerd IAM server"
+description = "Storage backends (PostgreSQL/SQLite via sqlx, in-memory, JSON file) for the Issuerd IAM server"
 keywords = ["oidc", "iam", "postgresql"]
 categories = ["authentication", "database"]
 
@@ -32,3 +32,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 testcontainers = { workspace = true }
 uuid = { workspace = true }
 rstest = { workspace = true }
+tempfile = { workspace = true }

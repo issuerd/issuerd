@@ -86,6 +86,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 issuerd_server::config::StorageConfig::JsonFile { path } => {
                     Arc::new(issuerd_storage::JsonFileStorage::new(path)?)
                 }
+                issuerd_server::config::StorageConfig::Sqlite { path } => {
+                    let sqlite = issuerd_storage::SqliteStorage::connect(path).await?;
+                    sqlite.run_migrations().await?;
+                    Arc::new(sqlite)
+                }
             };
 
             let provisioner = issuerd_server::provisioner::Provisioner::from_file(&file)?;

@@ -1965,4 +1965,272 @@ mod tests {
         storage.run_migrations().await.unwrap();
         mutation_matrix(&storage).await;
     }
+
+    #[tokio::test]
+    async fn sqlite_executes_once_reconciles_and_fails_changed_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(
+            crate::sqlite::SqliteStorage::connect(&dir.path().join("issuerd.db"))
+                .await
+                .unwrap(),
+        );
+        storage.run_migrations().await.unwrap();
+        grant_lifecycle(storage.as_ref()).await;
+
+        for _ in 0..2 {
+            concurrent_reconciliation(std::sync::Arc::clone(&storage), 16).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_supports_every_strict_mutation_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::sqlite::SqliteStorage::connect(&dir.path().join("issuerd.db"))
+            .await
+            .unwrap();
+        storage.run_migrations().await.unwrap();
+        mutation_matrix(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_step_up_subject_uses_a_validated_blob_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::sqlite::SqliteStorage::connect(&dir.path().join("issuerd.db"))
+            .await
+            .unwrap();
+        storage.run_migrations().await.unwrap();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let grant = test_grant(&user);
+        storage.create_mcp_step_up_grant(&grant).await.unwrap();
+        let (id_type,): (String,) = sqlx::query_as(
+            "SELECT typeof(subject_user_id) FROM mcp_step_up_grants WHERE token_jti = ?1",
+        )
+        .bind(grant.token_jti.as_ref())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(id_type, "blob");
+
+        let mut invalid = grant.clone();
+        invalid.token_jti = JwtId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        invalid.operation_id = uuid::Uuid::new_v4().to_string();
+        invalid.subject_user_id = UserId::new("not-a-uuid").unwrap();
+        assert!(matches!(
+            storage.create_mcp_step_up_grant(&invalid).await,
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_step_up_enforces_terminal_states_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::sqlite::SqliteStorage::connect(&dir.path().join("issuerd.db"))
+            .await
+            .unwrap();
+        storage.run_migrations().await.unwrap();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+
+        let missing = test_grant(&user);
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &missing.token_jti,
+                    &missing.operation_hash,
+                    &missing.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::InvalidGrant
+        );
+
+        let mut expired = test_grant(&user);
+        expired.expires_at = chrono::Utc::now().timestamp() - 1;
+        storage.create_mcp_step_up_grant(&expired).await.unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &expired.token_jti,
+                    &expired.operation_hash,
+                    &expired.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::InvalidGrant
+        );
+
+        for status in [
+            McpStepUpExecutionStatus::Executing,
+            McpStepUpExecutionStatus::OutcomeUnknown,
+        ] {
+            let mut grant = test_grant(&user);
+            grant.status = status;
+            storage.create_mcp_step_up_grant(&grant).await.unwrap();
+            assert_eq!(
+                storage
+                    .execute_mcp_step_up(
+                        &grant.token_jti,
+                        &grant.operation_hash,
+                        &grant.mutation,
+                        Value::Null,
+                    )
+                    .await
+                    .unwrap_err(),
+                IssuerdError::TemporarilyUnavailable
+            );
+        }
+
+        let mut failed = test_grant(&user);
+        failed.status = McpStepUpExecutionStatus::FailedDefinite;
+        storage.create_mcp_step_up_grant(&failed).await.unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &failed.token_jti,
+                    &failed.operation_hash,
+                    &failed.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::Conflict
+        );
+
+        let mut succeeded = test_grant(&user);
+        succeeded.status = McpStepUpExecutionStatus::Succeeded;
+        succeeded.result_json = Some(serde_json::json!({"already": "done"}));
+        storage.create_mcp_step_up_grant(&succeeded).await.unwrap();
+        let execution = storage
+            .execute_mcp_step_up(
+                &succeeded.token_jti,
+                &succeeded.operation_hash,
+                &succeeded.mutation,
+                Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.status, McpStepUpExecutionStatus::Succeeded);
+        assert_eq!(execution.result_json, succeeded.result_json);
+        assert!(storage.get_user(&realm.id, &user.id).await.unwrap().is_some());
+
+        let mut invalid_version = test_grant(&user);
+        invalid_version.version = u32::MAX;
+        assert!(matches!(
+            storage.create_mcp_step_up_grant(&invalid_version).await,
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+        let mut invalid_canonicalization = test_grant(&user);
+        invalid_canonicalization.canonicalization_version = u32::MAX;
+        assert!(matches!(
+            storage.create_mcp_step_up_grant(&invalid_canonicalization).await,
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+        let mut invalid_realm = test_grant(&user);
+        invalid_realm.realm_id = RealmId::new("not-a-uuid").unwrap();
+        assert!(matches!(
+            storage.create_mcp_step_up_grant(&invalid_realm).await,
+            Err(IssuerdError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_step_up_rejects_corrupt_serialized_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::sqlite::SqliteStorage::connect(&dir.path().join("issuerd.db"))
+            .await
+            .unwrap();
+        storage.run_migrations().await.unwrap();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let grant = test_grant(&user);
+        storage.create_mcp_step_up_grant(&grant).await.unwrap();
+
+        for (corrupt, restore) in [
+            (
+                "UPDATE mcp_step_up_grants SET version = -1 WHERE token_jti = ?1",
+                "UPDATE mcp_step_up_grants SET version = 1 WHERE token_jti = ?1",
+            ),
+            (
+                "UPDATE mcp_step_up_grants SET canonicalization_version = -1 WHERE token_jti = ?1",
+                "UPDATE mcp_step_up_grants SET canonicalization_version = 1 WHERE token_jti = ?1",
+            ),
+        ] {
+            sqlx::query(corrupt)
+                .bind(grant.token_jti.as_ref())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            assert!(storage.get_mcp_step_up_grant(&grant.token_jti).await.is_err());
+            sqlx::query(restore)
+                .bind(grant.token_jti.as_ref())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+        }
+
+        for (corrupt, restore, restored) in [
+            (
+                "UPDATE mcp_step_up_grants SET client_id = '' WHERE token_jti = ?1",
+                "UPDATE mcp_step_up_grants SET client_id = ?2 WHERE token_jti = ?1",
+                "test-client".to_string(),
+            ),
+            (
+                "UPDATE mcp_step_up_grants SET mutation_json = 'null' WHERE token_jti = ?1",
+                "UPDATE mcp_step_up_grants SET mutation_json = ?2 WHERE token_jti = ?1",
+                serde_json::to_string(&grant.mutation.redacted()).unwrap(),
+            ),
+            (
+                "UPDATE mcp_step_up_grants SET approval_amr = 'null' WHERE token_jti = ?1",
+                "UPDATE mcp_step_up_grants SET approval_amr = ?2 WHERE token_jti = ?1",
+                "[\"pwd\"]".to_string(),
+            ),
+        ] {
+            sqlx::query(corrupt)
+                .bind(grant.token_jti.as_ref())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+            assert!(storage.get_mcp_step_up_grant(&grant.token_jti).await.is_err());
+            sqlx::query(restore)
+                .bind(grant.token_jti.as_ref())
+                .bind(restored)
+                .execute(storage.pool())
+                .await
+                .unwrap();
+        }
+        assert!(storage.get_mcp_step_up_grant(&grant.token_jti).await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_step_up_create_retries_after_external_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issuerd.db");
+        let storage = crate::sqlite::SqliteStorage::connect(&path).await.unwrap();
+        storage.run_migrations().await.unwrap();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let grant = test_grant(&user);
+
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let lock_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let lock = lock_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+            lock.commit().await.unwrap();
+        });
+        storage.create_mcp_step_up_grant(&grant).await.unwrap();
+        release.await.unwrap();
+        assert!(storage.get_mcp_step_up_grant(&grant.token_jti).await.unwrap().is_some());
+    }
 }

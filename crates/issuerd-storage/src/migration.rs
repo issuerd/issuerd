@@ -17,6 +17,17 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), IssuerdError> {
     Ok(())
 }
 
+/// Run the embedded SQLite schema migrations.
+pub async fn run_sqlite_migrations(pool: &sqlx::SqlitePool) -> Result<(), IssuerdError> {
+    info!("running SQLite schema migrations");
+    sqlx::migrate!("./migrations-sqlite")
+        .run(pool)
+        .await
+        .map_err(|e| IssuerdError::ServerError(format!("migration failed: {e}")))?;
+    info!("SQLite schema migrations completed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

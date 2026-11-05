@@ -25,7 +25,7 @@ Issuerd exposes three probe routes (registered in `crates/issuerd-server/src/rou
 
 **Readiness** (`/ready`) performs two real probes, in order:
 
-1. **Storage** — runs `list_realms` against the configured storage backend. With PostgreSQL this is an actual database round-trip (so it catches a dead DB, dropped connections, and missing migrations); with the in-memory or JSON-file backends it is an in-process read that effectively always succeeds.
+1. **Storage** — runs `list_realms` against the configured storage backend. PostgreSQL and SQLite perform a real database query (so it catches a dead DB, dropped connections, and missing migrations); with the in-memory or JSON-file backends it is an in-process read that effectively always succeeds.
 2. **Cache** — runs `get("__ready_probe__")` against the configured `DistributedCache`. With Redis this is a real round-trip to the server; with the in-memory cache it is an in-process read.
 
 The first failing probe short-circuits the response, so the `dependency` field tells you which subsystem is down, and a WARN line — `readiness check failed: storage unreachable` or `readiness check failed: cache unreachable` — is written to the log with the underlying error as a structured `error` field.

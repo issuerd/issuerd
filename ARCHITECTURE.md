@@ -27,7 +27,7 @@ flowchart TD
     issuerd_federation["issuerd-federation<br/>LDAP/Kerberos providers, user sync"]
     issuerd_protocol["issuerd-protocol<br/>pure OIDC/OAuth2 parsing (no I/O)"]
     issuerd_token["issuerd-token<br/>JWT/JWS/JWK engine"]
-    issuerd_storage["issuerd-storage<br/>Storage impls: Postgres / InMemory / JsonFile"]
+    issuerd_storage["issuerd-storage<br/>Storage impls: Postgres / Sqlite / InMemory / JsonFile"]
     issuerd_cluster["issuerd-cluster<br/>DistributedCache: Redis / InMemory"]
     issuerd_mcp["issuerd-mcp<br/>curated MCP tools/resources, policy, safe DTOs, stateless rmcp transport"]
     issuerd_core["issuerd-core<br/>types, SPI traits, errors, models — no I/O"]
@@ -96,7 +96,7 @@ flowchart TD
                                   │
 ┌──────────────────────────────────────────────────────────────────┐
 │                       Infrastructure Layer                       │
-│ issuerd-storage (PostgreSQL) │ issuerd-cluster (Redis/discovery) │
+│ issuerd-storage (PostgreSQL/SQLite) │ issuerd-cluster (Redis)  │
 └──────────────────────────────────────────────────────────────────┘
                                   │
 ┌──────────────────────────────────────────────────────────────────┐

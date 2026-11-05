@@ -18,11 +18,24 @@ Issuerd is a single `issuerd` binary whose state model decides the topology. Dur
 
 ### Development / evaluation (single node, no dependencies)
 
-With no `[storage]` section the daemon uses the in-memory backend; `[storage.json_file]` persists the full state to a JSON snapshot. Both are single-node modes for development, evaluation, and demos — never production. They are covered in [getting-started.md](getting-started.md) and the [configuration.md](configuration.md) storage reference; the rest of this guide assumes PostgreSQL + Redis.
+With no `[storage]` section the daemon uses the in-memory backend; `[storage.json_file]` persists the full state to a JSON snapshot. Both are single-node modes for development, evaluation, and demos — never production. They are covered in [getting-started.md](getting-started.md) and the [configuration.md](configuration.md) storage reference.
+
+### Single-node production (SQLite, no external DB)
+
+For an edge site, branch office, or homelab with one daemon and no database service, use embedded SQLite:
+
+```toml
+[storage.sqlite]
+path = "/var/lib/issuerd/issuerd.db"
+```
+
+SQLite stores every durable entity, including sessions and signing keys, and runs migrations at boot. WAL mode and `synchronous=FULL` provide durable local operation; a fresh file gets the automatic `master` bootstrap. The parent directory must exist and the daemon needs write access to the database and its `-wal`/`-shm` sidecars. Do not put the live database on a network filesystem or start multiple Issuerd processes against it; multi-node requires PostgreSQL. See [backup-and-upgrade.md](backup-and-upgrade.md) for online and offline backups.
+
+Without `redis`, transient authorization/revocation state uses the in-process cache and is lost on restart. Configure a local Redis when that state must survive restarts; it does not make SQLite suitable for multiple nodes.
 
 ### Single-node production (PostgreSQL + Redis)
 
-The baseline production topology is one Issuerd node with:
+The shared-database production topology is one Issuerd node with:
 
 - **PostgreSQL** for all durable state (`[storage.postgres]`). Signing keys live in the shared `signing_keys` table, so tokens and sessions survive restarts and redeploys. Schema migrations run automatically at boot.
 - **Redis** for transient state (`redis = "redis://…"`). The shipped demo and cluster stacks use `--maxmemory 256mb --maxmemory-policy noeviction`, so revocation, rotation, replay, and lockout markers are never silently evicted under memory pressure; security-critical writes fail closed instead. The integration stack enables `--appendonly yes` with a volume. A Redis wipe still drops revocation entries and in-flight flows, so use the durable realm `notBefore` cutoff when revocation must survive it.
@@ -42,7 +55,7 @@ The full multi-node guide — state model, configuration, LB contract, scaling �
 The root `Dockerfile` is the canonical production image. It is a multi-stage build:
 
 1. **Builder** — compiles the embedded web client (`npm ci && npm run generate-api && npm run build` in `webclientsrc/`, regenerated from the committed `openapi.json`) and then the release binary (`cargo auditable build --bin issuerd --release --locked`). The web client is embedded into the binary at compile time (`include_dir!`), so the runtime image contains only the binary plus its shared libraries. The `cargo auditable` wrapper embeds the Cargo dependency tree so image-only SBOM scans (syft) can see the Rust crates.
-2. **Runtime** — a Google **distroless** userland (`gcr.io/distroless/cc-debian13:nonroot`: glibc + OpenSSL 3 + CA certs — no shell, no package manager, non-root uid 65532 by default). The Kerberos GSS-API libraries the binary links for LDAP federation are copied from the builder stage; libpq is not needed (sqlx is a pure-Rust PostgreSQL driver). `EXPOSE 8080`; the entrypoint is `issuerd` with default arguments `daemon -c /etc/issuerd/issuerd.toml`. Container healthchecks should use the binary itself (`issuerd healthcheck --url ...`), since the image ships no curl/wget.
+2. **Runtime** — a Google **distroless** userland (`gcr.io/distroless/cc-debian13:nonroot`: glibc + OpenSSL 3 + CA certs — no shell, no package manager, non-root uid 65532 by default). The Kerberos GSS-API libraries the binary links for LDAP federation are copied from the builder stage; libpq is not needed (sqlx is a pure-Rust PostgreSQL driver), and SQLite is linked statically through sqlx's bundled driver. `EXPOSE 8080`; the entrypoint is `issuerd` with default arguments `daemon -c /etc/issuerd/issuerd.toml`. Container healthchecks should use the binary itself (`issuerd healthcheck --url ...`), since the image ships no curl/wget.
 
 ```bash
 docker build -t issuerd:local .
@@ -168,10 +181,10 @@ A suggested layout for a systemd-managed install:
 | `/etc/issuerd/provision.yaml` | Optional provision file (applied once at first boot) |
 | `/etc/issuerd/issuerd.env` | Secrets/environment overrides (`root:issuerd`, mode `0640`) |
 | `/etc/issuerd/certs/` | PEM certificate/key, only when using direct [`[tls]`](#tls) |
-| `/var/lib/issuerd/` | Working directory: JSON-file storage (if used), any writable state |
+| `/var/lib/issuerd/` | Working directory: SQLite/JSON-file storage (if used), any writable state |
 | `/var/lib/issuerd/themes/` | Login-theme assets, if you use them |
 
-Notes on relative paths: the config file path (`-c`), `tls.cert_path`/`key_path`, `themes.dir`, and `storage.json_file.path` all resolve against the daemon's **working directory**. The systemd unit below pins `WorkingDirectory=/var/lib/issuerd` and uses absolute paths everywhere else. Login-theme assets are read **from disk on every request** (`crates/issuerd-server/src/routes/theme.rs`) — copy the repository's `themes/` directory into the layout (and point `[themes] dir` at it) if you rely on the default login CSS or custom themes.
+Notes on relative paths: the config file path (`-c`), `tls.cert_path`/`key_path`, `themes.dir`, `storage.sqlite.path`, and `storage.json_file.path` all resolve against the daemon's **working directory**. The systemd unit below pins `WorkingDirectory=/var/lib/issuerd` and uses absolute paths everywhere else. Login-theme assets are read **from disk on every request** (`crates/issuerd-server/src/routes/theme.rs`) — copy the repository's `themes/` directory into the layout (and point `[themes] dir` at it) if you rely on the default login CSS or custom themes.
 
 ### systemd unit
 
@@ -327,7 +340,7 @@ Kubernetes deployment is the container image plus the multi-node contract; there
 ## Production checklist
 
 - [ ] **`issuer_url` is the public base URL** clients use (e.g. `https://id.example.com`), with the correct scheme/host/port. It is baked into `iss` and discovery; treat it as permanent once realms are in use — changing it later invalidates outstanding tokens, sessions, and stored client configs.
-- [ ] **PostgreSQL storage configured** (`[storage.postgres]`) — durable realms/users/sessions/signing keys; migrations run at boot. **Redis configured** for transient state.
+- [ ] **Durable storage configured** (`[storage.postgres]` for shared/multi-node state or `[storage.sqlite]` for one self-contained node) — realms/users/sessions/signing keys survive restarts and migrations run at boot. **Redis configured** when transient state must survive restarts.
 - [ ] **`cluster.enabled = true`** whenever more than one node serves the same issuer — boot then fails fast on a split-brain configuration. See [CLUSTERING.md](CLUSTERING.md).
 - [ ] **TLS end-to-end** — direct `[tls]` or a TLS-terminating proxy with `https:` `issuer_url` and `[proxy].trusted_proxies` listing exactly the proxy subnets.
 - [ ] **`master` realm exists** — provision file applied on the fresh PostgreSQL database (no automatic bootstrap on that backend), and **`admin`/`admin` or any seeded default credentials are rotated or deleted**. Demo content (`alice`/`changeme`, `my-app-secret`) removed.
@@ -337,4 +350,4 @@ Kubernetes deployment is the container image plus the multi-node contract; there
 - [ ] **Realm `ssl_required` reviewed** (`none` / `external` / `all`; default `external`) to match the TLS topology.
 - [ ] **Metrics scraped** — Prometheus pulls `/metrics` from every node; health probes wired to `/health` + `/ready`. See [monitoring.md](monitoring.md).
 - [ ] **Events retention reviewed** per realm: `events_expiration_secs` hides events older than the window from query results (it does not delete rows); actual cleanup is the Admin API wipe endpoints (`DELETE /admin/realms/{realm}/events`, `…/admin-events`) — see [monitoring.md](monitoring.md).
-- [ ] **Backups scheduled** for the PostgreSQL database (the only durable state) — see [backup-and-upgrade.md](backup-and-upgrade.md).
+- [ ] **Backups scheduled** for the PostgreSQL database or SQLite file (whichever holds durable state) — see [backup-and-upgrade.md](backup-and-upgrade.md).
