@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Admin console realm selection.** Token refresh now preserves the selected admin realm instead of replacing it with the token's issuer realm. Refresh requests still target the issuer realm, including master-issued cross-realm admin sessions, and restored legacy token sets infer that issuer from their storage keys.
 - **Docker builds.** Update the pinned `rustup-init.sh` SHA-256 to match the current upstream installer, restoring canonical and glibc-2.28 image builds after the upstream artifact changed.
 
 ## [0.2.1] - 2026-11-03
