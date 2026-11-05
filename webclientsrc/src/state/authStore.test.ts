@@ -18,7 +18,7 @@ describe('authStore', () => {
       idToken: 'id789',
       expiresAt: Date.now() + 300_000,
     }
-    const owned = { ...ts, clientId: 'admin-cli' }
+    const owned = { ...ts, clientId: 'admin-cli', realm: 'master' }
     useAuthStore.getState().setTokenSet('master', ts)
     expect(useAuthStore.getState().tokenSet).toEqual(owned)
     expect(useAuthStore.getState().currentRealm).toBe('master')
@@ -45,11 +45,14 @@ describe('authStore', () => {
     useAuthStore.getState().setTokenSet('master', admin)
     useAuthStore.getState().setTokenSet('master', account)
 
-    expect(useAuthStore.getState().getTokenSet('master')).toEqual(admin)
-    expect(useAuthStore.getState().getTokenSet('master', 'account-console')).toEqual(account)
+    expect(useAuthStore.getState().getTokenSet('master')).toEqual({ ...admin, realm: 'master' })
+    expect(useAuthStore.getState().getTokenSet('master', 'account-console')).toEqual({
+      ...account,
+      realm: 'master',
+    })
     expect(useAuthStore.getState().isAuthenticated('master', 'account-console')).toBe(true)
     useAuthStore.getState().hydrate('account-console')
-    expect(useAuthStore.getState().tokenSet).toEqual(account)
+    expect(useAuthStore.getState().tokenSet).toEqual({ ...account, realm: 'master' })
   })
 
   it('clears token sets for a single realm without affecting others', () => {
@@ -70,7 +73,7 @@ describe('authStore', () => {
     useAuthStore.getState().setTokenSet('master', null)
     const stored = JSON.parse(sessionStorage.getItem('issuerd_tokens')!)
     expect(stored.master).toBeUndefined()
-    expect(stored.demo['admin-cli']).toEqual({ ...demoTs, clientId: 'admin-cli' })
+    expect(stored.demo['admin-cli']).toEqual({ ...demoTs, clientId: 'admin-cli', realm: 'demo' })
   })
 
   it('sets realm and persists to localStorage', () => {
@@ -111,7 +114,7 @@ describe('authStore', () => {
     sessionStorage.setItem('issuerd_tokens', JSON.stringify({ demo: ts }))
     localStorage.setItem('issuerd_realm', 'demo')
     useAuthStore.getState().hydrate()
-    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli' })
+    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli', realm: 'demo' })
     expect(useAuthStore.getState().currentRealm).toBe('demo')
   })
 
@@ -126,7 +129,7 @@ describe('authStore', () => {
     sessionStorage.setItem('issuerd_tokens', JSON.stringify({ master: ts }))
     localStorage.setItem('issuerd_realm', 'demo')
     useAuthStore.getState().hydrate()
-    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli' })
+    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli', realm: 'master' })
     // The shared realm context is preserved, only the token selection falls back.
     expect(useAuthStore.getState().currentRealm).toBe('demo')
   })
@@ -141,7 +144,7 @@ describe('authStore', () => {
     sessionStorage.setItem('issuerd_tokens', JSON.stringify({ demo: ts }))
     localStorage.setItem('issuerd_realm', 'other')
     useAuthStore.getState().hydrate()
-    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli' })
+    expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli', realm: 'demo' })
   })
 
   it('hydrate stays null when no tokens exist at all', () => {
@@ -200,7 +203,7 @@ describe('authStore', () => {
       idToken: 'id',
       expiresAt: Date.now() + 300_000,
     }
-    const owned = { ...legacy, clientId: 'admin-cli' }
+    const owned = { ...legacy, clientId: 'admin-cli', realm: 'master' }
     sessionStorage.setItem('issuerd_tokens', JSON.stringify(legacy))
     localStorage.setItem('issuerd_realm', 'master')
     useAuthStore.getState().hydrate()

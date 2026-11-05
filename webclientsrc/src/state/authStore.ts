@@ -9,12 +9,13 @@ interface TokenSet {
   idToken: string
   expiresAt: number
   clientId?: string
+  realm?: string
 }
 
 interface AuthState {
   tokenSet: TokenSet | null
   currentRealm: string | null
-  setTokenSet: (realm: string, tokenSet: TokenSet | null) => void
+  setTokenSet: (realm: string, tokenSet: TokenSet | null, preserveCurrentRealm?: boolean) => void
   setRealm: (realm: string | null) => void
   logout: () => void
   hydrate: (clientId?: string) => void
@@ -49,7 +50,7 @@ function getStoredTokens(): TokensByRealm {
     const parsed: unknown = JSON.parse(raw)
     if (isTokenSet(parsed)) {
       const realm = localStorage.getItem(STORAGE_KEY_REALM) || 'master'
-      const tokenSet = withClientId(parsed)
+      const tokenSet = { ...withClientId(parsed), realm: parsed.realm ?? realm }
       const migrated: TokensByRealm = { [realm]: { [tokenSet.clientId]: tokenSet } }
       sessionStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(migrated))
       return migrated
@@ -59,7 +60,7 @@ function getStoredTokens(): TokensByRealm {
       let migrated = false
       for (const [realm, value] of Object.entries(parsed)) {
         if (isTokenSet(value)) {
-          const tokenSet = withClientId(value)
+          const tokenSet = { ...withClientId(value), realm: value.realm ?? realm }
           tokens[realm] = { [tokenSet.clientId]: tokenSet }
           migrated = true
           continue
@@ -68,8 +69,8 @@ function getStoredTokens(): TokensByRealm {
         const byClient: TokensByClient = {}
         for (const [clientId, candidate] of Object.entries(value)) {
           if (!isTokenSet(candidate)) continue
-          byClient[clientId] = withClientId(candidate, clientId)
-          if (candidate.clientId !== clientId) migrated = true
+          byClient[clientId] = { ...withClientId(candidate, clientId), realm: candidate.realm ?? realm }
+          if (candidate.clientId !== clientId || candidate.realm === undefined) migrated = true
         }
         if (Object.keys(byClient).length > 0) tokens[realm] = byClient
       }
@@ -86,16 +87,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   tokenSet: null,
   currentRealm: null,
 
-  setTokenSet: (realm, tokenSet) => {
+  setTokenSet: (realm, tokenSet, preserveCurrentRealm = false) => {
     const existing = getStoredTokens()
-    const nextTokenSet = tokenSet ? withClientId(tokenSet) : null
+    const nextTokenSet = tokenSet ? { ...withClientId(tokenSet), realm } : null
     if (nextTokenSet) {
       existing[realm] = { ...existing[realm], [nextTokenSet.clientId]: nextTokenSet }
     } else {
       delete existing[realm]
     }
     sessionStorage.setItem(STORAGE_KEY_TOKENS, JSON.stringify(existing))
-    set({ tokenSet: nextTokenSet, currentRealm: realm })
+    set((state) => ({
+      tokenSet: nextTokenSet,
+      currentRealm: preserveCurrentRealm ? state.currentRealm : realm,
+    }))
   },
 
   setRealm: (realm) => {

@@ -85,6 +85,59 @@ describe('tokenRefresh', () => {
     expect(body).toContain('client_id=admin-cli')
   })
 
+  it('refreshes the selected admin realm instead of switching to master', async () => {
+    useAuthStore.getState().setTokenSet('master', {
+      accessToken: 'old-master-access',
+      refreshToken: 'old-master-refresh',
+      idToken: 'old-master-id',
+      expiresAt: Date.now() + 300_000,
+    })
+    useAuthStore.getState().setTokenSet('mcp-admin-demo', {
+      accessToken: 'old-demo-access',
+      refreshToken: 'old-demo-refresh',
+      idToken: 'old-demo-id',
+      expiresAt: Date.now() + 300_000,
+    })
+    fetchMock.mockResolvedValue(jsonResponse(200, rotatedTokens))
+
+    const outcome = await refreshNow()
+
+    expect(outcome).toBe('ok')
+    const request: Request = fetchMock.mock.calls[0][0]
+    expect(request.url).toBe(
+      `${window.location.origin}/realms/mcp-admin-demo/protocol/openid-connect/token`,
+    )
+    const body = await request.text()
+    expect(body).toContain('refresh_token=old-demo-refresh')
+    expect(body).not.toContain('refresh_token=old-master-refresh')
+    expect(useAuthStore.getState().currentRealm).toBe('mcp-admin-demo')
+    expect(useAuthStore.getState().getTokenSet('mcp-admin-demo')?.accessToken).toBe('new-access')
+    expect(useAuthStore.getState().getTokenSet('master')?.accessToken).toBe('old-master-access')
+  })
+
+  it('refreshes a master-issued admin token without changing the selected realm', async () => {
+    useAuthStore.getState().setTokenSet('master', {
+      accessToken: 'old-master-access',
+      refreshToken: 'old-master-refresh',
+      idToken: 'old-master-id',
+      expiresAt: Date.now() + 300_000,
+    })
+    useAuthStore.getState().setRealm('mcp-admin-demo')
+    fetchMock.mockResolvedValue(jsonResponse(200, rotatedTokens))
+
+    const outcome = await refreshNow()
+
+    expect(outcome).toBe('ok')
+    const request: Request = fetchMock.mock.calls[0][0]
+    expect(request.url).toBe(
+      `${window.location.origin}/realms/master/protocol/openid-connect/token`,
+    )
+    const body = await request.text()
+    expect(body).toContain('refresh_token=old-master-refresh')
+    expect(useAuthStore.getState().currentRealm).toBe('mcp-admin-demo')
+    expect(useAuthStore.getState().getTokenSet('master')?.accessToken).toBe('new-access')
+  })
+
   it('refreshes standalone account tokens as account-console without overwriting admin', async () => {
     window.history.pushState({}, '', '/realms/master/account')
     useAuthStore.getState().setTokenSet('master', {
