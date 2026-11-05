@@ -779,6 +779,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn frontchannel_page_escapes_html_and_javascript_url_contexts() {
+        let iframe_url =
+            "https://client.example/logout?x=\"><script>alert('iframe')</script>&emoji=☃";
+        let continue_url =
+            "https://app.example/continue?x=\"></script><script>alert('continue')</script>&emoji=☃";
+
+        let response = frontchannel_logout_page(Some(continue_url), &[iframe_url.to_string()]);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            body.contains(concat!(
+                r#"<iframe src="https://client.example/logout?x=&quot;&gt;"#,
+                r#"&lt;script&gt;alert(&#39;iframe&#39;)&lt;/script&gt;"#,
+                r#"&amp;emoji=☃" style="display:none" title="logout"></iframe>"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(concat!(
+                r#"<a href="https://app.example/continue?x=&quot;&gt;"#,
+                r#"&lt;/script&gt;&lt;script&gt;alert(&#39;continue&#39;)&lt;/script&gt;"#,
+                r#"&amp;emoji=☃">Continue</a>"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(concat!(
+                r#"window.location.replace("https://app.example/continue?x=\">"#,
+                r#"\u003c/script>\u003cscript>alert('continue')\u003c/script>&emoji=☃");"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(concat!(
+                r#"<noscript><meta http-equiv="refresh" content="3;url=https://app.example/continue?x=&quot;&gt;"#,
+                r#"&lt;/script&gt;&lt;script&gt;alert(&#39;continue&#39;)&lt;/script&gt;"#,
+                r#"&amp;emoji=☃"></noscript>"#
+            )),
+            "{body}"
+        );
+        assert_eq!(body.matches("</script>").count(), 1, "{body}");
+        assert!(!body.contains("<script>alert"), "{body}");
+        assert!(!body.contains(iframe_url), "{body}");
+        assert!(!body.contains(continue_url), "{body}");
+        assert!(body.contains("☃"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn frontchannel_urls_encode_session_parameters_and_keep_existing_query() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let realm_id = RealmId::new("master").unwrap();
+        let mut client = client("c-fc-encoded", "fc-encoded-client", None);
+        client.attributes.insert(
+            CLIENT_ATTR_FRONTCHANNEL_LOGOUT_URI.to_string(),
+            "https://client.example.com/fc-logout?existing=keep".to_string(),
+        );
+        storage.create_client(&realm_id, &client).await.unwrap();
+        let user = user(&realm_id);
+        let mut session = session_for(&realm_id, &user, &[&client]);
+        session.id = SessionId::new("sess +&=/☃").unwrap();
+        for client_session in &mut session.clients {
+            client_session.session_id = session.id.clone();
+        }
+
+        let urls = frontchannel_logout_urls(
+            &storage,
+            &realm_id,
+            "https://issuer.example.com/realms/master?tenant=a b&next=/",
+            &session,
+        )
+        .await;
+
+        let expected = concat!(
+            "https://client.example.com/fc-logout?existing=keep",
+            "&iss=https%3A%2F%2Fissuer.example.com%2Frealms%2Fmaster",
+            "%3Ftenant%3Da+b%26next%3D%2F",
+            "&sid=sess+%2B%26%3D%2F%E2%98%83"
+        );
+        assert_eq!(urls, vec![expected.to_string()]);
+    }
+
+    #[test]
+    fn issuer_for_realm_trims_all_trailing_slashes() {
+        for base in [
+            "https://issuer.example.com",
+            "https://issuer.example.com/",
+            "https://issuer.example.com///",
+        ] {
+            assert_eq!(
+                issuer_for_realm(base, "master"),
+                "https://issuer.example.com/realms/master"
+            );
+        }
+        assert_eq!(
+            issuer_for_realm("https://issuer.example.com/iam///", "tenant"),
+            "https://issuer.example.com/iam/realms/tenant"
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct RecordedLogoutRequest {
         method: String,

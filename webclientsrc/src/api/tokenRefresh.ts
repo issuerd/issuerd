@@ -36,8 +36,10 @@ let sessionExpiredHandler: (() => void) | null = null
 let listenersAttached = false
 
 function currentTokens() {
-  const realm = getAccountRealm()
-  return { realm, tokenSet: useAuthStore.getState().getTokenSet(realm, getConsoleClientId()) }
+  const state = useAuthStore.getState()
+  const active = state.tokenSet
+  const realm = active?.realm ?? getAccountRealm()
+  return { realm, tokenSet: state.getTokenSet(realm, getConsoleClientId()) ?? active }
 }
 
 function clearTimer() {
@@ -130,7 +132,7 @@ async function doRefresh(): Promise<RefreshOutcome> {
     idToken: data.id_token || tokenSet.idToken,
     expiresAt: Date.now() + (data.expires_in || 300) * 1000,
     clientId: tokenSet.clientId ?? CONFIG.CLIENT_ID,
-  })
+  }, true)
   schedule()
   return 'ok'
 }

@@ -29,11 +29,11 @@ export function consoleHref(path: string): string {
 export const ACCOUNT_CLIENT_ID = 'account-console'
 const ACCOUNT_PATH = /^\/realms\/([^/]+)\/account/
 
-/** Realm of the account-console bundle, parsed from the URL path (`/realms/{realm}/account/...`). */
+/** Realm of the account-console URL, or the admin console's selected realm. */
 export function getAccountRealm(): string {
   if (typeof window === 'undefined') return CONFIG.REALM
   const match = window.location.pathname.match(ACCOUNT_PATH)
-  return match?.[1] || CONFIG.REALM
+  return match?.[1] || useAuthStore.getState().currentRealm || CONFIG.REALM
 }
 
 export function getConsoleClientId(): string {
