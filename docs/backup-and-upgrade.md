@@ -130,8 +130,10 @@ docker compose exec -T postgres pg_dump -U issuerd -Fc issuerd > issuerd-$(date 
 
 ```bash
 install -d -m 0750 /var/backups/issuerd
+umask 077
 sqlite3 /var/lib/issuerd/issuerd.db \
   "VACUUM INTO '/var/backups/issuerd/issuerd-2026-11-05.db';"
+chmod 0600 /var/backups/issuerd/issuerd-2026-11-05.db
 sqlite3 /var/backups/issuerd/issuerd-2026-11-05.db \
   "PRAGMA integrity_check; PRAGMA foreign_key_check;"
 ```

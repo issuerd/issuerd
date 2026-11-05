@@ -17,6 +17,7 @@ use std::{
 use tracing::{error, info, instrument};
 
 use crate::db_types::*;
+use crate::migration::SQLITE_BUSY;
 use crate::sqlite_types::{SqliteConsent, SqliteUserSession};
 
 #[cfg(unix)]
@@ -24,6 +25,18 @@ fn secure_owner_only(path: &Path) -> Result<(), IssuerdError> {
     use std::os::unix::fs::PermissionsExt;
 
     if path.exists() {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            IssuerdError::ServerError(format!(
+                "SQLite file metadata failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(IssuerdError::InvalidRequest(format!(
+                "SQLite path is not a regular file: {}",
+                path.display()
+            )));
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
             |error| {
                 IssuerdError::ServerError(format!(
@@ -190,7 +203,6 @@ impl SqliteStorage {
 }
 
 const MAX_BUSY_ATTEMPTS: usize = 4;
-const SQLITE_BUSY: &str = "SQLite database is locked";
 
 fn is_busy(error: &IssuerdError) -> bool {
     matches!(error, IssuerdError::ServerError(message) if message == SQLITE_BUSY)
@@ -224,12 +236,7 @@ async fn begin_immediate_with_retry(
 
 fn sqlx_err(e: sqlx::Error) -> IssuerdError {
     match e {
-        sqlx::Error::Database(ref db)
-            if db
-                .code()
-                .and_then(|code| code.parse::<i32>().ok())
-                .is_some_and(|code| matches!(code & 0xff, 5 | 6)) =>
-        {
+        sqlx::Error::Database(_) if crate::migration::is_sqlite_busy_error(&e) => {
             IssuerdError::ServerError(SQLITE_BUSY.into())
         }
         sqlx::Error::Database(ref db)
@@ -4387,6 +4394,50 @@ mod tests {
         assert!(elapsed < Duration::from_secs(20), "retry budget was not bounded: {elapsed:?}");
         release.await.unwrap();
         assert!(storage.get_realm(&realm.id).await.unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_non_regular_paths_are_rejected_without_chmod() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let original_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        let result = SqliteStorage::connect(dir.path()).await;
+        assert!(matches!(result, Err(IssuerdError::InvalidRequest(_))));
+        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode(), original_mode);
+
+        let target = dir.path().join("target.db");
+        std::fs::write(&target, b"not a database").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("linked.db");
+        symlink(&target, &link).unwrap();
+        let result = SqliteStorage::connect(&link).await;
+        assert!(matches!(result, Err(IssuerdError::InvalidRequest(_))));
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_schema_migrations_retry_after_external_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issuerd.db");
+        let storage = SqliteStorage::connect(&path).await.unwrap();
+        let options = SqliteConnectOptions::new().filename(&path);
+        let lock_pool =
+            SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+        let lock = lock_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            lock.commit().await.unwrap();
+        });
+
+        storage.run_migrations().await.unwrap();
+        release.await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, 19);
     }
 
     #[tokio::test]

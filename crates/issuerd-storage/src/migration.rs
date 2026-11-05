@@ -4,7 +4,28 @@
 // Embedded SQLx migration runner.
 
 use issuerd_core::IssuerdError;
+use sqlx::migrate::MigrateError;
 use tracing::info;
+
+pub(crate) const SQLITE_BUSY: &str = "SQLite database is locked";
+
+pub(crate) fn is_sqlite_busy_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db)
+    if db.code().and_then(|code| code.parse::<i32>().ok()).is_some_and(
+        |code| matches!(code & 0xff, 5 | 6),
+    ))
+}
+
+fn map_sqlite_migration_error(error: MigrateError) -> IssuerdError {
+    match &error {
+        MigrateError::Execute(inner) | MigrateError::ExecuteMigration(inner, _)
+            if is_sqlite_busy_error(inner) =>
+        {
+            IssuerdError::ServerError(SQLITE_BUSY.into())
+        }
+        _ => IssuerdError::ServerError(format!("migration failed: {error}")),
+    }
+}
 
 /// Run embedded SQLx migrations.
 pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), IssuerdError> {
@@ -23,7 +44,7 @@ pub async fn run_sqlite_migrations(pool: &sqlx::SqlitePool) -> Result<(), Issuer
     sqlx::migrate!("./migrations-sqlite")
         .run(pool)
         .await
-        .map_err(|e| IssuerdError::ServerError(format!("migration failed: {e}")))?;
+        .map_err(map_sqlite_migration_error)?;
     info!("SQLite schema migrations completed");
     Ok(())
 }
