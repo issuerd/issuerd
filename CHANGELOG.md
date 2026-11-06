@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Operational user administration over MCP.** The endpoint now has 71 curated tools: `users_request_password_reset` sends only the signed `UPDATE_PASSWORD` action link without exposing passwords; `users_clear_lockout` clears brute-force state; `users_update_credential_label` manages device names; and strict `users_remove_second_factor` removes an exact lost TOTP/HOTP/second-factor WebAuthn credential after fresh operation-bound approval, with full user/realm/credential-set preconditions, rejection of password or passwordless deletion, and a surviving supported primary sign-in method (active password, configured LDAP/Kerberos federation, enabled broker link, or a bound email-code browser flow with an email address). Credential relabeling and removal accept existing non-UUID credential IDs where the backend permits them. `users_create` and `users_update` now validate required-action IDs through the plugin registry and reject duplicates. Password-reset lifespans are positive and capped at 365 days; generic action-email retains previously valid lifespans while both paths reject timestamp/cache-duration overflow before token creation or SMTP side effects. Existing enable/disable, session revocation, group, and role operations complete the support workflows. ([#39](https://github.com/issuerd/issuerd/issues/39))
+
 ### Fixed
 
 - **Admin console realm selection.** Token refresh now preserves the selected admin realm instead of replacing it with the token's issuer realm. Refresh requests still target the issuer realm, including master-issued cross-realm admin sessions, and restored legacy token sets infer that issuer from their storage keys.

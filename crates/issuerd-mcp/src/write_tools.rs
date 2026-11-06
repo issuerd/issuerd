@@ -82,10 +82,31 @@ pub struct UserSetEnabledArgs {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserClearLockoutArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserActionsEmailArgs {
     pub id: String,
     pub actions: Vec<String>,
     pub lifespan: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserPasswordResetArgs {
+    pub id: String,
+    pub lifespan: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserCredentialLabelArgs {
+    pub id: String,
+    pub credential_id: String,
+    pub user_label: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -195,13 +216,16 @@ pub fn is_admin_write(tool: ToolName) -> bool {
             | ToolName::RolesUpdate
             | ToolName::UsersAddToGroup
             | ToolName::UsersAssignRole
+            | ToolName::UsersClearLockout
             | ToolName::UsersCreate
             | ToolName::UsersRemoveFromGroup
+            | ToolName::UsersRequestPasswordReset
             | ToolName::UsersRevokeSessions
             | ToolName::UsersSendActionsEmail
             | ToolName::UsersSetEnabled
             | ToolName::UsersUnassignRole
             | ToolName::UsersUpdate
+            | ToolName::UsersUpdateCredentialLabel
     )
 }
 
@@ -213,7 +237,10 @@ pub fn parse_operation(
         ToolName::UsersCreate => canonical::<UserCreateArgs>(arguments)?,
         ToolName::UsersUpdate => canonical::<UserUpdateArgs>(arguments)?,
         ToolName::UsersSetEnabled => canonical::<UserSetEnabledArgs>(arguments)?,
+        ToolName::UsersClearLockout => canonical::<UserClearLockoutArgs>(arguments)?,
         ToolName::UsersSendActionsEmail => canonical::<UserActionsEmailArgs>(arguments)?,
+        ToolName::UsersRequestPasswordReset => canonical::<UserPasswordResetArgs>(arguments)?,
+        ToolName::UsersUpdateCredentialLabel => canonical::<UserCredentialLabelArgs>(arguments)?,
         ToolName::UsersRevokeSessions => canonical::<UserRevokeSessionsArgs>(arguments)?,
         ToolName::UsersAddToGroup | ToolName::UsersRemoveFromGroup => {
             canonical::<UserGroupArgs>(arguments)?
@@ -251,15 +278,26 @@ pub fn definition(name: ToolName) -> Option<Tool> {
         return None;
     }
     let description = match name {
-        ToolName::UsersCreate => "Create a user without an initial password or credential payload.",
+        ToolName::UsersCreate => {
+            "Create a user with profile and registered required actions, without credentials."
+        }
         ToolName::UsersUpdate => {
-            "Update user profile fields and safe attributes without changing enabled state."
+            "Update profile fields, registered required actions, and safe attributes; enabled state is separate."
         }
         ToolName::UsersSetEnabled => {
             "Enable or disable a user without changing other profile fields."
         }
+        ToolName::UsersClearLockout => {
+            "Clear a user's brute-force failure counters and lockout markers across all source IPs."
+        }
         ToolName::UsersSendActionsEmail => {
             "Send a required-action email through the existing Admin flow."
+        }
+        ToolName::UsersRequestPasswordReset => {
+            "Email the user a signed UPDATE_PASSWORD action link; never accepts or returns a password."
+        }
+        ToolName::UsersUpdateCredentialLabel => {
+            "Rename a user's credential without exposing credential material; an empty userLabel clears the label."
         }
         ToolName::UsersRevokeSessions => "Revoke one user session or every session of a user.",
         ToolName::UsersAddToGroup => "Add a user to an existing group.",
@@ -285,7 +323,10 @@ pub fn definition(name: ToolName) -> Option<Tool> {
         ToolName::UsersCreate => tool.with_input_schema::<UserCreateArgs>(),
         ToolName::UsersUpdate => tool.with_input_schema::<UserUpdateArgs>(),
         ToolName::UsersSetEnabled => tool.with_input_schema::<UserSetEnabledArgs>(),
+        ToolName::UsersClearLockout => tool.with_input_schema::<UserClearLockoutArgs>(),
         ToolName::UsersSendActionsEmail => tool.with_input_schema::<UserActionsEmailArgs>(),
+        ToolName::UsersRequestPasswordReset => tool.with_input_schema::<UserPasswordResetArgs>(),
+        ToolName::UsersUpdateCredentialLabel => tool.with_input_schema::<UserCredentialLabelArgs>(),
         ToolName::UsersRevokeSessions => tool.with_input_schema::<UserRevokeSessionsArgs>(),
         ToolName::UsersAddToGroup | ToolName::UsersRemoveFromGroup => {
             tool.with_input_schema::<UserGroupArgs>()
@@ -312,7 +353,8 @@ pub fn definition(name: ToolName) -> Option<Tool> {
             | ToolName::RolesCreate
             | ToolName::ClientsCreate
     );
-    let external = matches!(name, ToolName::UsersSendActionsEmail);
+    let external =
+        matches!(name, ToolName::UsersSendActionsEmail | ToolName::UsersRequestPasswordReset);
     Some(
         tool.with_output_schema::<WriteOutput>()
             .with_annotations(ToolAnnotations::from_raw(
@@ -335,6 +377,12 @@ mod tests {
         for (tool, value) in [
             (ToolName::UsersCreate, json!({"username":"alice","credentials":[]})),
             (ToolName::UsersUpdate, json!({"id":"user","enabled":false})),
+            (ToolName::UsersClearLockout, json!({"id":"user","enabled":true})),
+            (ToolName::UsersRequestPasswordReset, json!({"id":"user","password":"secret"})),
+            (
+                ToolName::UsersUpdateCredentialLabel,
+                json!({"id":"user","credentialId":"credential","userLabel":"Phone","secretData":"secret"}),
+            ),
             (ToolName::ClientsCreate, json!({"clientId":"agent","secret":"secret"})),
             (
                 ToolName::ClientsCreate,
@@ -354,13 +402,13 @@ mod tests {
             assert_eq!(definition.annotations.as_ref().unwrap().destructive_hint, Some(false));
             assert_eq!(definition.output_schema.unwrap()["type"], "object");
         }
-        assert_eq!(
-            definition(ToolName::UsersSendActionsEmail)
-                .unwrap()
-                .annotations
-                .unwrap()
-                .open_world_hint,
-            Some(true)
-        );
+        for tool in [
+            ToolName::UsersSendActionsEmail,
+            ToolName::UsersRequestPasswordReset,
+        ] {
+            let annotations = definition(tool).unwrap().annotations.unwrap();
+            assert_eq!(annotations.open_world_hint, Some(true));
+            assert_eq!(annotations.idempotent_hint, Some(false));
+        }
     }
 }

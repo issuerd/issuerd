@@ -11,6 +11,7 @@ The documentation is written against the repository itself (configuration struct
 - [Deployment guides](#deployment-guides)
 - [Administration and integration](#administration-and-integration)
 - [Agentic and MCP workloads](#agentic-and-mcp-workloads)
+- [Engineering articles](#engineering-articles)
 - [Identity sources](#identity-sources)
 - [Operations](#operations)
 - [Related references](#related-references)
@@ -29,6 +30,8 @@ Depending on your role, you will typically read the set in this order:
 | Connecting external identity providers | [Identity brokering](identity-brokering.md) → [Security](security.md) |
 | Application developer | [Client integration](client-integration.md) → [Configuration](configuration.md) (CORS, issuer) |
 | Building an AI agent or MCP server | [Agentic IAM: MCP tool calls](agentic-iam-mcp.md) → [Human step-up approval with CIBA](ciba-step-up.md) → [Client integration](client-integration.md) → [runnable demo](../examples/agentic-mcp/) |
+| Letting an agent administer a realm | [MCP server](mcp-server.md) → [Exact-operation security article](mcp-exact-operation-approval.md) → [runnable acceptance example](../examples/mcp-admin/) |
+| Reviewing protocol evidence | [OpenID conformance and certification](openid-conformance.md) → [conformance harness](../tests/conformance/README.md) → [coverage](../tests/conformance/COVERAGE.md) |
 
 ## Documents
 
@@ -59,10 +62,18 @@ Depending on your role, you will typically read the set in this order:
 
 | Document | What it covers |
 |---|---|
-| [MCP server](mcp-server.md) | The realm-scoped external MCP endpoint: 67 curated read/write/account/strict tools, three read-only resources, exact operation-bound CIBA, resource provenance, DPoP by default, dual-era stateless transport, and real TypeScript/`rmcp` acceptance rigs. |
+| [MCP server](mcp-server.md) | The realm-scoped external MCP endpoint: 71 curated read/write/account/strict tools, three read-only resources, exact operation-bound CIBA, resource provenance, DPoP by default, dual-era stateless transport, and real TypeScript/`rmcp` acceptance rigs. |
 | [Agentic IAM: MCP tool calls with DPoP and token exchange](agentic-iam-mcp.md) | Securing AI-agent tool calls end to end and governing non-human identities: DPoP sender-constraining (`cnf.jkt`, single-use `jti` replay cache), RFC 8693 audience/scope attenuation per call (per-tool scoped credentials), the resource-server enforcement checklist, a live failure matrix, and the recorded MCP demo. |
 | [Human step-up approval with CIBA](ciba-step-up.md) | Client-Initiated Backchannel Authentication (poll mode) as the human-in-the-loop for privileged agent actions: endpoints and parameters, binding messages, DPoP-bound step-up tokens, the step-up configuration pattern, and the recorded refund-approval demo. |
-| [Runnable example: `examples/agentic-mcp/`](../examples/agentic-mcp/) | The same scenario as a self-contained docker compose stack (chat agent + MCP server + PostgreSQL RLS): `docker compose up -d`, sign in as alice/changeme, and watch every protocol step in the security-trace panel. |
+| [Runnable example: `examples/agentic-mcp/`](../examples/agentic-mcp/) | The external downstream-agent scenario as a self-contained docker compose stack (chat agent + MCP server + PostgreSQL RLS): `docker compose up -d`, sign in as alice/changeme, and watch every protocol step in the security-trace panel. |
+| [Runnable example: `examples/mcp-admin/`](../examples/mcp-admin/) | Official-TypeScript-SDK acceptance for the built-in endpoint: code + PKCE + DPoP, reads/resources, ordinary writes, exact-operation approval, replay reconciliation, and a three-node rig. |
+
+### Engineering articles
+
+| Document | What it covers |
+|---|---|
+| [One approval, one exact operation](mcp-exact-operation-approval.md) | The security architecture of agent-native administration: model-independent server policy, risk tiers, canonical operation binding, fresh CIBA approval, atomic mutation, and reconciliation across three nodes. |
+| [OpenID conformance and certification](openid-conformance.md) | What self-hosted engineering runs, OIDF-hosted evidence, and registry entries each prove; the 11-profile version matrix, expected results, and the v0.1.19 resubmission. |
 
 ### Identity sources
 
@@ -89,7 +100,7 @@ These documents live outside `docs/` but are part of the operational picture:
 |---|---|
 | [README.md](../README.md) | Project overview, feature list, standards coverage, quickstart. |
 | [ARCHITECTURE.md](../ARCHITECTURE.md) | High-level design and module contracts. |
-| [CHANGELOG.md](../CHANGELOG.md) | Project changelog (currently: initial release). |
+| [CHANGELOG.md](../CHANGELOG.md) | Project changelog and release history. |
 | [tests/KEYCLOAK_DIFFS.md](../tests/KEYCLOAK_DIFFS.md) | Every deliberate behavioral divergence from Keycloak 24. |
 | [tests/conformance/README.md](../tests/conformance/README.md) | OIDC conformance suite harness and results. |
 | [examples/](../examples/) | Fully-commented example server and provision configs (regenerable via `issuerd example`). |
