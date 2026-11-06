@@ -4470,4 +4470,59 @@ mod tests {
         assert_eq!(stored.error.as_deref(), Some("that email address is already in use"));
         assert!(storage.get_user_by_username(&realm_id, "unique-name").await.unwrap().is_none());
     }
+
+    async fn seed_keycloak_link_scenario(
+        storage: &TestStorage,
+        cache: &TestCache,
+        execution: &str,
+        cred: &issuerd_core::Credential,
+    ) -> User {
+        let realm_id = master_realm_id();
+        seed_broker_idp(storage, &realm_id).await;
+        let user = broker_user(&realm_id, "existing-user", true);
+        storage.create_user(&realm_id, &user).await.unwrap();
+        storage.create_credential(&realm_id, &user.id, cred).await.unwrap();
+        let entry = first_login_entry(&realm_id, "link", Some(user.id.to_string()));
+        seed_first_login_entry(cache, &realm_id, execution, &entry).await;
+        user
+    }
+
+    #[tokio::test]
+    async fn submit_link_accepts_keycloak_rows() {
+        for (password, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let (state, storage, cache) = test_state().await;
+            let execution = "exec-link-keycloak";
+            let user = seed_keycloak_link_scenario(&storage, &cache, execution, &cred).await;
+
+            let resp = submit_first_login(&state, execution, link_form(password), true).await;
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{password}");
+            assert!(location(&resp).contains("code="), "{password}");
+            let link = storage
+                .get_identity_provider_link(&master_realm_id(), IDP_ALIAS, "ext-sub-1")
+                .await
+                .unwrap()
+                .expect("identity provider link created");
+            assert_eq!(link.user_id, user.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_link_rejects_wrong_password_on_keycloak_rows() {
+        for (_, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let (state, storage, cache) = test_state().await;
+            let execution = "exec-link-keycloak-wrong";
+            seed_keycloak_link_scenario(&storage, &cache, execution, &cred).await;
+
+            let resp = submit_first_login(&state, execution, link_form("wrong"), true).await;
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(location(&resp), format!("/realms/master/broker/first-login/{execution}"));
+            assert!(storage
+                .get_identity_provider_link(&master_realm_id(), IDP_ALIAS, "ext-sub-1")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
 }

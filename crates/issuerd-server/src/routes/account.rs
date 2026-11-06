@@ -4177,4 +4177,69 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn account_change_password_accepts_keycloak_row_and_upgrades_it() {
+        for (password, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let state = test_state().await;
+            let realm_id = RealmId::new("master").unwrap();
+            let access_token = password_grant_token(&state).await;
+            let user_id = crate::routes::login_api::tests::give_admin_row(&state, &cred).await;
+
+            let resp = account_change_password_handler(
+                State(state.clone()),
+                master_realm(),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                bearer_headers(&access_token),
+                Json(ChangePasswordRequest {
+                    current_password: password.to_string(),
+                    new_password: "N0wPassword!".to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{password}");
+
+            let creds = state
+                .storage
+                .get_credentials(&realm_id, &user_id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(creds.len(), 1);
+            assert!(creds[0].secret_data.starts_with(b"$argon2id$"));
+            assert!(verify_password_hash("N0wPassword!", &creds[0]));
+            assert!(!verify_password_hash(password, &creds[0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn account_change_password_wrong_current_keeps_keycloak_row() {
+        for (_, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let state = test_state().await;
+            let realm_id = RealmId::new("master").unwrap();
+            let access_token = password_grant_token(&state).await;
+            let user_id = crate::routes::login_api::tests::give_admin_row(&state, &cred).await;
+
+            let resp = account_change_password_handler(
+                State(state.clone()),
+                master_realm(),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                bearer_headers(&access_token),
+                Json(ChangePasswordRequest {
+                    current_password: "not-the-password".to_string(),
+                    new_password: "N0wPassword!".to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(resp).await["error"], "current password is incorrect");
+
+            let creds = state
+                .storage
+                .get_credentials(&realm_id, &user_id, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(creds.len(), 1);
+            assert_eq!(creds[0].secret_data, cred.secret_data);
+        }
+    }
 }
