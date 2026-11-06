@@ -1,8 +1,8 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
 #
-# There are currently no ignores; the list must stay empty. Resolved
-# advisories that once carried (or nearly carried) ignores:
+# One temporary exception is documented below and mirrored in deny.toml.
+# Previously resolved advisories that once carried (or nearly carried) ignores:
 #
 # - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction): resolved for real —
 #   the utoipa 6.0 / utoipa-swagger-ui 10.0.2 upgrade (2026-10) builds with
@@ -28,4 +28,10 @@
 #   lockfile nor the build graph. No ignore.
 
 [advisories]
-ignore = []
+# Informational unmaintained notice, not a vulnerability. astral-tokio-tar is
+# reachable only through dev-only testcontainers 0.28.0 and is not shipped in
+# the daemon. No patched testcontainers release exists yet; remove this ignore
+# when https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
+ignore = [
+    "RUSTSEC-2026-0440",
+]

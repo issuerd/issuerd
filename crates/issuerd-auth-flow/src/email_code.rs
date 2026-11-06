@@ -48,7 +48,7 @@ pub const AUTHENTICATOR_ID: &str = "auth-email-code";
 
 /// Realm attribute (`"true"`) that switches the login page into email-code
 /// mode (email field instead of username+password).
-pub const REALM_ATTR_EMAIL_CODE_LOGIN: &str = "email_code_login";
+pub const REALM_ATTR_EMAIL_CODE_LOGIN: &str = issuerd_core::Realm::EMAIL_CODE_LOGIN_ATTRIBUTE;
 /// Realm attribute overriding the generated code length.
 pub const REALM_ATTR_CODE_LENGTH: &str = "email_code_length";
 /// Realm attribute overriding the code entry TTL (seconds).

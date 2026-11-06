@@ -764,6 +764,113 @@ async fn apply_mutation(
                 .rows_affected(),
             )
         }
+        McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id,
+            user_id,
+            expected_user,
+            expected_realm,
+            expected_credential,
+            expected_credentials,
+        } => {
+            let current_realm: Option<PgRealm> =
+                sqlx::query_as("SELECT * FROM realms WHERE id = $1 FOR UPDATE")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let current_user: Option<PgUser> =
+                sqlx::query_as("SELECT * FROM users WHERE realm_id = $1 AND id = $2 FOR UPDATE")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .bind(uuid(user_id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let (Some(current_realm), Some(current_user)) = (current_realm, current_user) else {
+                return Err(IssuerdError::Conflict);
+            };
+            let current_realm: Realm = current_realm.try_into()?;
+            let current_user: User = current_user.try_into()?;
+            let user_matches = redacted_user(current_user.clone()) == expected_user;
+            let realm_matches = redacted_realm(current_realm.clone()) == expected_realm;
+            if !user_matches || !realm_matches {
+                return Err(IssuerdError::Conflict);
+            }
+            let current_credentials: Vec<Credential> = sqlx::query_as::<_, PgCredential>(
+                "SELECT * FROM credentials WHERE realm_id = $1 AND user_id = $2 FOR UPDATE",
+            )
+            .bind(uuid(realm_id.as_ref())?)
+            .bind(uuid(user_id.as_ref())?)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(sqlx_error)?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+            let identity_providers: Vec<IdentityProviderConfig> =
+                sqlx::query_as::<_, PgIdentityProvider>(
+                    "SELECT * FROM identity_providers WHERE realm_id = $1 FOR UPDATE",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?;
+            let identity_provider_links: Vec<IdentityProviderLink> =
+                sqlx::query_as::<_, PgIdentityProviderLink>(
+                    "SELECT * FROM identity_provider_links WHERE realm_id = $1 AND user_id = $2 FOR UPDATE",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(user_id.as_ref())?)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?;
+            let flows: Vec<FlowConfig> = sqlx::query_as::<_, PgFlowConfig>(
+                "SELECT * FROM flow_configs WHERE realm_id = $1 FOR UPDATE",
+            )
+            .bind(uuid(realm_id.as_ref())?)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(sqlx_error)?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+            let target_present =
+                expected_credentials.iter().any(|credential| credential == &expected_credential);
+            let has_primary_remaining = has_primary_sign_in_method(
+                &current_user,
+                &current_realm,
+                &current_credentials,
+                &identity_providers,
+                &identity_provider_links,
+                &flows,
+            );
+            let credentials_match =
+                same_credentials(current_credentials.clone(), expected_credentials.clone());
+            if !has_primary_remaining
+                || !target_present
+                || !is_second_factor_credential_type(&expected_credential.credential_type)
+                || !credentials_match
+            {
+                return Err(IssuerdError::Conflict);
+            }
+            expect_one(
+                sqlx::query(
+                    "DELETE FROM credentials WHERE realm_id = $1 AND user_id = $2 AND id = $3",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(user_id.as_ref())?)
+                .bind(uuid(expected_credential.id.as_ref())?)
+                .execute(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .rows_affected(),
+            )
+        }
         McpStepUpMutation::UserRoleMapping {
             realm_id,
             user_id,
@@ -1254,6 +1361,234 @@ mod tests {
                 .status,
             McpStepUpExecutionStatus::FailedDefinite
         );
+
+        let (_, second_user) = realm_and_user();
+        storage.create_user(&realm.id, &second_user).await.unwrap();
+        let second_user = storage.get_user(&realm.id, &second_user.id).await.unwrap().unwrap();
+        let credential = |credential_type| Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"test-only-secret".to_vec(),
+            credential_data: Value::Null,
+            priority: 0,
+        };
+        let password = credential(CredentialType::Password);
+        let second_factor = credential(CredentialType::Totp);
+        storage.create_credential(&realm.id, &second_user.id, &password).await.unwrap();
+        storage
+            .create_credential(&realm.id, &second_user.id, &second_factor)
+            .await
+            .unwrap();
+        let expected_credentials =
+            storage.list_credentials(&realm.id, &second_user.id).await.unwrap();
+        let expected_credential = expected_credentials
+            .iter()
+            .find(|credential| credential.id == second_factor.id)
+            .unwrap()
+            .clone();
+        let mutation = McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id: realm.id.clone(),
+            user_id: second_user.id.clone(),
+            expected_user: second_user.clone(),
+            expected_realm: realm.clone(),
+            expected_credential: expected_credential.clone(),
+            expected_credentials,
+        };
+        let mut second_grant = test_grant(&second_user);
+        second_grant.tool = mutation.tool().into();
+        second_grant.mutation = mutation;
+        storage.create_mcp_step_up_grant(&second_grant).await.unwrap();
+        let mut changed_credential = expected_credential;
+        changed_credential.user_label = Some("changed after approval".into());
+        storage
+            .update_credential(&realm.id, &second_user.id, &changed_credential)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &second_grant.token_jti,
+                    &second_grant.operation_hash,
+                    &second_grant.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::Conflict
+        );
+        assert_eq!(storage.list_credentials(&realm.id, &second_user.id).await.unwrap().len(), 2);
+        assert_eq!(
+            storage
+                .get_mcp_step_up_grant(&second_grant.token_jti)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            McpStepUpExecutionStatus::FailedDefinite
+        );
+
+        let (_, second_only_user) = realm_and_user();
+        storage.create_user(&realm.id, &second_only_user).await.unwrap();
+        let second_only_user =
+            storage.get_user(&realm.id, &second_only_user.id).await.unwrap().unwrap();
+        let totp = credential(CredentialType::Totp);
+        let webauthn = credential(CredentialType::WebAuthn);
+        for credential in [&totp, &webauthn] {
+            storage
+                .create_credential(&realm.id, &second_only_user.id, credential)
+                .await
+                .unwrap();
+        }
+        let expected_credentials =
+            storage.list_credentials(&realm.id, &second_only_user.id).await.unwrap();
+        let expected_credential = expected_credentials
+            .iter()
+            .find(|credential| credential.id == totp.id)
+            .unwrap()
+            .clone();
+        let mutation = McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id: realm.id.clone(),
+            user_id: second_only_user.id.clone(),
+            expected_user: second_only_user.clone(),
+            expected_realm: realm.clone(),
+            expected_credential,
+            expected_credentials,
+        };
+        let mut second_only_grant = test_grant(&second_only_user);
+        second_only_grant.tool = mutation.tool().into();
+        second_only_grant.mutation = mutation;
+        storage.create_mcp_step_up_grant(&second_only_grant).await.unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &second_only_grant.token_jti,
+                    &second_only_grant.operation_hash,
+                    &second_only_grant.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::Conflict
+        );
+        assert_eq!(
+            storage.list_credentials(&realm.id, &second_only_user.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            storage
+                .get_mcp_step_up_grant(&second_only_grant.token_jti)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            McpStepUpExecutionStatus::FailedDefinite
+        );
+
+        let (_, custom_user) = realm_and_user();
+        storage.create_user(&realm.id, &custom_user).await.unwrap();
+        let custom_user = storage.get_user(&realm.id, &custom_user.id).await.unwrap().unwrap();
+        let totp = credential(CredentialType::Totp);
+        let custom = credential(CredentialType::Custom("unknown-second-factor".into()));
+        for credential in [&totp, &custom] {
+            storage.create_credential(&realm.id, &custom_user.id, credential).await.unwrap();
+        }
+        let expected_credentials =
+            storage.list_credentials(&realm.id, &custom_user.id).await.unwrap();
+        let expected_credential = expected_credentials
+            .iter()
+            .find(|credential| credential.id == totp.id)
+            .unwrap()
+            .clone();
+        let mutation = McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id: realm.id.clone(),
+            user_id: custom_user.id.clone(),
+            expected_user: custom_user.clone(),
+            expected_realm: realm.clone(),
+            expected_credential,
+            expected_credentials,
+        };
+        let mut custom_grant = test_grant(&custom_user);
+        custom_grant.tool = mutation.tool().into();
+        custom_grant.mutation = mutation;
+        storage.create_mcp_step_up_grant(&custom_grant).await.unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &custom_grant.token_jti,
+                    &custom_grant.operation_hash,
+                    &custom_grant.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::Conflict
+        );
+        assert_eq!(storage.list_credentials(&realm.id, &custom_user.id).await.unwrap().len(), 2);
+        assert_eq!(
+            storage
+                .get_mcp_step_up_grant(&custom_grant.token_jti)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            McpStepUpExecutionStatus::FailedDefinite
+        );
+
+        let directory = IdentityProviderConfig {
+            id: IdentityProviderId::new(uuid::Uuid::new_v4()).unwrap(),
+            alias: Alias::new("federated-primary").unwrap(),
+            provider_id: ProviderId::Ldap,
+            enabled: true,
+            config: Default::default(),
+        };
+        storage.create_identity_provider(&realm.id, &directory).await.unwrap();
+        let (_, mut federated_user) = realm_and_user();
+        federated_user.federation_link = Some(directory.id.to_string());
+        storage.create_user(&realm.id, &federated_user).await.unwrap();
+        let federated_user =
+            storage.get_user(&realm.id, &federated_user.id).await.unwrap().unwrap();
+        let totp = credential(CredentialType::Totp);
+        storage.create_credential(&realm.id, &federated_user.id, &totp).await.unwrap();
+        let expected_credentials =
+            storage.list_credentials(&realm.id, &federated_user.id).await.unwrap();
+        let expected_credential = expected_credentials[0].clone();
+        let mutation = McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id: realm.id.clone(),
+            user_id: federated_user.id.clone(),
+            expected_user: federated_user.clone(),
+            expected_realm: realm.clone(),
+            expected_credential,
+            expected_credentials,
+        };
+        let mut federated_grant = test_grant(&federated_user);
+        federated_grant.tool = mutation.tool().into();
+        federated_grant.mutation = mutation;
+        storage.create_mcp_step_up_grant(&federated_grant).await.unwrap();
+        storage.delete_identity_provider(&realm.id, &directory.id).await.unwrap();
+        assert_eq!(
+            storage
+                .execute_mcp_step_up(
+                    &federated_grant.token_jti,
+                    &federated_grant.operation_hash,
+                    &federated_grant.mutation,
+                    Value::Null,
+                )
+                .await
+                .unwrap_err(),
+            IssuerdError::Conflict
+        );
+        assert_eq!(storage.list_credentials(&realm.id, &federated_user.id).await.unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .get_mcp_step_up_grant(&federated_grant.token_jti)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            McpStepUpExecutionStatus::FailedDefinite
+        );
     }
 
     #[tokio::test]
@@ -1463,6 +1798,45 @@ mod tests {
     }
 
     async fn execute_variant(storage: &dyn Storage, subject: &User, mutation: McpStepUpMutation) {
+        if let McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id,
+            user_id,
+            expected_user,
+            expected_realm,
+            expected_credentials,
+            ..
+        } = &mutation
+        {
+            let current_user = storage.get_user(realm_id, user_id).await.unwrap().unwrap();
+            assert!(
+                redacted_user(current_user.clone()) == redacted_user(expected_user.clone()),
+                "user precondition"
+            );
+            let current_realm = storage.get_realm(realm_id).await.unwrap().unwrap();
+            assert!(
+                redacted_realm(current_realm.clone()) == redacted_realm(expected_realm.clone()),
+                "realm precondition"
+            );
+            let current_credentials = storage.list_credentials(realm_id, user_id).await.unwrap();
+            assert!(
+                same_credentials(current_credentials.clone(), expected_credentials.clone()),
+                "credential-set precondition"
+            );
+            let providers = storage.list_identity_providers(realm_id).await.unwrap();
+            let links = storage.list_identity_provider_links(realm_id, user_id).await.unwrap();
+            let flows = storage.list_flow_configs(realm_id).await.unwrap();
+            assert!(
+                has_primary_sign_in_method(
+                    &current_user,
+                    &current_realm,
+                    &current_credentials,
+                    &providers,
+                    &links,
+                    &flows,
+                ),
+                "primary-method precondition"
+            );
+        }
         let mut grant = test_grant(subject);
         grant.tool = mutation.tool().into();
         grant.mutation = mutation.clone();
@@ -1550,6 +1924,7 @@ mod tests {
         .await;
         assert!(storage.get_user(&realm.id, &subject.id).await.unwrap().is_none());
         storage.create_user(&realm.id, &subject).await.unwrap();
+        let subject = storage.get_user(&realm.id, &subject.id).await.unwrap().unwrap();
 
         let group = test_group(&realm, "delete-group");
         storage.create_group(&realm.id, &group).await.unwrap();
@@ -1810,6 +2185,83 @@ mod tests {
         )
         .await;
 
+        let mut password = webauthn.clone();
+        password.id = CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        password.credential_type = CredentialType::Password;
+        password.secret_data = b"password-secret".to_vec();
+        let mut second_factor = webauthn.clone();
+        second_factor.id = CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        second_factor.credential_type = CredentialType::Totp;
+        second_factor.secret_data = b"second-factor-secret".to_vec();
+        storage.create_credential(&realm.id, &subject.id, &password).await.unwrap();
+        storage.create_credential(&realm.id, &subject.id, &second_factor).await.unwrap();
+        let expected_credentials = storage.list_credentials(&realm.id, &subject.id).await.unwrap();
+        let expected_credential = expected_credentials
+            .iter()
+            .find(|credential| credential.id == second_factor.id)
+            .unwrap()
+            .clone();
+        execute_variant(
+            storage,
+            &subject,
+            McpStepUpMutation::DeleteUserSecondFactor {
+                realm_id: realm.id.clone(),
+                user_id: subject.id.clone(),
+                expected_user: subject.clone(),
+                expected_realm: storage.get_realm(&realm.id).await.unwrap().unwrap(),
+                expected_credential,
+                expected_credentials,
+            },
+        )
+        .await;
+        let remaining = storage.list_credentials(&realm.id, &subject.id).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, password.id);
+        assert_eq!(remaining[0].secret_data, b"password-secret");
+
+        let directory = IdentityProviderConfig {
+            id: IdentityProviderId::new(uuid::Uuid::new_v4()).unwrap(),
+            alias: Alias::new("federated-success").unwrap(),
+            provider_id: ProviderId::Ldap,
+            enabled: true,
+            config: Default::default(),
+        };
+        storage.create_identity_provider(&realm.id, &directory).await.unwrap();
+        let (_, mut federated_user) = realm_and_user();
+        federated_user.federation_link = Some(directory.id.to_string());
+        storage.create_user(&realm.id, &federated_user).await.unwrap();
+        let federated_user =
+            storage.get_user(&realm.id, &federated_user.id).await.unwrap().unwrap();
+        let mut totp = webauthn.clone();
+        totp.id = CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        totp.credential_type = CredentialType::Totp;
+        storage.create_credential(&realm.id, &federated_user.id, &totp).await.unwrap();
+        let expected_credentials =
+            storage.list_credentials(&realm.id, &federated_user.id).await.unwrap();
+        let expected_credential = expected_credentials
+            .iter()
+            .find(|credential| credential.id == totp.id)
+            .unwrap()
+            .clone();
+        execute_variant(
+            storage,
+            &federated_user,
+            McpStepUpMutation::DeleteUserSecondFactor {
+                realm_id: realm.id.clone(),
+                user_id: federated_user.id.clone(),
+                expected_user: federated_user.clone(),
+                expected_realm: storage.get_realm(&realm.id).await.unwrap().unwrap(),
+                expected_credential,
+                expected_credentials,
+            },
+        )
+        .await;
+        assert!(storage
+            .list_credentials(&realm.id, &federated_user.id)
+            .await
+            .unwrap()
+            .is_empty());
+
         let mut mapped_role = test_role(&realm, "mapped-role");
         mapped_role.attributes.insert("api_secret".into(), vec!["role-secret".into()]);
         storage.create_role(&realm.id, &mapped_role).await.unwrap();
@@ -1933,6 +2385,42 @@ mod tests {
     #[tokio::test]
     async fn memory_supports_every_strict_mutation_variant() {
         mutation_matrix(&InMemoryStorage::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_removes_a_non_uuid_second_factor_credential() {
+        let storage = InMemoryStorage::new();
+        let (realm, user) = realm_and_user();
+        storage.create_realm(&realm).await.unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        let user = storage.get_user(&realm.id, &user.id).await.unwrap().unwrap();
+        let password = Credential {
+            id: CredentialId::new("legacy-password").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"password-secret".to_vec(),
+            credential_data: Value::Null,
+            priority: 0,
+        };
+        let mut totp = password.clone();
+        totp.id = CredentialId::new("legacy-totp").unwrap();
+        totp.credential_type = CredentialType::Totp;
+        storage.create_credential(&realm.id, &user.id, &password).await.unwrap();
+        storage.create_credential(&realm.id, &user.id, &totp).await.unwrap();
+        let expected_credentials = storage.list_credentials(&realm.id, &user.id).await.unwrap();
+        let mutation = McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id: realm.id.clone(),
+            user_id: user.id.clone(),
+            expected_user: user.clone(),
+            expected_realm: storage.get_realm(&realm.id).await.unwrap().unwrap(),
+            expected_credential: totp,
+            expected_credentials,
+        };
+        execute_variant(&storage, &user, mutation).await;
+        let remaining = storage.list_credentials(&realm.id, &user.id).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, password.id);
     }
 
     #[tokio::test]

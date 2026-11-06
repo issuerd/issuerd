@@ -79,6 +79,7 @@ pub enum ToolName {
     SessionsList,
     UsersAddToGroup,
     UsersAssignRole,
+    UsersClearLockout,
     UsersCreate,
     UsersDelete,
     UsersGet,
@@ -87,16 +88,19 @@ pub enum ToolName {
     UsersGetRoleMappings,
     UsersGetSessions,
     UsersRemoveFromGroup,
+    UsersRemoveSecondFactor,
+    UsersRequestPasswordReset,
     UsersRevokeSessions,
     UsersSearch,
     UsersSendActionsEmail,
     UsersSetEnabled,
     UsersUnassignRole,
     UsersUpdate,
+    UsersUpdateCredentialLabel,
 }
 
 impl ToolName {
-    pub const ALL: [Self; 67] = [
+    pub const ALL: [Self; 71] = [
         Self::AttackDetectionStatus,
         Self::ClientScopesList,
         Self::ClientsCreate,
@@ -150,6 +154,7 @@ impl ToolName {
         Self::SessionsList,
         Self::UsersAddToGroup,
         Self::UsersAssignRole,
+        Self::UsersClearLockout,
         Self::UsersCreate,
         Self::UsersDelete,
         Self::UsersGet,
@@ -158,12 +163,15 @@ impl ToolName {
         Self::UsersGetRoleMappings,
         Self::UsersGetSessions,
         Self::UsersRemoveFromGroup,
+        Self::UsersRemoveSecondFactor,
+        Self::UsersRequestPasswordReset,
         Self::UsersRevokeSessions,
         Self::UsersSearch,
         Self::UsersSendActionsEmail,
         Self::UsersSetEnabled,
         Self::UsersUnassignRole,
         Self::UsersUpdate,
+        Self::UsersUpdateCredentialLabel,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -221,6 +229,7 @@ impl ToolName {
             Self::SessionsList => "sessions_list",
             Self::UsersAddToGroup => "users_add_to_group",
             Self::UsersAssignRole => "users_assign_role",
+            Self::UsersClearLockout => "users_clear_lockout",
             Self::UsersCreate => "users_create",
             Self::UsersDelete => "users_delete",
             Self::UsersGet => "users_get",
@@ -229,12 +238,15 @@ impl ToolName {
             Self::UsersGetRoleMappings => "users_get_role_mappings",
             Self::UsersGetSessions => "users_get_sessions",
             Self::UsersRemoveFromGroup => "users_remove_from_group",
+            Self::UsersRemoveSecondFactor => "users_remove_second_factor",
+            Self::UsersRequestPasswordReset => "users_request_password_reset",
             Self::UsersRevokeSessions => "users_revoke_sessions",
             Self::UsersSearch => "users_search",
             Self::UsersSendActionsEmail => "users_send_actions_email",
             Self::UsersSetEnabled => "users_set_enabled",
             Self::UsersUnassignRole => "users_unassign_role",
             Self::UsersUpdate => "users_update",
+            Self::UsersUpdateCredentialLabel => "users_update_credential_label",
         }
     }
 
@@ -287,7 +299,8 @@ impl ToolName {
             | Self::RealmDelete
             | Self::RealmUpdateSettings
             | Self::RolesDelete
-            | Self::UsersDelete => RiskTier::T3,
+            | Self::UsersDelete
+            | Self::UsersRemoveSecondFactor => RiskTier::T3,
             _ => RiskTier::T2,
         }
     }
@@ -320,7 +333,7 @@ macro_rules! policy {
     };
 }
 
-pub const POLICIES: [ToolPolicy; 67] = [
+pub const POLICIES: [ToolPolicy; 71] = [
     policy!(AttackDetectionStatus, MCP_SCOPE_READ, MANAGE_USERS),
     policy!(ClientScopesList, MCP_SCOPE_READ, CLIENT_ROLES),
     policy!(ClientsCreate, MCP_SCOPE_WRITE, MANAGE_CLIENTS),
@@ -374,6 +387,7 @@ pub const POLICIES: [ToolPolicy; 67] = [
     policy!(SessionsList, MCP_SCOPE_READ, REALM_ROLES),
     policy!(UsersAddToGroup, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersAssignRole, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersClearLockout, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersCreate, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersDelete, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersGet, MCP_SCOPE_READ, USER_ROLES),
@@ -382,12 +396,15 @@ pub const POLICIES: [ToolPolicy; 67] = [
     policy!(UsersGetRoleMappings, MCP_SCOPE_READ, USER_ROLES),
     policy!(UsersGetSessions, MCP_SCOPE_READ, USER_ROLES),
     policy!(UsersRemoveFromGroup, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersRemoveSecondFactor, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersRequestPasswordReset, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersRevokeSessions, MCP_SCOPE_WRITE, REVOKE_SESSION_ROLES),
     policy!(UsersSearch, MCP_SCOPE_READ, USER_ROLES),
     policy!(UsersSendActionsEmail, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersSetEnabled, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersUnassignRole, MCP_SCOPE_WRITE, MANAGE_USERS),
     policy!(UsersUpdate, MCP_SCOPE_WRITE, MANAGE_USERS),
+    policy!(UsersUpdateCredentialLabel, MCP_SCOPE_WRITE, MANAGE_USERS),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +428,7 @@ impl PolicyDecision {
     }
 }
 
-pub fn policies() -> &'static [ToolPolicy; 67] {
+pub fn policies() -> &'static [ToolPolicy; 71] {
     &POLICIES
 }
 
@@ -505,7 +522,7 @@ mod tests {
     fn policies_are_unique_complete_and_sorted() {
         let names: Vec<_> = policies().iter().map(|policy| policy.tool.as_str()).collect();
         let unique: BTreeSet<_> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 67);
+        assert_eq!(unique.len(), 71);
         assert_eq!(unique, ToolName::ALL.iter().map(|tool| tool.as_str()).collect());
         let mut sorted = names.clone();
         sorted.sort_unstable();

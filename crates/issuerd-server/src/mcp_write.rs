@@ -9,7 +9,7 @@ use issuerd_admin_api::{
     auth::AdminAuth,
     dto::{
         ClientRepresentation, ExecuteActionsEmailParams, GroupRepresentation, RoleRepresentation,
-        UserRepresentation,
+        UpdateCredentialLabelRequest, UserRepresentation,
     },
     error::AdminApiError,
     state::AdminApiState,
@@ -19,8 +19,9 @@ use issuerd_mcp::{
     write_tools::{
         ClientCreateArgs, ClientSetScopesArgs, ClientUpdateProfileArgs, GroupChildArgs,
         GroupCreateArgs, GroupUpdateArgs, McpOperation, RoleAssignmentArgs, RoleCreateArgs,
-        RoleUpdateArgs, UserActionsEmailArgs, UserCreateArgs, UserGroupArgs,
-        UserRevokeSessionsArgs, UserSetEnabledArgs, UserUpdateArgs, WriteOutput,
+        RoleUpdateArgs, UserActionsEmailArgs, UserClearLockoutArgs, UserCreateArgs,
+        UserCredentialLabelArgs, UserGroupArgs, UserPasswordResetArgs, UserRevokeSessionsArgs,
+        UserSetEnabledArgs, UserUpdateArgs, WriteOutput,
     },
     McpAuthContext, McpError, ToolName,
 };
@@ -42,6 +43,7 @@ pub async fn write(
         ToolName::UsersCreate => {
             let args: UserCreateArgs = decode(&operation)?;
             validate_attributes(&args.attributes)?;
+            validate_required_actions(&state, &args.required_actions)?;
             let body = UserRepresentation {
                 id: None,
                 username: required_text(&args.username, "username")?,
@@ -71,6 +73,7 @@ pub async fn write(
         ToolName::UsersUpdate => {
             let args: UserUpdateArgs = decode(&operation)?;
             validate_attributes(&args.attributes)?;
+            validate_required_actions(&state, &args.required_actions)?;
             let id = canonical_uuid(&args.id, "id")?;
             let existing = state
                 .storage
@@ -129,15 +132,53 @@ pub async fn write(
             .map_err(admin_error)?;
             WriteOutput::completed(tool, Some(id))
         }
-        ToolName::UsersSendActionsEmail => {
-            let args: UserActionsEmailArgs = decode(&operation)?;
+        ToolName::UsersClearLockout => {
+            let args: UserClearLockoutArgs = decode(&operation)?;
             let id = canonical_uuid(&args.id, "id")?;
-            if args.actions.is_empty() || args.actions.len() > 20 {
+            issuerd_admin_api::attack_detection::clear_user_brute_force_state(
+                axum::extract::State(state.clone()),
+                Extension(admin),
+                axum::extract::Path((realm, id.clone())),
+            )
+            .await
+            .map_err(admin_error)?;
+            WriteOutput::completed(tool, Some(id))
+        }
+        ToolName::UsersUpdateCredentialLabel => {
+            let args: UserCredentialLabelArgs = decode(&operation)?;
+            let id = canonical_uuid(&args.id, "id")?;
+            let credential_id = required_text(&args.credential_id, "credentialId")?;
+            let user_label = if args.user_label.is_empty() {
+                None
+            } else {
+                optional_text(&Some(args.user_label), "userLabel", 255)?
+            };
+            issuerd_admin_api::credentials::update_credential_label(
+                axum::extract::State(state.clone()),
+                Extension(admin),
+                axum::extract::Path((realm, id.clone(), credential_id)),
+                Json(UpdateCredentialLabelRequest { user_label }),
+            )
+            .await
+            .map_err(admin_error)?;
+            WriteOutput::completed(tool, Some(id))
+        }
+        ToolName::UsersSendActionsEmail | ToolName::UsersRequestPasswordReset => {
+            let (id, actions, lifespan) = if tool == ToolName::UsersSendActionsEmail {
+                let args: UserActionsEmailArgs = decode(&operation)?;
+                (args.id, args.actions, args.lifespan)
+            } else {
+                let args: UserPasswordResetArgs = decode(&operation)?;
+                (args.id, vec!["UPDATE_PASSWORD".into()], args.lifespan)
+            };
+            let id = canonical_uuid(&id, "id")?;
+            validate_action_lifespan(lifespan, tool == ToolName::UsersRequestPasswordReset)?;
+            if actions.is_empty() || actions.len() > 20 {
                 return Err(McpError::InvalidInput(
                     "actions must contain between 1 and 20 action ids".into(),
                 ));
             }
-            for action in &args.actions {
+            for action in &actions {
                 required_text(action, "actions")?;
             }
             issuerd_admin_api::user_actions::execute_actions_email(
@@ -146,9 +187,9 @@ pub async fn write(
                 axum::extract::Path((realm, id.clone())),
                 axum::extract::Query(ExecuteActionsEmailParams {
                     redirect_uri: None,
-                    lifespan: args.lifespan,
+                    lifespan,
                 }),
-                Json(args.actions),
+                Json(actions),
             )
             .await
             .map_err(admin_error)?;
@@ -698,6 +739,63 @@ fn optional_text(
         .transpose()
 }
 
+const MAX_ACTION_EMAIL_LIFESPAN_SECS: i64 = 31_536_000;
+
+fn validate_action_lifespan(lifespan: Option<i64>, password_reset: bool) -> Result<(), McpError> {
+    let Some(lifespan) = lifespan else {
+        return Ok(());
+    };
+    if lifespan <= 0 {
+        return Err(McpError::InvalidInput("lifespan must be positive".into()));
+    }
+    if password_reset && lifespan > MAX_ACTION_EMAIL_LIFESPAN_SECS {
+        return Err(McpError::InvalidInput(
+            "password-reset lifespan must not exceed 31536000 seconds (365 days)".into(),
+        ));
+    }
+    let duration = std::time::Duration::from_secs(lifespan as u64);
+    let timestamp_overflow =
+        lifespan > i64::MAX - chrono::Utc::now().timestamp().saturating_add(60);
+    if timestamp_overflow || std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(McpError::InvalidInput("lifespan is too large".into()));
+    }
+    Ok(())
+}
+
+fn validate_required_actions(
+    state: &Arc<AdminApiState>,
+    actions: &Option<Vec<String>>,
+) -> Result<(), McpError> {
+    let Some(actions) = actions else {
+        return Ok(());
+    };
+    if actions.len() > 20 {
+        return Err(McpError::InvalidInput("at most 20 required actions are allowed".into()));
+    }
+    let unique: HashSet<_> = actions.iter().collect();
+    if unique.len() != actions.len() {
+        return Err(McpError::InvalidInput("required actions must be unique".into()));
+    }
+    for action in actions {
+        required_text(action, "requiredActions")?;
+    }
+    let registered = state.plugin_registry.list_required_action_ids();
+    let known: HashSet<_> = registered.iter().map(String::as_str).collect();
+    let mut unknown: Vec<_> = actions
+        .iter()
+        .map(String::as_str)
+        .filter(|action| !known.contains(action))
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(McpError::InvalidInput(format!(
+            "unknown required action ids: {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn validate_attributes(
     attributes: &Option<std::collections::BTreeMap<String, Vec<String>>>,
 ) -> Result<(), McpError> {
@@ -921,6 +1019,82 @@ mod tests {
         )
         .await
         .unwrap();
+
+        for (family, value) in [("login-failure", "3"), ("login-lockout", "1")] {
+            fixture
+                .state
+                .cache
+                .set(
+                    &format!("{family}:{realm}:mcp-write-user:127.0.0.1"),
+                    value.as_bytes().to_vec(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        call(&fixture, ToolName::UsersClearLockout, json!({"id": user_id}))
+            .await
+            .unwrap();
+        for family in ["login-failure", "login-lockout"] {
+            assert!(fixture
+                .state
+                .cache
+                .scan_keys(&format!("{family}:{realm}:mcp-write-user:*"))
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        let credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("legacy-non-uuid-credential").unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: Utc::now(),
+            secret_data: b"test-only-totp-secret".to_vec(),
+            credential_data: json!({"temporary": false}),
+            priority: 0,
+        };
+        fixture
+            .state
+            .storage
+            .create_credential(realm, &user_uuid, &credential)
+            .await
+            .unwrap();
+        call(
+            &fixture,
+            ToolName::UsersUpdateCredentialLabel,
+            json!({"id": user_id, "credentialId": credential.id.to_string(), "userLabel": "Lost phone"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .get_credentials(realm, &user_uuid, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap()[0]
+                .user_label
+                .as_deref(),
+            Some("Lost phone")
+        );
+        call(
+            &fixture,
+            ToolName::UsersUpdateCredentialLabel,
+            json!({"id": user_id, "credentialId": credential.id.to_string(), "userLabel": ""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .get_credentials(realm, &user_uuid, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap()[0]
+                .user_label,
+            None
+        );
 
         let group_id = id(&call(&fixture, ToolName::GroupsCreate, json!({"name": "mcp-parent"}))
             .await
@@ -1201,7 +1375,151 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(count >= 19, "expected mutation audit events, got {count}");
+        assert!(count >= 22, "expected mutation audit events, got {count}");
+    }
+
+    #[tokio::test]
+    async fn password_reset_sends_only_the_update_password_action() {
+        let fixture = fixture().await;
+        let user_id = id(&call(
+            &fixture,
+            ToolName::UsersCreate,
+            json!({"username": "password-reset-user", "email": "password-reset@example.com"}),
+        )
+        .await
+        .unwrap());
+        let output = call(
+            &fixture,
+            ToolName::UsersRequestPasswordReset,
+            json!({"id": user_id, "lifespan": 600}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["tool"], "users_request_password_reset");
+        assert_eq!(output["status"], "completed");
+
+        let keys = fixture.state.cache.scan_keys("execute-actions:master:*").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        let continuation: Value =
+            serde_json::from_slice(&fixture.state.cache.get(&keys[0]).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(continuation["user_id"], user_id);
+        assert_eq!(continuation["actions"], json!(["UPDATE_PASSWORD"]));
+    }
+
+    #[tokio::test]
+    async fn action_email_rejects_invalid_lifespans_before_side_effects() {
+        let fixture = fixture_with_email(false).await;
+        let user_id = id(&call(
+            &fixture,
+            ToolName::UsersCreate,
+            json!({"username": "invalid-lifespan-user", "email": "invalid-lifespan@example.com"}),
+        )
+        .await
+        .unwrap());
+        for (tool, arguments) in [
+            (ToolName::UsersRequestPasswordReset, json!({"id": user_id, "lifespan": 0})),
+            (
+                ToolName::UsersRequestPasswordReset,
+                json!({"id": user_id, "lifespan": i64::MAX}),
+            ),
+            (
+                ToolName::UsersRequestPasswordReset,
+                json!({"id": user_id, "lifespan": MAX_ACTION_EMAIL_LIFESPAN_SECS + 1}),
+            ),
+            (
+                ToolName::UsersSendActionsEmail,
+                json!({"id": user_id, "actions": ["UPDATE_PASSWORD"], "lifespan": -1}),
+            ),
+            (
+                ToolName::UsersSendActionsEmail,
+                json!({"id": user_id, "actions": ["UPDATE_PASSWORD"], "lifespan": i64::MAX}),
+            ),
+        ] {
+            assert!(call(&fixture, tool, arguments).await.is_err());
+        }
+        assert!(validate_action_lifespan(Some(MAX_ACTION_EMAIL_LIFESPAN_SECS), true).is_ok());
+        assert!(validate_action_lifespan(Some(MAX_ACTION_EMAIL_LIFESPAN_SECS + 1), false).is_ok());
+        assert!(validate_action_lifespan(Some(MAX_ACTION_EMAIL_LIFESPAN_SECS + 1), true).is_err());
+        assert!(fixture
+            .state
+            .cache
+            .scan_keys("execute-actions:master:*")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_create_and_update_validate_required_actions_before_mutating() {
+        let fixture = fixture_with_email(false).await;
+        let user_id = id(&call(
+            &fixture,
+            ToolName::UsersCreate,
+            json!({
+                "username": "required-actions-user",
+                "requiredActions": ["UPDATE_PASSWORD", "VERIFY_EMAIL"]
+            }),
+        )
+        .await
+        .unwrap());
+        let user_uuid = UserId::new(&user_id).unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .get_user(&fixture.realm_id, &user_uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .required_actions,
+            ["UPDATE_PASSWORD", "VERIFY_EMAIL"]
+        );
+        call(
+            &fixture,
+            ToolName::UsersUpdate,
+            json!({"id": user_id, "requiredActions": ["UPDATE_PROFILE"]}),
+        )
+        .await
+        .unwrap();
+
+        assert!(call(
+            &fixture,
+            ToolName::UsersCreate,
+            json!({"username": "unknown-action-user", "requiredActions": ["NOT_REGISTERED"]}),
+        )
+        .await
+        .is_err());
+        assert!(fixture
+            .state
+            .storage
+            .get_user_by_username(&fixture.realm_id, "unknown-action-user")
+            .await
+            .unwrap()
+            .is_none());
+        for actions in [
+            json!(["NOT_REGISTERED"]),
+            json!(["UPDATE_PASSWORD", "UPDATE_PASSWORD"]),
+        ] {
+            assert!(call(
+                &fixture,
+                ToolName::UsersUpdate,
+                json!({"id": user_id, "requiredActions": actions}),
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .get_user(&fixture.realm_id, &user_uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .required_actions,
+            ["UPDATE_PROFILE"]
+        );
     }
 
     #[tokio::test]

@@ -369,6 +369,7 @@ Because the page and its script are served as static files, it is deterministic 
 - On success, the JWT is stored in `sessionStorage` and the Zustand store.
 - The generated API client (`src/api/client.ts`) attaches the token to every request automatically.
 - Token refresh is proactive and activity-gated (`src/api/tokenRefresh.ts`): while the user interacts with the console, the access token is refreshed ~30 s before expiry (each refresh slides the server-side SSO idle window). With no user interaction the refresh stops, the access token lapses, and once the realm's SSO idle timeout passes the server answers the next refresh with `invalid_grant` → the session ends.
+- Each token set records its issuer realm; refresh targets that issuer but preserves the selected admin realm, including master-issued cross-realm administration. Legacy snapshots infer the issuer from their storage keys.
 - On 401, the client interceptor (`src/api/client.ts`) attempts one token refresh and retries the original request; only if the refresh fails with `invalid_grant` (or the retry still 401s) does it call `logout()` and redirect to `/login.html?logged_out=1`.
 - Admin API endpoints require realm-management roles (`view-realm`, `manage-realm`, `view-users`, `manage-users`, etc.). The backend returns 403 if roles are missing.
 

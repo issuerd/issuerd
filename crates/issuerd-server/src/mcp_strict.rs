@@ -10,7 +10,7 @@ use issuerd_mcp::{
     strict_tools::{
         ClientSecurityArgs, DeleteArgs, EventsConfigArgs, FlowUpdateArgs, IdpCreateArgs,
         IdpUpdateArgs, NotBeforeArgs, RealmDeleteArgs, RealmSettingsArgs, RoleDeleteArgs,
-        WebauthnDeleteArgs,
+        UserSecondFactorArgs, WebauthnDeleteArgs,
     },
     write_tools::{McpOperation, RoleAssignmentArgs},
     McpAuthContext, McpError, ToolName,
@@ -41,6 +41,50 @@ pub async fn prepare(
             confirm(&args.confirmation, "DELETE")?;
             let user = load_user(state, realm_id, &args.id).await?;
             McpStepUpMutation::DeleteUser { expected: user }
+        }
+        ToolName::UsersRemoveSecondFactor => {
+            let args: UserSecondFactorArgs = decode(&operation)?;
+            confirm(&args.confirmation, "REMOVE")?;
+            let user = load_user(state, realm_id, &args.id).await?;
+            let realm = load_realm(state, realm_id).await?;
+            bounded_text(&args.credential_id, "credentialId")?;
+            let credential_id = CredentialId::new(&args.credential_id)?;
+            let expected_credentials = state.storage.list_credentials(realm_id, &user.id).await?;
+            let expected_credential = expected_credentials
+                .iter()
+                .find(|credential| credential.id == credential_id)
+                .cloned()
+                .ok_or(McpError::NotFound("second-factor credential"))?;
+            if !is_second_factor_credential_type(&expected_credential.credential_type) {
+                return Err(McpError::Forbidden(
+                    "only TOTP, HOTP, and second-factor WebAuthn credentials can be removed",
+                ));
+            }
+            let identity_providers = state.storage.list_identity_providers(realm_id).await?;
+            let identity_provider_links =
+                state.storage.list_identity_provider_links(realm_id, &user.id).await?;
+            let flows = state.storage.list_flow_configs(realm_id).await?;
+            if !has_primary_sign_in_method(
+                &user,
+                &realm,
+                &expected_credentials,
+                &identity_providers,
+                &identity_provider_links,
+                &flows,
+            ) {
+                return Err(McpError::InvalidInput(
+                    "cannot remove a second factor without a surviving primary sign-in method"
+                        .into(),
+                ));
+            }
+            McpStepUpMutation::DeleteUserSecondFactor {
+                realm_id: realm_id.clone(),
+                user_id: user.id.clone(),
+                expected_user: user,
+                expected_realm: realm,
+                expected_credential,
+                expected_credentials,
+            }
         }
         ToolName::GroupsDelete => {
             let args: DeleteArgs = decode(&operation)?;
@@ -538,7 +582,8 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
             }
         }
         McpStepUpMutation::DeleteTotp { user_id, .. }
-        | McpStepUpMutation::DeleteWebauthn { user_id, .. } => {
+        | McpStepUpMutation::DeleteWebauthn { user_id, .. }
+        | McpStepUpMutation::DeleteUserSecondFactor { user_id, .. } => {
             issuerd_cluster::invalidate::invalidate_user_claims(
                 state.cache.as_ref(),
                 realm_id,
@@ -607,7 +652,8 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
         | McpStepUpMutation::DeleteIdentityProvider { .. }
         | McpStepUpMutation::DeleteRealm { .. }
         | McpStepUpMutation::DeleteTotp { .. }
-        | McpStepUpMutation::DeleteWebauthn { .. } => OperationType::Delete,
+        | McpStepUpMutation::DeleteWebauthn { .. }
+        | McpStepUpMutation::DeleteUserSecondFactor { .. } => OperationType::Delete,
         McpStepUpMutation::CreateIdentityProvider { .. } => OperationType::Create,
         _ => OperationType::Update,
     };
@@ -615,6 +661,7 @@ pub async fn committed(state: &Arc<AdminApiState>, grant: &McpStepUpGrant) {
         McpStepUpMutation::DeleteUser { .. }
         | McpStepUpMutation::DeleteTotp { .. }
         | McpStepUpMutation::DeleteWebauthn { .. }
+        | McpStepUpMutation::DeleteUserSecondFactor { .. }
         | McpStepUpMutation::UserRoleMapping { .. }
         | McpStepUpMutation::UserGroupMembership { .. } => ResourceType::User,
         McpStepUpMutation::DeleteGroup { .. } | McpStepUpMutation::GroupRoleMapping { .. } => {
@@ -1165,6 +1212,42 @@ mod tests {
                 .unwrap(),
             Some(McpStepUpMutation::DeleteWebauthn { .. })
         ));
+        let password = Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"password-secret".to_vec(),
+            credential_data: serde_json::Value::Null,
+            priority: 0,
+        };
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &user.id, &password)
+            .await
+            .unwrap();
+        let second_factor = call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({
+                "id": user.id.to_string(),
+                "credentialId": totp.id.to_string(),
+                "confirmation": "REMOVE"
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            &second_factor,
+            McpStepUpMutation::DeleteUserSecondFactor { expected_credentials, .. }
+            if expected_credentials.len() == 3
+        ));
+        let redacted = serde_json::to_string(&second_factor.redacted()).unwrap();
+        assert!(!redacted.contains("totp-secret"));
+        assert!(!redacted.contains("webauthn-secret"));
+        assert!(!redacted.contains("password-secret"));
 
         let admin_role = test_role(realm, "manage-realm");
         create_role_if_missing(&fixture.state, realm, &admin_role).await;
@@ -1275,6 +1358,316 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn second_factor_builder_enforces_a_remaining_primary_sign_in_method() {
+        let fixture = fixture().await;
+        let realm = &fixture.realm;
+        let user = &fixture.user;
+        let credential = |credential_type| Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"test-only-secret".to_vec(),
+            credential_data: serde_json::Value::Null,
+            priority: 0,
+        };
+        let password = credential(CredentialType::Password);
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &user.id, &password)
+            .await
+            .unwrap();
+        assert!(call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({"id": user.id.to_string(), "credentialId": password.id.to_string(), "confirmation": "REMOVE"}),
+        )
+        .await
+        .is_err());
+
+        let passwordless = credential(CredentialType::WebAuthnPasswordless);
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &user.id, &passwordless)
+            .await
+            .unwrap();
+        assert!(call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({"id": user.id.to_string(), "credentialId": passwordless.id.to_string(), "confirmation": "REMOVE"}),
+        )
+        .await
+        .is_err());
+
+        let other = self::tests::user(realm, "single-second-factor-user");
+        fixture.state.storage.create_user(&realm.id, &other).await.unwrap();
+        let totp = credential(CredentialType::Totp);
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &other.id, &totp)
+            .await
+            .unwrap();
+        assert!(call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({"id": other.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .list_credentials(&realm.id, &other.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second_only = self::tests::user(realm, "second-factor-only-user");
+        fixture.state.storage.create_user(&realm.id, &second_only).await.unwrap();
+        let totp = credential(CredentialType::Totp);
+        let webauthn = credential(CredentialType::WebAuthn);
+        for credential in [&totp, &webauthn] {
+            fixture
+                .state
+                .storage
+                .create_credential(&realm.id, &second_only.id, credential)
+                .await
+                .unwrap();
+        }
+        assert!(call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({"id": second_only.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .list_credentials(&realm.id, &second_only.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let custom_only = self::tests::user(realm, "custom-credential-only-user");
+        fixture.state.storage.create_user(&realm.id, &custom_only).await.unwrap();
+        let totp = credential(CredentialType::Totp);
+        let custom = credential(CredentialType::Custom("unknown-second-factor".into()));
+        for credential in [&totp, &custom] {
+            fixture
+                .state
+                .storage
+                .create_credential(&realm.id, &custom_only.id, credential)
+                .await
+                .unwrap();
+        }
+        assert!(call(
+            &fixture,
+            ToolName::UsersRemoveSecondFactor,
+            json!({"id": custom_only.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            fixture
+                .state
+                .storage
+                .list_credentials(&realm.id, &custom_only.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        for (name, unsupported_type) in [
+            ("passwordless-recovery-user", CredentialType::WebAuthnPasswordless),
+            ("kerberos-recovery-user", CredentialType::Kerberos),
+            ("ssh-recovery-user", CredentialType::SshPublicKey),
+        ] {
+            let account = self::tests::user(realm, name);
+            fixture.state.storage.create_user(&realm.id, &account).await.unwrap();
+            let totp = credential(CredentialType::Totp);
+            let unsupported = credential(unsupported_type);
+            for credential in [&totp, &unsupported] {
+                fixture
+                    .state
+                    .storage
+                    .create_credential(&realm.id, &account.id, credential)
+                    .await
+                    .unwrap();
+            }
+            assert!(call(
+                &fixture,
+                ToolName::UsersRemoveSecondFactor,
+                json!({"id": account.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                fixture
+                    .state
+                    .storage
+                    .list_credentials(&realm.id, &account.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn second_factor_builder_accepts_federated_broker_and_email_code_primaries() {
+        let fixture = fixture().await;
+        let realm = &fixture.realm;
+        let credential = |credential_type| Credential {
+            id: CredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            credential_type,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"test-only-secret".to_vec(),
+            credential_data: serde_json::Value::Null,
+            priority: 0,
+        };
+
+        let directory_id = uuid::Uuid::new_v4().to_string();
+        let directory = IdentityProviderConfig {
+            id: IdentityProviderId::new(&directory_id).unwrap(),
+            alias: Alias::new("directory").unwrap(),
+            provider_id: ProviderId::Ldap,
+            enabled: true,
+            config: Default::default(),
+        };
+        fixture
+            .state
+            .storage
+            .create_identity_provider(&realm.id, &directory)
+            .await
+            .unwrap();
+        let mut federated = self::tests::user(realm, "federated-recovery-user");
+        federated.federation_link = Some(directory_id);
+        fixture.state.storage.create_user(&realm.id, &federated).await.unwrap();
+        let mut totp = credential(CredentialType::Totp);
+        totp.id = CredentialId::new("legacy-federated-totp").unwrap();
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &federated.id, &totp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::UsersRemoveSecondFactor,
+                json!({"id": federated.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::DeleteUserSecondFactor { .. })
+        ));
+
+        let broker = IdentityProviderConfig {
+            id: IdentityProviderId::new(uuid::Uuid::new_v4()).unwrap(),
+            alias: Alias::new("broker").unwrap(),
+            provider_id: ProviderId::Oidc,
+            enabled: true,
+            config: Default::default(),
+        };
+        fixture
+            .state
+            .storage
+            .create_identity_provider(&realm.id, &broker)
+            .await
+            .unwrap();
+        let mut broker_user = self::tests::user(realm, "broker-recovery-user");
+        broker_user.federation_link = Some("idp:broker".into());
+        fixture.state.storage.create_user(&realm.id, &broker_user).await.unwrap();
+        let link = IdentityProviderLink {
+            user_id: broker_user.id.clone(),
+            provider_alias: "broker".into(),
+            external_subject: "broker-subject".into(),
+            external_username: None,
+            stored_refresh_token: None,
+            created_at: chrono::Utc::now(),
+        };
+        fixture
+            .state
+            .storage
+            .create_identity_provider_link(&realm.id, &link)
+            .await
+            .unwrap();
+        let totp = credential(CredentialType::Totp);
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &broker_user.id, &totp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::UsersRemoveSecondFactor,
+                json!({"id": broker_user.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::DeleteUserSecondFactor { .. })
+        ));
+
+        let mut email_realm = realm.clone();
+        email_realm
+            .attributes
+            .insert(Realm::EMAIL_CODE_LOGIN_ATTRIBUTE.into(), "true".into());
+        email_realm.browser_flow = Some("email-login".into());
+        let email_flow = FlowConfig {
+            alias: Alias::new("email-login").unwrap(),
+            realm_id: realm.id.clone(),
+            provider_id: "basic-flow".into(),
+            top_level: true,
+            built_in: false,
+            stages: vec![FlowStage {
+                id: FlowStageId::new("email-code").unwrap(),
+                requirement: Requirement::Required,
+                authenticator: Alias::new("auth-email-code").unwrap(),
+                priority: 1,
+                sub_flow_alias: None,
+                authenticator_config: None,
+            }],
+        };
+        fixture.state.storage.create_flow_config(&realm.id, &email_flow).await.unwrap();
+        fixture.state.storage.update_realm(&email_realm).await.unwrap();
+        let mut email_user = self::tests::user(realm, "email-code-recovery-user");
+        email_user.email = Some(Email::new("email-code@example.com").unwrap());
+        fixture.state.storage.create_user(&realm.id, &email_user).await.unwrap();
+        let totp = credential(CredentialType::Totp);
+        fixture
+            .state
+            .storage
+            .create_credential(&realm.id, &email_user.id, &totp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            call(
+                &fixture,
+                ToolName::UsersRemoveSecondFactor,
+                json!({"id": email_user.id.to_string(), "credentialId": totp.id.to_string(), "confirmation": "REMOVE"}),
+            )
+            .await
+            .unwrap(),
+            Some(McpStepUpMutation::DeleteUserSecondFactor { .. })
+        ));
     }
 
     #[tokio::test]

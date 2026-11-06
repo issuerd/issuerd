@@ -278,13 +278,28 @@ class AdminApi {
     username: string,
     roles: readonly string[],
     roleRepresentations: Map<string, JsonObject>,
+    secondFactor = false,
   ): Promise<JsonObject> {
     const base = `/admin/realms/${encodeURIComponent(this.config.realm)}`;
     const users = objects(
       await this.expect(`${base}/users?username=${encodeURIComponent(username)}`, { token }),
       "users",
     );
-    let user = users[0];
+    let user: JsonObject | undefined = users[0];
+    if (user && secondFactor) {
+      const userId = id(user);
+      const credentials = objects(
+        await this.expect(`${base}/users/${encodeURIComponent(userId)}/credentials`, { token }),
+        "credential fixtures",
+      );
+      if (!credentials.some((credential) => credential.type === "totp")) {
+        await this.expect(`${base}/users/${encodeURIComponent(userId)}`, {
+          method: "DELETE",
+          token,
+        }, [200, 204]);
+        user = undefined;
+      }
+    }
     if (!user) {
       user = object(
         await this.expect(
@@ -300,7 +315,18 @@ class AdminApi {
               enabled: true,
               email_verified: true,
               realm_roles: [...roles],
-              credentials: [{ type: "password", value: this.config.userPassword, temporary: false }],
+              credentials: [
+                { type: "password", value: this.config.userPassword, temporary: false },
+                ...(secondFactor
+                  ? [{
+                    type: "totp",
+                    user_label: "Lost phone",
+                    secret_data: "lab-only-mcp-step-up-totp-secret",
+                    credential_data: JSON.stringify({ temporary: false }),
+                    priority: 1,
+                  }]
+                  : []),
+              ],
             },
           },
           [201],
@@ -355,7 +381,7 @@ async function main(): Promise<void> {
     const reporting = await api.ensureClient(token, "mcp-reporting", false);
     const admin = await api.ensureUser(token, "mcp-admin", READ_ROLES, roles);
     const observer = await api.ensureUser(token, "mcp-observer", ["view-users"], roles);
-    const target = await api.ensureUser(token, "mcp-step-up-target", [], roles);
+    const target = await api.ensureUser(token, "mcp-step-up-target", [], roles, true);
     const group = await api.ensureGroup(token, "mcp-acceptance", id(observer));
     const identityProvider = await api.ensureIdentityProvider(token, "mcp-acceptance-idp");
     process.stdout.write(`${JSON.stringify({
