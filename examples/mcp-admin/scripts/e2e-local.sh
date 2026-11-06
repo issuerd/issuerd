@@ -83,5 +83,6 @@ node -e '
 const fs = require("node:fs");
 const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 if (!report.ok || report.resources.length !== 3 || !report.strict.replayReconciled || report.strict.cibaReplay !== "invalid_grant") process.exit(1);
+if (!report.secondFactor.replayReconciled || !report.secondFactor.crossGrantRejected || !report.secondFactor.removed || report.secondFactor.cibaReplay !== "invalid_grant") process.exit(1);
 console.log(JSON.stringify({ok: true, evidence: process.argv[1], strict: report.strict.execution}));
 ' "$RUNTIME/step-up-acceptance.json"

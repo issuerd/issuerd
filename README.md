@@ -61,7 +61,7 @@ Guides with the full protocol detail, curl walkthroughs, and the failure matrix:
 
 ### Built-in MCP administration with exact-operation approval
 
-Issuerd itself also exposes a realm-scoped MCP server with **67 curated administration/self-service tools and three redacted resources**. Any hosted or local LLM can participate through a compatible MCP client; server-side policy, not the prompt, defines the boundary. Reads and reversible writes stay within explicit scopes and realm roles. Strict operations require fresh human approval for canonical `tool + arguments` and expected state, followed by a single-purpose DPoP token without refresh. Changed arguments fail, and exact retries return the recorded result without a second mutation. See the [MCP server guide](docs/mcp-server.md), the [exact-operation security article](docs/mcp-exact-operation-approval.md), and the [official-SDK acceptance example](examples/mcp-admin/).
+Issuerd itself also exposes a realm-scoped MCP server with **71 curated administration/self-service tools and three redacted resources**. Any hosted or local LLM can participate through a compatible MCP client; server-side policy, not the prompt, defines the boundary. Reads and reversible writes stay within explicit scopes and realm roles. Strict operations require fresh human approval for canonical `tool + arguments` and expected state, followed by a single-purpose DPoP token without refresh. Changed arguments fail, and exact retries return the recorded result without a second mutation. See the [MCP server guide](docs/mcp-server.md), the [exact-operation security article](docs/mcp-exact-operation-approval.md), and the [official-SDK acceptance example](examples/mcp-admin/).
 
 ---
 
@@ -137,7 +137,7 @@ If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model,
 | Rich Authorization Requests (RFC 9396) | Implemented |
 | DPoP (RFC 9449) | Implemented (mTLS sender-constraining deferred) |
 | OAuth 2.0 Protected Resource Metadata (RFC 9728) | Implemented; gated by `[mcp] enabled` (default off) |
-| Model Context Protocol (2025-06-18, 2025-11-25, 2026-07-28) | Implemented; realm-scoped server with 67 tools and 3 resources, disabled by default |
+| Model Context Protocol (2025-06-18, 2025-11-25, 2026-07-28) | Implemented; realm-scoped server with 71 tools and 3 resources, disabled by default |
 | Dynamic Client Registration (RFC 7591/7592) | Implemented, incl. read/update/delete |
 | CIBA (OpenID Connect Client-Initiated Backchannel Authentication) | Poll mode |
 | TOTP (RFC 6238), WebAuthn / FIDO2 | Implemented |
@@ -306,7 +306,7 @@ The full documentation set is also published at **[issuerd.org](https://issuerd.
 | [AGENTS.md](AGENTS.md) | Conventions, build/test commands, per-crate notes, compatibility policy |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Multi-node deployment guide |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Measured performance & sizing vs Keycloak 26.7 (k6 benchmark stack) |
-| [docs/mcp-server.md](docs/mcp-server.md) | **Built-in MCP server** — 67 curated tools, three resources, DPoP, same-realm authorization, and exact-operation CIBA |
+| [docs/mcp-server.md](docs/mcp-server.md) | **Built-in MCP server** — 71 curated tools, three resources, DPoP, same-realm authorization, and exact-operation CIBA |
 | [docs/mcp-exact-operation-approval.md](docs/mcp-exact-operation-approval.md) | **Agent-native security architecture** — one fresh approval for one exact operation, atomic execution, and replay reconciliation |
 | [docs/agentic-iam-mcp.md](docs/agentic-iam-mcp.md) | **External agentic IAM** — downstream MCP tool calls secured with DPoP + RFC 8693 token exchange (demo GIF included) |
 | [docs/ciba-step-up.md](docs/ciba-step-up.md) | **Human step-up for agents** — scope-based and exact-operation CIBA approval flows |

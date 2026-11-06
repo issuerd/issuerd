@@ -67,9 +67,10 @@ Setup uses the setup-only admin token to create:
   same redirect, and optional `mcp:read`, `mcp:write`, and `mcp:step_up`;
 - `mcp-admin` with `view-realm`, `view-users`, `manage-users`, and `view-clients`
   (`manage-users` is required for attack detection, ordinary user writes, and
-  strict user deletion);
+  strict credential/user deletion);
 - additional user `mcp-observer`, disposable deletion target
-  `mcp-step-up-target`, and client `mcp-reporting` fixtures;
+  `mcp-step-up-target` with password and lab-only TOTP credentials, and client
+  `mcp-reporting` fixtures;
 - group `mcp-acceptance` with `mcp-observer` as a member, realm roles used by
   role list/get acceptance, and `mcp-acceptance-idp` with a lab-only credential
   that acceptance proves is omitted from MCP output.
@@ -103,12 +104,15 @@ Expected `acceptance.json` evidence:
 Expected `step-up-acceptance.json` evidence:
 
 - confidential code + PKCE S256 and `client_secret_basic` profile metadata;
-- three redacted resource reads and a completed ordinary `users_update`;
-- an exact `users_delete` operation ID, fresh authentication and CSRF evidence,
-  single-purpose DPoP scope, no refresh token, and a bounded expiry;
+- three redacted resource reads, a completed ordinary `users_update`, lockout
+  clearing, and credential relabeling;
+- independent exact `users_remove_second_factor` and `users_delete` operation
+  IDs, fresh authentication and CSRF evidence, single-purpose DPoP scope, no
+  refresh token, and bounded expiries;
 - rejected unrelated-tool and changed-argument calls;
-- one completed deletion with an identical exact-replay result, and
-  `invalid_grant` when the consumed CIBA request is polled again.
+- one completed second-factor removal and one completed user deletion, each
+  with an identical exact-replay result, and `invalid_grant` when the consumed
+  CIBA request is polled again.
 
 The report contains no token, proof, cookie, CSRF value, client secret, or
 approval identifier. User and operation IDs are non-secret fixture metadata.

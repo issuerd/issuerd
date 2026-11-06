@@ -630,7 +630,10 @@ mod tests {
                     | ToolName::RolesCreate
                     | ToolName::ClientsCreate
             );
-            let external = name == ToolName::UsersSendActionsEmail;
+            let external = matches!(
+                name,
+                ToolName::UsersSendActionsEmail | ToolName::UsersRequestPasswordReset
+            );
             let read_only = name.tier() == crate::policy::RiskTier::T0
                 || matches!(
                     name,

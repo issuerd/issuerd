@@ -51,7 +51,9 @@ pub use ids::{
     IdentityProviderId, JwtId, KeyId, MapperId, RealmId, RoleId, SessionId, UserId,
 };
 pub use mcp_step_up::{
-    McpStepUpExecution, McpStepUpExecutionStatus, McpStepUpGrant, McpStepUpMutation,
+    has_primary_sign_in_method, is_primary_sign_in_credential_type,
+    is_second_factor_credential_type, McpStepUpExecution, McpStepUpExecutionStatus, McpStepUpGrant,
+    McpStepUpMutation,
 };
 pub use models::{
     Alias, ClaimName, ClientIdentifier, DisplayName, LogoutToken, LogoutTokenClaims, ProviderId,

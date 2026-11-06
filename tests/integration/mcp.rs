@@ -232,6 +232,20 @@ impl Default for ServerOptions {
 }
 
 async fn spawn_server(options: ServerOptions) -> Loopback {
+    spawn_server_with_optional_email(options, None).await
+}
+
+async fn spawn_server_with_email(
+    options: ServerOptions,
+    email_sender: Arc<dyn issuerd_core::EmailSender>,
+) -> Loopback {
+    spawn_server_with_optional_email(options, Some(email_sender)).await
+}
+
+async fn spawn_server_with_optional_email(
+    options: ServerOptions,
+    email_sender: Option<Arc<dyn issuerd_core::EmailSender>>,
+) -> Loopback {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base_url = format!("http://{address}");
@@ -242,6 +256,11 @@ async fn spawn_server(options: ServerOptions) -> Loopback {
     config.mcp.invocation_rate_limit_per_minute = options.invocation_rate_limit;
     config.mcp.allowed_origins = options.allowed_origins;
     config.dpop.nonce.mode = options.nonce_mode;
+    if let Some(email_sender) = email_sender {
+        let mut state = ServerState::from_config(&config).await.unwrap();
+        state.email_sender = email_sender;
+        return serve(listener, config, state);
+    }
     spawn_listener(listener, config, None).await
 }
 
@@ -250,12 +269,16 @@ async fn spawn_listener(
     config: ServerConfig,
     components: Option<(Arc<dyn Storage>, Arc<dyn DistributedCache>)>,
 ) -> Loopback {
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
     let state = match components {
         Some((storage, cache)) => ServerState::from_components(&config, storage, cache).await,
         None => ServerState::from_config(&config).await,
     }
     .unwrap();
+    serve(listener, config, state)
+}
+
+fn serve(listener: tokio::net::TcpListener, _config: ServerConfig, state: ServerState) -> Loopback {
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(state);
     let app = app_router(Arc::clone(&state));
     let task = tokio::spawn(async move {
@@ -3474,7 +3497,9 @@ async fn expired_resource_bound_token_is_invalid_token() {
 
 #[tokio::test]
 async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service() {
-    let server = spawn_server(ServerOptions::default()).await;
+    let mut email = issuerd_core::MockEmailSender::new();
+    email.expect_send().times(1).returning(|_, _, _, _, _| Ok(()));
+    let server = spawn_server_with_email(ServerOptions::default(), Arc::new(email)).await;
     let fixture = make_fixture(&server, "write-service", &ALL_READ_ROLES).await;
     let username = unique("created-by-mcp");
     let issued = issue_token(&server, &fixture, "openid mcp:write", None, true).await;
@@ -3487,6 +3512,7 @@ async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service(
     )
     .await;
     let arguments = json!({"username": username, "email": "mcp-write@example.com"});
+    let schemas = output_schemas(&client.list_tools(None).await.unwrap());
     let result = client
         .call_tool(
             CallToolRequestParams::new("users_create")
@@ -3494,11 +3520,7 @@ async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service(
         )
         .await
         .unwrap();
-    assert_tool_result(
-        &result,
-        &output_schemas(&client.list_tools(None).await.unwrap())["users_create"],
-        false,
-    );
+    assert_tool_result(&result, &schemas["users_create"], false);
     let output = result.structured_content.unwrap();
     assert_eq!(output["status"], "completed");
     assert_eq!(output["tool"], "users_create");
@@ -3517,6 +3539,122 @@ async fn admin_write_tool_enforces_scope_and_uses_the_admin_application_service(
         .await
         .unwrap()
         .is_empty());
+
+    let credential = issuerd_core::Credential {
+        id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+        credential_type: issuerd_core::CredentialType::Totp,
+        user_label: None,
+        created_date: chrono::Utc::now(),
+        secret_data: b"loopback-test-totp-secret".to_vec(),
+        credential_data: json!({"temporary": false}),
+        priority: 0,
+    };
+    server
+        .state
+        .storage
+        .create_credential(&fixture.realm.id, &created.id, &credential)
+        .await
+        .unwrap();
+    for family in ["login-failure", "login-lockout"] {
+        server
+            .state
+            .cache
+            .set(
+                &format!("{family}:{}:{username}:127.0.0.1", fixture.realm.id),
+                b"1".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    for (tool, arguments) in [
+        (
+            "users_update",
+            json!({"id": created.id.to_string(), "requiredActions": ["UPDATE_PASSWORD"]}),
+        ),
+        ("users_clear_lockout", json!({"id": created.id.to_string()})),
+        (
+            "users_update_credential_label",
+            json!({"id": created.id.to_string(), "credentialId": credential.id.to_string(), "userLabel": "Replacement phone"}),
+        ),
+        (
+            "users_request_password_reset",
+            json!({"id": created.id.to_string(), "lifespan": 600}),
+        ),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert_tool_result(&result, &schemas[tool], false);
+        assert_eq!(result.structured_content.as_ref().unwrap()["status"], "completed");
+    }
+    let updated = server
+        .state
+        .storage
+        .get_user(&fixture.realm.id, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.required_actions, ["UPDATE_PASSWORD"]);
+    for family in ["login-failure", "login-lockout"] {
+        assert!(server
+            .state
+            .cache
+            .scan_keys(&format!("{family}:{}:{username}:*", fixture.realm.id))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        server
+            .state
+            .storage
+            .get_credentials(&fixture.realm.id, &created.id, issuerd_core::CredentialType::Totp)
+            .await
+            .unwrap()[0]
+            .user_label
+            .as_deref(),
+        Some("Replacement phone")
+    );
+    let keys = server
+        .state
+        .cache
+        .scan_keys(&format!("execute-actions:{}:*", fixture.realm.name))
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    let continuation: Value =
+        serde_json::from_slice(&server.state.cache.get(&keys[0]).await.unwrap().unwrap()).unwrap();
+    assert_eq!(continuation["user_id"], created.id.to_string());
+    assert_eq!(continuation["actions"], json!(["UPDATE_PASSWORD"]));
+
+    let rejected = client
+        .call_tool(
+            CallToolRequestParams::new("users_update").with_arguments(
+                json!({"id": created.id.to_string(), "requiredActions": ["NOT_REGISTERED"]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.is_error, Some(true));
+    assert_eq!(
+        server
+            .state
+            .storage
+            .get_user(&fixture.realm.id, &created.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .required_actions,
+        ["UPDATE_PASSWORD"]
+    );
     client.cancel().await.unwrap();
 
     let read_only = issue_token(&server, &fixture, "openid mcp:read", None, true).await;

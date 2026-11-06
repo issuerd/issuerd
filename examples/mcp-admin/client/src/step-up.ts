@@ -86,6 +86,8 @@ function escapeHtml(value: string): string {
 async function approveFresh(
   approvalUrl: string,
   options: StepUpOptions,
+  tool: string,
+  confirmation: string,
   targetId: string,
   bindingMessage: string,
   fetchFn: FetchLike,
@@ -134,10 +136,10 @@ async function approveFresh(
   if (page.status !== 200) throw new AcceptanceError("authenticated approval page was not rendered");
   const html = await page.text();
   for (const expected of [
-    "users_delete",
+    tool,
     targetId,
     escapeHtml(bindingMessage),
-    "&quot;confirmation&quot;: &quot;DELETE&quot;",
+    `&quot;confirmation&quot;: &quot;${escapeHtml(confirmation)}&quot;`,
   ]) {
     if (!html.includes(expected)) throw new AcceptanceError("approval page omitted exact operation details");
   }
@@ -247,6 +249,7 @@ async function run(options: StepUpOptions): Promise<Record<string, unknown>> {
     });
     let targetId: string;
     let wrongTargetId: string;
+    let secondFactorId: string;
     let snapshots: Record<string, unknown>[];
     try {
       await client.connect(transport);
@@ -266,6 +269,24 @@ async function run(options: StepUpOptions): Promise<Record<string, unknown>> {
         arguments: { id: targetId, firstName: "Step-up target" },
       }));
       if (updated.status !== "completed") throw new AcceptanceError("ordinary reversible write did not complete");
+      const unlocked = sdkStructured(await client.callTool({
+        name: "users_clear_lockout",
+        arguments: { id: targetId },
+      }));
+      if (unlocked.status !== "completed") throw new AcceptanceError("lockout clear did not complete");
+      const credentials = sdkStructured(await client.callTool({
+        name: "users_get_credentials",
+        arguments: { id: targetId },
+      }));
+      const secondFactor = objects(credentials.credentials, "target credentials")
+        .find((credential) => credential.type === "totp");
+      if (!secondFactor) throw new AcceptanceError("target second-factor fixture was not discoverable");
+      secondFactorId = nonempty(secondFactor.id, "second-factor credential id");
+      const relabeled = sdkStructured(await client.callTool({
+        name: "users_update_credential_label",
+        arguments: { id: targetId, credentialId: secondFactorId, userLabel: "Replacement phone" },
+      }));
+      if (relabeled.status !== "completed") throw new AcceptanceError("credential relabel did not complete");
     } finally {
       await client.close();
     }
@@ -277,34 +298,107 @@ async function run(options: StepUpOptions): Promise<Record<string, unknown>> {
       clientSecret: options.clientSecret,
       fetchFn: route.fetchFn,
     });
-    const arguments_ = { id: targetId, confirmation: "DELETE" };
-    const challengeResponse = await protocol.mcp(options.resource, initialToken, "users_delete", arguments_);
     const cibaEndpoint = `${options.issuer}/protocol/openid-connect/ext/ciba/auth`;
-    const challenge = validateStepUpChallenge(challengeResponse, cibaEndpoint, options.resource);
-    const initiated = await protocol.initiateCiba(
-      challenge.backchannelAuthenticationEndpoint,
-      challenge,
-      options.username,
-    );
-
-    route.select("approval", "2");
-    await approveFresh(
-      initiated.approvalUrl,
-      options,
-      targetId,
-      challenge.bindingMessage,
-      route.fetchFn,
-    );
-
-    route.select("poll", "3");
     const tokenEndpoint = `${options.issuer}/protocol/openid-connect/token`;
-    const stepUpToken = await protocol.pollCiba(
-      tokenEndpoint,
-      initiated.authReqId,
-      options.resource,
-      initiated.interval,
-    );
+    const authorize = async (
+      tool: string,
+      arguments_: Record<string, unknown>,
+      confirmation: string,
+      phase: string,
+    ) => {
+      const challengeResponse = await protocol.mcp(options.resource, initialToken, tool, arguments_);
+      const challenge = validateStepUpChallenge(challengeResponse, cibaEndpoint, options.resource);
+      const initiated = await protocol.initiateCiba(
+        challenge.backchannelAuthenticationEndpoint,
+        challenge,
+        options.username,
+      );
+      route.select(`${phase}approval`, "2");
+      await approveFresh(
+        initiated.approvalUrl,
+        options,
+        tool,
+        confirmation,
+        targetId,
+        challenge.bindingMessage,
+        route.fetchFn,
+      );
+      route.select(`${phase}poll`, "3");
+      const stepUpToken = await protocol.pollCiba(
+        tokenEndpoint,
+        initiated.authReqId,
+        options.resource,
+        initiated.interval,
+      );
+      return { challenge, initiated, stepUpToken };
+    };
 
+    const secondFactorArguments = {
+      id: targetId,
+      credentialId: secondFactorId,
+      confirmation: "REMOVE",
+    };
+    const secondFactorApproval = await authorize(
+      "users_remove_second_factor",
+      secondFactorArguments,
+      "REMOVE",
+      "secondFactor-",
+    );
+    route.select("secondFactor-execution", "1");
+    const crossGrant = await protocol.mcp(
+      options.resource,
+      secondFactorApproval.stepUpToken.accessToken,
+      "users_delete",
+      { id: targetId, confirmation: "DELETE" },
+    );
+    if (crossGrant.status !== 403 || object(crossGrant.body, "cross-grant error").error !== "operation_binding_mismatch") {
+      throw new AcceptanceError("second-factor grant authorized an unrelated destructive operation");
+    }
+    const secondFactorFirst = successfulToolResult(await protocol.mcp(
+      options.resource,
+      secondFactorApproval.stepUpToken.accessToken,
+      "users_remove_second_factor",
+      secondFactorArguments,
+    ));
+    const secondFactorReplay = successfulToolResult(await protocol.mcp(
+      options.resource,
+      secondFactorApproval.stepUpToken.accessToken,
+      "users_remove_second_factor",
+      secondFactorArguments,
+    ));
+    if (secondFactorFirst.status !== "completed" || secondFactorFirst.tool !== "users_remove_second_factor" || secondFactorFirst.id !== targetId) {
+      throw new AcceptanceError("second-factor removal returned an invalid result");
+    }
+    if (!isDeepStrictEqual(secondFactorFirst, secondFactorReplay)) {
+      throw new AcceptanceError("second-factor retry did not reconcile the recorded result");
+    }
+    const remainingCredentials = successfulToolResult(await protocol.mcp(
+      options.resource,
+      initialToken,
+      "users_get_credentials",
+      { id: targetId },
+    ));
+    if (objects(remainingCredentials.credentials, "remaining credentials")
+      .some((credential) => credential.type === "totp")) {
+      throw new AcceptanceError("second-factor credential survived exact approved removal");
+    }
+    route.select("secondFactor-cibaReplay", "3");
+    const secondFactorReplayCode = await protocol.pollCibaReplay(
+      tokenEndpoint,
+      secondFactorApproval.initiated.authReqId,
+      options.resource,
+    );
+    if (secondFactorReplayCode !== "invalid_grant") {
+      throw new AcceptanceError("consumed second-factor auth_req_id did not fail with invalid_grant");
+    }
+
+    const arguments_ = { id: targetId, confirmation: "DELETE" };
+    const { challenge, initiated, stepUpToken } = await authorize(
+      "users_delete",
+      arguments_,
+      "DELETE",
+      "",
+    );
     route.select("execution", "1");
     const unrelated = await protocol.mcp(options.resource, stepUpToken.accessToken, "realm_get", {});
     if (unrelated.status !== 403) throw new AcceptanceError("single-purpose token reached an unrelated read tool");
@@ -363,6 +457,21 @@ async function run(options: StepUpOptions): Promise<Record<string, unknown>> {
         redacted: true,
       })),
       ordinaryWrite: { tool: "users_update", status: "completed" },
+      operationalWrites: [
+        { tool: "users_clear_lockout", status: "completed" },
+        { tool: "users_update_credential_label", status: "completed" },
+      ],
+      secondFactor: {
+        tool: "users_remove_second_factor",
+        operationId: secondFactorApproval.challenge.operationId,
+        credentialId: secondFactorId,
+        exactApproval: true,
+        execution: secondFactorFirst,
+        replayReconciled: true,
+        crossGrantRejected: true,
+        removed: true,
+        cibaReplay: secondFactorReplayCode,
+      },
       strict: {
         tool: "users_delete",
         targetId,

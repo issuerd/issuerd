@@ -2219,6 +2219,16 @@ impl Realm {
             .is_some_and(|v| v == "true")
     }
 
+    /// Realm attribute (`"true"`) enabling passwordless email-code login.
+    pub const EMAIL_CODE_LOGIN_ATTRIBUTE: &'static str = "email_code_login";
+
+    /// Whether this realm uses email codes as a primary sign-in method.
+    pub fn email_code_login(&self) -> bool {
+        self.attributes
+            .get(Self::EMAIL_CODE_LOGIN_ATTRIBUTE)
+            .is_some_and(|v| v == "true")
+    }
+
     /// Realm attribute (`"true"`) for strict `UPDATE_PROFILE`: a submitted
     /// form with a blank/absent first or last name re-presents the form with
     /// an error instead of clearing the stored names. Default off (blank

@@ -40,7 +40,9 @@ node -e '
 const fs = require("node:fs");
 const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 if (!report.ok || report.resources.length !== 3 || !report.strict.replayReconciled) process.exit(1);
+if (!report.secondFactor.replayReconciled || !report.secondFactor.crossGrantRejected || !report.secondFactor.removed || report.secondFactor.cibaReplay !== "invalid_grant") process.exit(1);
 const nodes = report.multiNode;
 if (nodes.initial !== "1" || nodes.approval !== "2" || nodes.poll !== "3" || nodes.execution !== "1" || nodes.cibaReplay !== "3") process.exit(1);
+if (nodes["secondFactor-approval"] !== "2" || nodes["secondFactor-poll"] !== "3" || nodes["secondFactor-execution"] !== "1" || nodes["secondFactor-cibaReplay"] !== "3") process.exit(1);
 console.log(JSON.stringify({ok: true, evidence: process.argv[1], multiNode: nodes, execution: report.strict.execution}));
 ' "$EVIDENCE"

@@ -2037,6 +2037,48 @@ impl InMemoryStorage {
                 }
                 self.delete_credential(&realm_id, &user_id, &expected.id).await
             }
+            McpStepUpMutation::DeleteUserSecondFactor {
+                realm_id,
+                user_id,
+                expected_user,
+                expected_realm,
+                expected_credential,
+                expected_credentials,
+            } => {
+                let current_user =
+                    self.get_user(&realm_id, &user_id).await?.ok_or(IssuerdError::Conflict)?;
+                let current_realm =
+                    self.get_realm(&realm_id).await?.ok_or(IssuerdError::Conflict)?;
+                if redacted_user(current_user.clone()) != expected_user
+                    || redacted_realm(current_realm.clone()) != expected_realm
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                let current_credentials = self.list_credentials(&realm_id, &user_id).await?;
+                let identity_providers = self.list_identity_providers(&realm_id).await?;
+                let identity_provider_links =
+                    self.list_identity_provider_links(&realm_id, &user_id).await?;
+                let flows = self.list_flow_configs(&realm_id).await?;
+                let target_present = expected_credentials
+                    .iter()
+                    .any(|credential| credential == &expected_credential);
+                let has_primary_remaining = has_primary_sign_in_method(
+                    &current_user,
+                    &current_realm,
+                    &current_credentials,
+                    &identity_providers,
+                    &identity_provider_links,
+                    &flows,
+                );
+                if !has_primary_remaining
+                    || !target_present
+                    || !is_second_factor_credential_type(&expected_credential.credential_type)
+                    || !same_credentials(current_credentials, expected_credentials)
+                {
+                    return Err(IssuerdError::Conflict);
+                }
+                self.delete_credential(&realm_id, &user_id, &expected_credential.id).await
+            }
             McpStepUpMutation::UserRoleMapping {
                 realm_id,
                 user_id,

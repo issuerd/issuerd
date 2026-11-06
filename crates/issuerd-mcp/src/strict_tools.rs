@@ -168,6 +168,14 @@ pub struct WebauthnDeleteArgs {
     pub id: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserSecondFactorArgs {
+    pub id: String,
+    pub credential_id: String,
+    pub confirmation: String,
+}
+
 pub fn target_id(operation: &McpOperation, auth: &crate::auth::McpAuthContext) -> Option<String> {
     let string = |name: &str| operation.arguments.get(name)?.as_str().map(str::to_string);
     match operation.tool {
@@ -179,6 +187,7 @@ pub fn target_id(operation: &McpOperation, auth: &crate::auth::McpAuthContext) -
         ToolName::RolesDelete => string("name"),
         ToolName::FlowsUpdateExecutions => string("alias"),
         ToolName::UsersDelete
+        | ToolName::UsersRemoveSecondFactor
         | ToolName::GroupsDelete
         | ToolName::ClientsDelete
         | ToolName::ClientsUpdateSecurity
@@ -224,6 +233,7 @@ pub fn parse_operation(
         ToolName::RealmDelete => canonical::<RealmDeleteArgs>(arguments)?,
         ToolName::MeTotpDelete => canonical::<NoArgs>(arguments)?,
         ToolName::MeWebauthnDelete => canonical::<WebauthnDeleteArgs>(arguments)?,
+        ToolName::UsersRemoveSecondFactor => canonical::<UserSecondFactorArgs>(arguments)?,
         _ => return Err(McpError::UnknownTool(tool.to_string())),
     };
     Ok(McpOperation { tool, arguments })
@@ -246,6 +256,9 @@ pub fn definition(name: ToolName) -> Option<Tool> {
     }
     let description = match name {
         ToolName::UsersDelete => "Delete an existing user after fresh exact-operation approval.",
+        ToolName::UsersRemoveSecondFactor => {
+            "Remove one lost TOTP, HOTP, or second-factor WebAuthn credential after fresh exact-operation approval; password and passwordless credentials are excluded, and a supported primary sign-in method must remain: password, configured federation/broker, or a bound email-code browser flow."
+        }
         ToolName::GroupsDelete => "Delete a group after fresh exact-operation approval.",
         ToolName::RolesDelete => "Delete a realm role after fresh exact-operation approval.",
         ToolName::ClientsDelete => "Delete a client after fresh exact-operation approval.",
@@ -297,6 +310,7 @@ pub fn definition(name: ToolName) -> Option<Tool> {
         ToolName::RealmDelete => tool.with_input_schema::<RealmDeleteArgs>(),
         ToolName::MeTotpDelete => tool.with_input_schema::<NoArgs>(),
         ToolName::MeWebauthnDelete => tool.with_input_schema::<WebauthnDeleteArgs>(),
+        ToolName::UsersRemoveSecondFactor => tool.with_input_schema::<UserSecondFactorArgs>(),
         _ => return None,
     };
     Some(
@@ -329,6 +343,10 @@ mod tests {
                 json!({"id":"id","alias":"oidc","providerId":"oidc","clientSecret":"x"}),
             ),
             (ToolName::MeTotpDelete, json!({"seed":"secret"})),
+            (
+                ToolName::UsersRemoveSecondFactor,
+                json!({"id":"user","credentialId":"credential","confirmation":"REMOVE","secretData":"secret"}),
+            ),
             (ToolName::RealmDelete, json!({"name":"demo"})),
             (ToolName::FlowsUpdateExecutions, json!({"alias":"browser","config":{}})),
         ] {
