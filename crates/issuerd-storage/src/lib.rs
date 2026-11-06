@@ -12,9 +12,13 @@ pub mod memory;
 pub mod migration;
 pub mod postgres;
 pub mod seed;
+pub mod sqlite;
+mod sqlite_types;
 pub mod step_up;
+pub mod step_up_sqlite;
 
 pub use json::JsonFileStorage;
 pub use key_encryption::Aes256GcmKekProvider;
 pub use memory::InMemoryStorage;
 pub use postgres::PostgresStorage;
+pub use sqlite::SqliteStorage;

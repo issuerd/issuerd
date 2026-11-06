@@ -142,15 +142,18 @@ their peers immediately.
 ### Encryption at rest
 
 By default the `signing_keys` table holds private key material in **plaintext** — anyone who can
-read a database dump can mint tokens for every realm. The optional
+read a database dump can mint tokens for every realm. On PostgreSQL, the optional
 [`[crypto.key_encryption]`](configuration.md#cryptokey_encryption) section enables **envelope
 encryption**: the server encrypts each signing key with a config/env-provided 32-byte Key
 Encryption Key (AES-256-GCM, random per-key nonce) before writing, so the table only ever holds
-ciphertext and the KEK never touches the database.
+ciphertext and the KEK never touches the database. This feature is PostgreSQL-only: SQLite and JSON
+keep plaintext keys, and configuring the section there logs a warning and ignores it. On Unix the
+SQLite database and its `-wal`/`-shm` files are created and maintained with owner-only `0600`
+permissions; apply equivalent protection to every backup.
 
 - **Enablement is transparent**: a boot-time sweep re-encrypts legacy plaintext rows, reads
-  decrypt on the fly, and key rotation writes ciphertext from the start. Existing deployments
-  without the section boot unchanged (with a startup WARN recommending the feature).
+  decrypt on the fly, and key rotation writes ciphertext from the start. Existing PostgreSQL
+  deployments without the section boot unchanged (with a startup WARN recommending the feature).
 - **Fail closed**: a node booted with the wrong KEK refuses to start; there is no plaintext
   fallback. Every cluster node must carry the identical section.
 - **Operational consequences move to the KEK**: back it up alongside the config (a dump without
@@ -612,7 +615,7 @@ per-realm secret generated automatically into the realm attributes at realm crea
 Admin tokens are bound to the realm that issued them (Keycloak model): tokens issued by `master`
 administer every realm, other tokens only their own; realm creation/listing is master-only
 (`crates/issuerd-admin-api/src/auth.rs`). The automatic bootstrap of the master realm with the
-`admin` user runs **only** for the in-memory/json-file backends; its password is
+`admin` user runs **only** for the in-memory/JSON-file/SQLite backends; its password is
 `bootstrap_admin_password` (`ISSUERD_BOOTSTRAP_ADMIN_PASSWORD`) or, when unset, a random one
 printed once to stderr. On PostgreSQL the provision file defines the master realm (see
 `examples/provision.demo.yaml`).

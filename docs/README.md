@@ -89,7 +89,7 @@ Depending on your role, you will typically read the set in this order:
 |---|---|
 | [Security](security.md) | Hardening: TLS and proxy baseline, signing-key rotation, password policies, brute-force protection, MFA operations (TOTP, WebAuthn, email codes), session and token hardening, admin-surface hygiene. |
 | [Monitoring](monitoring.md) | `/health` and `/ready` probes, Prometheus metrics, logging and request correlation, login events and admin events (querying, retention, auditing). |
-| [Backup, restore, and upgrade](backup-and-upgrade.md) | Where state lives, PostgreSQL and JSON-snapshot backup/restore procedures, schema migrations, single-node and rolling cluster upgrades, rollback rules, and a disaster-recovery skeleton. |
+| [Backup, restore, and upgrade](backup-and-upgrade.md) | Where state lives, PostgreSQL, SQLite, and JSON-snapshot backup/restore procedures, schema migrations, single-node and rolling cluster upgrades, rollback rules, and a disaster-recovery skeleton. |
 | [Troubleshooting](troubleshooting.md) | Symptom → cause → fix for startup, login flow, token, email, federation, brokering, and cluster problems, plus how to gather diagnostics and file a useful bug report. |
 
 ## Related references

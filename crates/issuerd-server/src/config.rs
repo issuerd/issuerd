@@ -70,7 +70,7 @@ pub struct ServerConfig {
     /// Optional path to a provision config file (YAML/TOML/JSON).
     /// Applied exactly once at first startup; ignored on restarts.
     pub provision: Option<PathBuf>,
-    /// Password for the `admin` user that the in-memory/JSON-file first-boot
+    /// Password for the `admin` user that the in-memory/JSON-file/SQLite first-boot
     /// bootstrap seeds into the `master` realm
     /// (`ISSUERD_BOOTSTRAP_ADMIN_PASSWORD`). Unset or empty ⇒ a random
     /// password is generated and printed once to stderr.
@@ -244,6 +244,7 @@ pub enum StorageConfig {
     InMemory,
     Postgres { url: String },
     JsonFile { path: PathBuf },
+    Sqlite { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1722,6 +1723,31 @@ key_base64 = "{}"
         assert!(!cfg.mcp.require_dpop);
         assert_eq!(cfg.mcp.invocation_rate_limit_per_minute, 120);
         assert!(cfg.mcp.step_up.enabled);
+    }
+
+    #[test]
+    fn sqlite_storage_loads_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (path, dir) = temp_path("sqlite_storage_toml", "toml");
+        fs::write(&path, "[storage.sqlite]\npath = \"var/lib/issuerd.db\"\n").unwrap();
+        let cfg = ServerConfig::load(Some(path)).unwrap();
+        assert!(matches!(
+            cfg.storage,
+            StorageConfig::Sqlite { ref path } if path == &std::path::PathBuf::from("var/lib/issuerd.db")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sqlite_storage_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ISSUERD_STORAGE__SQLITE__PATH", "var/lib/from-env.db");
+        let cfg = ServerConfig::load(None).unwrap();
+        std::env::remove_var("ISSUERD_STORAGE__SQLITE__PATH");
+        assert!(matches!(
+            cfg.storage,
+            StorageConfig::Sqlite { ref path } if path == &std::path::PathBuf::from("var/lib/from-env.db")
+        ));
     }
 
     #[test]

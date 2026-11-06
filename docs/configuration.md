@@ -102,12 +102,12 @@ issuer_url = "http://localhost:8080"
 ```
 
 The root `issuerd.toml` in the repository is a working example of this rig.
-With in-memory (or JSON-file) storage the `master` realm is bootstrapped
+With in-memory, JSON-file, or SQLite storage the `master` realm is bootstrapped
 automatically on first start (admin user `admin`, password from
 `bootstrap_admin_password` or randomly generated and printed once to stderr;
 the root rig pins `admin`/`admin`); see [getting-started.md](getting-started.md).
 
-**Production (PostgreSQL + Redis, TLS terminated at a proxy):**
+**Shared production (PostgreSQL + Redis, TLS terminated at a proxy):**
 
 ```toml
 bind       = "0.0.0.0"
@@ -128,6 +128,21 @@ config). With PostgreSQL, automatic master-realm bootstrap does **not** run —
 define `master` in a provision file (see `examples/provision.demo.yaml` and
 [provisioning.md](provisioning.md)) or create it via the Admin API.
 
+**Self-contained production (one node, no external DB):**
+
+```toml
+bind       = "0.0.0.0"
+port       = 8080
+issuer_url = "https://idp.example.com"
+
+[storage.sqlite]
+path = "/var/lib/issuerd/issuerd.db"
+```
+
+Create the parent directory and restrict it to the service account before the
+first boot. SQLite gets the automatic `master` bootstrap and migrations; do
+not enable cluster mode.
+
 ## Root keys
 
 | Key | Type | Default | Description |
@@ -137,7 +152,7 @@ define `master` in a provision file (see `examples/provision.demo.yaml` and
 | `issuer_url` | string (URL) | `"http://localhost:8080"` | Public base URL of this server. See the deep-dive below. |
 | `redis` | string (URL), optional | unset | Single Redis node, e.g. `"redis://localhost:6379"` (`rediss://` for TLS). Unset ⇒ in-process ephemeral cache. Overridden by `cluster.redis_nodes` when that list is non-empty. |
 | `provision` | path, optional | unset | Provision file (YAML/TOML/JSON by extension) applied **exactly once** at startup — a marker is claimed in storage before applying, so restarts and concurrent first boots skip it. Relative paths resolve against the working directory. A missing/unreadable file logs an error and boot continues. Format: [provisioning.md](provisioning.md). |
-| `bootstrap_admin_password` | string, optional | unset | Password of the `admin` user the in-memory/JSON-file first-boot bootstrap seeds into the `master` realm (only when no realm exists yet). Unset or empty ⇒ a random password is generated and printed **once** to stderr (not through the log output). Prefer the `ISSUERD_BOOTSTRAP_ADMIN_PASSWORD` environment variable over writing it into the file; environment values are parsed like TOML values, so quote one that would read as a number, boolean, or array (`ISSUERD_BOOTSTRAP_ADMIN_PASSWORD='"12345"'`) — unquoted, it fails the boot with `config load failed`. Ignored by PostgreSQL storage, which has no automatic bootstrap. |
+| `bootstrap_admin_password` | string, optional | unset | Password of the `admin` user the in-memory/JSON-file/SQLite first-boot bootstrap seeds into the `master` realm (only when no realm exists yet). Unset or empty ⇒ a random password is generated and printed **once** to stderr (not through the log output). Prefer the `ISSUERD_BOOTSTRAP_ADMIN_PASSWORD` environment variable over writing it into the file; environment values are parsed like TOML values, so quote one that would read as a number, boolean, or array (`ISSUERD_BOOTSTRAP_ADMIN_PASSWORD='"12345"'`) — unquoted, it fails the boot with `config load failed`. Ignored by PostgreSQL storage, which has no automatic bootstrap. |
 
 ### About `issuer_url`
 
@@ -174,10 +189,11 @@ all).
 |---|---|---|---|
 | In-memory (default) | *(omit the section)* | None — empty on every boot | Development, tests, demos |
 | PostgreSQL | `[storage.postgres]` + `url` | Durable, shared between nodes | Production, clusters |
+| SQLite | `[storage.sqlite]` + `path` | Durable, single node | Production without an external DB, edge sites, branches, homelabs |
 | JSON file | `[storage.json_file]` + `path` | Durable, single node | Manual testing, small single-node rigs |
 
 ```toml
-# PostgreSQL — recommended for production.
+# PostgreSQL — recommended for shared production deployments and clusters.
 [storage.postgres]
 url = "postgres://issuerd:issuerd_secret@localhost:5432/issuerd"
 ```
@@ -190,7 +206,33 @@ url = "postgres://issuerd:issuerd_secret@localhost:5432/issuerd"
   nodes via the shared `signing_keys` table.
 
 ```toml
-# JSON file — full-state snapshot persistence.
+# SQLite — embedded production storage for one node; no database service.
+[storage.sqlite]
+path = "/var/lib/issuerd/issuerd.db"
+```
+
+- SQLite runs in WAL mode with `synchronous=FULL`, foreign-key enforcement, a
+  five-second busy timeout, and four pooled connections. Writes also retry each
+  statement a bounded number of times before returning `temporarily_unavailable`.
+  Multi-statement writes use immediate transactions; operation-bound MCP grants
+  retain the same atomic consume/mutate/result semantics as PostgreSQL.
+- The daemon creates the database file but not its parent directory. Relative
+  paths resolve against the daemon's working directory. On Unix the database,
+  `-wal`, and `-shm` files are created and maintained with owner-only `0600`
+  permissions. Keep them on a local filesystem and protect backups equally.
+- Independent, append-only migrations run automatically at boot and by
+  `issuerd provision`. Migration 019 adds Unicode-normalized user search columns,
+  backfilled on boot, so username/email search is case-insensitive beyond ASCII.
+  A fresh empty file gets the automatic `master` realm bootstrap, like JSON.
+- SQLite is strictly single-node: `cluster.enabled = true` is rejected. Use
+  PostgreSQL when more than one daemon process or host must share state.
+- `[crypto.key_encryption]` remains PostgreSQL-only. SQLite signing keys are
+  plaintext at rest, so protect the database at the filesystem level. Back up
+  with `VACUUM INTO` or stop the daemon and copy the file — see
+  [backup-and-upgrade.md](backup-and-upgrade.md).
+
+```toml
+# JSON file — full-state snapshot persistence for manual testing.
 [storage.json_file]
 path = "issuerd-data.json"
 ```
@@ -198,13 +240,13 @@ path = "issuerd-data.json"
 - The entire state is loaded from the file at boot and **rewritten in full on
   every write**, serialized through a global lock — correct but slow, so it is
   meant for manual testing and single-node rigs, not production traffic.
-- Like in-memory, it triggers the automatic master-realm bootstrap on first
-  start.
+- Like in-memory and SQLite, it triggers the automatic master-realm bootstrap
+  on first start.
 
 > **Note:** with in-memory storage, JWT signing keys are generated per boot,
-> so all outstanding tokens are invalidated by a restart. The JSON-file
-> backend persists them in its snapshot; with PostgreSQL they live in the
-> shared `signing_keys` table — both survive restarts and redeploys.
+> so all outstanding tokens are invalidated by a restart. Every durable backend
+> persists them: PostgreSQL and SQLite in the `signing_keys` table, JSON in its
+> snapshot.
 
 ## [tls]
 
@@ -609,9 +651,9 @@ Environment equivalents: `ISSUERD_CRYPTO__KEY_ENCRYPTION__KEY_ID` and
   re-encrypts the rows under the new KEK. Verify with
   `SELECT DISTINCT kek_kid FROM signing_keys`, then drop the `previous_keys`
   entry. Full procedure in [backup-and-upgrade.md](backup-and-upgrade.md).
-- **PostgreSQL-only**: with the in-memory or JSON-file backends the section is
-  ignored (boot WARN) — protect JSON snapshots at the filesystem level; they
-  hold plaintext keys by design (dev/manual-test backend).
+- **PostgreSQL-only**: with in-memory, JSON-file, or SQLite storage the section is
+  ignored (boot WARN). JSON snapshots and SQLite databases hold plaintext keys by
+  design; protect them and their backups at the filesystem level.
 - **Memory-hygiene limits**: decrypted key material is zeroized on drop
   (`StoredSigningKey`, the keystore's retired keys, and transient buffers).
   What cannot be zeroized is the resident signing key while it is in use and
@@ -850,11 +892,13 @@ key_path  = "certs/issuerd.test.internal.key"  # PEM private key
 
 # ---- Storage ---------------------------------------------------------------
 # Omit [storage] entirely for the in-memory default (dev only, empty per boot).
-# Alternative: [storage.json_file] path = "issuerd-data.json" (single-node).
+# Alternatives:
+#   [storage.sqlite] path = "/var/lib/issuerd/issuerd.db" (production single-node)
+#   [storage.json_file] path = "issuerd-data.json" (manual-test single-node)
 [storage.postgres]
 url = "postgres://issuerd:issuerd_secret@localhost:5433/issuerd"
 # Migrations run automatically at boot. With PostgreSQL, create the master
-# realm via the provision file — automatic bootstrap only covers in-memory/json.
+# realm via the provision file — automatic bootstrap covers in-memory/JSON/SQLite.
 
 # ---- Logging ---------------------------------------------------------------
 # Honored at startup; RUST_LOG and -v/-q flags take precedence (see [logging]).
