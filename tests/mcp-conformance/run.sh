@@ -68,6 +68,7 @@ for attempt in {1..60}; do
 done
 curl -fsS "$ISSUERD_ISSUER/.well-known/openid-configuration" >/dev/null
 
+export CONFORMANCE_RUNNER="$SCRIPT_DIR/exit-safe.mjs"
 node --test tests/mcp-conformance/authorization-lifecycle.test.mjs
 
 CONFORMANCE_BIN="$HARNESS/dist/index.js" CONFORMANCE_RESULTS="$RESULTS/authorization" \
@@ -82,7 +83,7 @@ for scenario in \
   resources-list \
   completion-complete \
   dns-rebinding-protection; do
-  "$HARNESS/dist/index.js" server \
+  CONFORMANCE_BIN="$HARNESS/dist/index.js" node "$SCRIPT_DIR/exit-safe.mjs" server \
     --url "$ISSUERD_ISSUER/mcp" \
     --scenario "$scenario" \
     -o "$RESULTS/$scenario" &

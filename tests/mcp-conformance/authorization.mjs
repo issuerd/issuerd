@@ -9,8 +9,9 @@ const clientSecret = process.env.MCP_CLIENT_SECRET;
 const port = process.env.MCP_CALLBACK_PORT ?? '3000';
 const username = process.env.MCP_USERNAME ?? 'mcp-admin';
 const password = process.env.MCP_PASSWORD ?? 'Password123!';
+const runner = process.env.CONFORMANCE_RUNNER ?? harness;
 const args = [
-  harness,
+  runner,
   'authorization',
   '--url', url,
   '--client-id', clientId,
@@ -24,7 +25,7 @@ const callbackTimeoutMs = Number(process.env.MCP_BROWSER_CALLBACK_TIMEOUT_MS ?? 
 const browsers = new Set();
 const child = spawn(process.execPath, args, {
   env: { ...process.env },
-  stdio: ['ignore', 'pipe', 'pipe'],
+  stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
 });
 let output = '';
 let codeGrantLogin;
@@ -94,6 +95,10 @@ const onSigterm = () => {
 };
 process.once('SIGINT', onSigint);
 process.once('SIGTERM', onSigterm);
+const onInterruptMessage = (message) => {
+  if (message === 'interrupt') onSigterm();
+};
+process.once('message', onInterruptMessage);
 const timeout = new Promise((_, reject) => {
   setTimeout(() => {
     child.kill('SIGTERM');
@@ -111,6 +116,7 @@ try {
 } finally {
   process.removeListener('SIGINT', onSigint);
   process.removeListener('SIGTERM', onSigterm);
+  process.removeListener('message', onInterruptMessage);
   child.kill('SIGTERM');
   await Promise.allSettled([completion, codeGrantLogin, dpopLogin]);
   await Promise.allSettled([...browsers].map((browser) => browser.close()));

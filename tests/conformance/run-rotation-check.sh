@@ -11,10 +11,15 @@
 # bootstraps, then runs the rotation check inside the network.
 set -euo pipefail
 
+# Git Bash must pass container-side paths to docker compose unchanged.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 compose() {
-    docker compose -f "$SCRIPT_DIR/docker-compose.yml" "$@"
+    docker compose -f docker-compose.yml "$@"
 }
 
 if [[ -z "$(compose ps -q test-runner 2>/dev/null)" ]]; then

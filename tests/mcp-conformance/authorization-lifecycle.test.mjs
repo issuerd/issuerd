@@ -40,17 +40,32 @@ function kill(pid) {
   }
 }
 
-function descendants(rootPid) {
+function processList() {
+  if (process.platform === 'win32') {
+    const listing = execFileSync('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json',
+    ], { encoding: 'utf8' });
+    return JSON.parse(listing).map((row) => ({
+      pid: row.ProcessId,
+      parentPid: row.ParentProcessId,
+      args: row.CommandLine ?? '',
+    }));
+  }
   const listing = execFileSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8' });
-  const children = new Map();
-  for (const line of listing.split('\n')) {
+  return listing.split('\n').flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-    if (!match) continue;
-    const processInfo = { pid: Number(match[1]), args: match[3] };
-    const parentPid = Number(match[2]);
-    const siblings = children.get(parentPid) ?? [];
+    return match ? [{ pid: Number(match[1]), parentPid: Number(match[2]), args: match[3] }] : [];
+  });
+}
+
+function descendants(rootPid) {
+  const children = new Map();
+  for (const processInfo of processList()) {
+    const siblings = children.get(processInfo.parentPid) ?? [];
     siblings.push(processInfo);
-    children.set(parentPid, siblings);
+    children.set(processInfo.parentPid, siblings);
   }
   const result = [];
   const queue = [rootPid];
@@ -73,7 +88,7 @@ async function makeTempDirectory(t) {
 function startDriver(t, environment) {
   const child = spawn(process.execPath, [driverPath], {
     env: { ...process.env, MCP_CLIENT_SECRET: '', ...environment },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   let output = '';
   child.stdout.on('data', (chunk) => { output += chunk.toString(); });
@@ -86,6 +101,14 @@ function startDriver(t, environment) {
     await completion.catch(() => {});
   });
   return { child, completion, output: () => output };
+}
+
+function interruptDriver(driver) {
+  if (process.platform === 'win32') {
+    driver.child.send('interrupt');
+  } else {
+    driver.child.kill('SIGTERM');
+  }
 }
 
 async function waitForHarnessPid(pidFile) {
@@ -128,7 +151,7 @@ test('interrupting the driver terminates the harness', { timeout: 15_000 }, asyn
   const harnessPid = await waitForHarnessPid(pidFile);
   t.after(() => kill(harnessPid));
 
-  driver.child.kill('SIGTERM');
+  interruptDriver(driver);
   const [code, signal] = await driver.completion;
   assert.equal(signal, null, driver.output());
   assert.notEqual(code, 0, driver.output());
@@ -182,7 +205,7 @@ test('interrupting browser login reaps the harness and Chromium', { timeout: 20_
     kill(harnessPid);
   });
 
-  driver.child.kill('SIGTERM');
+  interruptDriver(driver);
   const [code, signal] = await driver.completion;
   assert.equal(signal, null, driver.output());
   assert.notEqual(code, 0, driver.output());
