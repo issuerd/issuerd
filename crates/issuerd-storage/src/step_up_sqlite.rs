@@ -772,6 +772,112 @@ async fn apply_mutation(
                 .rows_affected(),
             )
         }
+        McpStepUpMutation::DeleteUserSecondFactor {
+            realm_id,
+            user_id,
+            expected_user,
+            expected_realm,
+            expected_credential,
+            expected_credentials,
+        } => {
+            let current_realm: Option<PgRealm> =
+                sqlx::query_as("SELECT * FROM realms WHERE id = ?1")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let current_user: Option<PgUser> =
+                sqlx::query_as("SELECT * FROM users WHERE realm_id = ?1 AND id = ?2")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .bind(uuid(user_id.as_ref())?)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?;
+            let (Some(current_realm), Some(current_user)) = (current_realm, current_user) else {
+                return Err(IssuerdError::Conflict);
+            };
+            let current_realm: Realm = current_realm.try_into()?;
+            let current_user: User = current_user.try_into()?;
+            let user_matches = redacted_user(current_user.clone()) == expected_user;
+            let realm_matches = redacted_realm(current_realm.clone()) == expected_realm;
+            if !user_matches || !realm_matches {
+                return Err(IssuerdError::Conflict);
+            }
+            let current_credentials: Vec<Credential> = sqlx::query_as::<_, PgCredential>(
+                "SELECT * FROM credentials WHERE realm_id = ?1 AND user_id = ?2",
+            )
+            .bind(uuid(realm_id.as_ref())?)
+            .bind(uuid(user_id.as_ref())?)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(sqlx_error)?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+            let identity_providers: Vec<IdentityProviderConfig> =
+                sqlx::query_as::<_, PgIdentityProvider>(
+                    "SELECT * FROM identity_providers WHERE realm_id = ?1",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?;
+            let identity_provider_links: Vec<IdentityProviderLink> =
+                sqlx::query_as::<_, PgIdentityProviderLink>(
+                    "SELECT * FROM identity_provider_links WHERE realm_id = ?1 AND user_id = ?2",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(user_id.as_ref())?)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?;
+            let flows: Vec<FlowConfig> =
+                sqlx::query_as::<_, PgFlowConfig>("SELECT * FROM flow_configs WHERE realm_id = ?1")
+                    .bind(uuid(realm_id.as_ref())?)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(sqlx_error)?
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()?;
+            let target_present =
+                expected_credentials.iter().any(|credential| credential == &expected_credential);
+            let has_primary_remaining = has_primary_sign_in_method(
+                &current_user,
+                &current_realm,
+                &current_credentials,
+                &identity_providers,
+                &identity_provider_links,
+                &flows,
+            );
+            let credentials_match =
+                same_credentials(current_credentials.clone(), expected_credentials.clone());
+            if !has_primary_remaining
+                || !target_present
+                || !is_second_factor_credential_type(&expected_credential.credential_type)
+                || !credentials_match
+            {
+                return Err(IssuerdError::Conflict);
+            }
+            expect_one(
+                sqlx::query(
+                    "DELETE FROM credentials WHERE realm_id = ?1 AND user_id = ?2 AND id = ?3",
+                )
+                .bind(uuid(realm_id.as_ref())?)
+                .bind(uuid(user_id.as_ref())?)
+                .bind(uuid(expected_credential.id.as_ref())?)
+                .execute(&mut **tx)
+                .await
+                .map_err(sqlx_error)?
+                .rows_affected(),
+            )
+        }
         McpStepUpMutation::UserRoleMapping {
             realm_id,
             user_id,

@@ -234,7 +234,7 @@ rather than granting general write authority:
 5. The client retries the original tool with byte-equivalent typed arguments.
    The server compares every operation, subject, client, realm, resource, key,
    hash, and precondition binding, then atomically records the grant state,
-   target mutation, and redacted result. PostgreSQL, in-memory, and JSON
+   target mutation, and redacted result. PostgreSQL, SQLite, in-memory, and JSON
    backends implement the same conditional transaction contract.
 
 The single-purpose token cannot call unrelated tools or UserInfo, Account, or
