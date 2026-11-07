@@ -127,7 +127,7 @@ serde-saphyr = "2.0"
 schemars = "1.0"
 
 # Model Context Protocol SDK (features are selected by each consumer)
-rmcp = { version = "~3.7.0", default-features = false }
+rmcp = { version = "~3.8.0", default-features = false }
 
 # Crypto
 ring = "0.17"

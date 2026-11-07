@@ -15,6 +15,10 @@ updates:
       interval: weekly
     labels:
       - no-changelog
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
 
   - package-ecosystem: npm
     directory: /webclientsrc
