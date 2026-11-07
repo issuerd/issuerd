@@ -185,4 +185,21 @@ describe('Modal', () => {
     expect(document.activeElement).toBe(trigger)
     document.body.removeChild(trigger)
   })
+
+  it('does not override focus already moved into the dialog', () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <Modal open title="Test" onClose={() => {}}>
+          <input aria-label="Redirect URI" />
+        </Modal>
+      )
+      const input = screen.getByLabelText('Redirect URI')
+      input.focus()
+      vi.advanceTimersByTime(50)
+      expect(input).toHaveFocus()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

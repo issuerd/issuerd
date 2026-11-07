@@ -24,9 +24,11 @@ export default function Modal({ title, open, onClose, children, footer, classNam
     if (open) {
       previousActiveElement.current = document.activeElement
       document.body.style.overflow = 'hidden'
-      // Focus first focusable element in modal after animation
+      // Apply initial focus after animation unless the user already focused something inside.
       const timer = setTimeout(() => {
-        const focusable = contentRef.current?.querySelector<HTMLElement>(
+        const content = contentRef.current
+        if (!content || content.contains(document.activeElement)) return
+        const focusable = content.querySelector<HTMLElement>(
           'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
         )
         focusable?.focus()
