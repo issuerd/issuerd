@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQLite migration and file hardening.** Schema migrations now honor the same bounded lock retry as other writes, non-regular storage paths are rejected before any permission change, and the `VACUUM INTO` runbook creates owner-only backups with `umask 077` and `chmod 0600`.
 - **Admin console realm selection.** Token refresh now preserves the selected admin realm instead of replacing it with the token's issuer realm. Refresh requests still target the issuer realm, including master-issued cross-realm admin sessions, and restored legacy token sets infer that issuer from their storage keys.
 - **Docker builds.** Update the pinned `rustup-init.sh` SHA-256 to match the current upstream installer, restoring canonical and glibc-2.28 image builds after the upstream artifact changed.
+- **Admin console dialogs.** Initial focus no longer steals focus from a field the user has already selected while a dialog is opening, preserving complete input during the entry animation.
 
 ## [0.2.1] - 2026-11-03
 
