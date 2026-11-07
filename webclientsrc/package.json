@@ -31,7 +31,7 @@
     "zustand": "^5.0.16"
   },
   "devDependencies": {
-    "@axe-core/react": "^4.11.3",
+    "@axe-core/react": "^4.14.0",
     "@hey-api/openapi-ts": "^0.99.0",
     "@tailwindcss/postcss": "^4.3.0",
     "@tanstack/react-query-devtools": "^5.105.3",
