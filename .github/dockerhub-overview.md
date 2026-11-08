@@ -1,6 +1,12 @@
 # issuerd/issuerd
 
-Fast, Keycloak-compatible Identity & Access Management in Rust — conformance-tested OIDC/OAuth2 (Basic OP, Form Post OP, Config OP, 0 failures and 0 warnings), DPoP and CIBA out of the box, shipped as a single distroless binary, horizontally scalable.
+Fast, Keycloak-compatible IAM with DPoP and CIBA — OpenID Certified OIDC/OAuth2 in Rust, shipped as a single distroless binary and horizontally scalable.
+
+OpenID Certified across 11 OP profiles: 10 on v0.1.17 plus RP-Initiated Logout on v0.1.19. These version-specific entries do not certify v0.2.x. Every release ships fresh self-hosted conformance evidence. The realm-scoped MCP server exposes 71 curated tools with exact-operation approval for strict actions.
+
+## Public demo
+
+Explore [demo.issuerd.org](https://demo.issuerd.org): admin and account consoles, OIDC/OAuth2 flows, federation, DPoP, CIBA, and MCP administration with a read-only observer or an operator using exact-operation approval. The hosted playground contains synthetic data only, is best-effort, and may be reset. Do not enter real passwords or sensitive data.
 
 ## Quickstart
 
@@ -28,6 +34,7 @@ Healthchecks: the distroless image ships no shell/curl — use the binary itself
 
 ## Links
 
+- Public demo: https://demo.issuerd.org
 - GitHub (source, issues, conformance evidence bundles): https://github.com/issuerd/issuerd
 - Documentation: https://issuerd.org (deployment, clustering, federation, security)
 - License: Apache-2.0

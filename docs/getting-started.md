@@ -33,7 +33,7 @@ Everything in this guide is seeded demo content with well-known credentials — 
 | A — Docker demo stack | Docker with the Compose plugin (`docker compose`). Nothing else — the stack pulls the published server image from Docker Hub, no compilation. |
 | B — Build from source | Rust toolchain **1.95+** (the workspace MSRV). Node.js **20+** is additionally required if you want the embedded browser consoles (admin console, account console, login pages). |
 
-No database is needed for a first run: option B uses the in-memory storage backend by default, and option A brings its own PostgreSQL and Redis containers.
+No database is needed for a first run: option B uses the in-memory storage backend by default, and option A brings its own PostgreSQL and Redis containers. For a durable single-node installation without an external database service, option B can instead use embedded SQLite through `[storage.sqlite]`; see [Configuration](configuration.md#storage). SQLite runs automatic migrations and the master-realm bootstrap, and is strictly single-node.
 
 ## Installation option A — the Docker demo stack
 
