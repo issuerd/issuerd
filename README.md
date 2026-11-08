@@ -14,342 +14,137 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV: 1.95"></a>
   <a href="https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23"><img src="https://img.shields.io/badge/OpenID%20Certified-11%20OP%20profiles-brightgreen" alt="OpenID Certified: 11 OP profiles across v0.1.17 and v0.1.19"></a>
-  <a href="https://github.com/rust-secure-code/safety-dance/"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
+  <a href="https://github.com/rust-secure-code/safety-dance"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Frust.json" alt="Coverage: Rust"></a>
   <a href="https://github.com/issuerd/issuerd/tree/badges"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fissuerd%2Fissuerd%2Fbadges%2Fwebclient.json" alt="Coverage: web client"></a>
-  <a href="https://issuerd.org"><img src="https://img.shields.io/badge/docs-issuerd.org-blue" alt="Docs: issuerd.org"></a>
+  <a href="https://issuerd.org"><img src="https://img.shields.io/badge/docs-issuerd.org-blue.svg" alt="docs: issuerd.org"></a>
   <a href="https://crates.io/crates/issuerd"><img src="https://img.shields.io/crates/v/issuerd" alt="crates.io"></a>
   <a href="https://hub.docker.com/r/issuerd/issuerd"><img src="https://img.shields.io/docker/pulls/issuerd/issuerd" alt="Docker pulls"></a>
 </p>
 
-> **Proof, not promises:** OpenID Certified across the 11-profile OP matrix (10 profiles on v0.1.17 + RP-Initiated Logout on v0.1.19) · 31,000+ self-hosted conformance conditions with 0 unexpected failures and 0 unexpected warnings · 100,000-user LDAP sync in ~30 s · 3,460+ automated tests · one self-contained binary.
+> **Proof, not promises:** OpenID Certified across 11 OP profiles (10 on v0.1.17 + RP-Initiated Logout on v0.1.19) · 31,000+ self-hosted conformance conditions with zero unexpected failures or warnings · 71 curated MCP tools · 3,460+ automated tests.
 
-Issuerd is a modular Identity and Access Management (IAM) server implementing OpenID Connect and OAuth 2.x. It delivers the feature surface you expect from a mature identity provider — single sign-on, MFA and passkeys, user federation, social login, a full admin console and management API — with the operational profile of a Rust service: one self-contained binary, predictable latency, and no JVM to babysit. Keycloak is used throughout as the baseline reference implementation: protocol behavior, JSON shapes, and Admin API responses are continuously validated against a real Keycloak 24.0.
+Issuerd is a modular Identity and Access Management server implementing OpenID Connect and OAuth 2.x. It combines the realm model and Admin API shape familiar from Keycloak with a Rust runtime, embedded admin and account consoles, and deployment as one self-contained binary.
+
+**[Live demo](https://demo.issuerd.org)** · **[Quickstart](#quickstart)** · **[Documentation](docs/README.md)** · **[Performance](docs/PERFORMANCE.md)**
 
 <p align="center"><img src=".github/assets/demo.gif" alt="Issuerd demo" width="100%"></p>
 
----
-
 ## Why Issuerd?
 
-- **OpenID Certified, not "spec-inspired".** The [OpenID Foundation registry](https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23) lists Issuerd v0.1.17 for 10 OP profiles; the [logout registry](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) adds RP-Initiated Logout OP on v0.1.19. The accepted evidence comes from the OIDF-hosted conformance suite (release v5.3.3). Separately, a broader self-hosted run of release v5.3.3 passes the full OP certification matrix with **zero unexpected failures and zero unexpected warnings**, 31,000+ conditions verified per run, in a hermetic TLS environment against a pristine suite, with per-module results checked into the repo.
-- **Keycloak-compatible where it counts.** Realms, clients, roles, client scopes, protocol mappers, authentication flows, and the Admin REST API follow the Keycloak model, so existing OIDC clients and Keycloak-hardened operational knowledge transfer directly. A dual-target test suite runs the same protocol assertions against Issuerd and a live Keycloak 24.0 container, and [every deliberate difference is documented](tests/KEYCLOAK_DIFFS.md).
-- **Rust, end to end.** Memory safety without a garbage collector, async I/O on Tokio, constant-time secret handling, ~155k lines of Rust across 10 tightly-scoped library crates with a strictly acyclic dependency graph. The entire server — including the embedded admin and account consoles — deploys as one binary.
-- **Horizontally scalable from day one.** Access-token validation is stateless (no database lookup on the hot path), signing keys are shared cluster-wide through PostgreSQL, and transient coordination state lives in Redis. No sticky sessions — put any number of nodes behind any load balancer.
-- **Built for real directories.** LDAP (Samba AD, OpenLDAP, MS Active Directory) and Kerberos/SPNEGO federation with full user and group sync — a complete 100,000-user import from a live MS AD finishes in ~30 seconds (~3,300 users/s). Password validation via bind, password write-through, and group-membership reconciliation included.
-- **Batteries included.** Embedded React admin console and end-user account console served same-origin, themable login pages, per-realm i18n with localized emails, declarative YAML provisioning, one-command OpenAPI export, Prometheus metrics, health/readiness probes, TLS.
-- **Engineered for testability.** 3,460+ automated tests; every public function is testable without network or database; authentication state transitions are proven at compile time via typestate markers. The discovery document advertises exactly what is implemented and tested — nothing more.
+- **OpenID Certified, not merely spec-inspired.** The official registries list 10 OP profiles on v0.1.17 and RP-Initiated Logout OP on v0.1.19. These entries are version-specific and do not certify v0.2.x. Every release separately ships fresh self-hosted conformance evidence.
+- **Keycloak-compatible where it counts.** Realms, clients, roles, scopes, protocol mappers, authentication flows, and the Admin REST API follow the Keycloak model. A dual-target suite runs the same assertions against Issuerd and a live Keycloak 24.0; every deliberate difference is [documented](tests/KEYCLOAK_DIFFS.md).
+- **Built for agent authorization.** DPoP sender-constraining, RFC 8693 per-call audience/scope attenuation, and CIBA human approval are implemented and exercised in live demos, not just listed on a roadmap.
+- **One Rust binary, several storage modes.** Use PostgreSQL for shared production state and clusters, embedded SQLite for durable single-node deployments without an external database, or in-memory/JSON backends for development and test rigs. No JVM is required.
+- **Full IAM operations.** SSO, MFA and passkeys, LDAP/Kerberos federation, identity brokering, self-service account management, declarative provisioning, OpenAPI export, audit events, metrics, and health probes are included under Apache-2.0.
+- **Measured and reproducible.** Benchmarks cover throughput, latency, memory, storage, and agentic workloads against Keycloak 26.7. The [methodology and current results](docs/PERFORMANCE.md) are public, including limitations and scenarios where behavior differs.
 
----
+## Agent-first authorization
 
-## Built for the Agent Era
+Bearer tokens and broad admin credentials are a poor fit for agents that read untrusted input and call many tools. Issuerd enforces the boundary on the server:
 
-AI agents acting on behalf of your users break the assumptions bearer tokens were designed around: an agent holds credentials for hours, calls many downstream services, and reads untrusted input all day. Prompt-injection is not a thought experiment — it is Tuesday. Issuerd already ships the three standards the industry has converged on for exactly this world. Not on the roadmap — implemented, test-covered, and recorded live:
+- **DPoP (RFC 9449):** access tokens can be bound to the holder's key, with method/URL-bound, short-lived proofs and distributed replay protection.
+- **Token exchange (RFC 8693):** each downstream call can receive a fresh audience-narrowed, scope-attenuated token. Scope can only shrink, and DPoP binding survives the exchange.
+- **CIBA step-up:** a strict action requires a fresh human decision for an exact operation, followed by a short-lived, single-purpose token. No standing high-privilege agent credential is needed.
 
-- **Tokens that are worthless when stolen (RFC 9449 DPoP).** Every access token can be cryptographically bound to its holder's key via the `cnf.jkt` confirmation claim. Proofs are method- and URL-bound, short-lived, and single-use through a distributed `jti` replay cache. A token lifted from a log, a proxy, or a compromised MCP server is scrap metal: presenting it without the matching private key is a `401 invalid_dpop_proof`.
-- **Agents that never forward their login token (RFC 8693 token exchange).** Each tool call mints a fresh, audience-narrowed, scope-attenuated token on the spot: a `get_orders` call travels with `aud = mcp-server` and `scope = orders:read` — nothing more. Scope can only ever shrink across an exchange (asking for more is `invalid_scope`), targets opt in explicitly, and the DPoP binding survives the exchange.
-- **Humans in the loop for the dangerous actions (CIBA, poll mode).** Privileged scopes like `refunds:execute` exist nowhere in an agent's standing credentials. When an action crosses the agent's autonomy limit, Issuerd interrupts the user with an explicit approval request carrying a binding message — *"Refund $150 for order #123"* — and only an approval mints a short-lived, DPoP-bound step-up token. A denial is `access_denied`; without a human yes, that authority simply never exists.
-
-Both scenarios below ran end-to-end against a live Issuerd rig — a scripted chat agent calling a real [MCP](https://modelcontextprotocol.io) server backed by PostgreSQL row-level security. The attacks are real too: prompt injection absorbed by row-level security, a stolen token replayed with bare `curl`, and a refund attempted without step-up. What you see is what the servers actually answered.
-
-| MCP scenario — attenuated, sender-constrained tool calls | CIBA scenario — human step-up approval |
+| MCP scenario: attenuated, sender-constrained tool calls | CIBA scenario: human step-up approval |
 |---|---|
 | <img src=".github/assets/demo-mcp.gif" alt="MCP demo: DPoP-bound token exchange, RLS holds against injection, stolen-token replay rejected" width="100%"> | <img src=".github/assets/demo-ciba.gif" alt="CIBA demo: in-app approval card, DPoP-bound step-up token, 403 without it" width="100%"> |
-| Login → exchange down to `aud = mcp-server`, `orders:read` → orders listed → injection changes nothing → replayed token: **401** | Refund requested → approval card with binding message → short-lived step-up token → refund applied → same call without it: **403** |
+| Login → narrowed token → orders listed → injection changes nothing → replay rejected with **401** | Refund requested → exact approval → short-lived grant → refund applied → same call without it: **403** |
 
-Guides with the full protocol detail, curl walkthroughs, and the failure matrix: **[Agentic IAM: MCP tool calls with DPoP and token exchange](docs/agentic-iam-mcp.md)** and **[Human step-up approval for agent actions: CIBA](docs/ciba-step-up.md)**.
+### Built-in MCP administration
 
-### Built-in MCP administration with exact-operation approval
+Issuerd also exposes a realm-scoped MCP server with **71 curated administration and self-service tools plus three redacted resources**. Reads and reversible writes stay within explicit scopes and roles. Strict operations bind fresh approval to canonical `tool + arguments` and expected state; changed arguments fail, and exact retries reconcile the recorded result without a second mutation.
 
-Issuerd itself also exposes a realm-scoped MCP server with **71 curated administration/self-service tools and three redacted resources**. Any hosted or local LLM can participate through a compatible MCP client; server-side policy, not the prompt, defines the boundary. Reads and reversible writes stay within explicit scopes and realm roles. Strict operations require fresh human approval for canonical `tool + arguments` and expected state, followed by a single-purpose DPoP token without refresh. Changed arguments fail, and exact retries return the recorded result without a second mutation. See the [MCP server guide](docs/mcp-server.md), the [exact-operation security article](docs/mcp-exact-operation-approval.md), and the [official-SDK acceptance example](examples/mcp-admin/).
+Guides: [MCP server](docs/mcp-server.md) · [Exact-operation approval](docs/mcp-exact-operation-approval.md) · [Official-SDK acceptance example](examples/mcp-admin/) · [External DPoP/token-exchange demo](docs/agentic-iam-mcp.md)
 
----
+## OIDC conformance
 
-## Issuerd vs. Keycloak
+The accepted OIDF-hosted submissions used the OpenID Foundation Conformance Suite release v5.3.3:
 
-Issuerd deliberately mirrors Keycloak's domain model and API surface — it is not a from-scratch reinvention of IAM concepts. The difference is in the implementation and operations:
-
-| | Issuerd | Keycloak |
-|---|---|---|
-| Runtime | Single Rust binary | JVM (Quarkus) distribution |
-| Cluster state | PostgreSQL + Redis | Embedded Infinispan grid |
-| Protocol parity | Continuously diff-tested against Keycloak 24.0 | Reference |
-| Conformance evidence | OpenID Certified (11 OP profiles across v0.1.17/v0.1.19); public OIDF listings and per-release report bundles | Vendor certification program |
-| SAML, UMA, FGAP, Organizations | Not implemented (see [scope](#project-scope)) | Implemented |
-
-If your clients speak standard OIDC/OAuth2 and your team knows Keycloak's model, Issuerd is a drop-in alternative with a Rust operational footprint.
-
----
-
-## Feature Overview
-
-**Protocols & grants**
-- OpenID Connect Core: authorization code flow with PKCE (S256-only), implicit/hybrid response types, all response modes (`query`, `fragment`, `form_post`, and the JARM `*jwt` family)
-- OAuth2 grants: `password`, `client_credentials` (service accounts), refresh token rotation with reuse detection, device authorization (RFC 8628), CIBA (poll mode)
-- Advanced OAuth: PAR (RFC 9126), JAR (RFC 9101), JARM, RAR `authorization_details` (RFC 9396), token exchange & impersonation (RFC 8693), DPoP sender-constraining (RFC 9449), dynamic client registration (RFC 7591/7592), pairwise subjects (OIDC Core §8)
-- Client authentication: `client_secret_basic/post`, `private_key_jwt`, `client_secret_jwt`
-- Offline tokens, per-realm signing algorithm selection (RS256/384/512, ES256/384/512, EdDSA), key rotation
-- Session management: logout with `id_token_hint`, backchannel + frontchannel logout, realm `not_before` revocation
-
-**Identity**
-- MFA: TOTP (RFC 6238) and WebAuthn/passkeys as second factors, required-action enrollment
-- Passwordless email-code login (per-realm opt-in)
-- Identity brokering: external OIDC + social IdPs (Google/GitHub/Microsoft presets), first-broker-login, account linking, IdP mappers
-- User federation: LDAP (Samba AD, OpenLDAP, MS AD) and Kerberos/SPNEGO, full user + group sync, password validation via bind, password write-through
-- Self-service: registration, forgot/reset password, remember-me, account console (profile, credentials, TOTP, passkeys, consents, linked accounts, sessions)
-- Brute-force protection, password policies with history, attack-detection endpoints
-
-**Administration**
-- Reference-compatible REST Admin API with OpenAPI 3.0 export and an embedded React admin SPA
-- Client scopes & protocol mappers (claim shaping into tokens), client roles, composite roles
-- Editable authentication flows, required actions, events & admin-event auditing
-- Partial import/export, key rotation/disable, client adapter-config download
-- Declarative realm provisioning from YAML at first startup
-
-**End-user experience**
-- Themable login pages, per-realm locales, localized SMTP email templates
-- Embedded account console with dark/light themes
-
-**Platform**
-- Horizontal scaling: stateless token validation, shared signing keys, no sticky sessions (PostgreSQL + Redis)
-- Standalone daemon binary with TLS, Prometheus metrics, `/health` and `/ready` probes, graceful shutdown
-- Official Dockerfile plus compose stacks for a full integration environment and a two-node cluster demo
-
----
-
-## Standards Coverage
-
-| Specification | Status |
+| Certified version | Certified OP profiles |
 |---|---|
-| OpenID Connect Core 1.0 | **OpenID Certified** on v0.1.17 (Basic, Implicit, Hybrid, Config, Dynamic, Form Post, 3rd-Party-Init OP) |
-| OpenID Connect Discovery | Full metadata, truthful capability advertisement |
-| OIDC RP-Initiated, Front-Channel & Back-Channel Logout | **OpenID Certified**: RP-Initiated on v0.1.19; Front-Channel & Back-Channel on v0.1.17 |
-| OIDC Session Management 1.0 | **OpenID Certified** on v0.1.17 (Session Management OP) |
-| OAuth 2.0 (RFC 6749) + Bearer Tokens (RFC 6750) | Implemented |
-| PKCE (RFC 7636) | S256-only, enforced for public clients |
-| Token Introspection (RFC 7662) | Implemented |
-| Device Authorization Grant (RFC 8628) | Implemented |
-| Token Exchange (RFC 8693) | Implemented, incl. impersonation |
-| Resource Indicators (RFC 8707) | Implemented; exact-allowlist, gated by `[mcp] enabled` (default off) |
-| Pushed Authorization Requests (RFC 9126) | Implemented |
-| JWT-Secured Authorization Requests — JAR (RFC 9101) | Implemented |
-| JWT-Secured Authorization Response Mode — JARM | Implemented |
-| Rich Authorization Requests (RFC 9396) | Implemented |
-| DPoP (RFC 9449) | Implemented (mTLS sender-constraining deferred) |
-| OAuth 2.0 Protected Resource Metadata (RFC 9728) | Implemented; gated by `[mcp] enabled` (default off) |
-| Model Context Protocol (2025-06-18, 2025-11-25, 2026-07-28) | Implemented; realm-scoped server with 71 tools and 3 resources, disabled by default |
-| Dynamic Client Registration (RFC 7591/7592) | Implemented, incl. read/update/delete |
-| CIBA (OpenID Connect Client-Initiated Backchannel Authentication) | Poll mode |
-| TOTP (RFC 6238), WebAuthn / FIDO2 | Implemented |
-| JWT / JWS / JWK (RFC 7515–7519) | RS/ES family + EdDSA, per-realm algorithm selection |
+| **v0.1.17** | Config, Basic, Implicit, Hybrid, Dynamic, 3rd Party-Init, Form Post, Session Management, Front-Channel Logout, Back-Channel Logout |
+| **v0.1.19** | RP-Initiated Logout |
 
----
+Across those submissions, **524 modules finished: 393 PASSED, 41 declared SKIPPED, and 90 REVIEW with screenshots, with no FAILED or INTERRUPTED results**. The broader self-hosted matrix covers **43 plan invocations, 612 modules, and 31,000+ conditions**, with zero unexpected failures and zero unexpected warnings in the recorded run.
 
-## OIDC Conformance
+Every [GitHub Release](https://github.com/issuerd/issuerd/releases) re-runs that matrix against the tagged commit and attaches HTML reports, JSON exports, and runner logs as `issuerd_<version>_conformance-evidence.tar.gz`, covered by checksums, signatures, and a build-provenance attestation. This is continuous engineering evidence, not a new certification for each release.
 
-<p align="center">
-  <a href="https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23">
-    <img src=".github/assets/openid-certified.jpg" alt="OpenID Certified" width="180">
-  </a>
-</p>
-
-Issuerd is listed in the official OpenID Foundation certification registries:
-
-| Certified version | Certified OP profiles | Official registry |
-|---|---|---|
-| **v0.1.17** | Config, Basic, Implicit, Hybrid, Dynamic, 3rd Party-Init, Form Post, Front-Channel Logout, Back-Channel Logout, Session Management | [OIDC implementations](https://openid.net/certification/certified-openid-connect-implementations/?cache=2026-10-23) · [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
-| **v0.1.19** | RP-Initiated Logout | [Logout profiles](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) |
-
-These registry entries are version-specific: they do not mean that v0.1.19 alone is certified for all 11 profiles.
-
-Across the two accepted certification submissions, the OIDF-hosted runs used the [OpenID Foundation Conformance Suite](https://gitlab.com/openid/conformance-suite) (release v5.3.3): 33 plan invocations, **524 modules FINISHED — 393 PASSED, 41 declared SKIPPED, 90 REVIEW with screenshots — with no FAILED or INTERRUPTED results**.
-
-The broader self-hosted engineering matrix below used release v5.3.3 in a hermetic TLS environment against a pristine, unpatched suite: 43 plan invocations, **612 test modules, 31,000+ conditions, 0 unexpected failures and 0 unexpected warnings**:
-
-| Self-hosted profile | Result |
-|---------|--------|
-| Config OP | **PASSED** |
-| Basic OP | **PASSED** |
-| Implicit OP | **PASSED** (`id_token`, `id_token token`) |
-| Hybrid OP | **PASSED** (all three hybrid types) |
-| Dynamic OP | **PASSED** — 6 response types × DCR (RFC 7591/7592), per-client signing algs, signed userinfo, JAR-by-reference |
-| Form Post OP | **PASSED** (basic / implicit / hybrid legs) |
-| 3rd Party-Init OP | **PASSED** (×6) |
-| RP-Initiated Logout OP | **PASSED** (×6) |
-| Session Management OP | **PASSED** (×6) — `session_state` + `check_session_iframe` |
-| Front-Channel Logout OP | **PASSED** (×6) |
-| Back-Channel Logout OP | **PASSED** (×6) — signed logout tokens |
-
-`oidcc-server-rotate-keys` is the one manual-step module the pristine runner cannot exercise in-plan (upstream's own CI lists it identically) — the harness produces real evidence instead: `tests/conformance/run-rotation-check.sh` drives it standalone with a live admin-API key rotation (PASSED on every full run).
-
-Setup and per-module results: `tests/conformance/README.md`, `tests/conformance/COVERAGE.md`; logs are written to the (gitignored) `tests/conformance/results/` directory when the suite runs.
-
-Every [GitHub Release](https://github.com/issuerd/issuerd/releases) re-runs the suite — together with the rest of the heavy test suites — against the exact tagged commit and attaches the complete report bundle as a standalone release asset: `issuerd_<version>_conformance-evidence.tar.gz`, containing the HTML reports, JSON exports, and runner logs, covered by `SHA256SUMS.txt` and a build-provenance attestation.
-
-```bash
-# Re-run the full conformance suite (requires Docker)
-git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite  # once
-cd tests/conformance && docker compose up   # or ./run.sh (CI: exit code + teardown)
-```
-
----
+Details and reproduction: [conformance and certification guide](docs/openid-conformance.md) · [hermetic harness](tests/conformance/README.md) · [per-module coverage](tests/conformance/COVERAGE.md)
 
 ## Quickstart
 
-### Option A — Docker (one command, everything included)
+### Try the hosted demo
+
+Explore [demo.issuerd.org](https://demo.issuerd.org) for the consoles, OIDC/OAuth2 flows, federation, DPoP, CIBA, and MCP administration. The playground uses synthetic data only, is best-effort, and may be reset; do not enter real passwords or sensitive data. App 11 provides a read-only observer and an operator with exact-operation approval.
+
+### Docker demo stack
+
+From a repository checkout:
 
 ```bash
 docker compose up
 ```
 
-This pulls the published image (`issuerd/issuerd:latest`) and starts a single-node Issuerd with PostgreSQL and Redis on `http://localhost:8080`, seeded on first start with the `master` realm (admin `admin` / `admin`) and a demo realm `myrealm` (user `alice` / `changeme`, sample clients `my-app` and `public-app`). No build tools required — only Docker. Pin a specific release with `issuerd/issuerd:<version>` in `docker-compose.yml`; to build from local sources instead, use `docker compose -f docker-compose.yml -f docker-compose.from-source.yml up --build`.
-
-Prebuilt binaries (Linux/Windows, with SBOM and checksums) are attached to each [GitHub Release](https://github.com/issuerd/issuerd/releases).
+This starts Issuerd, PostgreSQL, and Redis on `http://localhost:8080`, with the `master` realm (admin `admin` / `admin`) and demo realm `myrealm` (user `alice` / `changeme`). No build tools are required.
 
 - **Admin console:** <http://localhost:8080/admin/console>
 - **Account console:** <http://localhost:8080/realms/myrealm/account>
 - **Discovery:** <http://localhost:8080/realms/myrealm/.well-known/openid-configuration>
 
-Stop with `docker compose down`; wipe the demo data with `docker compose down -v`.
+Stop with `docker compose down`; wipe the local demo data with `docker compose down -v`.
 
-### Option B — local Rust build
+### Build from source
 
-Prerequisites: a Rust toolchain (1.95+) and — for the embedded web consoles — Node.js 20+.
+Prerequisites: Rust 1.95+ and Node.js 20+ for the embedded browser consoles.
 
 ```bash
-# 1. Build the embedded web client (admin console, account console, login pages)
-cd webclientsrc && npm ci && npm run build && cd ..
-
-# 2. Run the server — zero external dependencies (in-memory backend)
+cd webclientsrc && npm ci && npm run generate-api && npm run build && cd ..
 cargo run --bin issuerd -- daemon
 ```
 
-The server listens on `http://localhost:8080` and seeds the same demo content via the checked-in `issuerd.toml`.
+The checked-in development rig listens on `http://localhost:8080` and uses in-memory storage. For durable single-node storage without PostgreSQL, configure `[storage.sqlite]` as described in [Configuration](docs/configuration.md#storage).
 
-> Skipping step 1 still yields a fully functional OIDC/OAuth2 and Admin REST API server; only the browser consoles and login pages stay unembedded.
+Prebuilt archives for **Linux, Windows, and macOS**, SBOMs, checksums, signatures, and conformance evidence are attached to every [GitHub Release](https://github.com/issuerd/issuerd/releases). See [Getting started](docs/getting-started.md) for a verified first token and [Deployment](docs/deployment.md) for production topologies.
 
-Useful companion commands:
+## Architecture and quality
 
-```bash
-# Export the OpenAPI specification
-cargo run --bin issuerd -- openapi -o openapi.json
+The workspace contains **10 library crates plus the `issuerd` binary**, with a strictly acyclic dependency graph and `issuerd-server` as the composition root. See [ARCHITECTURE.md](ARCHITECTURE.md) and [AGENTS.md](AGENTS.md) for module contracts.
 
-# Generate fully-commented example configs
-cargo run --bin issuerd -- example server-config -o my-server.toml
-cargo run --bin issuerd -- example provision-config -o my-provision.yaml
-```
-
-### More deployment options
-
-```bash
-# Contributor integration stack: extra PostgreSQL, Redis, reference Keycloak,
-# Bind9, Samba AD DC, OpenLDAP (used by the dual-target and federation tests)
-docker compose -f docker-compose.integration.yml up -d
-
-# Two Issuerd nodes behind an nginx load balancer (PostgreSQL + Redis)
-docker compose -f docker-compose.cluster.yml up -d --build
-# LB endpoint: http://localhost:8088 — see docs/CLUSTERING.md
-```
-
----
-
-## Architecture at a Glance
-
-A Cargo workspace of 9 library crates plus the `issuerd` binary. The dependency graph is a strict DAG: only `issuerd-core` is a universal dependency, and `issuerd-server` is the composition root that wires everything together.
-
-| Crate | Responsibility |
-|-------|----------------|
-| `issuerd-core` | Shared types, traits, errors, ID types, models — no I/O, no async |
-| `issuerd-protocol` | OIDC/OAuth2 request parsing & validation — pure functions |
-| `issuerd-auth-flow` | Pluggable authentication flow engine, TOTP, WebAuthn, email codes |
-| `issuerd-token` | JWT/JWS/JWK issuance, signing, validation, introspection |
-| `issuerd-storage` | `Storage` trait + PostgreSQL (sqlx), in-memory, and JSON-file backends |
-| `issuerd-federation` | User federation SPI: LDAP, Kerberos/SPNEGO, user sync |
-| `issuerd-admin-api` | REST Admin API (Axum + utoipa/OpenAPI) |
-| `issuerd-cluster` | Distributed cache (Redis cluster) & node discovery |
-| `issuerd-server` | Composition root: HTTP bootstrap, middleware, TLS, metrics |
-
-Design contracts (stateless validation, testability rule, typestate auth boundaries, horizontal scaling): see `ARCHITECTURE.md`.
-
----
-
-## Testing & Quality
-
-- **3,460+ automated tests.** Unit tests live next to the code; every public function is testable without network I/O or database via trait-based fakes (`InMemoryStorage`, `InMemoryCache`, mock crypto).
-
-  ```bash
-  cargo test --workspace --lib   # unit tests, fast, no I/O
-  cargo test --workspace         # + in-process E2E suite (< 30 s, no Docker)
-  ```
-
-- **Dual-target protocol parity.** A subset of the E2E suite runs the same assertions against Issuerd and a real Keycloak 24.0 container (`ISSUERD_TEST_TARGET=keycloak|both`) to catch behavioral drift.
-- **Real-directory federation tests** against Samba AD DC, OpenLDAP, and Windows Server AD (skip gracefully when unavailable), plus large-scale sync load tests (100k users). A full 100,000-user sync from a live MS AD lab completes in **~30 s** (~3,300 users/s on the `rig/` lab stack with PostgreSQL).
-- **CI-enforced hygiene:** `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo fmt --check` must stay green.
-- **Fast coverage** with `cargo-llvm-cov`:
-
-  ```bash
-  cargo llvm-cov --workspace --lib --summary-only
-  ```
-
----
+- **3,460+ automated tests**, including protocol, storage, federation, cluster, and MCP acceptance coverage.
+- **Dual-target Keycloak oracle** for behavior and JSON/API compatibility.
+- **Real-service test rigs** for Samba AD, OpenLDAP, PostgreSQL, Redis, and multi-node operation.
+- **Strict CI gates:** formatting, clippy with warnings denied, docs, audits, web-client tests, coverage, and heavy Docker suites.
+- **Backward compatibility:** append-only migrations, additive APIs, and optional configuration fields with safe defaults. Existing deployments must keep booting unchanged.
 
 ## Documentation
 
-The full documentation set is also published at **[issuerd.org](https://issuerd.org)** — rendered, searchable, with the same content as the files below.
+| Document | Purpose |
+|---|---|
+| [Operations documentation](docs/README.md) | Installation, configuration, provisioning, deployment, administration, federation, security, backup, and troubleshooting |
+| [Getting started](docs/getting-started.md) | Local installation, first login, and a verified first token |
+| [Configuration](docs/configuration.md) | Server, storage, TLS, cache, cluster, SMTP, and environment settings |
+| [MCP server](docs/mcp-server.md) | The 71-tool surface, resources, scopes, roles, and client operation |
+| [Exact-operation approval](docs/mcp-exact-operation-approval.md) | Canonical approval, atomic execution, and replay reconciliation |
+| [OpenID conformance](docs/openid-conformance.md) | Certification boundaries, hosted submissions, and self-hosted evidence |
+| [Performance](docs/PERFORMANCE.md) | Benchmark methodology and measured results against Keycloak 26.7 |
+| [Clustering](docs/CLUSTERING.md) | Shared state and multi-node deployment |
+| [Architecture](ARCHITECTURE.md) | Crate graph and module contracts |
+| [Keycloak differences](tests/KEYCLOAK_DIFFS.md) | Deliberate compatibility exceptions |
+| [Changelog](CHANGELOG.md) | Release history and migration notes |
 
-| File | Purpose |
-|------|---------|
-| [docs/README.md](docs/README.md) | **Operations documentation set** — installation, configuration, provisioning, deployment, administration, federation, security, monitoring, backup/upgrade, troubleshooting |
-| [webclientsrc/openapi.json](webclientsrc/openapi.json) | **Issuerd API** — OpenAPI spec covering the Admin REST API plus the account-console, public protocol, and internal SPA endpoints |
-| [CHANGELOG.md](CHANGELOG.md) | Project changelog and release history |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | High-level design + module contracts |
-| [AGENTS.md](AGENTS.md) | Conventions, build/test commands, per-crate notes, compatibility policy |
-| [docs/CLUSTERING.md](docs/CLUSTERING.md) | Multi-node deployment guide |
-| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Measured performance & sizing vs Keycloak 26.7 (k6 benchmark stack) |
-| [docs/mcp-server.md](docs/mcp-server.md) | **Built-in MCP server** — 71 curated tools, three resources, DPoP, same-realm authorization, and exact-operation CIBA |
-| [docs/mcp-exact-operation-approval.md](docs/mcp-exact-operation-approval.md) | **Agent-native security architecture** — one fresh approval for one exact operation, atomic execution, and replay reconciliation |
-| [docs/agentic-iam-mcp.md](docs/agentic-iam-mcp.md) | **External agentic IAM** — downstream MCP tool calls secured with DPoP + RFC 8693 token exchange (demo GIF included) |
-| [docs/ciba-step-up.md](docs/ciba-step-up.md) | **Human step-up for agents** — scope-based and exact-operation CIBA approval flows |
-| [docs/openid-conformance.md](docs/openid-conformance.md) | **OIDC conformance and certification** — self-hosted evidence, hosted submissions, the 11-profile version matrix, and resubmission lessons |
-| [tests/KEYCLOAK_DIFFS.md](tests/KEYCLOAK_DIFFS.md) | Documented divergences from Keycloak behavior |
-| [tests/conformance/README.md](tests/conformance/README.md) | OIDC conformance suite harness & results |
+The same operational guides are published at **[issuerd.org](https://issuerd.org)**.
 
----
+## Project scope
 
-## Stability & Compatibility
+Deliberately not implemented for now: SAML 2.0, UMA/Authorization Services, FGAP, Organizations, FAPI 2.0 message signing, and CIBA ping/push modes. Do not infer support from a generic OIDC/OAuth2 label; the discovery document and documentation describe the actual surface.
 
-**Backward compatibility is a standing commitment** across numbered releases:
+## Contributing, security, and license
 
-- **Database** — the schema evolves exclusively through new, append-only migrations. Existing migration files are never modified, and upgrading from any earlier schema version happens automatically at startup.
-- **APIs** — the Admin REST API and the OIDC/OAuth2 protocol surface change additively. Breaking changes require an explicit deprecation window, a documented migration path, and a `CHANGELOG.md` entry.
-- **Configuration & provisioning** — new config keys and provision-YAML fields are optional with sensible defaults, so existing deployments keep booting unchanged.
-
-The contributor-facing policy is enforced through `AGENTS.md`.
-
----
-
-## Project Scope
-
-All OIDC-parity feature areas are implemented. Deliberately out of scope for now: SAML 2.0, fine-grained admin permissions (FGAP), UMA/Authorization Services, Organizations, FAPI 2.0 message signing, CIBA ping/push modes.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, the CI gates, and the standing rules (backward compatibility, truthful discovery, dynamic admin SPA). The deep engineering conventions live in [AGENTS.md](AGENTS.md); participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
-
----
-
-## Security
-
-If you discover a security vulnerability in Issuerd, please report it privately — see [SECURITY.md](SECURITY.md) for the reporting process, scope, and supported versions.
-
-## License
+- Contributions: [CONTRIBUTING.md](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md).
+- Security reports: follow [SECURITY.md](SECURITY.md) for private reporting and supported versions.
+- License: Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+- Trademark: the Issuerd name and logo are unregistered trademarks; see [TRADEMARK.md](TRADEMARK.md).
 
 Copyright 2026 Dmitry Andreev <da@issuerd.org> and contributors.
-
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-## Trademark
-
-"Issuerd" and the Issuerd logo are unregistered trademarks claimed by the project. The code is Apache-2.0-licensed; the name and logo are not. See [TRADEMARK.md](TRADEMARK.md).

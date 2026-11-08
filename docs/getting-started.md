@@ -2,6 +2,8 @@
 
 From a fresh checkout to a verified access token in about five minutes. This guide walks a system operator through the two supported ways to run Issuerd locally — the Docker demo stack (one command, zero prerequisites beyond Docker) and a build from source — explains what happens on first boot, verifies the installation end to end, and finishes with the minimum hardening steps before going further. Production topology, TLS, and externalized configuration are covered in [deployment](deployment.md) and [security](security.md); this guide is deliberately local and hands-on.
 
+To explore Issuerd before installing anything, use the [public hosted demo](https://demo.issuerd.org). It contains synthetic data only, is best-effort, and may be reset. Do not enter real passwords or sensitive data.
+
 ## Contents
 
 - [What you will have at the end](#what-you-will-have-at-the-end)
@@ -33,7 +35,7 @@ Everything in this guide is seeded demo content with well-known credentials — 
 | A — Docker demo stack | Docker with the Compose plugin (`docker compose`). Nothing else — the stack pulls the published server image from Docker Hub, no compilation. |
 | B — Build from source | Rust toolchain **1.95+** (the workspace MSRV). Node.js **20+** is additionally required if you want the embedded browser consoles (admin console, account console, login pages). |
 
-No database is needed for a first run: option B uses the in-memory storage backend by default, and option A brings its own PostgreSQL and Redis containers.
+No database is needed for a first run: option B uses the in-memory storage backend by default, and option A brings its own PostgreSQL and Redis containers. For a durable single-node installation without an external database service, option B can instead use embedded SQLite through `[storage.sqlite]`; see [Configuration](configuration.md#storage). SQLite runs automatic migrations and the master-realm bootstrap, and is strictly single-node.
 
 ## Installation option A — the Docker demo stack
 

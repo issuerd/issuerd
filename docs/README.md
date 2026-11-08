@@ -98,7 +98,7 @@ These documents live outside `docs/` but are part of the operational picture:
 
 | Document | Purpose |
 |---|---|
-| [README.md](../README.md) | Project overview, feature list, standards coverage, quickstart. |
+| [README.md](../README.md) | Project overview, key differentiators, conformance summary, and quickstart. |
 | [ARCHITECTURE.md](../ARCHITECTURE.md) | High-level design and module contracts. |
 | [CHANGELOG.md](../CHANGELOG.md) | Project changelog and release history. |
 | [tests/KEYCLOAK_DIFFS.md](../tests/KEYCLOAK_DIFFS.md) | Every deliberate behavioral divergence from Keycloak 24. |
