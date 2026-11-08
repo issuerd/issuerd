@@ -88,6 +88,10 @@ pub struct AdminEventQuery {
 #[mockall::automock]
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Close backend connections and wait for their release. Backends without
+    /// external connections keep the default no-op implementation.
+    async fn close(&self) {}
+
     // Realm
     async fn get_realm(&self, id: &RealmId) -> Result<Option<Realm>, IssuerdError>;
     async fn get_realm_by_name(&self, name: &str) -> Result<Option<Realm>, IssuerdError>;

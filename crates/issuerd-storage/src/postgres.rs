@@ -221,6 +221,10 @@ fn to_uuid(id: &str) -> Result<uuid::Uuid, IssuerdError> {
 
 #[async_trait]
 impl Storage for PostgresStorage {
+    async fn close(&self) {
+        self.pool.close().await;
+    }
+
     // ------------------------------------------------------------------
     // Realm
     // ------------------------------------------------------------------

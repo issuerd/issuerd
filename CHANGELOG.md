@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-08
+
 ### Added
 
 - **Embedded SQLite storage.** `[storage.sqlite] path = "/var/lib/issuerd/issuerd.db"` adds a durable production single-node backend with no external database service, automatic migrations and master-realm bootstrap, WAL with full synchronous durability, atomic provisioning and MCP step-up transactions, and real-file conformance tests. UUID-backed identifiers are validated and stored as typed 16-byte blobs; Unicode-normalized search matches the other backends, busy writes retry a bounded number of times, and Unix DB/WAL/SHM files are maintained with owner-only `0600` permissions. Existing PostgreSQL, in-memory, and JSON behavior is unchanged. SQLite remains single-node, and signing-key envelope encryption remains PostgreSQL-only.
@@ -31,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Client-credentials audit persistence.** Legacy synthetic client-credential grants now record the internal client UUID with a null user ID and the public OAuth client ID in event details, preventing PostgreSQL audit write failures and warning floods while preserving `sub=client_id` and real service-account identity.
+- **DPoP benchmark reliability.** The k6 harness now left-pads exported P-256 JWK coordinates to their RFC-required fixed width, preventing occasional malformed proofs from distorting large-tier results. Server-side DPoP validation is unchanged.
+- **CIBA benchmark reliability.** The performance and smoke harnesses now select the realm-scoped SSO cookie explicitly instead of accidentally accepting the OIDC session-state companion cookie, preventing false approval failures. Server-side CIBA approval is unchanged.
 - **SQLite migration and file hardening.** Schema migrations now honor the same bounded lock retry as other writes, non-regular storage paths are rejected before any permission change, and the `VACUUM INTO` runbook creates owner-only backups with `umask 077` and `chmod 0600`.
+- **Storage shutdown lifecycle.** Daemon and provision commands now await SQL pool closure through the additive, default-no-op `Storage::close` hook. SQLite restart tests close both instances explicitly, preventing Windows directory-removal failures while preserving compatibility with external storage implementations.
 - **Admin console realm selection.** Token refresh now preserves the selected admin realm instead of replacing it with the token's issuer realm. Refresh requests still target the issuer realm, including master-issued cross-realm admin sessions, and restored legacy token sets infer that issuer from their storage keys.
 - **Docker builds.** Update the pinned `rustup-init.sh` SHA-256 to match the current upstream installer, restoring canonical and glibc-2.28 image builds after the upstream artifact changed.
 - **Admin console dialogs.** Initial focus no longer steals focus from a field the user has already selected while a dialog is opening, preserving complete input during the entry animation.

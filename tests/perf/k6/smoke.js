@@ -132,7 +132,7 @@ export default async function () {
     http.cookieJar().clear(t.base);
     const login = await lib.loginGetCode(t, 'perfuser', lib.PASSWORD);
     step('ciba_login', !!login.code, `stage=${login.stage}`);
-    const sess = Object.entries(login.cookies || {}).find(([name]) => name.startsWith('issuerd_session'));
+    const sess = lib.findSsoCookie(login.cookies);
     step('ciba_sso_cookie', !!sess, sess ? sess[0] : 'none found');
     sessName = sess[0];
     sessValue = sess[1][0].value;

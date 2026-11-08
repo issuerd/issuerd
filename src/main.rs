@@ -63,12 +63,19 @@ async fn main() -> Result<(), anyhow::Error> {
             let (config_path, cfg) = loaded.expect("daemon config loaded before init_logging");
             tracing::info!(config_path = %config_path.display(), "loaded configuration");
             let state = Arc::new(issuerd_server::state::ServerState::from_config(&cfg).await?);
+            let storage = state.storage.clone();
             let app = issuerd_server::routes::app_router(state);
             if let Err(e) = issuerd_server::routes::init_metrics() {
                 tracing::debug!(error = %e, "metrics recorder already initialized or unavailable");
             }
-            issuerd_server::bootstrap::run(&cfg, app, issuerd_server::bootstrap::shutdown_signal())
-                .await?;
+            let result = issuerd_server::bootstrap::run(
+                &cfg,
+                app,
+                issuerd_server::bootstrap::shutdown_signal(),
+            )
+            .await;
+            storage.close().await;
+            result?;
         }
         cli::Commands::Provision { file, .. } => {
             let (config_path, cfg) = loaded.expect("provision config loaded before init_logging");
@@ -94,7 +101,9 @@ async fn main() -> Result<(), anyhow::Error> {
             };
 
             let provisioner = issuerd_server::provisioner::Provisioner::from_file(&file)?;
-            provisioner.apply_once(storage.as_ref(), &cfg.issuer_url).await?;
+            let result = provisioner.apply_once(storage.as_ref(), &cfg.issuer_url).await;
+            storage.close().await;
+            result?;
             tracing::info!("Provision applied successfully");
         }
         cli::Commands::Openapi { output } => {
