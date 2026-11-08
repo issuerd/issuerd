@@ -232,6 +232,10 @@ pub async fn initiate(
         .into_response()
 }
 
+fn bounded_grant_expiry(now: i64, lifetime: i64, token_exp: i64, operation_exp: i64) -> i64 {
+    now.saturating_add(lifetime).min(token_exp).min(operation_exp)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn issue(
     state: Arc<ServerState>,
@@ -365,6 +369,9 @@ pub async fn issue(
             return temporary(&error);
         }
     };
+    let grant_expires_at =
+        bounded_grant_expiry(now, lifetime, access_token.claims.exp, operation.expires_at);
+    let expires_in = grant_expires_at.saturating_sub(now).max(0) as u64;
     let grant = McpStepUpGrant {
         version: 1,
         operation_id: operation.operation_id.clone(),
@@ -385,7 +392,7 @@ pub async fn issue(
         status: McpStepUpExecutionStatus::Active,
         result_json: None,
         issued_at: now,
-        expires_at: access_token.claims.exp.min(operation.expires_at),
+        expires_at: grant_expires_at,
         updated_at: now,
     };
     match state.storage.create_mcp_step_up_grant(&grant).await {
@@ -411,7 +418,6 @@ pub async fn issue(
     if let Err(error) = state.cache.delete(&cache_key).await {
         return temporary(&error);
     }
-    let expires_in = access_token.claims.exp.saturating_sub(now).max(0) as u64;
     token_response(TokenResponse {
         access_token: access_token.token,
         token_type: "DPoP".into(),
@@ -1708,6 +1714,19 @@ mod tests {
         let html = response_text(approval).await;
         assert!(html.contains("clients_delete"));
         assert!(!html.contains("test-secret"));
+    }
+
+    #[test]
+    fn grant_expiry_is_bounded_by_grant_token_and_operation() {
+        let now = 1_000;
+        let crossed_second = bounded_grant_expiry(now, 120, now + 121, now + 300);
+        assert_eq!(crossed_second, now + 120);
+        assert_eq!(crossed_second.saturating_sub(now) as u64, 120);
+
+        let shorter_operation = bounded_grant_expiry(now, 119, now + 121, now + 119);
+        assert_eq!(shorter_operation, now + 119);
+        let shorter_token = bounded_grant_expiry(now, 120, now + 110, now + 300);
+        assert_eq!(shorter_token, now + 110);
     }
 
     #[test]
