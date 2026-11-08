@@ -42,7 +42,7 @@ export async function setup() {
   if (!isIc) return { cookieName: null, cookieValue: null };
   const { code, cookies, stage } = await lib.loginGetCode(t, 'perfuser', lib.PASSWORD);
   if (!code) throw new Error(`CIBA setup login failed at ${stage}`);
-  const sess = Object.entries(cookies || {}).find(([name]) => name.startsWith('issuerd_session'));
+  const sess = lib.findSsoCookie(cookies);
   if (!sess) throw new Error(`no issuerd_session* cookie after login (got: ${Object.keys(cookies || {})})`);
   return { cookieName: sess[0], cookieValue: sess[1][0].value };
 }

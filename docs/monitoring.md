@@ -196,6 +196,8 @@ Both require a `view-realm` or `manage-realm` token (see [administration.md](adm
 
 `events` returns a JSON array of representations: `id`, `time` (Unix timestamp), `event_type`, `realm_id`, `client_id`, `user_id`, `username`, `session_id`, `ip_address`, `details`, `error`. `username` is resolved against the realm's users at query time; when the user no longer exists (deleted, or a federated user never imported) it falls back to the `username` recorded in the event's `details`. `events/count` returns `{"count": N}` for the same filters with pagination ignored — use it for totals and dashboard-style checks.
 
+For the legacy synthetic `client_credentials` subject, `user_id` is null and `details.username` carries the public OAuth `client_id`. A real service-account user keeps its UUID in `user_id`.
+
 > **Note:** The HTTP surface currently filters by event type and date range only — there are no `client`, `user`, or `session` query parameters, even though `client_id`, `user_id`, and `session_id` are returned in each representation. Filter those client-side after fetching.
 
 Examples (token acquisition is covered in [administration.md](administration.md#getting-an-admin-token)):

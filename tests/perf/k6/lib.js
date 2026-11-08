@@ -37,6 +37,14 @@ export function urls(t) {
   };
 }
 
+export function findSsoCookie(cookies) {
+  return Object.entries(cookies || {}).find(
+    ([name]) =>
+      name === 'issuerd_session' ||
+      (name.startsWith('issuerd_session_') && !name.startsWith('issuerd_session_state_'))
+  );
+}
+
 export function username(i) {
   // user0001..userNNNN, matching gen_kc_realm.py and the seeding scenario.
   return `user${String((i % NUM_USERS) + 1).padStart(4, '0')}`;
@@ -65,6 +73,19 @@ export function b64urlBytes(bytes) {
 
 export function b64urlStr(s) {
   return urlsafe(encoding.b64encode(s));
+}
+
+export function normalizeEcCoordinate(value, size) {
+  // k6 can omit leading zero octets when exporting EC JWK coordinates, but
+  // RFC 7518 requires fixed-width coordinates for the selected curve.
+  const bytes = new Uint8Array(encoding.b64decode(value, 'rawurl'));
+  if (bytes.length === 0 || bytes.length > size) {
+    throw new Error(`invalid EC coordinate length: ${bytes.length}`);
+  }
+  if (bytes.length === size) return value;
+  const padded = new Uint8Array(size);
+  padded.set(bytes, size - bytes.length);
+  return b64urlBytes(padded);
 }
 
 function strToBytes(s) {
@@ -131,7 +152,12 @@ export class DpopKey {
       'sign',
     ]);
     const jwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
-    return new DpopKey(kp, { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y });
+    return new DpopKey(kp, {
+      kty: jwk.kty,
+      crv: jwk.crv,
+      x: normalizeEcCoordinate(jwk.x, 32),
+      y: normalizeEcCoordinate(jwk.y, 32),
+    });
   }
 
   constructor(kp, pub) {

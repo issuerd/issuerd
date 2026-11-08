@@ -266,6 +266,10 @@ fn to_uuid(id: &str) -> Result<uuid::Uuid, IssuerdError> {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn close(&self) {
+        self.pool.close().await;
+    }
+
     // ------------------------------------------------------------------
     // Realm
     // ------------------------------------------------------------------

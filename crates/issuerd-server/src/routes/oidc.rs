@@ -4946,13 +4946,14 @@ async fn token_handler_inner(
             debug!(realm = %realm_id, client_id = %client.client_id, user_id = %token_user.id, grant_type = "client_credentials", "token issued");
             let mut details = std::collections::HashMap::new();
             details.insert("grant_type".to_string(), "client_credentials".to_string());
+            details.insert("username".to_string(), client.client_id.to_string());
             emit_oidc_event(
                 &state,
                 &realm_id,
                 EventType::ClientLogin,
                 &ip,
                 Some(client.id.clone()),
-                Some(token_user.id.clone()),
+                service_account.as_ref().map(|user| user.id.clone()),
                 Some(session_id.clone()),
                 None,
                 details,

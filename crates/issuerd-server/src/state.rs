@@ -1241,6 +1241,7 @@ mod tests {
         assert_eq!(first.storage.list_signing_keys().await.unwrap().len(), 2);
         let realm_id = realm.id.clone();
         let admin_id = admin.id.clone();
+        first.storage.close().await;
         drop(first);
 
         let second = ServerState::from_config(&cfg).await.unwrap();
@@ -1257,6 +1258,7 @@ mod tests {
             1
         );
         assert_eq!(second.storage.list_signing_keys().await.unwrap().len(), 2);
+        second.storage.close().await;
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
     }

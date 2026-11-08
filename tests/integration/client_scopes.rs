@@ -19,8 +19,9 @@ use axum::http::StatusCode;
 use base64::Engine;
 
 use issuerd_core::{
-    ClientId, ClientProtocol, ClientScope, ClientScopeId, GroupId, GroupName, GroupPath, MapperId,
-    MapperType, ProtocolMapper, RealmId, RoleId, RoleName, Scope, ScopeMappings,
+    ClientId, ClientProtocol, ClientScope, ClientScopeId, EventQuery, EventType, GroupId,
+    GroupName, GroupPath, MapperId, MapperType, Pagination, ProtocolMapper, RealmId, RoleId,
+    RoleName, Scope, ScopeMappings,
 };
 
 use crate::harness::TestHarness;
@@ -541,12 +542,30 @@ async fn service_account_backs_client_credentials_grant() {
     assert_eq!(claims["sub"], serde_json::json!(sa_user.id.to_string()));
     let roles = claims["realm_access"]["roles"].as_array().expect("realm_access.roles");
     assert!(roles.iter().any(|r| r == "svc-role"), "missing svc-role in {roles:?}");
+
+    let events = harness
+        .storage
+        .query_events(
+            &realm.id,
+            &EventQuery {
+                event_type: Some(EventType::ClientLogin),
+                client_id: Some(client.id.clone()),
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::new(0, 10),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user_id, Some(sa_user.id.clone()));
 }
 
 #[tokio::test]
 async fn client_credentials_without_service_account_keeps_legacy_shape() {
     let harness = TestHarness::new().await;
-    let _realm = harness.create_realm("cs-cc-legacy").await;
+    let realm = harness.create_realm("cs-cc-legacy").await;
     let client = harness.create_client("cs-cc-legacy", false).await;
 
     let client_id = client.client_id.to_string();
@@ -569,6 +588,26 @@ async fn client_credentials_without_service_account_keeps_legacy_shape() {
     assert_eq!(claims["sub"], serde_json::json!(client.client_id.to_string()));
     assert!(claims.get("realm_access").is_none());
     assert!(claims.get("resource_access").is_none());
+
+    let events = harness
+        .storage
+        .query_events(
+            &realm.id,
+            &EventQuery {
+                event_type: Some(EventType::ClientLogin),
+                client_id: Some(client.id.clone()),
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: Pagination::new(0, 10),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_id, Some(client.id.clone()));
+    assert_eq!(events[0].user_id, None, "synthetic client subjects have no stored user UUID");
+    assert_eq!(events[0].details.get("username"), Some(&client.client_id.to_string()),);
 }
 
 #[tokio::test]
