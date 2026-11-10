@@ -417,6 +417,7 @@ impl Storage for InMemoryStorage {
         self.client_scopes.retain(|k, _| k.0 != *id);
         self.client_scope_assignments.retain(|k, _| k.0 != *id);
         self.realm_default_client_scopes.retain(|k, _| k != id);
+        self.delete_webhook_realm(id).await;
 
         // Keep events/admin_events for audit; filter them at query time.
         Ok(())
@@ -1761,6 +1762,14 @@ impl Storage for InMemoryStorage {
     ) -> Result<(), IssuerdError> {
         InMemoryStorage::fail_webhook_delivery(self, realm, id, lease_owner, error, next_attempt_at)
             .await
+    }
+    async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        InMemoryStorage::get_webhook_delivery(self, realm, subscription_id, id).await
     }
     async fn replay_webhook_delivery(
         &self,

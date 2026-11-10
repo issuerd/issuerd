@@ -17,6 +17,51 @@ use crate::IssuerdError;
 pub const WEBHOOK_SCHEMA_VERSION: u32 = 1;
 const MAX_FILTERS: usize = 64;
 const MAX_FILTER_LEN: usize = 128;
+const MAX_SECRET_LEN: usize = 1024;
+const MAX_URL_LEN: usize = 2048;
+
+pub fn validate_webhook_url(value: &str) -> Result<(), IssuerdError> {
+    if value.len() > MAX_URL_LEN {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook URL cannot exceed 2048 bytes".to_string(),
+        ));
+    }
+    let url = url::Url::parse(value)
+        .map_err(|error| IssuerdError::InvalidRequest(format!("invalid webhook URL: {error}")))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook URL must be an absolute HTTPS URL".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook URL must not contain userinfo".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook URL must not contain a fragment".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_secret(value: &str) -> Result<(), IssuerdError> {
+    if value.is_empty() {
+        return Err(IssuerdError::InvalidRequest("webhook secret cannot be empty".to_string()));
+    }
+    if value.len() > MAX_SECRET_LEN {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook secret cannot exceed 1024 bytes".to_string(),
+        ));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(IssuerdError::InvalidRequest(
+            "webhook secret cannot contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 fn default_filters() -> Vec<String> {
     vec!["*".to_string()]
@@ -29,19 +74,7 @@ pub struct WebhookSecret(String);
 impl WebhookSecret {
     pub fn new(value: impl Into<String>) -> Result<Self, IssuerdError> {
         let value = value.into();
-        if value.is_empty() {
-            return Err(IssuerdError::InvalidRequest("webhook secret cannot be empty".to_string()));
-        }
-        if value.len() > 1024 {
-            return Err(IssuerdError::InvalidRequest(
-                "webhook secret cannot exceed 1024 bytes".to_string(),
-            ));
-        }
-        if value.chars().any(|c| c.is_control()) {
-            return Err(IssuerdError::InvalidRequest(
-                "webhook secret cannot contain control characters".to_string(),
-            ));
-        }
+        validate_secret(&value)?;
         Ok(Self(value))
     }
 
@@ -79,6 +112,8 @@ pub struct WebhookSubscription {
 
 impl WebhookSubscription {
     pub fn validate(&self) -> Result<(), IssuerdError> {
+        validate_webhook_url(&self.url)?;
+        validate_secret(self.secret.as_str())?;
         validate_webhook_filters(&self.event_types)
     }
 }
@@ -526,6 +561,39 @@ mod tests {
         for invalid in ["", "line\nfeed"] {
             assert!(WebhookSecret::new(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn subscription_validation_covers_url_filters_and_deserialized_secrets() {
+        let mut subscription = WebhookSubscription {
+            id: WebhookSubscriptionId::new("subscription-1").unwrap(),
+            realm_id: RealmId::new("realm-1").unwrap(),
+            url: "https://receiver.example/events".to_string(),
+            secret: WebhookSecret::new("very-secret-value").unwrap(),
+            enabled: true,
+            event_types: vec!["*".to_string()],
+            include_representation: false,
+            created_by: None,
+            created_at: Utc::now(),
+        };
+        assert!(!format!("{subscription:?}").contains("very-secret-value"));
+        for url in [
+            "http://receiver.example/events".to_string(),
+            "https://user@receiver.example/events".to_string(),
+            "https://receiver.example/events#fragment".to_string(),
+            format!("https://receiver.example/{}", "a".repeat(2048)),
+        ] {
+            subscription.url = url;
+            assert!(subscription.validate().is_err());
+        }
+        subscription.url = "https://receiver.example/events".to_string();
+        subscription.secret = serde_json::from_str("\"\"").unwrap();
+        assert!(subscription.validate().is_err());
+        subscription.secret = WebhookSecret::new("secret").unwrap();
+        subscription.event_types.clear();
+        assert!(subscription.validate().is_err());
+        subscription.event_types = vec!["USER.LOGIN".to_string()];
+        subscription.validate().unwrap();
     }
 
     #[test]

@@ -176,6 +176,153 @@ async fn failed_login_is_delivered_to_https_webhook_with_hmac() {
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].status, WebhookDeliveryStatus::Delivered);
     assert_eq!(deliveries[0].event_id.to_string(), event_id);
+
+    let delivery_id = history[0]["id"].as_str().unwrap();
+    let replay_response = harness
+        .post_json_auth(
+            &format!(
+                "/admin/realms/webhook-it/webhooks/{subscription_id}/deliveries/{delivery_id}/replay"
+            ),
+            &admin,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(replay_response.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(worker.process_batch().await.unwrap(), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].headers["idempotency-key"], requests[1].headers["idempotency-key"]);
+}
+
+#[tokio::test]
+async fn registration_admin_logout_and_revocation_reach_webhook_outbox() {
+    use axum::{body::Body, http::StatusCode};
+    use tower::ServiceExt;
+
+    let harness = TestHarness::new().await;
+    let mut realm = harness.create_realm("webhook-lifecycle").await;
+    realm.registration_enabled = true;
+    harness.storage.update_realm(&realm).await.unwrap();
+    let client = harness.create_client("webhook-lifecycle", false).await;
+    let client_id = client.client_id.to_string();
+    let client_secret = client.secret.as_deref().unwrap_or("").to_string();
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let response = harness
+        .post_json_auth(
+            "/admin/realms/webhook-lifecycle/webhooks",
+            &admin,
+            serde_json::json!({
+                "url": "https://receiver.example/events",
+                "secret": "test-secret",
+                "eventTypes": ["USER.REGISTER", "USER.LOGOUT", "ADMIN.USER.CREATE"]
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let registration = harness.get("/realms/webhook-lifecycle/login/register").await;
+    assert_eq!(registration.status(), StatusCode::OK);
+    let cookie = registration
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("registration flow cookie");
+    let flow_id = cookie
+        .strip_prefix("issuerd_flow_")
+        .expect("flow cookie name")
+        .split('=')
+        .next()
+        .unwrap();
+    let registration = harness
+        .post_form_with_cookie(
+            "/realms/webhook-lifecycle/login/register",
+            &[
+                ("flow", flow_id),
+                ("username", "alice"),
+                ("email", "alice@example.com"),
+                ("first_name", "Test"),
+                ("last_name", "User"),
+                ("password", "password123"),
+                ("confirm_password", "password123"),
+            ],
+            &TestHarness::flow_cookie(flow_id),
+        )
+        .await;
+    assert_eq!(registration.status(), StatusCode::OK);
+
+    let created = harness
+        .post_json_auth(
+            "/admin/realms/webhook-lifecycle/users",
+            &admin,
+            serde_json::json!({
+                "username": "bob",
+                "email": "bob@example.com",
+                "enabled": true
+            }),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let revoked = harness
+        .authenticate_user("webhook-lifecycle", &client_id, "alice", "password123")
+        .await;
+    let revoked_response = harness
+        .post_form(
+            "/realms/webhook-lifecycle/protocol/openid-connect/revoke",
+            &[
+                ("token", &revoked.access_token),
+                ("token_type_hint", "access_token"),
+                ("client_id", &client_id),
+                ("client_secret", &client_secret),
+            ],
+        )
+        .await;
+    assert_eq!(revoked_response.status(), StatusCode::OK);
+
+    let logout = harness
+        .authenticate_user("webhook-lifecycle", &client_id, "alice", "password123")
+        .await;
+    let id_token = logout.id_token.as_deref().unwrap();
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/realms/webhook-lifecycle/protocol/openid-connect/logout?id_token_hint={id_token}"
+        ))
+        .header("cookie", format!("issuerd_session_{}={}", realm.id, logout.sso_token))
+        .body(Body::empty())
+        .unwrap();
+    let response = harness.app.clone().oneshot(harness.add_connect_info(request)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let deliveries = harness
+        .storage
+        .list_webhook_deliveries(&realm.id, None, &Pagination::new(0, 100))
+        .await
+        .unwrap();
+    let payloads: Vec<serde_json::Value> = deliveries
+        .iter()
+        .map(|delivery| serde_json::from_str(&delivery.payload).unwrap())
+        .collect();
+    assert_eq!(payloads.len(), 4, "{payloads:?}");
+    assert!(payloads.iter().any(|payload| {
+        payload["kind"] == "USER"
+            && payload["type"] == "REGISTER"
+            && payload["details"]["username"] == "alice"
+    }));
+    assert!(payloads.iter().any(|payload| {
+        payload["kind"] == "ADMIN"
+            && payload["operationType"] == "CREATE"
+            && payload["resourceType"] == "USER"
+            && payload.get("representation").is_none()
+    }));
+    let logouts: Vec<_> = payloads
+        .iter()
+        .filter(|payload| payload["kind"] == "USER" && payload["type"] == "LOGOUT")
+        .collect();
+    assert_eq!(logouts.len(), 2, "{payloads:?}");
+    for payload in logouts {
+        assert_eq!(payload["clientId"], client_id);
+    }
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {

@@ -736,6 +736,16 @@ pub trait Storage: Send + Sync {
     ) -> Result<(), IssuerdError> {
         Err(IssuerdError::UnsupportedOperation)
     }
+    /// Find one delivery by its realm, owning subscription, and UUID without
+    /// scanning or loading the delivery history.
+    async fn get_webhook_delivery(
+        &self,
+        _realm: &RealmId,
+        _subscription_id: &WebhookSubscriptionId,
+        _id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
     /// Requeue a terminal or waiting delivery. An active claim is rejected
     /// atomically with `Conflict`, never cancelled by a check-then-act race.
     async fn replay_webhook_delivery(

@@ -9,12 +9,12 @@ use std::path::Path;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use issuerd_core::{
-    validate_webhook_filters, Alias, Client, ClientAuthenticatorType, ClientId, ClientIdentifier,
-    ClientProtocol, Credential, CredentialId, CredentialType, DisplayName, Email, FlowConfig,
-    FlowStage, FlowStageId, Group, GroupId, GroupName, GroupPath, IdentityProviderConfig,
-    IdentityProviderId, PasswordPolicy, ProvisionConfig, Realm, RealmId, RealmName, RedirectUri,
-    Requirement, Role, RoleId, RoleName, Scope, SecondsNonZero, SslRequired, Storage, User, UserId,
-    Username, WebOrigin, WebhookSecret, WebhookSubscription,
+    validate_webhook_filters, validate_webhook_url, Alias, Client, ClientAuthenticatorType,
+    ClientId, ClientIdentifier, ClientProtocol, Credential, CredentialId, CredentialType,
+    DisplayName, Email, FlowConfig, FlowStage, FlowStageId, Group, GroupId, GroupName, GroupPath,
+    IdentityProviderConfig, IdentityProviderId, PasswordPolicy, ProvisionConfig, Realm, RealmId,
+    RealmName, RedirectUri, Requirement, Role, RoleId, RoleName, Scope, SecondsNonZero,
+    SslRequired, Storage, User, UserId, Username, WebOrigin, WebhookSecret, WebhookSubscription,
 };
 use tracing::{info, warn};
 
@@ -598,19 +598,7 @@ impl Provisioner {
     ) -> Result<(), issuerd_core::IssuerdError> {
         for p in &self.config.webhooks {
             let realm_id = self.resolve_realm_id(storage, &p.realm).await?;
-            let url = url::Url::parse(&p.url).map_err(|e| {
-                issuerd_core::IssuerdError::InvalidRequest(format!("webhook URL: {e}"))
-            })?;
-            if url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(issuerd_core::IssuerdError::InvalidRequest(
-                    "webhook URL must be HTTPS without userinfo or a fragment".into(),
-                ));
-            }
+            validate_webhook_url(&p.url)?;
             validate_webhook_filters(&p.event_types)?;
             if storage
                 .list_webhook_subscriptions(&realm_id)
@@ -1663,6 +1651,7 @@ mod webhook_tests {
             event_types: vec!["USER.REGISTER".to_string()],
             include_representation: false,
         });
+        let repeated_config = config.clone();
         let provisioner = Provisioner { config };
         provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
 
@@ -1673,7 +1662,32 @@ mod webhook_tests {
         assert_eq!(subscriptions[0].event_types, vec!["USER.REGISTER".to_string()]);
         assert!(subscriptions[0].enabled);
 
-        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+        let mut repeated = Provisioner {
+            config: repeated_config,
+        };
+        repeated.config.marker = Some("webhook-second-marker".to_string());
+        repeated.apply_once(&storage, "http://localhost:8080").await.unwrap();
         assert_eq!(storage.list_webhook_subscriptions(&realm.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insecure_webhook_provisioning_is_rejected() {
+        let storage = InMemoryStorage::new();
+        let mut config = tests::sample_config();
+        config.webhooks.push(ProvisionWebhook {
+            realm: "testrealm".to_string(),
+            url: "http://receiver.example/events".to_string(),
+            secret: "secret".to_string(),
+            enabled: true,
+            event_types: vec!["USER.REGISTER".to_string()],
+            include_representation: false,
+        });
+        let provisioner = Provisioner { config };
+        assert!(matches!(
+            provisioner.apply_once(&storage, "http://localhost:8080").await,
+            Err(issuerd_core::IssuerdError::InvalidRequest(_))
+        ));
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        assert!(storage.list_webhook_subscriptions(&realm.id).await.unwrap().is_empty());
     }
 }

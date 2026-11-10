@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 //
-// In-memory webhook subscriptions and durable-delivery semantics.
+// In-memory webhook subscriptions and process-local outbox semantics.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -85,10 +85,13 @@ impl InMemoryStorage {
             return Err(IssuerdError::InvalidRequest("webhook subscription realm mismatch".into()));
         }
         let _guard = self.webhooks.lock.lock().await;
-        let key = (realm.clone(), subscription.id.clone());
-        if self.webhooks.subscriptions.contains_key(&key) {
+        if self.get_realm(realm).await?.is_none() {
+            return Err(IssuerdError::NotFound);
+        }
+        if self.webhooks.subscriptions.iter().any(|entry| entry.key().1 == subscription.id) {
             return Err(IssuerdError::Conflict);
         }
+        let key = (realm.clone(), subscription.id.clone());
         self.webhooks.subscriptions.insert(key, subscription.clone());
         Ok(())
     }
@@ -303,6 +306,37 @@ impl InMemoryStorage {
         Ok(())
     }
 
+    pub async fn delete_webhook_realm(&self, realm: &RealmId) {
+        let _guard = self.webhooks.lock.lock().await;
+        self.webhooks
+            .subscriptions
+            .retain(|(subscription_realm, _), _| subscription_realm != realm);
+        let subscriptions = &self.webhooks.subscriptions;
+        self.webhooks.deliveries.retain(|_, delivery| {
+            subscriptions.iter().any(|entry| entry.key().1 == delivery.subscription_id)
+        });
+    }
+
+    pub async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        let Some(delivery) = self.webhooks.deliveries.get(id).map(|entry| entry.clone()) else {
+            return Ok(None);
+        };
+        if delivery.subscription_id != *subscription_id
+            || !self
+                .webhooks
+                .subscriptions
+                .contains_key(&(realm.clone(), subscription_id.clone()))
+        {
+            return Ok(None);
+        }
+        Ok(Some(delivery))
+    }
+
     pub async fn replay_webhook_delivery(
         &self,
         realm: &RealmId,
@@ -370,6 +404,19 @@ mod tests {
         RealmId::new("realm-1").unwrap()
     }
 
+    async fn storage_with_realm() -> InMemoryStorage {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_realm(&Realm {
+                id: realm_id(),
+                name: RealmName::new("demo").unwrap(),
+                ..Realm::default()
+            })
+            .await
+            .unwrap();
+        storage
+    }
+
     fn subscription() -> WebhookSubscription {
         WebhookSubscription {
             id: WebhookSubscriptionId::new("subscription-1").unwrap(),
@@ -402,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     pub async fn outbox_is_idempotent_and_excludes_competing_workers() {
-        let storage = InMemoryStorage::new();
+        let storage = storage_with_realm().await;
         storage.create_webhook_subscription(&realm_id(), &subscription()).await.unwrap();
         assert!(storage
             .enqueue_webhook_delivery(&realm_id(), &subscription().id, &event())
@@ -460,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     pub async fn failed_attempts_retry_dead_and_recover_expired_leases() {
-        let storage = InMemoryStorage::new();
+        let storage = storage_with_realm().await;
         storage.create_webhook_subscription(&realm_id(), &subscription()).await.unwrap();
         storage
             .enqueue_webhook_delivery(&realm_id(), &subscription().id, &event())
@@ -527,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     pub async fn disabled_subscriptions_are_not_claimed_and_snapshots_restore_state() {
-        let storage = InMemoryStorage::new();
+        let storage = storage_with_realm().await;
         let mut subscription = subscription();
         subscription.enabled = false;
         storage.create_webhook_subscription(&realm_id(), &subscription).await.unwrap();
@@ -564,5 +611,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimed[0].delivery.sequence, 1);
+        assert!(restored
+            .get_webhook_delivery(&realm_id(), &subscription.id, &claimed[0].delivery.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(restored
+            .get_webhook_delivery(
+                &realm_id(),
+                &WebhookSubscriptionId::new("other").unwrap(),
+                &claimed[0].delivery.id,
+            )
+            .await
+            .unwrap()
+            .is_none());
+
+        restored.delete_realm(&realm_id()).await.unwrap();
+        assert!(restored.list_webhook_subscriptions(&realm_id()).await.unwrap().is_empty());
+        assert!(restored
+            .list_webhook_deliveries(&realm_id(), None, &Pagination::default())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscriptions_require_realm_and_globally_unique_ids() {
+        let storage = storage_with_realm().await;
+        storage.create_webhook_subscription(&realm_id(), &subscription()).await.unwrap();
+        let other_realm = Realm {
+            id: RealmId::new("realm-2").unwrap(),
+            name: RealmName::new("other").unwrap(),
+            ..Realm::default()
+        };
+        storage.create_realm(&other_realm).await.unwrap();
+        let mut other = subscription();
+        other.realm_id = other_realm.id.clone();
+        assert!(matches!(
+            storage.create_webhook_subscription(&other_realm.id, &other).await,
+            Err(IssuerdError::Conflict)
+        ));
+
+        other.realm_id = RealmId::new("missing").unwrap();
+        assert!(matches!(
+            storage.create_webhook_subscription(&other.realm_id.clone(), &other).await,
+            Err(IssuerdError::NotFound)
+        ));
     }
 }

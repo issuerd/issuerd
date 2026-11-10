@@ -67,11 +67,22 @@ impl WebhookWorker {
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
         loop {
-            let processed = match self.process_batch().await {
-                Ok(processed) => processed,
-                Err(error) => {
-                    warn!(error = %error, "webhook delivery batch failed");
-                    0
+            if *shutdown.borrow() {
+                break;
+            }
+            let processed = tokio::select! {
+                result = self.process_batch() => match result {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        warn!(error = %error, "webhook delivery batch failed");
+                        0
+                    }
+                },
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
                 }
             };
             if processed > 0 {
@@ -94,10 +105,28 @@ impl WebhookWorker {
             .claim_webhook_deliveries(&self.worker_id, self.batch_size, self.lease_duration)
             .await?;
         let count = tasks.len();
-        for task in tasks {
-            self.deliver(task).await?;
+        let results =
+            futures::future::join_all(tasks.into_iter().map(|task| self.deliver(task))).await;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => {}
+                Err(IssuerdError::Conflict) => {
+                    debug!("webhook delivery lease changed before settlement");
+                }
+                Err(error) => {
+                    if first_error.is_some() {
+                        warn!(error = %error, "additional webhook delivery failure");
+                    } else {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        Ok(count)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
     }
 
     async fn deliver(&self, task: WebhookDeliveryTask) -> Result<(), IssuerdError> {
@@ -268,8 +297,10 @@ mod tests {
     fn signature_uses_the_documented_raw_body_contract() {
         let secret = WebhookSecret::new("key").unwrap();
         let signature = sign_webhook(&secret, 42, "The quick brown fox jumps over the lazy dog");
-        assert!(signature.starts_with("t=42,v1="));
-        assert_eq!(signature.len(), "t=42,v1=".len() + 64);
+        assert_eq!(
+            signature,
+            "t=42,v1=6d163932b4f4ce568e22900ed3bf6d2fc53ed45b5e90f6b71cfb10f3da8b9423"
+        );
     }
 }
 
@@ -286,14 +317,30 @@ mod delivery_tests {
         body: String,
     }
 
+    #[derive(Clone, Default)]
+    struct ReceiverOptions {
+        response_bytes: usize,
+        gate: Option<Arc<tokio::sync::Barrier>>,
+        retry_after: Option<u64>,
+        delay_first: Option<Duration>,
+    }
+
     #[derive(Clone)]
     struct ReceiverState {
         statuses: Arc<std::sync::Mutex<VecDeque<reqwest::StatusCode>>>,
         requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+        options: ReceiverOptions,
     }
 
     async fn start_receiver(
         statuses: Vec<reqwest::StatusCode>,
+    ) -> (String, reqwest::Certificate, Arc<std::sync::Mutex<Vec<RecordedRequest>>>) {
+        start_receiver_with_options(statuses, ReceiverOptions::default()).await
+    }
+
+    async fn start_receiver_with_options(
+        statuses: Vec<reqwest::StatusCode>,
+        options: ReceiverOptions,
     ) -> (String, reqwest::Certificate, Arc<std::sync::Mutex<Vec<RecordedRequest>>>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
@@ -326,17 +373,45 @@ mod delivery_tests {
         let state = ReceiverState {
             statuses: Arc::new(std::sync::Mutex::new(statuses.into_iter().collect())),
             requests: Arc::clone(&requests),
+            options,
         };
         let app = Router::new().route(
             "/events",
             post(
                 |State(state): State<ReceiverState>, headers: HeaderMap, body: Bytes| async move {
-                    let body = String::from_utf8(body.to_vec()).unwrap();
-                    state.requests.lock().unwrap().push(RecordedRequest {
-                        headers: headers.clone(),
-                        body,
-                    });
-                    state.statuses.lock().unwrap().pop_front().unwrap_or(reqwest::StatusCode::OK)
+                    use axum::response::IntoResponse;
+
+                    let first_request = {
+                        let mut requests = state.requests.lock().unwrap();
+                        requests.push(RecordedRequest {
+                            headers,
+                            body: String::from_utf8(body.to_vec()).unwrap(),
+                        });
+                        requests.len() == 1
+                    };
+                    if first_request {
+                        if let Some(delay) = state.options.delay_first {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    if let Some(gate) = &state.options.gate {
+                        gate.wait().await;
+                    }
+                    let status = state
+                        .statuses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(reqwest::StatusCode::OK);
+                    let mut response =
+                        (status, vec![b'x'; state.options.response_bytes]).into_response();
+                    if let Some(seconds) = state.options.retry_after {
+                        response.headers_mut().insert(
+                            reqwest::header::RETRY_AFTER,
+                            reqwest::header::HeaderValue::from(seconds),
+                        );
+                    }
+                    response
                 },
             ),
         )
@@ -388,6 +463,14 @@ mod delivery_tests {
     async fn storage_with_delivery(url: String) -> (Arc<InMemoryStorage>, WebhookDeliveryId) {
         let storage = Arc::new(InMemoryStorage::new());
         let realm = RealmId::new("master").unwrap();
+        storage
+            .create_realm(&Realm {
+                id: realm.clone(),
+                name: RealmName::new("master").unwrap(),
+                ..Realm::default()
+            })
+            .await
+            .unwrap();
         let subscription = subscription(url);
         storage.create_webhook_subscription(&realm, &subscription).await.unwrap();
         storage
@@ -470,10 +553,17 @@ mod delivery_tests {
 
     #[tokio::test]
     async fn redirect_marks_delivery_dead_without_retry() {
-        let (url, root, requests) = start_receiver(vec![
-            reqwest::StatusCode::MOVED_PERMANENTLY,
-            reqwest::StatusCode::OK,
-        ])
+        let options = ReceiverOptions {
+            response_bytes: 64 * 1024 + 1,
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) = start_receiver_with_options(
+            vec![
+                reqwest::StatusCode::MOVED_PERMANENTLY,
+                reqwest::StatusCode::OK,
+            ],
+            options,
+        )
         .await;
         let (storage, _) = storage_with_delivery(url).await;
         let worker = WebhookWorker::with_policy(storage.clone(), &[root], true).unwrap();
@@ -482,5 +572,132 @@ mod delivery_tests {
         assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Dead);
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(worker.process_batch().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_requests_run_concurrently() {
+        let options = ReceiverOptions {
+            gate: Some(Arc::new(tokio::sync::Barrier::new(2))),
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) = start_receiver_with_options(
+            vec![reqwest::StatusCode::OK, reqwest::StatusCode::OK],
+            options,
+        )
+        .await;
+        let (storage, _) = storage_with_delivery(url.clone()).await;
+        let mut second = subscription(url);
+        second.id = WebhookSubscriptionId::new("subscription-2").unwrap();
+        storage
+            .create_webhook_subscription(&second.realm_id.clone(), &second)
+            .await
+            .unwrap();
+        storage
+            .enqueue_webhook_delivery(&second.realm_id.clone(), &second.id, &event())
+            .await
+            .unwrap();
+        let worker = WebhookWorker::with_policy(storage.clone(), &[root], true).unwrap();
+
+        assert_eq!(worker.process_batch().await.unwrap(), 2);
+        assert!(history(&storage)
+            .await
+            .iter()
+            .all(|delivery| { delivery.status == WebhookDeliveryStatus::Delivered }));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lost_response_retries_with_the_same_idempotency_key() {
+        let options = ReceiverOptions {
+            delay_first: Some(Duration::from_millis(150)),
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) = start_receiver_with_options(
+            vec![reqwest::StatusCode::OK, reqwest::StatusCode::OK],
+            options,
+        )
+        .await;
+        let (storage, _) = storage_with_delivery(url).await;
+        let mut worker =
+            WebhookWorker::with_policy(storage.clone(), std::slice::from_ref(&root), true).unwrap();
+        worker.http = SsrfGuardedClient::new(&[root], true, Duration::from_millis(50)).unwrap();
+
+        assert_eq!(worker.process_batch().await.unwrap(), 1);
+        assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Pending);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(worker.process_batch().await.unwrap(), 1);
+        assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Delivered);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].headers["idempotency-key"], requests[1].headers["idempotency-key"]);
+    }
+
+    #[tokio::test]
+    async fn retry_after_delays_the_next_claim() {
+        let options = ReceiverOptions {
+            retry_after: Some(2),
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) = start_receiver_with_options(
+            vec![
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                reqwest::StatusCode::OK,
+            ],
+            options,
+        )
+        .await;
+        let (storage, _) = storage_with_delivery(url).await;
+        let worker = WebhookWorker::with_policy(storage.clone(), &[root], true).unwrap();
+
+        assert_eq!(worker.process_batch().await.unwrap(), 1);
+        assert!(
+            history(&storage).await[0].next_attempt_at
+                > Utc::now() + chrono::Duration::milliseconds(1500)
+        );
+        assert_eq!(worker.process_batch().await.unwrap(), 0);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_in_flight_batch() {
+        let options = ReceiverOptions {
+            gate: Some(Arc::new(tokio::sync::Barrier::new(2))),
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) =
+            start_receiver_with_options(vec![reqwest::StatusCode::OK], options).await;
+        let (storage, _) = storage_with_delivery(url).await;
+        let worker = WebhookWorker::with_policy(storage, &[root], true).unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        let running = tokio::spawn(worker.run(receiver));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("webhook worker did not stop during an in-flight request")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_a_retryable_transport_failure() {
+        let options = ReceiverOptions {
+            response_bytes: 64 * 1024 + 1,
+            ..ReceiverOptions::default()
+        };
+        let (url, root, requests) =
+            start_receiver_with_options(vec![reqwest::StatusCode::OK], options).await;
+        let (storage, _) = storage_with_delivery(url).await;
+        let worker = WebhookWorker::with_policy(storage.clone(), &[root], true).unwrap();
+
+        assert_eq!(worker.process_batch().await.unwrap(), 1);
+        assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Pending);
+        assert_eq!(history(&storage).await[0].attempts, 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }

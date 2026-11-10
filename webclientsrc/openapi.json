@@ -17484,7 +17484,7 @@
           "Webhooks"
         ],
         "summary": "List webhook deliveries",
-        "description": "Lists delivery status and retry metadata without event payloads or secrets. Requires `view-realm` or `manage-realm` role.",
+        "description": "Lists delivery status and retry metadata without event payloads or secrets. The default page size is 20, capped at 1000. Requires `view-realm` or `manage-realm` role.",
         "operationId": "list_webhook_deliveries",
         "parameters": [
           {
@@ -17589,7 +17589,7 @@
           "Webhooks"
         ],
         "summary": "Replay a webhook delivery",
-        "description": "Returns a dead or already delivered event to the durable queue with the same event ID and idempotency key. Requires `manage-realm` role.",
+        "description": "Returns a delivery that is not in progress to the durable queue with the same event ID and idempotency key. Requires `manage-realm` role.",
         "operationId": "replay_webhook_delivery",
         "parameters": [
           {
@@ -21331,7 +21331,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Event listener ids active for this realm. Any string is accepted\n(custom listener SPIs); `logging` and durable webhook subscriptions are built in."
+            "description": "Event listener ids active for this realm. Any string is accepted\n(custom listener SPIs); only `logging` is built in. Webhook\nsubscriptions are configured separately and are not listener ids."
           }
         }
       },
@@ -22732,7 +22732,8 @@
       "WebhookSubscriptionCreateRequest": {
         "type": "object",
         "required": [
-          "url"
+          "url",
+          "secret"
         ],
         "properties": {
           "enabled": {
@@ -22757,10 +22758,8 @@
             ]
           },
           "secret": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string",
+            "writeOnly": true
           },
           "url": {
             "type": "string"
@@ -22835,7 +22834,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "writeOnly": true
           },
           "url": {
             "type": [

@@ -101,6 +101,15 @@ impl JsonFileStorage {
         self.persist()
     }
 
+    pub async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        self.inner.get_webhook_delivery(realm, subscription_id, id).await
+    }
+
     pub async fn replay_webhook_delivery(
         &self,
         realm: &RealmId,
@@ -158,6 +167,14 @@ mod tests {
             .join(format!("issuerd-webhooks-{}.json", issuerd_core::utils::generate_id()));
 
         let storage = JsonFileStorage::new(&path).unwrap();
+        storage
+            .create_realm(&Realm {
+                id: realm.clone(),
+                name: RealmName::new("demo").unwrap(),
+                ..Realm::default()
+            })
+            .await
+            .unwrap();
         storage.create_webhook_subscription(&realm, &subscription).await.unwrap();
         storage
             .enqueue_webhook_delivery(&realm, &subscription.id, &event)
@@ -195,6 +212,16 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, WebhookDeliveryStatus::Delivered);
+        storage.delete_realm(&realm).await.unwrap();
+        drop(storage);
+
+        let storage = JsonFileStorage::new(&path).unwrap();
+        assert!(storage.list_webhook_subscriptions(&realm).await.unwrap().is_empty());
+        assert!(storage
+            .list_webhook_deliveries(&realm, None, &Pagination::default())
+            .await
+            .unwrap()
+            .is_empty());
         drop(storage);
         std::fs::remove_file(path).unwrap();
     }

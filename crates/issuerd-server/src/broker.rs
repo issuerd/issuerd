@@ -16,7 +16,7 @@
 //! `jwks.url`) behind an SSRF guard: https-only, public-IP-only against an
 //! explicit non-public CIDR blocklist, no redirects, capped body, and a
 //! single generic error for every failure mode. The public-IP check lifts
-//! only under `[outbound_http] allow_private_addresses` (test rigs only).
+//! only under `[outbound_http] allow_private_addresses` (trusted internal integrations and test rigs).
 //!
 //! The IdP-facing calls (discovery, JWKS, token, userinfo — URLs a realm
 //! admin configures or the discovery document names) are SSRF-gated too:
@@ -123,8 +123,9 @@ impl ReqwestBrokerClient {
     /// Build the broker client. `extra_roots` are the additional root CAs from
     /// `[outbound_http] extra_ca_bundle` (empty = public webpki roots only).
     /// `allow_private_addresses` lifts the SSRF guard's public-IP check
-    /// (test rigs only); `allow_private_identity_providers` lifts the
-    /// public-address gate of the IdP-facing calls.
+    /// (trusted internal endpoints and test rigs);
+    /// `allow_private_identity_providers` lifts the public-address gate of the
+    /// IdP-facing calls.
     pub fn new(
         extra_roots: &[reqwest::Certificate],
         allow_private_addresses: bool,

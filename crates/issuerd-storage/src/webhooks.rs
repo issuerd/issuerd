@@ -11,19 +11,29 @@ async fn publish_with_subscriptions(
     subscriptions: Vec<WebhookSubscription>,
 ) -> Result<usize, IssuerdError> {
     let mut enqueued = 0;
+    let mut first_error = None;
     for subscription in subscriptions
         .into_iter()
         .filter(|subscription| subscription.enabled && event.matches(&subscription.event_types))
     {
         let event = event.clone().with_subscription_policy(&subscription);
-        if storage
+        match storage
             .enqueue_webhook_delivery(&event.realm_id, &subscription.id, &event)
-            .await?
+            .await
         {
-            enqueued += 1;
+            Ok(true) => enqueued += 1,
+            Ok(false) | Err(IssuerdError::NotFound) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
-    Ok(enqueued)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(enqueued),
+    }
 }
 
 pub async fn publish_webhook_event(
@@ -280,5 +290,46 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&delivery.payload).unwrap();
             assert!(payload.get("representation").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn publication_continues_after_deleted_and_failed_subscriptions() {
+        let realm = realm();
+        let subscriptions = vec![
+            subscription(&realm, "deleted", &["USER.LOGIN"], true, false),
+            subscription(&realm, "broken", &["USER.LOGIN"], true, false),
+            subscription(&realm, "good", &["USER.LOGIN"], true, false),
+        ];
+        let expected_subscriptions = subscriptions.clone();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_list_webhook_subscriptions()
+            .returning(move |_| Ok(expected_subscriptions.clone()));
+        let expected_realm = realm.clone();
+        storage.expect_get_realm().returning(move |_| Ok(Some(expected_realm.clone())));
+        storage
+            .expect_enqueue_webhook_delivery()
+            .times(3)
+            .returning(|_, subscription, _| match subscription.as_ref() {
+                "deleted" => Err(IssuerdError::NotFound),
+                "broken" => Err(IssuerdError::ServerError("write failed".to_string())),
+                _ => Ok(true),
+            });
+        let event = Event {
+            id: EventId::new("event-1").unwrap(),
+            realm_id: realm.id,
+            event_time: Utc::now(),
+            event_type: EventType::Login,
+            ip_address: None,
+            client_id: None,
+            user_id: None,
+            session_id: None,
+            error: None,
+            details: Default::default(),
+        };
+        assert!(matches!(
+            publish_user_event(&storage, &event).await,
+            Err(IssuerdError::ServerError(message)) if message == "write failed"
+        ));
     }
 }

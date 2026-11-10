@@ -2788,6 +2788,14 @@ impl Storage for SqliteStorage {
         SqliteStorage::fail_webhook_delivery(self, realm, id, lease_owner, error, next_attempt_at)
             .await
     }
+    async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        SqliteStorage::get_webhook_delivery(self, realm, subscription_id, id).await
+    }
     async fn replay_webhook_delivery(
         &self,
         realm: &RealmId,

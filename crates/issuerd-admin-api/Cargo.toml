@@ -32,7 +32,6 @@ rand_core = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

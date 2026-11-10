@@ -51,7 +51,8 @@ impl From<WebhookSubscription> for WebhookSubscriptionRepresentation {
 pub struct WebhookSubscriptionCreateRequest {
     pub url: String,
     #[serde(default)]
-    pub secret: Option<String>,
+    #[schema(required = true, write_only = true)]
+    pub secret: String,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -66,6 +67,7 @@ pub struct WebhookSubscriptionUpdateRequest {
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
+    #[schema(write_only = true)]
     pub secret: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -108,21 +110,7 @@ impl From<WebhookDelivery> for WebhookDeliveryRepresentation {
 }
 
 fn validate_url(value: &str) -> Result<(), AdminApiError> {
-    if value.len() > 2048 {
-        return Err(AdminApiError::BadRequest("webhook URL exceeds 2048 bytes".into()));
-    }
-    let url = url::Url::parse(value)
-        .map_err(|error| AdminApiError::BadRequest(format!("invalid webhook URL: {error}")))?;
-    if url.scheme() != "https" || url.host_str().is_none() {
-        return Err(AdminApiError::BadRequest("webhook URL must be an absolute HTTPS URL".into()));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(AdminApiError::BadRequest("webhook URL must not contain userinfo".into()));
-    }
-    if url.fragment().is_some() {
-        return Err(AdminApiError::BadRequest("webhook URL must not contain a fragment".into()));
-    }
-    Ok(())
+    validate_webhook_url(value).map_err(AdminApiError::from)
 }
 
 fn subscription_id(value: &str) -> Result<WebhookSubscriptionId, AdminApiError> {
@@ -149,10 +137,8 @@ async fn find_delivery(
 ) -> Result<WebhookDelivery, AdminApiError> {
     state
         .storage
-        .list_webhook_deliveries(realm, Some(subscription.clone()), &Pagination::new(0, i32::MAX))
+        .get_webhook_delivery(realm, subscription, delivery)
         .await?
-        .into_iter()
-        .find(|candidate| candidate.id == *delivery)
         .ok_or(AdminApiError::NotFound)
 }
 
@@ -214,10 +200,10 @@ pub async fn create_webhook(
     require_roles(&auth, &["manage-realm"])?;
     let realm = load_realm(&state, &realm).await?;
     validate_url(&body.url)?;
-    let secret = WebhookSecret::new(
-        body.secret
-            .ok_or_else(|| AdminApiError::BadRequest("webhook secret is required".into()))?,
-    )?;
+    if body.secret.is_empty() {
+        return Err(AdminApiError::BadRequest("webhook secret is required".into()));
+    }
+    let secret = WebhookSecret::new(body.secret)?;
     let subscription = WebhookSubscription {
         id: WebhookSubscriptionId::new(issuerd_core::utils::generate_id())?,
         realm_id: realm.id.clone(),
@@ -392,7 +378,7 @@ pub async fn delete_webhook(
     path = "/admin/realms/{realm}/webhooks/{id}/deliveries",
     tag = "Webhooks",
     summary = "List webhook deliveries",
-    description = "Lists delivery status and retry metadata without event payloads or secrets. Requires `view-realm` or `manage-realm` role.",
+    description = "Lists delivery status and retry metadata without event payloads or secrets. The default page size is 20, capped at 1000. Requires `view-realm` or `manage-realm` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("id" = String, Path, description = "Subscription UUID"),
@@ -420,7 +406,11 @@ pub async fn list_webhook_deliveries(
     }
     let deliveries = state
         .storage
-        .list_webhook_deliveries(&realm.id, Some(id), &Pagination::new(params.first, params.max))
+        .list_webhook_deliveries(
+            &realm.id,
+            Some(id),
+            &Pagination::new(params.first, params.max.min(1000)),
+        )
         .await?
         .into_iter()
         .map(WebhookDeliveryRepresentation::from)
@@ -433,7 +423,7 @@ pub async fn list_webhook_deliveries(
     path = "/admin/realms/{realm}/webhooks/{id}/deliveries/{delivery_id}/replay",
     tag = "Webhooks",
     summary = "Replay a webhook delivery",
-    description = "Returns a dead or already delivered event to the durable queue with the same event ID and idempotency key. Requires `manage-realm` role.",
+    description = "Returns a delivery that is not in progress to the durable queue with the same event ID and idempotency key. Requires `manage-realm` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         ("id" = String, Path, description = "Subscription UUID"),
@@ -457,10 +447,7 @@ pub async fn replay_webhook_delivery(
     let realm = load_realm(&state, &realm).await?;
     let subscription = subscription_id(&id)?;
     let delivery = delivery_id(&delivery)?;
-    let current = find_delivery(&state, &realm.id, &subscription, &delivery).await?;
-    if current.status == WebhookDeliveryStatus::InProgress {
-        return Err(AdminApiError::Conflict);
-    }
+    find_delivery(&state, &realm.id, &subscription, &delivery).await?;
     state.storage.replay_webhook_delivery(&realm.id, &delivery).await?;
     let replayed = find_delivery(&state, &realm.id, &subscription, &delivery).await?;
     crate::audit::emit_admin_event(
@@ -468,7 +455,7 @@ pub async fn replay_webhook_delivery(
         &auth,
         &realm.id,
         OperationType::Action,
-        ResourceType::Session,
+        ResourceType::Realm,
         &format!("webhooks/{subscription}/deliveries/{delivery}/replay"),
         None,
     )
@@ -551,6 +538,18 @@ mod tests {
             "master",
             None,
         )
+    }
+
+    #[test]
+    fn create_secret_is_required_write_only_and_non_nullable() {
+        use utoipa::OpenApi;
+
+        let specification = crate::openapi::AdminApiDoc::openapi();
+        let specification = serde_json::to_value(specification).unwrap();
+        let schema = &specification["components"]["schemas"]["WebhookSubscriptionCreateRequest"];
+        assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("secret")));
+        assert_eq!(schema["properties"]["secret"]["type"], "string");
+        assert_eq!(schema["properties"]["secret"]["writeOnly"], true);
     }
 
     #[tokio::test]

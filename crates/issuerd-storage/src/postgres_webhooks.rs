@@ -411,6 +411,27 @@ impl PostgresStorage {
         Ok(())
     }
 
+    pub async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        sqlx::query_as::<_, PgWebhookDelivery>(
+            "SELECT d.*, s.realm_id FROM webhook_deliveries d
+            JOIN webhook_subscriptions s ON s.id = d.subscription_id
+            WHERE s.realm_id = $1 AND d.subscription_id = $2 AND d.id = $3",
+        )
+        .bind(to_uuid(realm.as_ref())?)
+        .bind(to_uuid(subscription_id.as_ref())?)
+        .bind(to_uuid(id.as_ref())?)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(crate::postgres::sqlx_err)?
+        .map(delivery_from_row)
+        .transpose()
+    }
+
     pub async fn replay_webhook_delivery(
         &self,
         realm: &RealmId,

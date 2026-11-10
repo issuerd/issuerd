@@ -2329,7 +2329,6 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "url",
  "utoipa",
  "uuid",
 ]
@@ -2477,6 +2476,7 @@ dependencies = [
  "bytes",
  "chrono",
  "figment",
+ "futures",
  "http-body-util",
  "include_dir",
  "ipnet",
