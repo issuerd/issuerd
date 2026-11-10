@@ -521,9 +521,7 @@ mod tests {
             .times(1)
             .withf(|event| event.representation.is_none())
             .returning(|_| Ok(()));
-        mock.expect_list_webhook_subscriptions()
-            .times(1)
-            .returning(|_| Ok(Vec::new()));
+        mock.expect_list_webhook_subscriptions().times(1).returning(|_| Ok(Vec::new()));
         let state = crate::test_utils::tests::test_state_with_storage(Arc::new(mock), vec![]);
         let auth = admin_auth();
         let realm_id = RealmId::new("master").unwrap();

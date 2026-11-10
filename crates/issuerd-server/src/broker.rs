@@ -25,6 +25,8 @@
 //! allow_private_identity_providers` for an internal development IdP. Redirects
 //! never downgrade HTTPS to HTTP. Response bodies are capped in both modes.
 
+use std::time::Duration;
+
 use issuerd_core::{
     BrokerClient, BrokerDiscoveryDocument, BrokerIdpSettings, BrokerTokenResponse,
     BrokeredIdentity, IdentityProviderConfig, IssuerdError, RealmId,
@@ -51,6 +53,11 @@ const EXTERNAL_TOKEN_LEEWAY_SECS: u64 = 60;
 pub(crate) struct SsrfGuardedClient {
     client: reqwest::Client,
     allow_private_addresses: bool,
+}
+
+pub(crate) struct GuardedPostResponse {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<Duration>,
 }
 
 /// Production [`BrokerClient`] over `reqwest` (rustls). Timeouts are short:
@@ -596,6 +603,57 @@ impl SsrfGuardedClient {
             return Err(guarded_request_fail(&format!("redirect: {status}")));
         }
         Ok(status)
+    }
+
+    /// POST an exact JSON body with generated security headers. Redirects are
+    /// rejected and the response is drained with a 64 KiB cap.
+    pub(crate) async fn post_json(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<GuardedPostResponse, IssuerdError> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+        self.check_url(url)?;
+        let mut request =
+            self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let resp = request
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| guarded_request_fail(&format!("connect: {e}")))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(guarded_request_fail(&format!("redirect: {status}")));
+        }
+        if resp.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
+            return Err(guarded_request_fail("webhook response exceeds cap"));
+        }
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds.min(3600)));
+        let mut resp = resp;
+        let mut drained: usize = 0;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| guarded_request_fail(&format!("webhook response body: {e}")))?
+        {
+            drained = drained.saturating_add(chunk.len());
+            if drained > MAX_RESPONSE_BYTES {
+                return Err(guarded_request_fail("webhook response exceeds cap"));
+            }
+        }
+        Ok(GuardedPostResponse {
+            status,
+            retry_after,
+        })
     }
 }
 
