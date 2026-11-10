@@ -98,9 +98,11 @@ Commit: `Publish user and admin events to webhook outbox`
 
 Add a lifecycle-managed worker that claims due deliveries only after commit,
 recovers stale leases, and sends bounded HTTPS POST requests outside request
-paths. Reuse the outbound SSRF protections: HTTPS by default, DNS pinning, no
-redirects, explicit private-address opt-in, connection/request timeouts, and a
-small response-body cap.
+paths. Deliveries within a batch run concurrently, so receiver completion order
+is not guaranteed; shutdown cancels in-flight work and lease recovery may cause
+a duplicate. Reuse the outbound SSRF protections: HTTPS by default, DNS pinning,
+no redirects, explicit private-address opt-in, connection/request timeouts, and
+a small response-body cap.
 
 Retry transport failures, 408, 429, and 5xx with exponential backoff and jitter;
 honor bounded `Retry-After`. Ordinary 4xx responses become dead deliveries.

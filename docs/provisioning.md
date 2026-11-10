@@ -2,7 +2,7 @@
 
 This document describes Issuerd's declarative provisioning: a YAML, TOML, or JSON
 file ("provision file") that seeds realms, roles, groups, clients, users, identity
-providers, and authentication flow configs into a fresh — or partially seeded —
+providers, webhook subscriptions, and authentication flow configs into a fresh — or partially seeded —
 deployment. It is written for system operators who install and maintain Issuerd.
 For the server configuration file that points at a provision file, see
 [configuration.md](configuration.md); for a guided first boot, see
@@ -165,7 +165,8 @@ resolve the clients they reference.
 
 Every entity is skipped with a log warning if it already exists — realms by name,
 roles and groups by name within the realm, clients by `client_id` within the realm,
-users by username, identity providers by alias, flow configs by alias. Provisioning
+users by username, identity providers by alias, webhook subscriptions by URL,
+flow configs by alias. Provisioning
 **creates missing entities only; it never updates existing ones.**
 
 ### Built-in clients per realm

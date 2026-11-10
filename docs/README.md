@@ -28,6 +28,7 @@ Depending on your role, you will typically read the set in this order:
 | Day-2 operator | [Administration](administration.md) → [Monitoring](monitoring.md) → [Backup, restore, and upgrade](backup-and-upgrade.md) → [Troubleshooting](troubleshooting.md) |
 | Connecting a user directory | [User federation](user-federation.md) → [LDAP group mapping and token claims](ldap-group-mapping.md) → [Provisioning](provisioning.md) → [Troubleshooting](troubleshooting.md) |
 | Connecting external identity providers | [Identity brokering](identity-brokering.md) → [Security](security.md) |
+| Receiving authentication/admin events externally | [Webhooks](webhooks.md) → [Provisioning](provisioning.md) |
 | Application developer | [Client integration](client-integration.md) → [Configuration](configuration.md) (CORS, issuer) |
 | Building an AI agent or MCP server | [Agentic IAM: MCP tool calls](agentic-iam-mcp.md) → [Human step-up approval with CIBA](ciba-step-up.md) → [Client integration](client-integration.md) → [runnable demo](../examples/agentic-mcp/) |
 | Letting an agent administer a realm | [MCP server](mcp-server.md) → [Exact-operation security article](mcp-exact-operation-approval.md) → [runnable acceptance example](../examples/mcp-admin/) |

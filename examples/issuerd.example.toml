@@ -62,7 +62,7 @@ enabled = false
 [crypto]
 
 [outbound_http]
-# extra_ca_bundle = "/etc/ssl/corp-extra-roots.pem"  # optional PEM of extra root CAs trusted by outbound HTTPS (broker JWKS, client jwks_url, request_uri fetches); unset = public webpki roots only
+# extra_ca_bundle = "/etc/ssl/corp-extra-roots.pem"  # optional PEM of extra root CAs trusted by outbound HTTPS (broker JWKS, client jwks_url, request_uri fetches, back-channel logout, webhooks); unset = public webpki roots only
 allow_private_addresses = false
 allow_private_identity_providers = false
 
