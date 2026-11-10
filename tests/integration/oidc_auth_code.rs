@@ -67,6 +67,54 @@ async fn authorization_code_state_roundtrip() {
 }
 
 #[tokio::test]
+async fn failed_login_records_internal_client_id() {
+    let harness = TestHarness::new().await;
+    let _realm = harness.create_realm("test").await;
+    let client = harness.create_client("test", false).await;
+    let _user = harness.create_user("test", "alice", "password123").await;
+
+    let auth_path = format!(
+        "/realms/test/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri=http://localhost:8080/cb&scope=openid",
+        client.client_id
+    );
+    let auth_resp = harness.get(&auth_path).await;
+    let location = auth_resp.headers().get("location").unwrap().to_str().unwrap();
+    let execution_id =
+        TestHarness::extract_query_param(location, "execution_id").expect("missing execution_id");
+
+    let login_resp = harness
+        .post_json_with_cookie(
+            "/api/v1/auth/login?realm=test",
+            serde_json::json!({
+                "execution_id": execution_id,
+                "username": "alice",
+                "password": "wrong-password",
+            }),
+            &TestHarness::flow_cookie(&execution_id),
+        )
+        .await;
+    assert_eq!(login_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let events = harness
+        .storage
+        .query_events(
+            &issuerd_core::RealmId::new("test").unwrap(),
+            &issuerd_core::EventQuery {
+                event_type: Some(issuerd_core::EventType::LoginError),
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: issuerd_core::Pagination::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_id.as_ref(), Some(&client.id));
+}
+
+#[tokio::test]
 async fn authorization_code_invalid_code_rejected() {
     let harness = TestHarness::new().await;
     let _realm = harness.create_realm("test").await;

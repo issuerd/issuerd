@@ -31,6 +31,21 @@ use crate::{
     state::{default_browser_flow, ServerState},
 };
 
+pub(crate) async fn resolve_oidc_event_client_id(
+    state: &Arc<ServerState>,
+    realm_id: &RealmId,
+    client_id: Option<&str>,
+) -> Option<issuerd_core::ClientId> {
+    let identifier = client_id.and_then(|value| ClientIdentifier::new(value).ok())?;
+    match state.storage.get_client_by_client_id(realm_id, &identifier).await {
+        Ok(client) => client.map(|client| client.id),
+        Err(e) => {
+            warn!(realm = %realm_id, error = %e, "audit event client resolution failed");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_oidc_event(
     state: &Arc<ServerState>,
@@ -1054,6 +1069,12 @@ async fn handle_auth_request(
             Err(e) => {
                 if let Some(resp) = try_auth_error_redirect(&state, &realm_name, &params, &e).await
                 {
+                    let event_client_id = resolve_oidc_event_client_id(
+                        &state,
+                        &realm_id,
+                        params.get("client_id").map(String::as_str),
+                    )
+                    .await;
                     let mut details = std::collections::HashMap::new();
                     details.insert("error".to_string(), e.to_string());
                     emit_oidc_event(
@@ -1061,7 +1082,7 @@ async fn handle_auth_request(
                         &realm_id,
                         EventType::LoginError,
                         &ip,
-                        params.get("client_id").and_then(|s| issuerd_core::ClientId::new(s).ok()),
+                        event_client_id,
                         None,
                         None,
                         Some(e.to_string()),

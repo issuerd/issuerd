@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OIDC audit client attribution on PostgreSQL.** Resolve public OAuth client IDs to internal UUIDs before recording failed browser login, authorization-parse, JAR, PAR, and broker-linking `LOGIN_ERROR` events. These failures now remain in the persistent audit trail without invalid-UUID write warnings.
+- **Token-exchange impersonation admin events.** Record the requesting client's public OAuth client ID in `auth_client_id` instead of its internal UUID.
+
 ## [0.2.3] - 2026-11-08
 
 ### Fixed

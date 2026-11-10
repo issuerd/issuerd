@@ -1594,12 +1594,15 @@ async fn emit_link_login_error(
     let mut details = HashMap::new();
     details.insert("username".to_string(), user.username.to_string());
     details.insert("error".to_string(), error.to_string());
+    let event_client_id =
+        super::oidc::resolve_oidc_event_client_id(state, &realm.id, Some(&entry.pending.client_id))
+            .await;
     super::oidc::emit_oidc_event(
         state,
         &realm.id,
         issuerd_core::EventType::LoginError,
         ip,
-        issuerd_core::ClientId::new(&entry.pending.client_id).ok(),
+        event_client_id,
         Some(user.id.clone()),
         None,
         Some(error.to_string()),
@@ -3251,12 +3254,22 @@ mod tests {
             .expect("login-failure counter recorded");
         assert_eq!(String::from_utf8(counter).unwrap(), "1");
         // …and the browser-flow-class LOGIN_ERROR event was recorded.
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("admin-cli").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let events = query_all_events(&state, MASTER).await;
         let login_error = events
             .iter()
             .find(|e| e.event_type == issuerd_core::EventType::LoginError)
             .expect("LOGIN_ERROR event recorded");
         assert_eq!(login_error.error.as_deref(), Some("invalid_user_credentials"));
+        assert_eq!(login_error.client_id.as_ref(), Some(&client.id));
         assert_eq!(login_error.user_id, Some(user.id.clone()));
         assert_eq!(login_error.details.get("username").map(String::as_str), Some("existing-user"));
     }

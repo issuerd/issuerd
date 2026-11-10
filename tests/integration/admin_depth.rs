@@ -1927,6 +1927,143 @@ async fn create_realm_on_postgres_persists_builtin_clients() {
     }
 }
 
+/// Failed browser logins must persist the internal client UUID on PostgreSQL;
+/// the public OAuth client ID belongs in the login flow, not the UUID column.
+#[tokio::test]
+async fn failed_login_persists_internal_client_id_on_postgres() {
+    let docker = std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker {
+        eprintln!(
+            "skipping failed_login_persists_internal_client_id_on_postgres: docker unavailable"
+        );
+        return;
+    }
+
+    use issuerd_core::{DistributedCache, Storage};
+    use issuerd_server::{config::ServerConfig, state::ServerState};
+    use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+
+    let img = GenericImage::new("postgres", "15-alpine")
+        .with_wait_for(WaitFor::message_on_stderr("database system is ready to accept connections"))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "test");
+    let container = img.start().await.expect("postgres container start");
+    let host = container.get_host().await.expect("container host");
+    let port = container.get_host_port_ipv4(5432).await.expect("container port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/test");
+
+    let pg = issuerd_storage::PostgresStorage::connect(&url).await.expect("postgres connect");
+    pg.run_migrations().await.expect("migrations");
+    let storage: Arc<dyn Storage> = Arc::new(pg);
+    let cache: Arc<dyn DistributedCache> = Arc::new(issuerd_cluster::InMemoryCache::new());
+    seed_master_realm(&storage).await;
+
+    let config = ServerConfig {
+        storage: issuerd_server::config::StorageConfig::Postgres { url: url.clone() },
+        ..Default::default()
+    };
+    let state = ServerState::from_components(&config, Arc::clone(&storage), Arc::clone(&cache))
+        .await
+        .expect("node boot");
+    let node = TestHarness::with_state(Arc::new(state));
+    let admin = node.get_admin_token("master", "admin", "admin").await;
+
+    let resp = node
+        .post_json_auth(
+            "/admin/realms",
+            &admin,
+            serde_json::json!({"realm": "audit-login", "eventsEnabled": true}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let realm = storage.get_realm_by_name("audit-login").await.unwrap().unwrap();
+    let client = storage
+        .get_client_by_client_id(
+            &realm.id,
+            &issuerd_core::ClientIdentifier::new("account-console").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let user = issuerd_core::User {
+        id: issuerd_core::UserId::new(issuerd_core::utils::generate_id()).unwrap(),
+        realm_id: realm.id.clone(),
+        username: issuerd_core::Username::new("alice").unwrap(),
+        email: None,
+        email_verified: true,
+        first_name: None,
+        last_name: None,
+        enabled: true,
+        federation_link: None,
+        attributes: std::collections::HashMap::new(),
+        required_actions: Vec::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    storage.create_user(&realm.id, &user).await.unwrap();
+    use argon2::password_hash::rand_core::OsRng;
+    use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default().hash_password(b"Password123!", &salt).unwrap().to_string();
+    let credential = issuerd_core::Credential {
+        id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+        credential_type: issuerd_core::CredentialType::Password,
+        user_label: Some("Password".to_string()),
+        created_date: chrono::Utc::now(),
+        secret_data: hash.into_bytes(),
+        credential_data: serde_json::json!({"hash_algorithm": "argon2id"}),
+        priority: 1,
+    };
+    storage.create_credential(&realm.id, &user.id, &credential).await.unwrap();
+
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(verifier);
+    let auth_path = format!(
+        "/realms/audit-login/protocol/openid-connect/auth?response_type=code&client_id=account-console&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2F&scope=openid&code_challenge={challenge}&code_challenge_method=S256"
+    );
+    let auth_resp = node.get(&auth_path).await;
+    let location = location_header(&auth_resp);
+    let execution_id =
+        TestHarness::extract_query_param(&location, "execution_id").expect("execution id");
+    let login_resp = node
+        .post_json_with_cookie(
+            "/api/v1/auth/login?realm=audit-login",
+            serde_json::json!({
+                "execution_id": execution_id,
+                "username": "alice",
+                "password": "wrong-password"
+            }),
+            &TestHarness::flow_cookie(&execution_id),
+        )
+        .await;
+    assert_eq!(login_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let events = storage
+        .query_events(
+            &realm.id,
+            &issuerd_core::EventQuery {
+                event_type: Some(issuerd_core::EventType::LoginError),
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: issuerd_core::Pagination::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_id.as_ref(), Some(&client.id));
+    assert_eq!(events[0].details.get("username").map(String::as_str), Some("alice"));
+}
+
 // ---------------------------------------------------------------------------
 // Realm not_before
 // ---------------------------------------------------------------------------

@@ -601,6 +601,12 @@ pub async fn login_handler(
         }
         FlowOutput::Failure(e) => {
             warn!(username = %issuerd_core::utils::sanitize_log_str(&login_username), error = %e, "login failed");
+            let event_client_id = super::oidc::resolve_oidc_event_client_id(
+                &state,
+                &realm_id,
+                Some(&pending.client_id),
+            )
+            .await;
             let mut details = std::collections::HashMap::new();
             details.insert("username".to_string(), login_username.clone());
             details.insert("error".to_string(), e.to_string());
@@ -609,7 +615,7 @@ pub async fn login_handler(
                 &realm_id,
                 EventType::LoginError,
                 &pending.ip_address.unwrap_or("127.0.0.1".parse().unwrap()),
-                issuerd_core::ClientId::new(&pending.client_id).ok(),
+                event_client_id,
                 None,
                 None,
                 Some(e.to_string()),

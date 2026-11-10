@@ -699,11 +699,14 @@ async fn impersonation_exchange_mints_audited_token() {
     let resp = harness.get_auth("/admin/realms/ex-imp/admin-events", &admin).await;
     let events = body_json(resp).await;
     let events = events.as_array().unwrap();
-    assert!(
-        events.iter().any(|e| e["operation_type"] == "ACTION"
-            && e["resource_path"].as_str().is_some_and(|p| p.contains("impersonation"))),
-        "expected impersonation admin event: {events:?}"
-    );
+    let impersonation_event = events
+        .iter()
+        .find(|e| {
+            e["operation_type"] == "ACTION"
+                && e["resource_path"].as_str().is_some_and(|p| p.contains("impersonation"))
+        })
+        .unwrap_or_else(|| panic!("expected impersonation admin event: {events:?}"));
+    assert_eq!(impersonation_event["auth_client_id"].as_str(), Some(client.client_id.as_str()));
 
     // ... and a login event that bypasses the (disabled) events gate.
     let resp = harness.get_auth("/admin/realms/ex-imp/events", &admin).await;

@@ -492,7 +492,10 @@ async fn impersonation_exchange(
             id: issuerd_core::EventId::new(issuerd_core::utils::generate_id()).unwrap(),
             realm_id: realm_id.clone(),
             auth_realm_id: Some(realm_id.clone()),
-            auth_client_id: Some(client.id.clone()),
+            auth_client_id: Some(
+                issuerd_core::ClientId::new(client.client_id.as_str())
+                    .expect("stored client identifiers are valid"),
+            ),
             auth_user_id: Some(subject_user.id.clone()),
             operation_type: issuerd_core::OperationType::Action,
             resource_type: issuerd_core::ResourceType::User,

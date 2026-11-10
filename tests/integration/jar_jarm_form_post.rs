@@ -41,6 +41,30 @@ async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+async fn assert_login_error_client_id(
+    harness: &TestHarness,
+    realm: &str,
+    client: &issuerd_core::Client,
+) {
+    let events = harness
+        .storage
+        .query_events(
+            &issuerd_core::RealmId::new(realm).unwrap(),
+            &issuerd_core::EventQuery {
+                event_type: Some(issuerd_core::EventType::LoginError),
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: issuerd_core::Pagination::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_id.as_ref(), Some(&client.id));
+}
+
 /// Extract a text (HTML) body from a response.
 async fn text_body(resp: axum::response::Response) -> String {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -363,6 +387,7 @@ async fn jar_wrong_signature_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = json_body(resp).await;
     assert_eq!(json["error"], "invalid_request");
+    assert_login_error_client_id(&harness, "jar-wrong-sig", &client).await;
 }
 
 #[tokio::test]
@@ -627,6 +652,7 @@ async fn form_post_error_for_missing_response_type() {
     );
     assert_eq!(hidden_input_value(&html, "state").as_deref(), Some("st-1"));
     assert!(!html.contains("?error="), "error must not leak into a URL: {html}");
+    assert_login_error_client_id(&harness, "fp-nort", &client).await;
 }
 
 // ---------------------------------------------------------------------------
