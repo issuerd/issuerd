@@ -1,7 +1,7 @@
 # Advisory ignores for `cargo audit` — keep in sync with the `ignore` list in
 # deny.toml (cargo deny and cargo audit read separate config files).
 #
-# One temporary exception is documented below and mirrored in deny.toml.
+# Two temporary exceptions are documented below and mirrored in deny.toml.
 # Previously resolved advisories that once carried (or nearly carried) ignores:
 #
 # - RUSTSEC-2026-0367 / -0368 / -0369 (zip extraction): resolved for real —
@@ -28,10 +28,18 @@
 #   lockfile nor the build graph. No ignore.
 
 [advisories]
-# Informational unmaintained notice, not a vulnerability. astral-tokio-tar is
-# reachable only through dev-only testcontainers 0.28.0 and is not shipped in
-# the daemon. No patched testcontainers release exists yet; remove this ignore
-# when https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
+# RUSTSEC-2026-0459 requires a less-trusted local writer to supply a crafted
+# database and sibling WAL; Issuerd maintains these files with owner-only 0600
+# permissions. SQLx 0.9.0 requires libsqlite3-sys <0.38 while the fix requires
+# 0.39. The compatibility change is merged but unreleased upstream; upgrade and
+# remove this ignore when https://github.com/transact-rs/sqlx/pull/4502 ships.
+#
+# RUSTSEC-2026-0440 is an informational unmaintained notice, not a
+# vulnerability. astral-tokio-tar is reachable only through dev-only
+# testcontainers 0.28.0 and is not shipped in the daemon. No patched
+# testcontainers release exists yet; remove this ignore when
+# https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
 ignore = [
+    "RUSTSEC-2026-0459",
     "RUSTSEC-2026-0440",
 ]

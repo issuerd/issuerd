@@ -28,7 +28,13 @@ yanked = "deny"
 #   utoipa 6.0 / utoipa-swagger-ui 10.0.2 upgrade, which builds with zip ^9.0
 #   (>= 9.0.0 is the patched line). zip was only ever a build dependency of
 #   utoipa-swagger-ui's `vendored` feature, never linked into the daemon.
-# One temporary, narrowly scoped exception:
+# Two temporary, narrowly scoped exceptions:
+# - RUSTSEC-2026-0459 requires a less-trusted local writer to supply a crafted
+#   database and sibling WAL; Issuerd maintains these files with owner-only 0600
+#   permissions. SQLx 0.9.0 requires libsqlite3-sys <0.38 while the fix requires
+#   0.39. The compatibility change is merged but unreleased upstream:
+#   https://github.com/transact-rs/sqlx/pull/4502. Upgrade and remove this
+#   ignore when that change ships.
 # - RUSTSEC-2026-0440 is an informational unmaintained-crate notice, not a
 #   vulnerability. astral-tokio-tar is reachable only through the dev-only
 #   testcontainers 0.28.0 dependency and is not shipped in the daemon. There
@@ -36,6 +42,7 @@ yanked = "deny"
 #   https://github.com/testcontainers/testcontainers-rs/pull/1006.
 #   Remove this ignore when a release with the replacement lands.
 ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "Local crafted DB/WAL only; SQLx 0.9.0 excludes patched libsqlite3-sys 0.39; upgrade after transact-rs/sqlx#4502 is released" },
     { id = "RUSTSEC-2026-0440", reason = "Dev-only via testcontainers 0.28.0; unmaintained notice with replacement pending upstream in testcontainers#1006" },
 ]
 
