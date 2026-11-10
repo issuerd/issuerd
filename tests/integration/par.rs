@@ -177,6 +177,24 @@ async fn par_unknown_request_uri_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = json_body(resp).await;
     assert_eq!(json["error"], "invalid_request");
+
+    let events = harness
+        .storage
+        .query_events(
+            &issuerd_core::RealmId::new("par-unknown").unwrap(),
+            &issuerd_core::EventQuery {
+                event_type: Some(issuerd_core::EventType::LoginError),
+                client_id: None,
+                user_id: None,
+                date_from: None,
+                date_to: None,
+                pagination: issuerd_core::Pagination::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_id.as_ref(), Some(&client.id));
 }
 
 #[tokio::test]

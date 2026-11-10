@@ -394,12 +394,18 @@ async fn par_resolution_error(
     warn!(realm = %realm.id, error = %error, "PAR resolution failed");
     let mut details = HashMap::new();
     details.insert("error".to_string(), error.to_string());
+    let event_client_id = oidc::resolve_oidc_event_client_id(
+        state,
+        &realm.id,
+        params.get("client_id").map(String::as_str),
+    )
+    .await;
     oidc::emit_oidc_event(
         state,
         &realm.id,
         EventType::LoginError,
         ip,
-        params.get("client_id").and_then(|s| issuerd_core::ClientId::new(s).ok()),
+        event_client_id,
         None,
         None,
         Some(error.to_string()),
