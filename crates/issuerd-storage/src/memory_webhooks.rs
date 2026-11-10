@@ -235,8 +235,9 @@ impl InMemoryStorage {
         candidates.truncate(limit as usize);
         let mut tasks = Vec::with_capacity(candidates.len());
         for (mut delivery, subscription) in candidates {
+            let lease_owner = format!("{worker_id}:{}", issuerd_core::utils::generate_id());
             delivery.status = WebhookDeliveryStatus::InProgress;
-            delivery.lease_owner = Some(worker_id.to_string());
+            delivery.lease_owner = Some(lease_owner);
             delivery.lease_expires_at = Some(lease_expires_at);
             delivery.updated_at = now;
             self.webhooks.deliveries.insert(delivery.id.clone(), delivery.clone());
@@ -252,9 +253,15 @@ impl InMemoryStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
     ) -> Result<(), IssuerdError> {
         let _guard = self.webhooks.lock.lock().await;
         let (mut delivery, _) = subscription_for_delivery(&self.webhooks, realm, id)?;
+        if delivery.status != WebhookDeliveryStatus::InProgress
+            || delivery.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(IssuerdError::Conflict);
+        }
         let now = Utc::now();
         delivery.status = WebhookDeliveryStatus::Delivered;
         delivery.lease_owner = None;
@@ -270,11 +277,17 @@ impl InMemoryStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
         error: &str,
         next_attempt_at: Option<DateTime<Utc>>,
     ) -> Result<(), IssuerdError> {
         let _guard = self.webhooks.lock.lock().await;
         let (mut delivery, _) = subscription_for_delivery(&self.webhooks, realm, id)?;
+        if delivery.status != WebhookDeliveryStatus::InProgress
+            || delivery.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(IssuerdError::Conflict);
+        }
         delivery.attempts = delivery.attempts.saturating_add(1);
         delivery.status = if next_attempt_at.is_some() {
             WebhookDeliveryStatus::Pending
@@ -297,6 +310,9 @@ impl InMemoryStorage {
     ) -> Result<(), IssuerdError> {
         let _guard = self.webhooks.lock.lock().await;
         let (mut delivery, _) = subscription_for_delivery(&self.webhooks, realm, id)?;
+        if delivery.status == WebhookDeliveryStatus::InProgress {
+            return Err(IssuerdError::Conflict);
+        }
         let now = Utc::now();
         delivery.status = WebhookDeliveryStatus::Pending;
         delivery.attempts = 0;
@@ -408,7 +424,12 @@ mod tests {
             .unwrap()
             .is_empty());
         let id = first[0].delivery.id.clone();
-        storage.complete_webhook_delivery(&realm_id(), &id).await.unwrap();
+        let first_lease = first[0].delivery.lease_owner.clone().unwrap();
+        assert!(matches!(
+            storage.replay_webhook_delivery(&realm_id(), &id).await,
+            Err(IssuerdError::Conflict)
+        ));
+        storage.complete_webhook_delivery(&realm_id(), &id, &first_lease).await.unwrap();
         assert!(storage
             .claim_webhook_deliveries("worker-2", 10, Duration::from_secs(30))
             .await
@@ -422,6 +443,19 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].delivery.event_id, event().id);
+        assert_ne!(replayed[0].delivery.lease_owner.as_deref(), Some(first_lease.as_str()));
+        assert!(matches!(
+            storage.complete_webhook_delivery(&realm_id(), &id, &first_lease).await,
+            Err(IssuerdError::Conflict)
+        ));
+        assert_eq!(
+            storage
+                .list_webhook_deliveries(&realm_id(), None, &Pagination::default())
+                .await
+                .unwrap()[0]
+                .status,
+            WebhookDeliveryStatus::InProgress
+        );
     }
 
     #[tokio::test]
@@ -441,11 +475,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].delivery.lease_owner.as_deref(), Some("worker-2"));
+        assert!(recovered[0].delivery.lease_owner.as_deref().unwrap().starts_with("worker-2:"));
+        assert!(matches!(
+            storage
+                .fail_webhook_delivery(
+                    &realm_id(),
+                    &id,
+                    claimed[0].delivery.lease_owner.as_deref().unwrap(),
+                    "stale",
+                    None,
+                )
+                .await,
+            Err(IssuerdError::Conflict)
+        ));
         storage
             .fail_webhook_delivery(
                 &realm_id(),
                 &id,
+                recovered[0].delivery.lease_owner.as_deref().unwrap(),
                 "temporary",
                 Some(Utc::now() - chrono::Duration::seconds(1)),
             )
@@ -457,7 +504,13 @@ mod tests {
             .unwrap();
         assert_eq!(retried[0].delivery.attempts, 1);
         storage
-            .fail_webhook_delivery(&realm_id(), &id, "permanent", None)
+            .fail_webhook_delivery(
+                &realm_id(),
+                &id,
+                retried[0].delivery.lease_owner.as_deref().unwrap(),
+                "permanent",
+                None,
+            )
             .await
             .unwrap();
         assert!(storage

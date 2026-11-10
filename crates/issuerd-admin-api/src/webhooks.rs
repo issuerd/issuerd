@@ -657,9 +657,20 @@ mod tests {
             .unwrap()[0]
             .id
             .clone();
+        let claimed = state
+            .storage
+            .claim_webhook_deliveries("worker-1", 1, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
         state
             .storage
-            .fail_webhook_delivery(&realm, &delivery, "permanent", None)
+            .fail_webhook_delivery(
+                &realm,
+                &delivery,
+                claimed[0].delivery.lease_owner.as_deref().unwrap(),
+                "permanent",
+                None,
+            )
             .await
             .unwrap();
 

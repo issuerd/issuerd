@@ -1747,17 +1747,20 @@ impl Storage for InMemoryStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
     ) -> Result<(), IssuerdError> {
-        InMemoryStorage::complete_webhook_delivery(self, realm, id).await
+        InMemoryStorage::complete_webhook_delivery(self, realm, id, lease_owner).await
     }
     async fn fail_webhook_delivery(
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
         error: &str,
         next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), IssuerdError> {
-        InMemoryStorage::fail_webhook_delivery(self, realm, id, error, next_attempt_at).await
+        InMemoryStorage::fail_webhook_delivery(self, realm, id, lease_owner, error, next_attempt_at)
+            .await
     }
     async fn replay_webhook_delivery(
         &self,

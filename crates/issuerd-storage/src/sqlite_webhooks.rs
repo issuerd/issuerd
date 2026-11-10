@@ -338,13 +338,14 @@ impl SqliteStorage {
         for row in rows {
             let realm = RealmId::new(row.realm_id.to_string())?;
             let subscription_id = WebhookSubscriptionId::new(row.subscription_id.to_string())?;
+            let lease_owner = format!("{worker_id}:{}", issuerd_core::utils::generate_id());
             sqlx::query(
                 "UPDATE webhook_deliveries SET
                     status = 'in_progress', lease_owner = ?2, lease_expires_at = ?3, updated_at = ?4
                 WHERE id = ?1",
             )
             .bind(row.id)
-            .bind(worker_id)
+            .bind(&lease_owner)
             .bind(lease_expires_at)
             .bind(now_ms)
             .execute(&mut *tx)
@@ -352,7 +353,7 @@ impl SqliteStorage {
             .map_err(sqlx_err)?;
             let mut delivery = delivery_from_row(row)?;
             delivery.status = WebhookDeliveryStatus::InProgress;
-            delivery.lease_owner = Some(worker_id.to_string());
+            delivery.lease_owner = Some(lease_owner);
             delivery.lease_expires_at = timestamp(lease_expires_at).ok();
             delivery.updated_at = now;
             let subscription = select_subscription_tx(&mut tx, &realm, &subscription_id).await?;
@@ -369,6 +370,7 @@ impl SqliteStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
     ) -> Result<(), IssuerdError> {
         let now = Utc::now().timestamp_millis();
         let result = with_busy_retry(|| async {
@@ -376,20 +378,22 @@ impl SqliteStorage {
                 "UPDATE webhook_deliveries SET
                     status = 'delivered', lease_owner = NULL, lease_expires_at = NULL,
                     last_error = NULL, updated_at = ?3, delivered_at = ?3
-                WHERE id = ?1 AND subscription_id IN (
-                    SELECT id FROM webhook_subscriptions WHERE realm_id = ?2
-                )",
+                WHERE id = ?1 AND status = 'in_progress' AND lease_owner = ?4
+                    AND subscription_id IN (
+                        SELECT id FROM webhook_subscriptions WHERE realm_id = ?2
+                    )",
             )
             .bind(to_uuid(id.as_ref())?)
             .bind(to_uuid(realm.as_ref())?)
             .bind(now)
+            .bind(lease_owner)
             .execute(self.pool())
             .await
             .map_err(sqlx_err)
         })
         .await?;
         if result.rows_affected() == 0 {
-            return Err(IssuerdError::NotFound);
+            return Err(IssuerdError::Conflict);
         }
         Ok(())
     }
@@ -398,6 +402,7 @@ impl SqliteStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
         error: &str,
         next_attempt_at: Option<DateTime<Utc>>,
     ) -> Result<(), IssuerdError> {
@@ -414,9 +419,10 @@ impl SqliteStorage {
                     next_attempt_at = COALESCE(?4, next_attempt_at),
                     lease_owner = NULL, lease_expires_at = NULL,
                     last_error = ?5, updated_at = ?6
-                WHERE id = ?1 AND subscription_id IN (
-                    SELECT id FROM webhook_subscriptions WHERE realm_id = ?2
-                )",
+                WHERE id = ?1 AND status = 'in_progress' AND lease_owner = ?7
+                    AND subscription_id IN (
+                        SELECT id FROM webhook_subscriptions WHERE realm_id = ?2
+                    )",
             )
             .bind(to_uuid(id.as_ref())?)
             .bind(to_uuid(realm.as_ref())?)
@@ -424,13 +430,14 @@ impl SqliteStorage {
             .bind(next_attempt_at)
             .bind(error)
             .bind(Utc::now().timestamp_millis())
+            .bind(lease_owner)
             .execute(self.pool())
             .await
             .map_err(sqlx_err)
         })
         .await?;
         if result.rows_affected() == 0 {
-            return Err(IssuerdError::NotFound);
+            return Err(IssuerdError::Conflict);
         }
         Ok(())
     }
@@ -447,7 +454,7 @@ impl SqliteStorage {
                     status = 'pending', attempts = 0, next_attempt_at = ?3,
                     lease_owner = NULL, lease_expires_at = NULL, last_error = NULL,
                     updated_at = ?3, delivered_at = NULL
-                WHERE id = ?1 AND subscription_id IN (
+                WHERE id = ?1 AND status <> 'in_progress' AND subscription_id IN (
                     SELECT id FROM webhook_subscriptions WHERE realm_id = ?2
                 )",
             )
@@ -460,7 +467,23 @@ impl SqliteStorage {
         })
         .await?;
         if result.rows_affected() == 0 {
-            return Err(IssuerdError::NotFound);
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                    SELECT 1 FROM webhook_deliveries d
+                    JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                    WHERE d.id = ?1 AND s.realm_id = ?2
+                )",
+            )
+            .bind(to_uuid(id.as_ref())?)
+            .bind(to_uuid(realm.as_ref())?)
+            .fetch_one(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+            return Err(if exists {
+                IssuerdError::Conflict
+            } else {
+                IssuerdError::NotFound
+            });
         }
         Ok(())
     }
@@ -571,11 +594,16 @@ mod tests {
             .unwrap()
             .is_empty());
         let id = first[0].delivery.id.clone();
+        assert!(matches!(
+            storage.replay_webhook_delivery(&realm, &id).await,
+            Err(IssuerdError::Conflict)
+        ));
 
         storage
             .fail_webhook_delivery(
                 &realm,
                 &id,
+                first[0].delivery.lease_owner.as_deref().unwrap(),
                 "temporary",
                 Some(Utc::now() - chrono::Duration::seconds(1)),
             )
@@ -588,8 +616,29 @@ mod tests {
             .claim_webhook_deliveries("worker-3", 10, Duration::from_secs(30))
             .await
             .unwrap();
-        assert_eq!(recovered[0].delivery.lease_owner.as_deref(), Some("worker-3"));
-        storage.fail_webhook_delivery(&realm, &id, "permanent", None).await.unwrap();
+        assert!(recovered[0].delivery.lease_owner.as_deref().unwrap().starts_with("worker-3:"));
+        assert!(matches!(
+            storage
+                .fail_webhook_delivery(
+                    &realm,
+                    &id,
+                    retried[0].delivery.lease_owner.as_deref().unwrap(),
+                    "stale",
+                    None,
+                )
+                .await,
+            Err(IssuerdError::Conflict)
+        ));
+        storage
+            .fail_webhook_delivery(
+                &realm,
+                &id,
+                recovered[0].delivery.lease_owner.as_deref().unwrap(),
+                "permanent",
+                None,
+            )
+            .await
+            .unwrap();
         assert!(storage
             .claim_webhook_deliveries("worker-4", 10, Duration::from_secs(30))
             .await
@@ -602,7 +651,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed[0].delivery.attempts, 0);
-        storage.complete_webhook_delivery(&realm, &id).await.unwrap();
+        storage
+            .complete_webhook_delivery(
+                &realm,
+                &id,
+                replayed[0].delivery.lease_owner.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
         let history = storage
             .list_webhook_deliveries(&realm, None, &Pagination::default())
             .await

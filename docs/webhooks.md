@@ -7,6 +7,7 @@ Realm-scoped webhooks deliver authentication and administration events to extern
 - **At least once:** a receiver can see the same event more than once after a lost response, restart, or lease expiry. Exactly-once delivery is not claimed.
 - Every event has a stable UUID, also sent as `Idempotency-Key` and `X-Issuerd-Event-Id`. Deduplicate using that value and the subscription ID.
 - Deliveries are queued durably before any network I/O. Login and admin requests never wait for a receiver.
+- Publication preserves the existing non-fatal audit behavior: a business mutation is not rolled back when event publication fails. At-least-once applies after an outbox entry is committed; atomicity between a business mutation and event creation is not claimed.
 - Each `(subscription_id, event_id)` is unique. Retries and manual replay retain the same event ID and idempotency key.
 - Subscription secrets are accepted only on create/update and are never returned by the API or logged. Protect database and snapshot backups as secret-bearing material.
 - Payload `schemaVersion` is `1`. `kind` is `USER` or `ADMIN`; field names follow Keycloak where practical.
@@ -169,11 +170,11 @@ Retries generate a new timestamp and signature while preserving the event ID. A 
 
 ## Retry, dead letter, and replay
 
-A background worker claims due deliveries with expiring leases and restores abandoned leases after a restart. Multiple nodes exclude each other through storage transactions.
+A background worker claims due deliveries with expiring, unique per-attempt lease tokens and restores abandoned leases after a restart. Multiple nodes exclude each other through storage transactions. Settlement checks the lease token, so a late worker cannot overwrite the result of a newer attempt or replay. Replay rejects an active delivery atomically.
 
 - `2xx`: delivered.
 - Transport failures, `408`, `425`, `429`, and `5xx`: exponential backoff with jitter. The default starts at one second, caps at 60 seconds, and allows at most eight failed attempts. `Retry-After` is honored and capped at one hour.
-- Ordinary `4xx`: the delivery becomes `dead` instead of being retried forever.
+- `3xx` and ordinary `4xx`: the delivery becomes `dead` instead of being retried forever. Redirects are never followed.
 - `in_progress` cannot be replayed and returns `409 Conflict`.
 
 `POST .../replay` moves a dead or completed delivery back to `pending` with zero attempts, preserving the event ID and idempotency key. `lastError` and `deliveredAt` are cleared. A wrong subscription UUID returns `404` even when the delivery exists elsewhere in the realm.

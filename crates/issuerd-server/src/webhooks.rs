@@ -117,7 +117,9 @@ impl WebhookWorker {
             .await;
         match result {
             Ok(response) if response.status.is_success() => {
-                self.storage.complete_webhook_delivery(&realm, &delivery_id).await?;
+                self.storage
+                    .complete_webhook_delivery(&realm, &delivery_id, lease_owner(&task)?)
+                    .await?;
                 debug!(delivery = %delivery_id, event = %event_id, "webhook delivered");
                 Ok(())
             }
@@ -162,7 +164,13 @@ impl WebhookWorker {
         let realm = task.subscription.realm_id.clone();
         let delivery_id = task.delivery.id.clone();
         self.storage
-            .fail_webhook_delivery(&realm, &delivery_id, &error, next_attempt_at)
+            .fail_webhook_delivery(
+                &realm,
+                &delivery_id,
+                lease_owner(&task)?,
+                &error,
+                next_attempt_at,
+            )
             .await?;
         if next_attempt_at.is_some() {
             debug!(delivery = %delivery_id, error = %error, "webhook delivery scheduled for retry");
@@ -171,6 +179,13 @@ impl WebhookWorker {
         }
         Ok(())
     }
+}
+
+fn lease_owner(task: &WebhookDeliveryTask) -> Result<&str, IssuerdError> {
+    task.delivery
+        .lease_owner
+        .as_deref()
+        .ok_or_else(|| IssuerdError::ServerError("claimed webhook delivery has no lease".into()))
 }
 
 fn retry_decision(status: reqwest::StatusCode) -> RetryDecision {
@@ -451,5 +466,21 @@ mod delivery_tests {
         assert_eq!(worker.process_batch().await.unwrap(), 1);
         assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Dead);
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirect_marks_delivery_dead_without_retry() {
+        let (url, root, requests) = start_receiver(vec![
+            reqwest::StatusCode::MOVED_PERMANENTLY,
+            reqwest::StatusCode::OK,
+        ])
+        .await;
+        let (storage, _) = storage_with_delivery(url).await;
+        let worker = WebhookWorker::with_policy(storage.clone(), &[root], true).unwrap();
+
+        assert_eq!(worker.process_batch().await.unwrap(), 1);
+        assert_eq!(history(&storage).await[0].status, WebhookDeliveryStatus::Dead);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(worker.process_batch().await.unwrap(), 0);
     }
 }

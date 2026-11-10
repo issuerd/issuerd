@@ -113,11 +113,10 @@ impl BackchannelLogoutDispatcher {
 
     /// Record the delivery outcome as a system-initiated admin event.
     ///
-    /// Admin-event gating: skipped entirely when the realm has
-    /// `admin_events_enabled = false` (Issuerd default: on — Keycloak parity
-    /// break; Keycloak defaults to off). The realm is always
-    /// already loaded on the wired dispatch paths, so there is no fetch to
-    /// fail open on.
+    /// Local audit storage is skipped when the realm has
+    /// `admin_events_enabled = false`; enabled webhook subscriptions still
+    /// receive the event. The realm is always already loaded on the wired
+    /// dispatch paths, so there is no fetch to fail open on.
     async fn record(
         &self,
         realm: &Realm,

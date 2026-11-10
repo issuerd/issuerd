@@ -86,10 +86,11 @@ matching enabled subscriptions. Preserve current audit-storage behavior and the
 existing logging listener. Wire `on_admin_event` where appropriate, but do not
 silently change the meaning of current realm settings.
 
-The outbox write and its corresponding business mutation must share a
-transaction where such a transaction exists. For authentication events without
-a business database mutation, persist the outbox entry before any external
-side effect. Dispatch happens only after the relevant commit.
+Publication follows the existing non-fatal audit behavior after the relevant
+business mutation. Once committed, an outbox entry is delivered at least once;
+atomicity between the business mutation and event creation is not claimed by
+this listener-based implementation. No receiver network I/O happens in request
+paths.
 
 Commit: `Publish user and admin events to webhook outbox`
 

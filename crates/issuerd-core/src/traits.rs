@@ -703,7 +703,8 @@ pub trait Storage: Send + Sync {
         Err(IssuerdError::UnsupportedOperation)
     }
     /// Recover expired leases, then claim due deliveries in sequence order.
-    /// The returned subscription is the configuration snapshot used by the worker.
+    /// The returned subscription and opaque lease token are the snapshots used
+    /// by the worker for delivery and settlement.
     async fn claim_webhook_deliveries(
         &self,
         _worker_id: &str,
@@ -712,24 +713,31 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
         Err(IssuerdError::UnsupportedOperation)
     }
+    /// Complete only the current claim. A stale or replayed claim returns
+    /// `Conflict` without overwriting the newer delivery state.
     async fn complete_webhook_delivery(
         &self,
         _realm: &RealmId,
         _id: &WebhookDeliveryId,
+        _lease_owner: &str,
     ) -> Result<(), IssuerdError> {
         Err(IssuerdError::UnsupportedOperation)
     }
-    /// Record a failed attempt. `Some(next_attempt_at)` schedules a retry;
-    /// `None` marks the delivery dead. The backend increments attempts atomically.
+    /// Record a failed attempt for the current claim. `Some(next_attempt_at)`
+    /// schedules a retry; `None` marks the delivery dead. The backend increments
+    /// attempts atomically and rejects stale or replayed claims with `Conflict`.
     async fn fail_webhook_delivery(
         &self,
         _realm: &RealmId,
         _id: &WebhookDeliveryId,
+        _lease_owner: &str,
         _error: &str,
         _next_attempt_at: Option<DateTime<Utc>>,
     ) -> Result<(), IssuerdError> {
         Err(IssuerdError::UnsupportedOperation)
     }
+    /// Requeue a terminal or waiting delivery. An active claim is rejected
+    /// atomically with `Conflict`, never cancelled by a check-then-act race.
     async fn replay_webhook_delivery(
         &self,
         _realm: &RealmId,

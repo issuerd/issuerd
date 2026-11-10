@@ -620,14 +620,20 @@ impl SsrfGuardedClient {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let resp = request
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| guarded_request_fail(&format!("connect: {e}")))?;
+        let resp = request.body(body.to_string()).send().await.map_err(|error| {
+            let reason = if error.is_timeout() {
+                "webhook request timed out"
+            } else {
+                "webhook connection failed"
+            };
+            guarded_request_fail(reason)
+        })?;
         let status = resp.status();
         if status.is_redirection() {
-            return Err(guarded_request_fail(&format!("redirect: {status}")));
+            return Ok(GuardedPostResponse {
+                status,
+                retry_after: None,
+            });
         }
         if resp.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
             return Err(guarded_request_fail("webhook response exceeds cap"));
@@ -643,7 +649,7 @@ impl SsrfGuardedClient {
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| guarded_request_fail(&format!("webhook response body: {e}")))?
+            .map_err(|_| guarded_request_fail("webhook response body read failed"))?
         {
             drained = drained.saturating_add(chunk.len());
             if drained > MAX_RESPONSE_BYTES {

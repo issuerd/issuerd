@@ -81,8 +81,9 @@ impl JsonFileStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
     ) -> Result<(), IssuerdError> {
-        self.inner.complete_webhook_delivery(realm, id).await?;
+        self.inner.complete_webhook_delivery(realm, id, lease_owner).await?;
         self.persist()
     }
 
@@ -90,10 +91,13 @@ impl JsonFileStorage {
         &self,
         realm: &RealmId,
         id: &WebhookDeliveryId,
+        lease_owner: &str,
         error: &str,
         next_attempt_at: Option<DateTime<Utc>>,
     ) -> Result<(), IssuerdError> {
-        self.inner.fail_webhook_delivery(realm, id, error, next_attempt_at).await?;
+        self.inner
+            .fail_webhook_delivery(realm, id, lease_owner, error, next_attempt_at)
+            .await?;
         self.persist()
     }
 
@@ -174,7 +178,14 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         let id = claimed[0].delivery.id.clone();
-        storage.complete_webhook_delivery(&realm, &id).await.unwrap();
+        storage
+            .complete_webhook_delivery(
+                &realm,
+                &id,
+                claimed[0].delivery.lease_owner.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
         drop(storage);
 
         let storage = JsonFileStorage::new(&path).unwrap();
