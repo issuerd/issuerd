@@ -4523,7 +4523,7 @@ mod tests {
             .fetch_one(storage.pool())
             .await
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
     }
 
     #[tokio::test]

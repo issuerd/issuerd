@@ -251,7 +251,7 @@ Because signing keys are restored with the database, tokens and SSO sessions iss
 
 ## Schema migrations
 
-Issuerd manages PostgreSQL with embedded, numbered SQL migrations in `crates/issuerd-storage/migrations/` and SQLite with an independent, mirrored sequence in `crates/issuerd-storage/migrations-sqlite/` (PostgreSQL through `018_mcp_step_up_grants.sql`, SQLite through `019_user_search.sql`):
+Issuerd manages PostgreSQL with embedded, numbered SQL migrations in `crates/issuerd-storage/migrations/` and SQLite with an independent, mirrored sequence in `crates/issuerd-storage/migrations-sqlite/` (PostgreSQL through `019_webhooks.sql`, SQLite through `020_webhooks.sql`):
 
 - Migrations are compiled into the binary and **applied automatically at startup** (`sqlx::migrate!`, invoked from `ServerState::from_config` and each SQL backend's `run_migrations`). The `issuerd provision` CLI subcommand runs them too before applying a provision file.
 - Applied migrations are recorded in the database's sqlx migration ledger, so restarts and subsequent boots only run what is new.
