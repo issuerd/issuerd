@@ -41,6 +41,7 @@ pub struct InMemoryStorage {
     signing_keys: DashMap<String, StoredSigningKey>,
     mcp_step_up_grants: DashMap<String, McpStepUpGrant>,
     pub(crate) step_up_lock: tokio::sync::Mutex<()>,
+    pub(crate) webhooks: crate::memory_webhooks::MemoryWebhookState,
 }
 
 impl InMemoryStorage {
@@ -69,6 +70,7 @@ impl InMemoryStorage {
             signing_keys: DashMap::new(),
             mcp_step_up_grants: DashMap::new(),
             step_up_lock: tokio::sync::Mutex::new(()),
+            webhooks: crate::memory_webhooks::MemoryWebhookState::default(),
         }
     }
 }
@@ -120,10 +122,18 @@ pub(crate) struct StorageSnapshot {
     pub signing_keys: Vec<StoredSigningKey>,
     #[serde(default)]
     pub mcp_step_up_grants: Vec<McpStepUpGrant>,
+    #[serde(default)]
+    pub webhook_subscriptions: Vec<WebhookSubscription>,
+    #[serde(default)]
+    pub webhook_deliveries: Vec<WebhookDelivery>,
+    #[serde(default)]
+    pub webhook_next_sequence: i64,
 }
 
 impl InMemoryStorage {
     pub(crate) fn to_snapshot(&self) -> StorageSnapshot {
+        let (webhook_subscriptions, webhook_deliveries, webhook_next_sequence) =
+            self.webhooks.snapshot();
         StorageSnapshot {
             realms: self.realms.iter().map(|r| r.clone()).collect(),
             users: self.users.iter().map(|u| u.clone()).collect(),
@@ -183,6 +193,9 @@ impl InMemoryStorage {
                 .collect(),
             signing_keys: self.signing_keys.iter().map(|k| k.clone()).collect(),
             mcp_step_up_grants: self.mcp_step_up_grants.iter().map(|grant| grant.clone()).collect(),
+            webhook_subscriptions,
+            webhook_deliveries,
+            webhook_next_sequence,
         }
     }
 
@@ -289,6 +302,12 @@ impl InMemoryStorage {
         for grant in snapshot.mcp_step_up_grants {
             self.mcp_step_up_grants.insert(grant.token_jti.to_string(), grant);
         }
+
+        self.webhooks.restore(
+            snapshot.webhook_subscriptions,
+            snapshot.webhook_deliveries,
+            snapshot.webhook_next_sequence,
+        );
     }
 }
 
@@ -1672,6 +1691,88 @@ impl Storage for InMemoryStorage {
         let _guard = self.mutation_lock().await;
         self.admin_events.write().unwrap().retain(|e| e.realm_id != *realm);
         Ok(())
+    }
+
+    async fn create_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::create_webhook_subscription(self, realm, subscription).await
+    }
+    async fn get_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<Option<WebhookSubscription>, IssuerdError> {
+        InMemoryStorage::get_webhook_subscription(self, realm, id).await
+    }
+    async fn list_webhook_subscriptions(
+        &self,
+        realm: &RealmId,
+    ) -> Result<Vec<WebhookSubscription>, IssuerdError> {
+        InMemoryStorage::list_webhook_subscriptions(self, realm).await
+    }
+    async fn update_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::update_webhook_subscription(self, realm, subscription).await
+    }
+    async fn delete_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::delete_webhook_subscription(self, realm, id).await
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        event: &WebhookEvent,
+    ) -> Result<bool, IssuerdError> {
+        InMemoryStorage::enqueue_webhook_delivery(self, realm, subscription_id, event).await
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        lease_duration: std::time::Duration,
+    ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
+        InMemoryStorage::claim_webhook_deliveries(self, worker_id, limit, lease_duration).await
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::complete_webhook_delivery(self, realm, id).await
+    }
+    async fn fail_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        error: &str,
+        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::fail_webhook_delivery(self, realm, id, error, next_attempt_at).await
+    }
+    async fn replay_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        InMemoryStorage::replay_webhook_delivery(self, realm, id).await
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        realm: &RealmId,
+        subscription_id: Option<WebhookSubscriptionId>,
+        pagination: &Pagination,
+    ) -> Result<Vec<WebhookDelivery>, IssuerdError> {
+        InMemoryStorage::list_webhook_deliveries(self, realm, subscription_id, pagination).await
     }
 
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {

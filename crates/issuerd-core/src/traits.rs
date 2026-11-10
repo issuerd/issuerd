@@ -16,10 +16,11 @@ use crate::error::IssuerdError;
 use crate::events::{AdminEvent, Event, EventType, OperationType, ResourceType};
 use crate::ids::{
     ClientId, ClientScopeId, CredentialId, GroupId, IdentityProviderId, JwtId, KeyId, RealmId,
-    RoleId, SessionId, UserId,
+    RoleId, SessionId, UserId, WebhookDeliveryId, WebhookSubscriptionId,
 };
 use crate::mcp_step_up::{McpStepUpExecution, McpStepUpGrant, McpStepUpMutation};
 use crate::models::*;
+use crate::webhooks::{WebhookDelivery, WebhookDeliveryTask, WebhookEvent, WebhookSubscription};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -655,6 +656,95 @@ pub trait Storage: Send + Sync {
     /// Delete all admin events of a realm (events config "clear admin
     /// events").
     async fn delete_admin_events(&self, realm: &RealmId) -> Result<(), IssuerdError>;
+
+    // Webhook subscriptions and durable deliveries
+    async fn create_webhook_subscription(
+        &self,
+        _realm: &RealmId,
+        _subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn get_webhook_subscription(
+        &self,
+        _realm: &RealmId,
+        _id: &WebhookSubscriptionId,
+    ) -> Result<Option<WebhookSubscription>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn list_webhook_subscriptions(
+        &self,
+        _realm: &RealmId,
+    ) -> Result<Vec<WebhookSubscription>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn update_webhook_subscription(
+        &self,
+        _realm: &RealmId,
+        _subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn delete_webhook_subscription(
+        &self,
+        _realm: &RealmId,
+        _id: &WebhookSubscriptionId,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    /// Insert a delivery if this subscription has not seen the event before.
+    /// Returns `false` for an idempotent duplicate.
+    async fn enqueue_webhook_delivery(
+        &self,
+        _realm: &RealmId,
+        _subscription_id: &WebhookSubscriptionId,
+        _event: &WebhookEvent,
+    ) -> Result<bool, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    /// Recover expired leases, then claim due deliveries in sequence order.
+    /// The returned subscription is the configuration snapshot used by the worker.
+    async fn claim_webhook_deliveries(
+        &self,
+        _worker_id: &str,
+        _limit: u32,
+        _lease_duration: Duration,
+    ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        _realm: &RealmId,
+        _id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    /// Record a failed attempt. `Some(next_attempt_at)` schedules a retry;
+    /// `None` marks the delivery dead. The backend increments attempts atomically.
+    async fn fail_webhook_delivery(
+        &self,
+        _realm: &RealmId,
+        _id: &WebhookDeliveryId,
+        _error: &str,
+        _next_attempt_at: Option<DateTime<Utc>>,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn replay_webhook_delivery(
+        &self,
+        _realm: &RealmId,
+        _id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        _realm: &RealmId,
+        _subscription_id: Option<WebhookSubscriptionId>,
+        _pagination: &Pagination,
+    ) -> Result<Vec<WebhookDelivery>, IssuerdError> {
+        Err(IssuerdError::UnsupportedOperation)
+    }
 
     // Provision markers
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError>;

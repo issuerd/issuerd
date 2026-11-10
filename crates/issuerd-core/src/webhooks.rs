@@ -263,6 +263,12 @@ pub struct WebhookDelivery {
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebhookDeliveryTask {
+    pub delivery: WebhookDelivery,
+    pub subscription: WebhookSubscription,
+}
+
 pub fn webhook_signing_input(timestamp: i64, raw_body: &str) -> String {
     format!("{timestamp}.{raw_body}")
 }
