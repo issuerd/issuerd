@@ -264,7 +264,7 @@ pub fn redact_admin_representation(
     serde_json::to_string(&value).ok()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookDeliveryStatus {
     Pending,

@@ -36,6 +36,7 @@ pub mod scope_mappings;
 pub mod sessions;
 pub mod user_actions;
 pub mod users;
+pub mod webhooks;
 
 #[cfg(test)]
 pub mod test_utils;

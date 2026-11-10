@@ -157,7 +157,7 @@ Entities are applied in a fixed order regardless of how the lists are arranged i
 the file (`crates/issuerd-server/src/provisioner.rs`):
 
 ```
-realms → roles → clients → groups → users → identity_providers → flow_configs
+realms → roles → clients → groups → users → identity_providers → webhooks → flow_configs
 ```
 
 Groups are applied **after clients** so that group `client_roles` mappings can
@@ -408,6 +408,35 @@ identity_providers:
       editMode: READ_ONLY
       priority: "1"
 ```
+
+### webhooks
+
+Declares realm webhook subscriptions. The secret is required and is used for
+HMAC-SHA256 signatures; it is never returned by the Admin API or logged. See
+[webhooks.md](webhooks.md) for the payload, filters, retry, and delivery model.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `realm` | string | required | Owning realm name. |
+| `url` | string | required | Absolute HTTPS endpoint, without userinfo or a fragment. |
+| `secret` | string | required | Shared secret for HMAC-SHA256. Supply it via `${ENV}` rather than committing it. |
+| `enabled` | bool | `true` | Enables delivery independently of local audit retention. |
+| `event_types` | list | `["*"]` | Filters such as `USER.LOGIN`, `USER.REGISTER`, or `ADMIN.USER.CREATE`. |
+| `include_representation` | bool | `false` | Includes admin representation only when the realm and subscription both allow it. |
+
+```yaml
+webhooks:
+  - realm: myrealm
+    url: ${ISSUERD_WEBHOOK_URL}
+    secret: ${ISSUERD_WEBHOOK_SECRET}
+    enabled: true
+    event_types: [USER.LOGIN, USER.REGISTER, ADMIN.USER.CREATE]
+    include_representation: false
+```
+
+Provisioning skips an existing subscription with the same URL. It creates missing
+subscriptions only and never rotates an existing secret or changes filters;
+perform those changes through the Admin API.
 
 ### flow_configs
 

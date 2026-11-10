@@ -10,7 +10,7 @@ use utoipa::OpenApi;
 use crate::{
     attack_detection, client_installation, client_roles, client_scopes, clients, composites,
     credentials, enums, events, federation, flows, groups, idp, import_export, initial_access,
-    keys, realms, roles, scope_mappings, sessions, user_actions, users,
+    keys, realms, roles, scope_mappings, sessions, user_actions, users, webhooks,
 };
 use crate::{auth::admin_auth_middleware, state::AdminApiState};
 
@@ -343,6 +343,24 @@ pub fn admin_routes(state: Arc<AdminApiState>) -> Router {
         .route(
             "/realms/{realm}/events/config",
             get(events::get_events_config).put(events::update_events_config),
+        )
+        .route(
+            "/realms/{realm}/webhooks",
+            get(webhooks::list_webhooks).post(webhooks::create_webhook),
+        )
+        .route(
+            "/realms/{realm}/webhooks/{id}",
+            get(webhooks::get_webhook)
+                .put(webhooks::update_webhook)
+                .delete(webhooks::delete_webhook),
+        )
+        .route(
+            "/realms/{realm}/webhooks/{id}/deliveries",
+            get(webhooks::list_webhook_deliveries),
+        )
+        .route(
+            "/realms/{realm}/webhooks/{id}/deliveries/{delivery_id}/replay",
+            post(webhooks::replay_webhook_delivery),
         )
         .route(
             "/realms/{realm}/identity-provider/instances",

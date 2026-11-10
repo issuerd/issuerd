@@ -2256,6 +2256,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "axum-server",
  "base64 0.23.1",
  "bytes",
  "chrono",
@@ -2277,6 +2278,7 @@ dependencies = [
  "ldap3",
  "rand 0.10.3",
  "rand_core 0.6.4",
+ "rcgen",
  "reqwest 0.12.28",
  "ring",
  "rmcp",
@@ -2327,7 +2329,9 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

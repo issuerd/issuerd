@@ -88,7 +88,7 @@ impl WebhookWorker {
         }
     }
 
-    async fn process_batch(&self) -> Result<usize, IssuerdError> {
+    pub async fn process_batch(&self) -> Result<usize, IssuerdError> {
         let tasks = self
             .storage
             .claim_webhook_deliveries(&self.worker_id, self.batch_size, self.lease_duration)

@@ -44,6 +44,10 @@ pub struct ProvisionConfig {
     #[serde(default)]
     pub identity_providers: Vec<ProvisionIdentityProvider>,
 
+    /// Webhook subscriptions to create.
+    #[serde(default)]
+    pub webhooks: Vec<ProvisionWebhook>,
+
     /// Authentication flow configs to create.
     #[serde(default)]
     pub flow_configs: Vec<ProvisionFlowConfig>,
@@ -184,6 +188,7 @@ impl ProvisionConfig {
                 config: idp_config,
                 mappers: vec![],
             }],
+            webhooks: vec![],
             flow_configs: vec![ProvisionFlowConfig {
                 realm: "myrealm".to_string(),
                 alias: "browser".to_string(),
@@ -392,6 +397,27 @@ pub struct ProvisionIdentityProvider {
     /// `msad-user-account-control-mapper`) on `ldap` providers.
     #[serde(default)]
     pub mappers: Vec<crate::broker::IdpMapper>,
+}
+
+// ---------------------------------------------------------------------------
+// Webhook Subscription
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionWebhook {
+    pub realm: String,
+    pub url: String,
+    pub secret: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_webhook_filters")]
+    pub event_types: Vec<String>,
+    #[serde(default)]
+    pub include_representation: bool,
+}
+
+fn default_webhook_filters() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 // ---------------------------------------------------------------------------

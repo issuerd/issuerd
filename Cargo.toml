@@ -95,6 +95,8 @@ sqlx = { workspace = true }
 ring = { workspace = true }
 jsonwebtoken = { workspace = true }
 testcontainers = { workspace = true }
+rcgen = { workspace = true }
+axum-server = { workspace = true }
 
 [workspace.package]
 version = "0.2.3"

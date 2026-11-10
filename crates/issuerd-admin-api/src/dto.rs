@@ -830,7 +830,7 @@ pub struct RealmEventsConfigRepresentation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_events_details_enabled: Option<bool>,
     /// Event listener ids active for this realm. Any string is accepted
-    /// (custom listener SPIs); only `logging` is built in.
+    /// (custom listener SPIs); `logging` and durable webhook subscriptions are built in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_listeners: Option<Vec<String>>,
 }

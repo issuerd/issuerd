@@ -41,7 +41,7 @@ Depending on your role, you will typically read the set in this order:
 |---|---|
 | [Getting started](getting-started.md) | Installation (Docker demo stack or build from source), first boot and seeding, verifying the installation, obtaining a first token, first hardening steps. |
 | [Configuration](configuration.md) | Complete `issuerd.toml` reference: loading order, environment overrides, and every section — storage, TLS, logging, proxy, CORS, cluster, cache, themes, SMTP including per-realm overrides. |
-| [Provisioning](provisioning.md) | Declarative realm seeding with `provision.yaml`: the apply-once marker semantics, the `provision` CLI command, and a field-by-field reference for realms, roles, groups, clients, users, identity providers, and flow configs. |
+| [Provisioning](provisioning.md) | Declarative realm seeding with `provision.yaml`: the apply-once marker semantics, the `provision` CLI command, and a field-by-field reference for realms, roles, groups, clients, users, identity providers, webhooks, and flow configs. |
 
 ### Deployment guides
 
@@ -57,6 +57,7 @@ Depending on your role, you will typically read the set in this order:
 |---|---|
 | [Administration](administration.md) | The admin access model (master realm, `realm-management` roles), the admin console, the Admin REST API with a curl cookbook, OpenAPI export, and events management. |
 | [Client integration](client-integration.md) | The application developer's guide: discovery and endpoint map, choosing a flow, registering clients, the authorization code flow with PKCE end to end, token handling, logout, client authentication methods, adapter-config download, and advanced OAuth capabilities. |
+| [Webhooks](webhooks.md) | Realm-scoped event delivery: subscriptions, filters, Keycloak-shaped payloads, HMAC-SHA256 verification, idempotency, durable retry and replay, Admin REST and provisioning. |
 
 ### Agentic and MCP workloads
 

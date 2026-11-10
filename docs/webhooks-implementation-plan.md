@@ -64,7 +64,7 @@ Commit: `Add webhook event and subscription models`
 
 ### 3. Durable storage and outbox
 
-Add append-only `019_webhooks.sql` migrations to both SQL backends. Subscription
+Add append-only `019_webhooks.sql` for PostgreSQL and `020_webhooks.sql` for SQLite. Subscription
 rows hold realm ownership, endpoint, secret, enabled state, filters, and
 representation policy. Delivery rows hold a monotonically increasing sequence,
 event ID, payload, status, attempts, schedule, lease, and last error, with a

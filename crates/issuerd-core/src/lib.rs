@@ -65,7 +65,7 @@ pub use pairwise::{validate_pairwise_subject_config, validate_sector_document};
 pub use password::{PasswordPolicyError, PasswordPolicyViolation};
 pub use provision::{
     ProvisionClient, ProvisionConfig, ProvisionFlowConfig, ProvisionFlowStage, ProvisionGroup,
-    ProvisionIdentityProvider, ProvisionRealm, ProvisionRole, ProvisionUser,
+    ProvisionIdentityProvider, ProvisionRealm, ProvisionRole, ProvisionUser, ProvisionWebhook,
 };
 pub use roles::{effective_group_roles, effective_user_roles, expand_composites, list_all_roles};
 pub use scope::{Scope, OFFLINE_ACCESS_SCOPE};

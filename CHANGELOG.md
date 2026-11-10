@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Durable realm webhooks.** Add realm-scoped subscriptions for user and admin events with Keycloak-shaped versioned payloads, event filters, HMAC-SHA256 signatures, stable idempotency keys, and at-least-once delivery. A durable outbox on PostgreSQL, SQLite, in-memory, and JSON storage supports background HTTPS delivery, bounded retries with jitter, stale-lease recovery, dead-letter history, and replay. Admin REST CRUD, delivery history/replay, and declarative provisioning are included, with write-only secrets and independent local audit-retention controls.
+
 ### Fixed
 
 - **OIDC audit client attribution on PostgreSQL.** Resolve public OAuth client IDs to internal UUIDs before recording failed browser login, authorization-parse, JAR, PAR, and broker-linking `LOGIN_ERROR` events. These failures now remain in the persistent audit trail without invalid-UUID write warnings.
