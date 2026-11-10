@@ -83,13 +83,15 @@ pub async fn publish_admin_event(
         .as_ref()
         .map(|realm| realm.name.to_string())
         .unwrap_or_else(|| event.realm_id.to_string());
+    let include_representation = realm.is_some_and(|realm| realm.include_representations);
     let auth_realm_name = match &event.auth_realm_id {
         Some(realm_id) => storage.get_realm(realm_id).await?.map(|realm| realm.name.to_string()),
         None => None,
     };
     let mut event = event.clone();
     event.representation = redact_admin_representation(event.resource_type, event.representation);
-    let event = WebhookEvent::from_admin_event(&event, realm_name, auth_realm_name, true);
+    let event =
+        WebhookEvent::from_admin_event(&event, realm_name, auth_realm_name, include_representation);
     publish_with_subscriptions(storage, &event, subscriptions).await
 }
 
@@ -208,7 +210,9 @@ mod tests {
     #[tokio::test]
     async fn admin_publication_applies_per_subscription_representation_policy() {
         let storage = InMemoryStorage::new();
-        let realm = realm();
+        let mut realm = realm();
+        realm.include_representations = true;
+        realm.admin_events_enabled = false;
         storage.create_realm(&realm).await.unwrap();
         storage
             .create_webhook_subscription(
@@ -256,6 +260,25 @@ mod tests {
                 assert!(!representation.contains("secret-key"));
                 assert!(representation.contains("other"));
             }
+        }
+
+        realm.include_representations = false;
+        storage.update_realm(&realm).await.unwrap();
+        let mut event = event;
+        event.id = EventId::new("event-3").unwrap();
+        assert_eq!(publish_admin_event(&storage, &event).await.unwrap(), 2);
+        let deliveries = storage
+            .list_webhook_deliveries(&realm.id, None, &Pagination::default())
+            .await
+            .unwrap();
+        let redacted: Vec<_> = deliveries
+            .iter()
+            .filter(|delivery| delivery.event_id.as_ref() == "event-3")
+            .collect();
+        assert_eq!(redacted.len(), 2);
+        for delivery in redacted {
+            let payload: serde_json::Value = serde_json::from_str(&delivery.payload).unwrap();
+            assert!(payload.get("representation").is_none());
         }
     }
 }
