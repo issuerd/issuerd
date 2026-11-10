@@ -25,6 +25,7 @@ pub mod traits;
 pub mod typestate;
 pub mod urls;
 pub mod utils;
+pub mod webhooks;
 
 pub use broker::{
     apply_mappers, claims_need_userinfo, decide_first_broker_login, identity_provider_presets,
@@ -49,6 +50,7 @@ pub use federation::{
 pub use ids::{
     ClientId, ClientScopeId, ClientSessionId, CredentialId, EventId, FlowStageId, GroupId,
     IdentityProviderId, JwtId, KeyId, MapperId, RealmId, RoleId, SessionId, UserId,
+    WebhookDeliveryId, WebhookSubscriptionId,
 };
 pub use mcp_step_up::{
     has_primary_sign_in_method, is_primary_sign_in_credential_type,
@@ -68,6 +70,11 @@ pub use provision::{
 pub use roles::{effective_group_roles, effective_user_roles, expand_composites, list_all_roles};
 pub use scope::{Scope, OFFLINE_ACCESS_SCOPE};
 pub use traits::*;
+pub use webhooks::{
+    validate_webhook_filters, webhook_signing_input, WebhookAdminEvent, WebhookAuthDetails,
+    WebhookDelivery, WebhookDeliveryStatus, WebhookEvent, WebhookEventData, WebhookEventKind,
+    WebhookSecret, WebhookSubscription, WebhookUserEvent, WEBHOOK_SCHEMA_VERSION,
+};
 // Re-export commonly used typestate types for ergonomics
 pub use typestate::{
     ActionState, ActionsCleared, ActionsPending, AnonymousState, AuthRequestState, AuthState,
