@@ -208,7 +208,7 @@ fn is_busy(error: &IssuerdError) -> bool {
     matches!(error, IssuerdError::ServerError(message) if message == SQLITE_BUSY)
 }
 
-async fn with_busy_retry<F, Fut, T>(mut operation: F) -> Result<T, IssuerdError>
+pub(crate) async fn with_busy_retry<F, Fut, T>(mut operation: F) -> Result<T, IssuerdError>
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<T, IssuerdError>> + Send,
@@ -228,13 +228,13 @@ where
     }
 }
 
-async fn begin_immediate_with_retry(
+pub(crate) async fn begin_immediate_with_retry(
     pool: &SqlitePool,
 ) -> Result<Transaction<'static, Sqlite>, IssuerdError> {
     with_busy_retry(|| async { pool.begin_with("BEGIN IMMEDIATE").await.map_err(sqlx_err) }).await
 }
 
-fn sqlx_err(e: sqlx::Error) -> IssuerdError {
+pub(crate) fn sqlx_err(e: sqlx::Error) -> IssuerdError {
     match e {
         sqlx::Error::Database(_) if crate::migration::is_sqlite_busy_error(&e) => {
             IssuerdError::ServerError(SQLITE_BUSY.into())
@@ -2717,6 +2717,88 @@ impl Storage for SqliteStorage {
                 .bind(to_uuid(realm.as_ref())?)
         )?;
         Ok(())
+    }
+
+    async fn create_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::create_webhook_subscription(self, realm, subscription).await
+    }
+    async fn get_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<Option<WebhookSubscription>, IssuerdError> {
+        SqliteStorage::get_webhook_subscription(self, realm, id).await
+    }
+    async fn list_webhook_subscriptions(
+        &self,
+        realm: &RealmId,
+    ) -> Result<Vec<WebhookSubscription>, IssuerdError> {
+        SqliteStorage::list_webhook_subscriptions(self, realm).await
+    }
+    async fn update_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::update_webhook_subscription(self, realm, subscription).await
+    }
+    async fn delete_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::delete_webhook_subscription(self, realm, id).await
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        event: &WebhookEvent,
+    ) -> Result<bool, IssuerdError> {
+        SqliteStorage::enqueue_webhook_delivery(self, realm, subscription_id, event).await
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        lease_duration: std::time::Duration,
+    ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
+        SqliteStorage::claim_webhook_deliveries(self, worker_id, limit, lease_duration).await
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::complete_webhook_delivery(self, realm, id).await
+    }
+    async fn fail_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        error: &str,
+        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::fail_webhook_delivery(self, realm, id, error, next_attempt_at).await
+    }
+    async fn replay_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        SqliteStorage::replay_webhook_delivery(self, realm, id).await
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        realm: &RealmId,
+        subscription_id: Option<WebhookSubscriptionId>,
+        pagination: &Pagination,
+    ) -> Result<Vec<WebhookDelivery>, IssuerdError> {
+        SqliteStorage::list_webhook_deliveries(self, realm, subscription_id, pagination).await
     }
 
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {
