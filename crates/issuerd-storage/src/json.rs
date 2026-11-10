@@ -107,7 +107,7 @@ fn write_snapshot(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// disk.  Reads are served directly from the in-memory copy without
 /// locking.
 pub struct JsonFileStorage {
-    inner: InMemoryStorage,
+    pub(crate) inner: InMemoryStorage,
     path: PathBuf,
     lock: Mutex<()>,
 }
@@ -188,7 +188,7 @@ impl JsonFileStorage {
     }
 
     /// Persist the current in-memory state to disk.
-    fn persist(&self) -> Result<(), IssuerdError> {
+    pub(crate) fn persist(&self) -> Result<(), IssuerdError> {
         let _guard = self.lock.lock().unwrap();
         let snapshot = self.inner.to_snapshot();
         let data = serde_json::to_string_pretty(&snapshot).map_err(|e| {
@@ -1006,6 +1006,99 @@ impl Storage for JsonFileStorage {
     async fn delete_admin_events(&self, realm: &RealmId) -> Result<(), IssuerdError> {
         self.inner.delete_admin_events(realm).await?;
         self.persist()
+    }
+
+    async fn create_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::create_webhook_subscription(self, realm, subscription).await
+    }
+    async fn get_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<Option<WebhookSubscription>, IssuerdError> {
+        JsonFileStorage::get_webhook_subscription(self, realm, id).await
+    }
+    async fn list_webhook_subscriptions(
+        &self,
+        realm: &RealmId,
+    ) -> Result<Vec<WebhookSubscription>, IssuerdError> {
+        JsonFileStorage::list_webhook_subscriptions(self, realm).await
+    }
+    async fn update_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::update_webhook_subscription(self, realm, subscription).await
+    }
+    async fn delete_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::delete_webhook_subscription(self, realm, id).await
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        event: &WebhookEvent,
+    ) -> Result<bool, IssuerdError> {
+        JsonFileStorage::enqueue_webhook_delivery(self, realm, subscription_id, event).await
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        lease_duration: std::time::Duration,
+    ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
+        JsonFileStorage::claim_webhook_deliveries(self, worker_id, limit, lease_duration).await
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        lease_owner: &str,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::complete_webhook_delivery(self, realm, id, lease_owner).await
+    }
+    async fn fail_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        lease_owner: &str,
+        error: &str,
+        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::fail_webhook_delivery(self, realm, id, lease_owner, error, next_attempt_at)
+            .await
+    }
+    async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        JsonFileStorage::get_webhook_delivery(self, realm, subscription_id, id).await
+    }
+    async fn replay_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        JsonFileStorage::replay_webhook_delivery(self, realm, id).await
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        realm: &RealmId,
+        subscription_id: Option<WebhookSubscriptionId>,
+        pagination: &Pagination,
+    ) -> Result<Vec<WebhookDelivery>, IssuerdError> {
+        JsonFileStorage::list_webhook_deliveries(self, realm, subscription_id, pagination).await
     }
 
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {

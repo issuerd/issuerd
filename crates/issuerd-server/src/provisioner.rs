@@ -9,11 +9,12 @@ use std::path::Path;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use issuerd_core::{
-    Alias, Client, ClientAuthenticatorType, ClientId, ClientIdentifier, ClientProtocol, Credential,
-    CredentialId, CredentialType, DisplayName, Email, FlowConfig, FlowStage, FlowStageId, Group,
-    GroupId, GroupName, GroupPath, IdentityProviderConfig, IdentityProviderId, PasswordPolicy,
-    ProvisionConfig, Realm, RealmId, RealmName, RedirectUri, Requirement, Role, RoleId, RoleName,
-    Scope, SecondsNonZero, SslRequired, Storage, User, UserId, Username, WebOrigin,
+    validate_webhook_filters, validate_webhook_url, Alias, Client, ClientAuthenticatorType,
+    ClientId, ClientIdentifier, ClientProtocol, Credential, CredentialId, CredentialType,
+    DisplayName, Email, FlowConfig, FlowStage, FlowStageId, Group, GroupId, GroupName, GroupPath,
+    IdentityProviderConfig, IdentityProviderId, PasswordPolicy, ProvisionConfig, Realm, RealmId,
+    RealmName, RedirectUri, Requirement, Role, RoleId, RoleName, Scope, SecondsNonZero,
+    SslRequired, Storage, User, UserId, Username, WebOrigin, WebhookSecret, WebhookSubscription,
 };
 use tracing::{info, warn};
 
@@ -95,6 +96,7 @@ impl Provisioner {
             self.apply_groups(storage).await?;
             self.apply_users(storage).await?;
             self.apply_identity_providers(storage).await?;
+            self.apply_webhooks(storage).await?;
             self.apply_flow_configs(storage).await?;
             storage.set_provision_marker(marker, "applied").await
         }
@@ -587,6 +589,45 @@ impl Provisioner {
     }
 
     // ------------------------------------------------------------------
+    // Webhook Subscriptions
+    // ------------------------------------------------------------------
+
+    async fn apply_webhooks(
+        &self,
+        storage: &dyn Storage,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        for p in &self.config.webhooks {
+            let realm_id = self.resolve_realm_id(storage, &p.realm).await?;
+            validate_webhook_url(&p.url)?;
+            validate_webhook_filters(&p.event_types)?;
+            if storage
+                .list_webhook_subscriptions(&realm_id)
+                .await?
+                .iter()
+                .any(|existing| existing.url == p.url)
+            {
+                warn!(realm = %p.realm, "webhook subscription already exists; skipping");
+                continue;
+            }
+            let subscription = WebhookSubscription {
+                id: issuerd_core::WebhookSubscriptionId::new(issuerd_core::utils::generate_id())?,
+                realm_id: realm_id.clone(),
+                url: p.url.clone(),
+                secret: WebhookSecret::new(&p.secret)?,
+                enabled: p.enabled,
+                event_types: p.event_types.clone(),
+                include_representation: p.include_representation,
+                created_by: None,
+                created_at: chrono::Utc::now(),
+            };
+            subscription.validate()?;
+            storage.create_webhook_subscription(&realm_id, &subscription).await?;
+            info!(realm = %p.realm, "provisioned webhook subscription");
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Flow Configs
     // ------------------------------------------------------------------
 
@@ -742,6 +783,15 @@ impl Provisioner {
             }
         }
 
+        for webhook in &mut config.webhooks {
+            webhook.realm = substitute(&webhook.realm, &mut errors);
+            webhook.url = substitute(&webhook.url, &mut errors);
+            webhook.secret = substitute(&webhook.secret, &mut errors);
+            for filter in &mut webhook.event_types {
+                *filter = substitute(filter, &mut errors);
+            }
+        }
+
         for flow in &mut config.flow_configs {
             flow.realm = substitute(&flow.realm, &mut errors);
             flow.alias = substitute(&flow.alias, &mut errors);
@@ -860,7 +910,7 @@ mod tests {
     use issuerd_storage::InMemoryStorage;
     use std::io::Write;
 
-    fn sample_config() -> ProvisionConfig {
+    pub(crate) fn sample_config() -> ProvisionConfig {
         ProvisionConfig {
             marker: Some("test-marker".to_string()),
             realms: vec![ProvisionRealm {
@@ -961,6 +1011,7 @@ mod tests {
                 },
                 mappers: vec![],
             }],
+            webhooks: vec![],
             flow_configs: vec![ProvisionFlowConfig {
                 realm: "testrealm".to_string(),
                 alias: "custom-browser".to_string(),
@@ -1458,6 +1509,7 @@ mod tests {
                 attributes: HashMap::new(),
             }],
             identity_providers: vec![],
+            webhooks: vec![],
             flow_configs: vec![],
         };
 
@@ -1578,5 +1630,64 @@ users:
             .unwrap()
             .expect("admin-cli should be provisioned");
         assert!(admin_cli.public_client);
+    }
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use issuerd_core::ProvisionWebhook;
+    use issuerd_storage::InMemoryStorage;
+
+    #[tokio::test]
+    async fn webhooks_are_provisioned_idempotently() {
+        let storage = InMemoryStorage::new();
+        let mut config = tests::sample_config();
+        config.webhooks.push(ProvisionWebhook {
+            realm: "testrealm".to_string(),
+            url: "https://receiver.example/events".to_string(),
+            secret: "secret".to_string(),
+            enabled: true,
+            event_types: vec!["USER.REGISTER".to_string()],
+            include_representation: false,
+        });
+        let repeated_config = config.clone();
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let subscriptions = storage.list_webhook_subscriptions(&realm.id).await.unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].url, "https://receiver.example/events");
+        assert_eq!(subscriptions[0].event_types, vec!["USER.REGISTER".to_string()]);
+        assert!(subscriptions[0].enabled);
+
+        let mut repeated = Provisioner {
+            config: repeated_config,
+        };
+        repeated.config.marker = Some("webhook-second-marker".to_string());
+        repeated.apply_once(&storage, "http://localhost:8080").await.unwrap();
+        assert_eq!(storage.list_webhook_subscriptions(&realm.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insecure_webhook_provisioning_is_rejected() {
+        let storage = InMemoryStorage::new();
+        let mut config = tests::sample_config();
+        config.webhooks.push(ProvisionWebhook {
+            realm: "testrealm".to_string(),
+            url: "http://receiver.example/events".to_string(),
+            secret: "secret".to_string(),
+            enabled: true,
+            event_types: vec!["USER.REGISTER".to_string()],
+            include_representation: false,
+        });
+        let provisioner = Provisioner { config };
+        assert!(matches!(
+            provisioner.apply_once(&storage, "http://localhost:8080").await,
+            Err(issuerd_core::IssuerdError::InvalidRequest(_))
+        ));
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        assert!(storage.list_webhook_subscriptions(&realm.id).await.unwrap().is_empty());
     }
 }

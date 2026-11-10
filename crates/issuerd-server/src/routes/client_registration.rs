@@ -1205,9 +1205,6 @@ async fn audit_registration_event(
     operation_type: OperationType,
     client: &Client,
 ) {
-    if !realm.admin_events_enabled {
-        return;
-    }
     let event = AdminEvent {
         id: EventId::new(issuerd_core::utils::generate_id()).unwrap(),
         realm_id: realm.id.clone(),
@@ -1222,8 +1219,15 @@ async fn audit_registration_event(
         error: None,
         event_time: chrono::Utc::now(),
     };
-    if let Err(e) = state.storage.save_admin_event(&event).await {
-        warn!(realm = %realm.id, error = %e, "registration admin event write failed");
+    if realm.admin_events_enabled {
+        if let Err(e) = state.storage.save_admin_event(&event).await {
+            warn!(realm = %realm.id, error = %e, "registration admin event write failed");
+        }
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_admin_event(state.storage.as_ref(), &event).await
+    {
+        warn!(realm = %realm.id, error = %e, "webhook registration event publication failed");
     }
 }
 

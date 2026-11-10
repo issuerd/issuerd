@@ -477,36 +477,41 @@ async fn impersonation_exchange(
 
     // Audit: an admin event (gated on the realm's admin-events config,
     // representation stripped unless opted in — realm gating rules) ...
+    let representation = if realm.include_representations {
+        serde_json::to_string(&serde_json::json!({
+            "impersonator": subject_user.id.to_string(),
+            "impersonated_user": target_user.id.to_string(),
+            "via": "token-exchange",
+        }))
+        .ok()
+    } else {
+        None
+    };
+    let admin_event = issuerd_core::AdminEvent {
+        id: issuerd_core::EventId::new(issuerd_core::utils::generate_id()).unwrap(),
+        realm_id: realm_id.clone(),
+        auth_realm_id: Some(realm_id.clone()),
+        auth_client_id: Some(
+            issuerd_core::ClientId::new(client.client_id.as_str())
+                .expect("stored client identifiers are valid"),
+        ),
+        auth_user_id: Some(subject_user.id.clone()),
+        operation_type: issuerd_core::OperationType::Action,
+        resource_type: issuerd_core::ResourceType::User,
+        resource_path: format!("users/{}/impersonation", target_user.id),
+        representation,
+        error: None,
+        event_time: now,
+    };
     if realm.admin_events_enabled {
-        let representation = if realm.include_representations {
-            serde_json::to_string(&serde_json::json!({
-                "impersonator": subject_user.id.to_string(),
-                "impersonated_user": target_user.id.to_string(),
-                "via": "token-exchange",
-            }))
-            .ok()
-        } else {
-            None
-        };
-        let event = issuerd_core::AdminEvent {
-            id: issuerd_core::EventId::new(issuerd_core::utils::generate_id()).unwrap(),
-            realm_id: realm_id.clone(),
-            auth_realm_id: Some(realm_id.clone()),
-            auth_client_id: Some(
-                issuerd_core::ClientId::new(client.client_id.as_str())
-                    .expect("stored client identifiers are valid"),
-            ),
-            auth_user_id: Some(subject_user.id.clone()),
-            operation_type: issuerd_core::OperationType::Action,
-            resource_type: issuerd_core::ResourceType::User,
-            resource_path: format!("users/{}/impersonation", target_user.id),
-            representation,
-            error: None,
-            event_time: now,
-        };
-        if let Err(e) = state.storage.save_admin_event(&event).await {
+        if let Err(e) = state.storage.save_admin_event(&admin_event).await {
             warn!(realm = %realm_id, impersonator = %subject_user.id, impersonated = %target_user.id, error = %e, "impersonation admin event write failed");
         }
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_admin_event(state.storage.as_ref(), &admin_event).await
+    {
+        warn!(realm = %realm_id, impersonator = %subject_user.id, impersonated = %target_user.id, error = %e, "webhook impersonation admin event publication failed");
     }
 
     // ... plus a login event that deliberately bypasses the `events_enabled`
@@ -531,6 +536,11 @@ async fn impersonation_exchange(
     };
     if let Err(e) = state.storage.save_event(realm_id, &event).await {
         warn!(realm = %realm_id, impersonator = %subject_user.id, impersonated = %target_user.id, error = %e, "impersonation login event write failed");
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_user_event(state.storage.as_ref(), &event).await
+    {
+        warn!(realm = %realm_id, impersonator = %subject_user.id, impersonated = %target_user.id, error = %e, "webhook impersonation login event publication failed");
     }
 
     info!(realm = %realm_id, client_id = %client.client_id, user_id = %target_user.id, impersonator = %subject_user.id, "impersonation token exchange");

@@ -23,6 +23,7 @@ Issuerd separates **durable** state (PostgreSQL, SQLite, or a JSON snapshot file
 | SSO sessions (`user_sessions`, `client_sessions`) | PostgreSQL or SQLite | **Yes** — restoring the DB restores logged-in sessions |
 | **Signing keys** (`signing_keys` table: private DER + public JWK) | PostgreSQL or SQLite | **Yes** — this is what keeps issued tokens valid across restores. With `[crypto.key_encryption]` enabled on PostgreSQL the rows are ciphertext; the **KEK must be backed up separately** (it is never in the DB — see below) |
 | Login/admin event audit trail (`events`, `admin_events`) | PostgreSQL or SQLite | **Yes** (compliance data) |
+| Webhook subscriptions and outbox (`webhook_subscriptions`, `webhook_deliveries`) | PostgreSQL or SQLite | **Yes** — signing secrets and pending event payloads; restoring can repeat an in-flight delivery |
 | Provision markers (`provision_markers`) | PostgreSQL or SQLite | **Yes** (comes along automatically) |
 | Auth codes, pending login/consent/registration/action flows, device and CIBA state, PAR requests, revocation blocklist, login-failure counters, registration access tokens | Redis | **No** — ephemeral by design |
 | Access/ID/refresh tokens | Nowhere — self-contained JWTs | No — validated statelessly against the JWKS built from the stored signing keys |
@@ -69,7 +70,7 @@ All Redis content is short-lived runtime state. The key prefixes below are defin
 - Login-failure counters — brute-force lockouts reset.
 - Registration access tokens of dynamically registered clients — those clients can no longer read/update/delete their own registration through the RFC 7592 endpoint.
 
-**What a Redis wipe does NOT lose:** realms, users, clients, SSO sessions (refresh tokens keep working), issued JWTs (validated statelessly), signing keys, audit events. The demo stack runs Redis with `--maxmemory-policy noeviction` and no persistence (`docker-compose.yml`), so these entries cannot be evicted selectively under memory pressure; security-critical writes fail closed when the cap is reached.
+**What a Redis wipe does NOT lose:** realms, users, clients, SSO sessions (refresh tokens keep working), issued JWTs (validated statelessly), signing keys, audit events, webhook subscriptions, or their outbox deliveries. The demo stack runs Redis with `--maxmemory-policy noeviction` and no persistence (`docker-compose.yml`), so these entries cannot be evicted selectively under memory pressure; security-critical writes fail closed when the cap is reached.
 
 > **Warning:** because single-token revocation entries are lost on a Redis wipe, use the realm-wide `notBefore` cutoff when a revocation must survive a cache flush — set it with `PUT /admin/realms/{realm}` (tokens issued before the cutoff are rejected). The cutoff itself is durable realm state in PostgreSQL.
 
@@ -78,7 +79,7 @@ All Redis content is short-lived runtime state. The key prefixes below are defin
 Both are development/evaluation modes, so their backup story is deliberately short:
 
 - **In-memory** (no `[storage]` section): all state — including signing keys — is generated per boot and lost on restart. There is nothing to back up.
-- **JSON-file** (`[storage.json_file] path = "..."`): the entire durable state — realms, users, sessions, events, and signing keys — lives in the one snapshot file. Back it up by stopping the daemon and copying that file (writes rewrite the whole file non-atomically — never copy it live); restore by copying it back to the configured path (relative paths resolve against the daemon's working directory) and starting the daemon.
+- **JSON-file** (`[storage.json_file] path = "..."`): the entire durable state — realms, users, sessions, events, signing keys, webhook subscriptions, and outbox deliveries — lives in the one snapshot file, including webhook signing secrets and pending payloads. Back it up by stopping the daemon and copying that file (writes rewrite the whole file non-atomically — never copy it live); restore by copying it back to the configured path (relative paths resolve against the daemon's working directory) and starting the daemon.
 
 ### SQLite backend
 
@@ -251,7 +252,7 @@ Because signing keys are restored with the database, tokens and SSO sessions iss
 
 ## Schema migrations
 
-Issuerd manages PostgreSQL with embedded, numbered SQL migrations in `crates/issuerd-storage/migrations/` and SQLite with an independent, mirrored sequence in `crates/issuerd-storage/migrations-sqlite/` (PostgreSQL through `018_mcp_step_up_grants.sql`, SQLite through `019_user_search.sql`):
+Issuerd manages PostgreSQL with embedded, numbered SQL migrations in `crates/issuerd-storage/migrations/` and SQLite with an independent, mirrored sequence in `crates/issuerd-storage/migrations-sqlite/` (PostgreSQL through `019_webhooks.sql`, SQLite through `020_webhooks.sql`):
 
 - Migrations are compiled into the binary and **applied automatically at startup** (`sqlx::migrate!`, invoked from `ServerState::from_config` and each SQL backend's `run_migrations`). The `issuerd provision` CLI subcommand runs them too before applying a provision file.
 - Applied migrations are recorded in the database's sqlx migration ledger, so restarts and subsequent boots only run what is new.

@@ -200,7 +200,7 @@ impl PostgresStorage {
     }
 }
 
-fn sqlx_err(e: sqlx::Error) -> IssuerdError {
+pub(crate) fn sqlx_err(e: sqlx::Error) -> IssuerdError {
     match e {
         // SQLSTATE 23505: unique_violation.
         sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23505") => {
@@ -2632,6 +2632,99 @@ impl Storage for PostgresStorage {
             .await
             .map_err(sqlx_err)?;
         Ok(())
+    }
+
+    async fn create_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::create_webhook_subscription(self, realm, subscription).await
+    }
+    async fn get_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<Option<WebhookSubscription>, IssuerdError> {
+        PostgresStorage::get_webhook_subscription(self, realm, id).await
+    }
+    async fn list_webhook_subscriptions(
+        &self,
+        realm: &RealmId,
+    ) -> Result<Vec<WebhookSubscription>, IssuerdError> {
+        PostgresStorage::list_webhook_subscriptions(self, realm).await
+    }
+    async fn update_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        subscription: &WebhookSubscription,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::update_webhook_subscription(self, realm, subscription).await
+    }
+    async fn delete_webhook_subscription(
+        &self,
+        realm: &RealmId,
+        id: &WebhookSubscriptionId,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::delete_webhook_subscription(self, realm, id).await
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        event: &WebhookEvent,
+    ) -> Result<bool, IssuerdError> {
+        PostgresStorage::enqueue_webhook_delivery(self, realm, subscription_id, event).await
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        lease_duration: std::time::Duration,
+    ) -> Result<Vec<WebhookDeliveryTask>, IssuerdError> {
+        PostgresStorage::claim_webhook_deliveries(self, worker_id, limit, lease_duration).await
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        lease_owner: &str,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::complete_webhook_delivery(self, realm, id, lease_owner).await
+    }
+    async fn fail_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+        lease_owner: &str,
+        error: &str,
+        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::fail_webhook_delivery(self, realm, id, lease_owner, error, next_attempt_at)
+            .await
+    }
+    async fn get_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        subscription_id: &WebhookSubscriptionId,
+        id: &WebhookDeliveryId,
+    ) -> Result<Option<WebhookDelivery>, IssuerdError> {
+        PostgresStorage::get_webhook_delivery(self, realm, subscription_id, id).await
+    }
+    async fn replay_webhook_delivery(
+        &self,
+        realm: &RealmId,
+        id: &WebhookDeliveryId,
+    ) -> Result<(), IssuerdError> {
+        PostgresStorage::replay_webhook_delivery(self, realm, id).await
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        realm: &RealmId,
+        subscription_id: Option<WebhookSubscriptionId>,
+        pagination: &Pagination,
+    ) -> Result<Vec<WebhookDelivery>, IssuerdError> {
+        PostgresStorage::list_webhook_deliveries(self, realm, subscription_id, pagination).await
     }
 
     async fn get_provision_marker(&self, name: &str) -> Result<Option<String>, IssuerdError> {

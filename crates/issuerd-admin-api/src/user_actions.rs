@@ -381,6 +381,11 @@ pub async fn impersonate_user(
         details,
     };
     state.storage.save_event(&realm.id, &event).await?;
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_user_event(state.storage.as_ref(), &event).await
+    {
+        tracing::warn!(realm = %realm.id, error = %e, "webhook impersonation event publication failed");
+    }
 
     info!(realm = %realm.id, user_id = %user.id, impersonator = %auth.claims.sub, "user impersonated");
     Ok((

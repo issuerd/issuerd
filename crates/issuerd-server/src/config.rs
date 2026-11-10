@@ -690,9 +690,10 @@ fn decode_kek(key_base64: &str) -> Result<[u8; 32], IssuerdError> {
 ///
 /// Every outbound HTTPS call the server makes — identity-broker and client
 /// JWKS fetches, pairwise `sector_identifier_uri` documents, back-channel
-/// logout POSTs — rides reqwest/rustls with the public webpki roots. A
-/// deployment behind a private CA (corporate proxy, hermetic test rig) adds
-/// its roots here; the extra bundle is ADDITIVE to the public roots.
+/// logout POSTs, and webhook deliveries — rides reqwest/rustls with the public
+/// webpki roots. A deployment behind a private CA (corporate proxy, internal
+/// receivers, hermetic test rig) adds its roots here; the extra bundle is
+/// ADDITIVE to the public roots.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OutboundHttpConfig {
     /// Path to a PEM bundle of additional root CA certificates (the file may
@@ -700,15 +701,15 @@ pub struct OutboundHttpConfig {
     /// zero valid certificates aborts the boot (fail closed — an operator
     /// typo must not silently fall back to public roots only).
     pub extra_ca_bundle: Option<PathBuf>,
-    /// **Test rigs and explicit internal endpoints only** — allow the
+    /// **Trusted internal endpoints and test rigs only** — allow the
     /// SSRF-guarded outbound calls (client `jwks_url` documents, pairwise
     /// `sector_identifier_uri` documents, JAR-by-reference `request_uri`
-    /// objects, and back-channel logout POSTs) to dial private, loopback,
-    /// link-local, and otherwise non-publicly-routable addresses. The
-    /// https-only scheme check, the no-redirect policy, applicable body-size
-    /// caps, and the timeout stay enforced. Never enable in production: the
-    /// guard is what keeps configured URLs from probing the internal network.
-    /// Default false.
+    /// objects, back-channel logout POSTs, and webhook deliveries) to dial
+    /// private, loopback, link-local, and otherwise non-publicly-routable
+    /// addresses. HTTPS, the no-redirect policy, applicable body-size caps,
+    /// and the timeout stay enforced. Enabling this also lets every client or
+    /// realm configuration that influences those URLs reach the internal
+    /// network; do not enable it for untrusted flows. Default false.
     #[serde(default)]
     pub allow_private_addresses: bool,
     /// Allow the identity-broker calls (discovery, JWKS, token, userinfo, the

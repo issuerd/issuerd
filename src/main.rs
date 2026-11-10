@@ -68,12 +68,20 @@ async fn main() -> Result<(), anyhow::Error> {
             if let Err(e) = issuerd_server::routes::init_metrics() {
                 tracing::debug!(error = %e, "metrics recorder already initialized or unavailable");
             }
+            let (worker_shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+            let worker =
+                issuerd_server::webhooks::WebhookWorker::from_config(Arc::clone(&storage), &cfg)?;
+            let worker_task = tokio::spawn(worker.run(shutdown_receiver));
             let result = issuerd_server::bootstrap::run(
                 &cfg,
                 app,
                 issuerd_server::bootstrap::shutdown_signal(),
             )
             .await;
+            let _ = worker_shutdown.send(true);
+            if let Err(e) = worker_task.await {
+                tracing::warn!(error = %e, "webhook worker task failed");
+            }
             storage.close().await;
             result?;
         }

@@ -12,16 +12,14 @@ use tracing::warn;
 
 use crate::{auth::AdminAuth, state::AdminApiState};
 
-/// Gate an admin event on the realm's events configuration.
+/// Apply the realm's local audit and representation preferences.
 ///
-/// Returns `false` when the realm has admin-event recording disabled, and
-/// clears `representation` unless the realm opted into storing request
-/// bodies. When the realm's config is unknown (the row is gone or cannot be
-/// loaded) the event is still recorded — the mutation it describes has
-/// already happened and the audit trail must not depend on a transient
-/// lookup — but the representation is stripped: a realm whose preferences
-/// are unknown has not opted into storing request bodies (fail-closed on
-/// the secrecy control).
+/// Returns `false` when local admin-event recording is disabled, independently
+/// of webhook delivery. The representation is retained only when the realm has
+/// opted into it. When the realm's config is unknown (the row is gone or cannot
+/// be loaded) the local event is still recorded, but the representation is
+/// stripped: a realm whose preferences are unknown has not opted into request
+/// bodies (fail-closed on the secrecy control).
 async fn apply_realm_event_config(
     state: &AdminApiState,
     realm_id: &RealmId,
@@ -40,13 +38,10 @@ async fn apply_realm_event_config(
             return true;
         }
     };
-    if !realm.admin_events_enabled {
-        return false;
-    }
     if !realm.include_representations {
         *representation = None;
     }
-    true
+    realm.admin_events_enabled
 }
 
 /// Derive the issuing realm's id for `auth_realm_id` attribution.
@@ -79,9 +74,7 @@ pub async fn emit_admin_event(
     resource_path: &str,
     mut representation: Option<String>,
 ) {
-    if !apply_realm_event_config(state, realm_id, &mut representation).await {
-        return;
-    }
+    let store_event = apply_realm_event_config(state, realm_id, &mut representation).await;
     let event = AdminEvent {
         id: EventId::new(issuerd_core::utils::generate_id()).unwrap(),
         realm_id: realm_id.clone(),
@@ -97,9 +90,17 @@ pub async fn emit_admin_event(
     };
     // Persistence stays non-fatal — the mutation the event describes has
     // already happened — but a failure must be visible in the logs.
-    if let Err(e) = state.storage.save_admin_event(&event).await {
+    if store_event {
+        if let Err(e) = state.storage.save_admin_event(&event).await {
+            warn!(realm = %realm_id, resource_path = %resource_path, error = %e,
+                "admin event persistence failed");
+        }
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_admin_event(state.storage.as_ref(), &event).await
+    {
         warn!(realm = %realm_id, resource_path = %resource_path, error = %e,
-            "admin event persistence failed");
+            "webhook admin event publication failed");
     }
 }
 
@@ -112,9 +113,7 @@ pub async fn emit_admin_event_error(
     error: &IssuerdError,
 ) {
     let mut representation = None;
-    if !apply_realm_event_config(state, realm_id, &mut representation).await {
-        return;
-    }
+    let store_event = apply_realm_event_config(state, realm_id, &mut representation).await;
     let event = AdminEvent {
         id: EventId::new(issuerd_core::utils::generate_id()).unwrap(),
         realm_id: realm_id.clone(),
@@ -128,10 +127,18 @@ pub async fn emit_admin_event_error(
         error: Some(error.to_string()),
         event_time: Utc::now(),
     };
-    // Non-fatal, but logged (see emit_admin_event).
-    if let Err(e) = state.storage.save_admin_event(&event).await {
+    if store_event {
+        // Non-fatal, but logged (see emit_admin_event).
+        if let Err(e) = state.storage.save_admin_event(&event).await {
+            warn!(realm = %realm_id, resource_path = %resource_path, error = %e,
+                "admin event persistence failed");
+        }
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_admin_event(state.storage.as_ref(), &event).await
+    {
         warn!(realm = %realm_id, resource_path = %resource_path, error = %e,
-            "admin event persistence failed");
+            "webhook admin event publication failed");
     }
 }
 
@@ -373,13 +380,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_admin_event_skipped_when_recording_disabled() {
-        // Issuerd defaults to admin_events_enabled=true; disable explicitly
-        // to exercise the gate.
-        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
-        configure_admin_events(&state, false, false).await;
+    async fn webhook_outbox_runs_when_admin_recording_disabled() {
+        let state = test_state(vec![]);
+        configure_admin_events(&state, false, true).await;
         let auth = admin_auth();
         let realm_id = RealmId::new("master").unwrap();
+        let subscription = issuerd_core::WebhookSubscription {
+            id: issuerd_core::WebhookSubscriptionId::new("webhook-1").unwrap(),
+            realm_id: realm_id.clone(),
+            url: "https://receiver.example/events".to_string(),
+            secret: issuerd_core::WebhookSecret::new("secret").unwrap(),
+            enabled: true,
+            event_types: vec!["ADMIN.USER.CREATE".to_string()],
+            include_representation: true,
+            created_by: None,
+            created_at: Utc::now(),
+        };
+        state
+            .storage
+            .create_webhook_subscription(&realm_id, &subscription)
+            .await
+            .unwrap();
+
+        emit_admin_event(
+            &state,
+            &auth,
+            &realm_id,
+            OperationType::Create,
+            ResourceType::User,
+            "users/alice",
+            Some("{\"username\":\"alice\"}".to_string()),
+        )
+        .await;
+
+        assert!(recorded_events(&state, &realm_id).await.is_empty());
+        let deliveries = state
+            .storage
+            .list_webhook_deliveries(&realm_id, None, &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
+        assert_eq!(payload["operationType"], "CREATE");
+        assert_eq!(payload["resourceType"], "USER");
+        assert_eq!(payload["representation"], "{\"username\":\"alice\"}");
+    }
+
+    #[tokio::test]
+    async fn emit_admin_event_skipped_when_recording_disabled() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-realm").unwrap()]);
+        configure_admin_events(&state, false, true).await;
+        let auth = admin_auth();
+        let realm_id = RealmId::new("master").unwrap();
+        let subscription = issuerd_core::WebhookSubscription {
+            id: issuerd_core::WebhookSubscriptionId::new(issuerd_core::utils::generate_id())
+                .unwrap(),
+            realm_id: realm_id.clone(),
+            url: "https://receiver.example/events".to_string(),
+            secret: issuerd_core::WebhookSecret::new("secret").unwrap(),
+            enabled: true,
+            event_types: vec!["ADMIN.*".to_string()],
+            include_representation: true,
+            created_by: None,
+            created_at: Utc::now(),
+        };
+        state
+            .storage
+            .create_webhook_subscription(&realm_id, &subscription)
+            .await
+            .unwrap();
 
         emit_admin_event(
             &state,
@@ -388,7 +457,7 @@ mod tests {
             OperationType::Create,
             ResourceType::Realm,
             "realms/master",
-            Some("{}".to_string()),
+            Some("{\"name\":\"master\"}".to_string()),
         )
         .await;
         emit_admin_event_error(
@@ -402,6 +471,21 @@ mod tests {
         .await;
 
         assert!(recorded_events(&state, &realm_id).await.is_empty());
+        let deliveries = state
+            .storage
+            .list_webhook_deliveries(&realm_id, None, &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        let payload: serde_json::Value = serde_json::from_str(
+            &deliveries
+                .iter()
+                .find(|delivery| delivery.payload.contains("realms/master"))
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(payload["representation"], "{\"name\":\"master\"}");
     }
 
     #[tokio::test]
@@ -461,6 +545,7 @@ mod tests {
             .times(1)
             .withf(|event| event.representation.is_none())
             .returning(|_| Ok(()));
+        mock.expect_list_webhook_subscriptions().times(1).returning(|_| Ok(Vec::new()));
         let state = crate::test_utils::tests::test_state_with_storage(Arc::new(mock), vec![]);
         let auth = admin_auth();
         let realm_id = RealmId::new("master").unwrap();

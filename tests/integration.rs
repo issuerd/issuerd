@@ -105,3 +105,5 @@ mod user_self_service;
 mod userinfo_cache;
 #[path = "integration/webauthn.rs"]
 mod webauthn;
+#[path = "integration/webhooks.rs"]
+mod webhooks;

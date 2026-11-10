@@ -90,6 +90,8 @@ id_type!(FlowStageId);
 id_type!(JwtId);
 id_type!(ClientScopeId);
 id_type!(MapperId);
+id_type!(WebhookSubscriptionId);
+id_type!(WebhookDeliveryId);
 
 #[cfg(test)]
 mod tests {

@@ -113,11 +113,10 @@ impl BackchannelLogoutDispatcher {
 
     /// Record the delivery outcome as a system-initiated admin event.
     ///
-    /// Admin-event gating: skipped entirely when the realm has
-    /// `admin_events_enabled = false` (Issuerd default: on — Keycloak parity
-    /// break; Keycloak defaults to off). The realm is always
-    /// already loaded on the wired dispatch paths, so there is no fetch to
-    /// fail open on.
+    /// Local audit storage is skipped when the realm has
+    /// `admin_events_enabled = false`; enabled webhook subscriptions still
+    /// receive the event. The realm is always already loaded on the wired
+    /// dispatch paths, so there is no fetch to fail open on.
     async fn record(
         &self,
         realm: &Realm,
@@ -125,9 +124,6 @@ impl BackchannelLogoutDispatcher {
         client_name: &str,
         error: Option<String>,
     ) {
-        if !realm.admin_events_enabled {
-            return;
-        }
         let event = AdminEvent {
             id: EventId::new(issuerd_core::utils::generate_id()).unwrap(),
             realm_id: realm.id.clone(),
@@ -141,7 +137,19 @@ impl BackchannelLogoutDispatcher {
             error,
             event_time: chrono::Utc::now(),
         };
-        let _ = self.storage.save_admin_event(&event).await;
+        if realm.admin_events_enabled {
+            let _ = self.storage.save_admin_event(&event).await;
+        }
+        let mut webhook_event = event;
+        if !realm.include_representations {
+            webhook_event.representation = None;
+        }
+        if let Err(e) =
+            issuerd_storage::webhooks::publish_admin_event(self.storage.as_ref(), &webhook_event)
+                .await
+        {
+            warn!(realm = %realm.id, error = %e, "webhook backchannel event publication failed");
+        }
     }
 
     /// Deliver back-channel logout tokens for every client session of

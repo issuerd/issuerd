@@ -830,7 +830,8 @@ pub struct RealmEventsConfigRepresentation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_events_details_enabled: Option<bool>,
     /// Event listener ids active for this realm. Any string is accepted
-    /// (custom listener SPIs); only `logging` is built in.
+    /// (custom listener SPIs); only `logging` is built in. Webhook
+    /// subscriptions are configured separately and are not listener ids.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_listeners: Option<Vec<String>>,
 }
@@ -1925,19 +1926,7 @@ fn redact_realm_audit_representation(
     resource_type: ResourceType,
     representation: Option<String>,
 ) -> Option<String> {
-    if resource_type != ResourceType::Realm {
-        return representation;
-    }
-    let raw = representation?;
-    if !raw.contains(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE) {
-        return Some(raw);
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    if let Some(attributes) = value.get_mut("attributes").and_then(serde_json::Value::as_object_mut)
-    {
-        attributes.remove(Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE);
-    }
-    serde_json::to_string(&value).ok()
+    issuerd_core::redact_admin_representation(resource_type, representation)
 }
 
 impl From<AdminEvent> for AdminEventRepresentation {
