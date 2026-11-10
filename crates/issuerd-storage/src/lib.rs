@@ -20,6 +20,7 @@ mod sqlite_types;
 mod sqlite_webhooks;
 pub mod step_up;
 pub mod step_up_sqlite;
+pub mod webhooks;
 
 pub use json::JsonFileStorage;
 pub use key_encryption::Aes256GcmKekProvider;

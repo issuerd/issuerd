@@ -58,12 +58,10 @@ pub(crate) async fn emit_oidc_event(
     error: Option<String>,
     details: std::collections::HashMap<String, String>,
 ) {
-    // Realm event gating: events are only recorded when the realm has
-    // `events_enabled` (Issuerd default: on — Keycloak parity break; Keycloak
-    // defaults to off). A realm re-read failure fails
-    // OPEN — the event is still written; an outage of the realm table must
-    // not blind the audit trail — but listener dispatch is skipped because
-    // the realm's listener list is then unknown.
+    // Local audit storage and the existing listener list honor `events_enabled`.
+    // A realm re-read failure fails OPEN for audit persistence, but the legacy
+    // listener list is unknown and therefore skipped. Webhook subscriptions are
+    // independent of local audit retention and are always offered the event.
     let realm = match state.storage.get_realm(realm_id).await {
         Ok(realm) => realm,
         Err(e) => {
@@ -71,9 +69,6 @@ pub(crate) async fn emit_oidc_event(
             None
         }
     };
-    if realm.as_ref().is_some_and(|r| !r.events_enabled) {
-        return;
-    }
     let event = issuerd_core::Event {
         id: issuerd_core::EventId::new(issuerd_core::utils::generate_id()).unwrap(),
         realm_id: realm_id.clone(),
@@ -86,10 +81,12 @@ pub(crate) async fn emit_oidc_event(
         error,
         details,
     };
-    if let Err(e) = state.storage.save_event(realm_id, &event).await {
-        warn!(realm = %realm_id, error = %e, "audit event write failed");
+    if realm.as_ref().is_none_or(|realm| realm.events_enabled) {
+        if let Err(e) = state.storage.save_event(realm_id, &event).await {
+            warn!(realm = %realm_id, error = %e, "audit event write failed");
+        }
     }
-    if let Some(realm) = realm {
+    if let Some(realm) = realm.filter(|realm| realm.events_enabled) {
         for name in &realm.events_listeners {
             match state.event_listeners.get(name) {
                 Some(listener) => {
@@ -102,6 +99,11 @@ pub(crate) async fn emit_oidc_event(
                 }
             }
         }
+    }
+    if let Err(e) =
+        issuerd_storage::webhooks::publish_user_event(state.storage.as_ref(), &event).await
+    {
+        warn!(realm = %realm_id, error = %e, "webhook event publication failed");
     }
 }
 
@@ -15592,6 +15594,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_outbox_runs_when_local_events_disabled() {
+        let state = setup_state().await;
+        let realm_id = RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.events_enabled = false;
+        state.storage.update_realm(&realm).await.unwrap();
+        let subscription = issuerd_core::WebhookSubscription {
+            id: issuerd_core::WebhookSubscriptionId::new("webhook-1").unwrap(),
+            realm_id: realm_id.clone(),
+            url: "https://receiver.example/events".to_string(),
+            secret: issuerd_core::WebhookSecret::new("secret").unwrap(),
+            enabled: true,
+            event_types: vec!["USER.LOGIN".to_string()],
+            include_representation: false,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+        };
+        state
+            .storage
+            .create_webhook_subscription(&realm_id, &subscription)
+            .await
+            .unwrap();
+
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        emit_oidc_event(
+            &state,
+            &realm_id,
+            issuerd_core::EventType::Login,
+            &ip,
+            None,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        )
+        .await;
+
+        assert!(query_all_events(&state, "master").await.is_empty());
+        let deliveries = state
+            .storage
+            .list_webhook_deliveries(&realm_id, None, &issuerd_core::Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
+        assert_eq!(payload["schemaVersion"], 1);
+        assert_eq!(payload["type"], "LOGIN");
+    }
+
+    #[tokio::test]
     async fn emit_oidc_event_recorded_and_dispatched_when_enabled() {
         let mut state = ServerState::from_config(&ServerConfig::default()).await.unwrap();
         let recorder = Arc::new(RecordingListener::default());
@@ -15656,6 +15708,10 @@ mod tests {
             .expect_get_realm()
             .returning(|_| Err(issuerd_core::IssuerdError::ServerError("db fail".to_string())));
         mock_storage.expect_save_event().times(1).returning(|_, _| Ok(()));
+        mock_storage
+            .expect_list_webhook_subscriptions()
+            .times(1)
+            .returning(|_| Ok(Vec::new()));
         let state = Arc::new(ServerState {
             config: ServerConfig::default(),
             storage: Arc::new(mock_storage),

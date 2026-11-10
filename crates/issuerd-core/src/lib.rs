@@ -71,9 +71,10 @@ pub use roles::{effective_group_roles, effective_user_roles, expand_composites, 
 pub use scope::{Scope, OFFLINE_ACCESS_SCOPE};
 pub use traits::*;
 pub use webhooks::{
-    validate_webhook_filters, webhook_signing_input, WebhookAdminEvent, WebhookAuthDetails,
-    WebhookDelivery, WebhookDeliveryStatus, WebhookDeliveryTask, WebhookEvent, WebhookEventData,
-    WebhookEventKind, WebhookSecret, WebhookSubscription, WebhookUserEvent, WEBHOOK_SCHEMA_VERSION,
+    redact_admin_representation, validate_webhook_filters, webhook_signing_input,
+    WebhookAdminEvent, WebhookAuthDetails, WebhookDelivery, WebhookDeliveryStatus,
+    WebhookDeliveryTask, WebhookEvent, WebhookEventData, WebhookEventKind, WebhookSecret,
+    WebhookSubscription, WebhookUserEvent, WEBHOOK_SCHEMA_VERSION,
 };
 // Re-export commonly used typestate types for ergonomics
 pub use typestate::{

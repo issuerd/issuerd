@@ -234,6 +234,34 @@ impl WebhookEvent {
                 || (self.kind == WebhookEventKind::Admin && filter == "ADMIN.*")
         })
     }
+
+    pub fn with_subscription_policy(mut self, subscription: &WebhookSubscription) -> Self {
+        if !subscription.include_representation {
+            if let WebhookEventData::Admin(event) = &mut self.data {
+                event.representation = None;
+            }
+        }
+        self
+    }
+}
+
+pub fn redact_admin_representation(
+    resource_type: ResourceType,
+    representation: Option<String>,
+) -> Option<String> {
+    if resource_type != ResourceType::Realm {
+        return representation;
+    }
+    let raw = representation?;
+    if !raw.contains(crate::models::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE) {
+        return Some(raw);
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if let Some(attributes) = value.get_mut("attributes").and_then(serde_json::Value::as_object_mut)
+    {
+        attributes.remove(crate::models::Realm::PAIRWISE_SECTOR_KEY_ATTRIBUTE);
+    }
+    serde_json::to_string(&value).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
