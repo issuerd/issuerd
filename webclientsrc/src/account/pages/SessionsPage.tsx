@@ -72,24 +72,24 @@ export default function SessionsPage() {
           {sessions.map((session) => (
             <div
               key={session.id}
-              className="bg-card border border-border rounded-xl p-5 flex items-center justify-between gap-4"
+              className="bg-card border border-border rounded-xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4"
             >
-              <div className="flex items-start gap-4">
+              <div className="flex items-start gap-3 sm:gap-4 min-w-0">
                 <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
                   <Monitor className="w-5 h-5 text-primary" />
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium text-foreground">Session</span>
                     <span className="text-xs text-muted-foreground font-mono">{session.id.slice(0, 8)}...</span>
                   </div>
-                  <div className="flex items-center gap-4 mt-1.5">
+                  <div className="flex flex-col gap-1.5 mt-1.5 sm:flex-row sm:flex-wrap sm:gap-x-4">
                     <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Globe className="w-3.5 h-3.5" />
-                      {session.ip_address}
+                      <Globe className="w-3.5 h-3.5 shrink-0" />
+                      <span className="break-all">{session.ip_address}</span>
                     </span>
                     <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Clock className="w-3.5 h-3.5" />
+                      <Clock className="w-3.5 h-3.5 shrink-0" />
                       {new Date(session.started).toLocaleString()}
                     </span>
                   </div>
@@ -110,7 +110,7 @@ export default function SessionsPage() {
 
               <button
                 onClick={() => handleLogout(session.id)}
-                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 rounded-lg transition-colors border border-destructive/20 hover:border-destructive/40 shrink-0"
+                className="flex items-center gap-2 self-start sm:self-center px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 rounded-lg transition-colors border border-destructive/20 hover:border-destructive/40 shrink-0"
               >
                 <LogOut className="w-4 h-4" />
                 Sign Out
