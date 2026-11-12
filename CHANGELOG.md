@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Account console mobile layout.** Replace the fixed phone sidebar with an accessible navigation drawer, prevent flex content from shrinking and clipping, and stack session details and actions on narrow screens. Profile, Security, Consents, Linked Accounts, and Sessions retain their desktop layout.
+- **Account login realm continuity after logout.** Restart the account-console OIDC flow in its own realm, refresh PKCE state when changing realms, and exchange authorization codes against the account URL's realm instead of stale session storage. Password and WebAuthn sign-in after logout no longer fail with `invalid_grant` after a preceding master-realm login attempt.
 
 ## [0.2.4] - 2026-11-10
 

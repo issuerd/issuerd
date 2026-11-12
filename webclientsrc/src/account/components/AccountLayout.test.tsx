@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import AccountLayout from './AccountLayout'
+import { postLogout } from '../../api/client'
 
 vi.mock('../../api/client', () => ({
   postLogout: vi.fn().mockResolvedValue(undefined),
@@ -22,6 +23,10 @@ function renderAccount() {
     </MemoryRouter>,
   )
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe('AccountLayout mobile navigation', () => {
   it('opens the account drawer and closes it after navigation', async () => {
@@ -48,5 +53,23 @@ describe('AccountLayout mobile navigation', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+})
+
+describe('AccountLayout logout', () => {
+  it('restarts the account login flow in the current realm', async () => {
+    vi.stubGlobal('location', {
+      href: '',
+      origin: 'http://localhost:3000',
+      pathname: '/realms/myrealm/account/profile',
+    })
+    renderAccount()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign Out', exact: true }))
+
+    await waitFor(() => expect(postLogout).toHaveBeenCalledTimes(1))
+    expect(window.location.href).toBe(
+      `/login.html?logged_out=1&realm=myrealm&client_id=account-console&redirect_uri=${encodeURIComponent('http://localhost:3000/realms/myrealm/account')}`,
+    )
   })
 })

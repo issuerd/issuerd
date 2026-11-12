@@ -68,4 +68,26 @@ describe('AccountApp authentication', () => {
     expect(sessionStorage.getItem('issuerd_oidc_state')).toBeNull()
     expect(sessionStorage.getItem('issuerd_code_verifier')).toBeNull()
   })
+
+  it('uses the account URL realm when the stored PKCE realm is stale', async () => {
+    window.history.pushState({}, '', '/realms/myrealm/account?code=abc&state=matching-state')
+    sessionStorage.setItem('issuerd_oidc_realm', 'master')
+    tokenEndpointMock.mockResolvedValue({
+      data: { access_token: 'account-token', refresh_token: 'account-refresh', id_token: '', expires_in: 300 },
+    })
+
+    render(
+      <MemoryRouter>
+        <AccountApp />
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => expect(tokenEndpointMock).toHaveBeenCalledTimes(1))
+    const call = tokenEndpointMock.mock.calls[0][0] as {
+      path: { realm: string }
+      body: { redirect_uri: string }
+    }
+    expect(call.path).toEqual({ realm: 'myrealm' })
+    expect(call.body.redirect_uri).toBe('http://localhost:3000/realms/myrealm/account')
+  })
 })

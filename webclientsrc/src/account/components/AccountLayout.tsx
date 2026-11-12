@@ -13,6 +13,7 @@ import {
   SheetTrigger,
 } from '../../components/ui/sheet'
 import { cn } from '../../lib/utils'
+import { ACCOUNT_CLIENT_ID, getAccountRealm } from '../../config'
 import { useAuthStore } from '../../state/authStore'
 import { postLogout } from '../../api/client'
 
@@ -71,7 +72,9 @@ export default function AccountLayout() {
   async function handleLogout() {
     await postLogout()
     logout()
-    window.location.href = '/login.html?logged_out=1'
+    const realm = getAccountRealm()
+    const redirectUri = `${window.location.origin}/realms/${encodeURIComponent(realm)}/account`
+    window.location.href = `/login.html?logged_out=1&realm=${encodeURIComponent(realm)}&client_id=${ACCOUNT_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}`
   }
 
   return (

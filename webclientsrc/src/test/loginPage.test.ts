@@ -612,6 +612,22 @@ describe('login page PKCE entry', () => {
     expect(new URL(location.href).searchParams.get('state')).toBe('stored-state')
   })
 
+  it('regenerates verifier and state when the login realm changes', async () => {
+    sessionStorage.setItem('issuerd_code_verifier', 'master-verifier')
+    sessionStorage.setItem('issuerd_oidc_state', 'master-state')
+    sessionStorage.setItem('issuerd_oidc_realm', 'master')
+    const { getRandomValues } = stubCrypto()
+
+    const { location } = await loadLoginPage({ query: '?realm=myrealm&client_id=account-console' })
+
+    expect(getRandomValues).toHaveBeenCalledTimes(2)
+    expect(sessionStorage.getItem('issuerd_code_verifier')).not.toBe('master-verifier')
+    expect(sessionStorage.getItem('issuerd_oidc_state')).not.toBe('master-state')
+    expect(sessionStorage.getItem('issuerd_oidc_realm')).toBe('myrealm')
+    expect(new URL(location.href).pathname).toBe('/realms/myrealm/protocol/openid-connect/auth')
+    expect(new URL(location.href).searchParams.get('state')).not.toBe('master-state')
+  })
+
   it('falls back to the verifier cookie', async () => {
     document.cookie = 'issuerd_code_verifier=cookie%20verifier; Path=/'
     sessionStorage.setItem('issuerd_oidc_state', 'stored-state')
