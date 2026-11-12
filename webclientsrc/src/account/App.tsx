@@ -22,7 +22,6 @@ interface TokenSet {
 }
 
 async function exchangeAuthorizationCode(realm: string, code: string, urlState: string): Promise<TokenSet> {
-  const storedRealm = sessionStorage.getItem('issuerd_oidc_realm') || realm
   const storedState = sessionStorage.getItem('issuerd_oidc_state')
   const codeVerifier = sessionStorage.getItem('issuerd_code_verifier')
 
@@ -33,10 +32,10 @@ async function exchangeAuthorizationCode(realm: string, code: string, urlState: 
     throw new Error('State mismatch — possible session tampering.')
   }
 
-  const redirectUri = `${window.location.origin}/realms/${encodeURIComponent(storedRealm)}/account`
+  const redirectUri = `${window.location.origin}/realms/${encodeURIComponent(realm)}/account`
 
   const res = await tokenEndpoint({
-    path: { realm: storedRealm },
+    path: { realm },
     body: {
       grant_type: 'authorization_code',
       code,

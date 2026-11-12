@@ -200,14 +200,15 @@
 
         var verifier = sessionStorage.getItem('issuerd_code_verifier') || getCookie('issuerd_code_verifier');
         var state = sessionStorage.getItem('issuerd_oidc_state');
-        if (!verifier || !state) {
+        var storedRealm = sessionStorage.getItem('issuerd_oidc_realm');
+        if (!verifier || !state || (storedRealm && storedRealm !== effectiveRealm)) {
             verifier = generateRandomString(128);
             state = generateRandomString(32);
             sessionStorage.setItem('issuerd_code_verifier', verifier);
             sessionStorage.setItem('issuerd_oidc_state', state);
-            sessionStorage.setItem('issuerd_oidc_realm', effectiveRealm);
             setCookie('issuerd_code_verifier', verifier);
         }
+        sessionStorage.setItem('issuerd_oidc_realm', effectiveRealm);
 
         var encoder = new TextEncoder();
         crypto.subtle.digest('SHA-256', encoder.encode(verifier)).then(function (digest) {
