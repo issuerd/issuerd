@@ -263,7 +263,7 @@ qrcodegen = "1.8"
 # than the one that started it, so the state must live in shared storage
 # (Redis), matching how Keycloak stores WebAuthn state in the auth session.
 openssl = "0.10"
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 
 # Internal crates (version pinned to workspace; version required for crates.io publish)
 issuerd-core = { path = "crates/issuerd-core", version = "0.2.5" }
