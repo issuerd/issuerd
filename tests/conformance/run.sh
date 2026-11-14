@@ -13,7 +13,7 @@ if [[ ! -d "$SCRIPT_DIR/conformance-suite/scripts" ]]; then
     echo "ERROR: conformance suite sources not found at tests/conformance/conformance-suite"
     echo "Clone the pinned release first:"
     echo "  git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite"
-    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.3.3"
+    echo "  cd tests/conformance/conformance-suite && git checkout release-v5.3.4"
     exit 1
 fi
 

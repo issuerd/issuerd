@@ -29,6 +29,9 @@ fi
 echo "=== Generating root CA ==="
 openssl req -x509 -newkey rsa:4096 -nodes -days "$DAYS" \
     -subj "/CN=Issuerd Conformance Root CA/O=Issuerd" \
+    -addext 'basicConstraints=critical,CA:true' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -addext 'subjectKeyIdentifier=hash' \
     -keyout ca.key -out ca.crt
 
 issue_cert() {
@@ -39,7 +42,7 @@ issue_cert() {
         -keyout "$name.key" -out "$name.csr"
     openssl x509 -req -in "$name.csr" \
         -CA ca.crt -CAkey ca.key -CAcreateserial -days "$DAYS" \
-        -extfile <(printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' "$san") \
+        -extfile <(printf 'subjectAltName=%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n' "$san") \
         -out "$name.crt"
     rm -f "$name.csr"
 }
