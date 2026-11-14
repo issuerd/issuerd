@@ -3965,4 +3965,128 @@ mod tests {
         assert!(stored.enabled);
         assert_eq!(stored.attributes, linked.attributes);
     }
+
+    fn keycloak_password_rows() -> Vec<(&'static str, Credential)> {
+        let row = |secret: &str, data: &str| Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data: serde_json::Value::String(data.to_string()),
+            priority: 1,
+        };
+        vec![
+            (
+                "Keycl0ak!sha256",
+                row(
+                    r#"{"value":"4yeu/KCh1x8hnnFntWdgwh5bIr7jF9PUevlvzv01foY=","salt":"AAECAwQFBgcICQoLDA0ODw=="}"#,
+                    r#"{"hashIterations":27500,"algorithm":"pbkdf2-sha256"}"#,
+                ),
+            ),
+            (
+                "Keycl0ak!pass",
+                row(
+                    r#"{"value":"TOnaXrr6ftbPgJCtlkY1NZfnuIoXDTzDBMkeiaf+s7pWBbYTqGXooG4pCCx/hiAGA7jBvulE+SaAuq+SGfDulA==","salt":"KsXHtVtR09QpbuSqrbHY/A=="}"#,
+                    r#"{"hashIterations":30000,"algorithm":"pbkdf2-sha512"}"#,
+                ),
+            ),
+            (
+                "Keycl0ak!pass",
+                row(
+                    r#"{"value":"8p+kFiuwL6QywmK/8nWwGAXDLYcTxy92v5QPxuTZz6Q=","salt":"sTkyFFYJJW7wQ9Jp3Yzf3Q=="}"#,
+                    r#"{"hashIterations":5,"algorithm":"argon2","additionalParameters":{"hashLength":["32"],"memory":["7168"],"type":["id"],"version":["1.3"],"parallelism":["1"]}}"#,
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_reuse_of_keycloak_row() {
+        for (password, cred) in keycloak_password_rows() {
+            let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+            let app = user_routes(state.clone());
+            let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+            let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+            realm.password_policy.history_size = 3;
+            state.storage.update_realm(&realm).await.unwrap();
+            let uid = issuerd_core::UserId::new(&user_id).unwrap();
+            state.storage.create_credential(&realm.id, &uid, &cred).await.unwrap();
+
+            let body = serde_json::json!({"type": "password", "value": password}).to_string();
+            let response = do_reset_password(&app, &realm_name, &user_id, &body).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{password}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let violations = json.get("policyViolations").and_then(|v| v.as_array()).unwrap();
+            assert!(violations
+                .iter()
+                .any(|v| v.get("code").and_then(|c| c.as_str()) == Some("password_history")));
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_reuse_of_keycloak_history_row() {
+        for (password, mut cred) in keycloak_password_rows() {
+            let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+            let app = user_routes(state.clone());
+            let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+            let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+            realm.password_policy.history_size = 3;
+            state.storage.update_realm(&realm).await.unwrap();
+            cred.credential_type =
+                CredentialType::Custom(PASSWORD_HISTORY_CREDENTIAL_TYPE.to_string());
+            let uid = issuerd_core::UserId::new(&user_id).unwrap();
+            state.storage.create_credential(&realm.id, &uid, &cred).await.unwrap();
+
+            let body = serde_json::json!({"type": "password", "value": password}).to_string();
+            let response = do_reset_password(&app, &realm_name, &user_id, &body).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{password}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_password_moves_keycloak_row_to_history_and_writes_argon2id() {
+        for (_, cred) in keycloak_password_rows() {
+            let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+            let app = user_routes(state.clone());
+            let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+            let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+            realm.password_policy.history_size = 3;
+            state.storage.update_realm(&realm).await.unwrap();
+            let uid = issuerd_core::UserId::new(&user_id).unwrap();
+            state.storage.create_credential(&realm.id, &uid, &cred).await.unwrap();
+
+            let response = do_reset_password(
+                &app,
+                &realm_name,
+                &user_id,
+                r#"{"type":"password","value":"Fresh!pass1"}"#,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+            let current = state
+                .storage
+                .get_credentials(&realm.id, &uid, CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(current.len(), 1);
+            assert!(current[0].secret_data.starts_with(b"$argon2id$"));
+
+            let history = state
+                .storage
+                .get_credentials(
+                    &realm.id,
+                    &uid,
+                    CredentialType::Custom(PASSWORD_HISTORY_CREDENTIAL_TYPE.to_string()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].secret_data, cred.secret_data);
+        }
+    }
 }

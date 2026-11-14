@@ -18839,4 +18839,66 @@ mod tests {
             "the storage fallback re-reads the now-enabled client"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Keycloak-format password rows
+    // -----------------------------------------------------------------------
+
+    async fn admin_password_grant(state: &Arc<ServerState>, password: &str) -> StatusCode {
+        token_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            format!(
+                "grant_type=password&username=admin&password={password}&client_id=admin-cli&scope=openid"
+            ),
+        )
+        .await
+        .status()
+    }
+
+    async fn admin_device_verify(state: &Arc<ServerState>, password: &str) -> StatusCode {
+        let user_code = seed_pending_device_code(state).await;
+        device_verify_handler(
+            State(state.clone()),
+            axum::extract::Extension(ResolvedRealm(Some("master".to_string()))),
+            axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+            format!("user_code={user_code}&username=admin&password={password}"),
+        )
+        .await
+        .status()
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_accepts_keycloak_rows() {
+        for (password, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let state = setup_state().await;
+            crate::routes::login_api::tests::give_admin_row(&state, &cred).await;
+            assert_eq!(admin_password_grant(&state, password).await, StatusCode::OK, "{password}");
+            assert_eq!(admin_password_grant(&state, "wrong").await, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn token_password_grant_rejects_unsupported_rows() {
+        for cred in crate::routes::login_api::tests::unsupported_rows() {
+            let state = setup_state().await;
+            crate::routes::login_api::tests::give_admin_row(&state, &cred).await;
+            assert_eq!(
+                admin_password_grant(&state, "Keycl0ak!pass").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn device_verify_accepts_keycloak_rows() {
+        for (password, cred) in crate::routes::login_api::tests::keycloak_rows() {
+            let state = setup_state().await;
+            crate::routes::login_api::tests::give_admin_row(&state, &cred).await;
+            assert_eq!(admin_device_verify(&state, "wrong").await, StatusCode::BAD_REQUEST);
+            assert_eq!(admin_device_verify(&state, password).await, StatusCode::OK, "{password}");
+        }
+    }
 }

@@ -5349,4 +5349,264 @@ pub(crate) mod tests {
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "/login.html?realm=master");
     }
+
+    // -----------------------------------------------------------------------
+    // Keycloak-format password rows
+    // -----------------------------------------------------------------------
+
+    fn password_credential(
+        secret: &str,
+        credential_data: serde_json::Value,
+    ) -> issuerd_core::Credential {
+        issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(issuerd_core::utils::generate_id()).unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data,
+            priority: 1,
+        }
+    }
+
+    /// One row of each format with its password. The SHA-256 and Argon2id
+    /// rows were exported by Keycloak; the SHA-512 row came from Python's hashlib.
+    pub(crate) fn keycloak_rows() -> Vec<(&'static str, issuerd_core::Credential)> {
+        vec![
+            (
+                "admin",
+                password_credential(
+                    r#"{"value":"OnsOPGVN5ku0lAuW+6IUMhiYyre5C9itUlMBH9xtQgWYYqeYG3kiRkWrdBVWfvv1t5F4r7FnNLqQzZ7R5Fna2w==","salt":"WQWgqINSHrX0yk5oIl4xpw==","additionalParameters":{}}"#,
+                    serde_json::Value::String(
+                        r#"{"hashIterations":27500,"algorithm":"pbkdf2-sha256","additionalParameters":{}}"#
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
+                "Keycl0ak!pass",
+                password_credential(
+                    r#"{"value":"TOnaXrr6ftbPgJCtlkY1NZfnuIoXDTzDBMkeiaf+s7pWBbYTqGXooG4pCCx/hiAGA7jBvulE+SaAuq+SGfDulA==","salt":"KsXHtVtR09QpbuSqrbHY/A=="}"#,
+                    serde_json::json!({"hashIterations": 30000, "algorithm": "pbkdf2-sha512"}),
+                ),
+            ),
+            (
+                "password",
+                password_credential(
+                    r#"{"value":"GNjvIqBcbM+mqCUt7nqYgl696zKTjNO1wLnvPkDfMFA=","salt":"txHDSAn9HgpQ7GE8Be9zTQ==","additionalParameters":{}}"#,
+                    serde_json::Value::String(
+                        r#"{"hashIterations":5,"algorithm":"argon2","additionalParameters":{"hashLength":["32"],"memory":["7168"],"type":["id"],"version":["1.3"],"parallelism":["1"]}}"#
+                            .to_string(),
+                    ),
+                ),
+            ),
+        ]
+    }
+
+    pub(crate) fn unsupported_rows() -> Vec<issuerd_core::Credential> {
+        let sha1 = "$pbkdf2$i=20000$sVZYIKXNrEDgUg0j+dCxSQ$VAk9tTOF3Wh8ss0Ewzo24F97gZg";
+        let over_cap = "$pbkdf2-sha256$i=2000001$x5gm+pKpqaRl4x8gzgYzCg$Ysjv8TgUTxPDbFyQQ9byzkZKSAw6u6iin/OYKULIVDc";
+        vec![
+            password_credential(sha1, serde_json::json!({})),
+            password_credential(over_cap, serde_json::json!({})),
+            password_credential(
+                r#"{"value":"VAk9tTOF3Wh8ss0Ewzo24F97gZg=","salt":"sVZYIKXNrEDgUg0j+dCxSQ=="}"#,
+                serde_json::json!({"hashIterations": 20000, "algorithm": "pbkdf2"}),
+            ),
+        ]
+    }
+
+    /// Replace the bootstrapped master-realm admin's password with `cred`.
+    pub(crate) async fn give_admin_row(
+        state: &Arc<ServerState>,
+        cred: &issuerd_core::Credential,
+    ) -> issuerd_core::UserId {
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let user = state.storage.get_user_by_username(&realm_id, "admin").await.unwrap().unwrap();
+        let current = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        for existing in current {
+            state
+                .storage
+                .delete_credential(&realm_id, &user.id, &existing.id)
+                .await
+                .unwrap();
+        }
+        state.storage.create_credential(&realm_id, &user.id, cred).await.unwrap();
+        user.id
+    }
+
+    async fn browser_login_as_admin(
+        state: &Arc<ServerState>,
+        password: &str,
+    ) -> axum::response::Response {
+        let execution_id = FlowStageId::new("username-password").unwrap();
+        let pending = crate::routes::oidc::PendingAuthData {
+            realm_id: "master".to_string(),
+            client_id: "admin-cli".to_string(),
+            redirect_uri: "http://localhost:8080/cb".to_string(),
+            scope: vec!["openid".to_string()],
+            state: None,
+            nonce: None,
+            response_type: "code".to_string(),
+            code_challenge: None,
+            code_challenge_method: None,
+            ip_address: Some("127.0.0.1".parse().unwrap()),
+            execution_id: execution_id.clone(),
+            acr_values: vec![],
+            claims: None,
+            _typestate_tag: "anonymous".to_string(),
+            attempt_count: 0,
+            remember_me: false,
+            user_id: None,
+            prompt_consent: false,
+            locale: None,
+            response_mode: None,
+            authorization_details: None,
+            resource: None,
+        };
+        let cache_key = crate::routes::oidc::pending_auth_cache_key(
+            &issuerd_core::RealmId::new("master").unwrap(),
+            &execution_id.0,
+        );
+        state
+            .cache
+            .set(
+                &cache_key,
+                serde_json::to_vec(&pending).unwrap(),
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+
+        login_handler(
+            State(state.clone()),
+            axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                "master".to_string(),
+            ))),
+            Query(std::collections::HashMap::new()),
+            headers_with_flow_cookie(&execution_id.0),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&LoginRequest {
+                    execution_id,
+                    username: "admin".to_string(),
+                    password: password.to_string(),
+                    otp: None,
+                    remember_me: None,
+                    webauthn_assertion: None,
+                    resend: None,
+                })
+                .unwrap(),
+            ),
+        )
+        .await
+    }
+
+    #[test]
+    fn verify_password_credentials_accepts_keycloak_rows_without_dummy() {
+        for (password, cred) in keycloak_rows() {
+            let before = dummy_verify_count();
+            assert!(
+                verify_password_credentials(std::slice::from_ref(&cred), password),
+                "{password}"
+            );
+            assert_eq!(dummy_verify_count(), before, "{password}");
+        }
+    }
+
+    #[test]
+    fn verify_password_credentials_wrong_password_on_keycloak_row_runs_no_dummy() {
+        for (_, cred) in keycloak_rows() {
+            let before = dummy_verify_count();
+            assert!(!verify_password_credentials(std::slice::from_ref(&cred), "wrong"));
+            assert_eq!(dummy_verify_count(), before);
+        }
+    }
+
+    #[test]
+    fn verify_password_credentials_unsupported_rows_run_dummy() {
+        for cred in unsupported_rows() {
+            let before = dummy_verify_count();
+            assert!(!verify_password_credentials(std::slice::from_ref(&cred), "Keycl0ak!pass"));
+            assert_eq!(dummy_verify_count() - before, 1);
+        }
+    }
+
+    #[test]
+    fn verify_password_credentials_dispatches_per_row() {
+        let rows: Vec<_> = keycloak_rows().into_iter().map(|(_, cred)| cred).collect();
+        for (password, _) in keycloak_rows() {
+            assert!(verify_password_credentials(&rows, password), "{password}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_accepts_keycloak_rows_and_keeps_them() {
+        for (password, cred) in keycloak_rows() {
+            let state = setup_state().await;
+            let user_id = give_admin_row(&state, &cred).await;
+
+            let response = browser_login_as_admin(&state, password).await;
+            assert_eq!(response.status(), StatusCode::OK, "{password}");
+            let json = extract_json(response).await;
+            assert!(json["code"].as_str().unwrap().len() > 5);
+
+            let stored = state
+                .storage
+                .get_credentials(
+                    &issuerd_core::RealmId::new("master").unwrap(),
+                    &user_id,
+                    issuerd_core::CredentialType::Password,
+                )
+                .await
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].secret_data, cred.secret_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_password_on_keycloak_rows() {
+        for (_, cred) in keycloak_rows() {
+            let state = setup_state().await;
+            give_admin_row(&state, &cred).await;
+            let response = browser_login_as_admin(&state, "wrong").await;
+            let status = response.status();
+            let json = extract_json(response).await;
+            assert_ne!(status, StatusCode::OK);
+            assert!(json.get("code").is_none(), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_token_accepts_keycloak_rows() {
+        for (password, cred) in keycloak_rows() {
+            let state = setup_state().await;
+            give_admin_row(&state, &cred).await;
+            let request = |password: &str| AdminTokenRequest {
+                realm: "master".to_string(),
+                username: "admin".to_string(),
+                password: password.to_string(),
+                totp: None,
+            };
+            let response = admin_token_handler(
+                State(state.clone()),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                Json(request(password)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{password}");
+
+            let response = admin_token_handler(
+                State(state.clone()),
+                axum::extract::Extension(ClientIp("127.0.0.1".parse().unwrap())),
+                Json(request("wrong")),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password}");
+        }
+    }
 }
