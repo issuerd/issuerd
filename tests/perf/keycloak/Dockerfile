@@ -20,7 +20,7 @@
 #
 # Build (from tests/perf/):
 #   docker compose -f docker-compose.perf.yml build keycloak
-# (needs the local keycloak/keycloak:26.8.1-0 base image; no network at runtime)
+# (needs the local keycloak/keycloak:26.8.2-1 base image; no network at runtime)
 FROM keycloak/keycloak:26.8.2-1@sha256:723b1d6e254c0fc96d5cffec860c7e0744d6a3277822b865bb538cf891575e41 AS builder
 
 ENV KC_DB=postgres \
