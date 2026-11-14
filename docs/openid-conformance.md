@@ -36,7 +36,7 @@ The accepted hosted evidence totals **33 plan invocations and 524 finished modul
 
 ## The self-hosted engineering matrix
 
-The broader continuous matrix runs 43 plan invocations covering Config, Basic, Implicit, Hybrid, Form Post, Dynamic and 3rd-Party-Init across response types, plus all four logout profiles. The latest full run recorded in the repository was on **2026-10-31** with suite `release-v5.3.3`:
+The broader continuous matrix runs 43 plan invocations covering Config, Basic, Implicit, Hybrid, Form Post, Dynamic and 3rd-Party-Init across response types, plus all four logout profiles. The latest full run recorded in the repository was on **2026-11-14** with suite `release-v5.3.4`:
 
 - 43 plan invocations and 612 test modules;
 - more than 31,000 evaluated conditions;
