@@ -96,7 +96,7 @@ The self-hosted runner clones the pinned suite, builds the environment, generate
 
 ```bash
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.3 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.4 && cd -
 ./tests/conformance/run.sh
 ```
 

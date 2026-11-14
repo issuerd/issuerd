@@ -7,7 +7,7 @@ Automated runs of the [OpenID Foundation Conformance Suite](https://gitlab.com/o
 ```bash
 # 1. Clone the conformance suite source (once; gitignored):
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.3 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.4 && cd -
 
 # 2. Run everything:
 cd tests/conformance
@@ -123,7 +123,7 @@ tests/conformance/
 
 ```bash
 conformance)
-  git clone --depth 1 --branch release-v5.3.3 https://gitlab.com/openid/conformance-suite.git
+  git clone --depth 1 --branch release-v5.3.4 https://gitlab.com/openid/conformance-suite.git
   tests/conformance/run.sh   # exits non-zero on unexpected failures
   ;;
 ```
