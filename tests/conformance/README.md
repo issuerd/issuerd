@@ -7,7 +7,7 @@ Automated runs of the [OpenID Foundation Conformance Suite](https://gitlab.com/o
 ```bash
 # 1. Clone the conformance suite source (once; gitignored):
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.3 && cd -
+cd tests/conformance/conformance-suite && git checkout release-v5.3.4 && cd -
 
 # 2. Run everything:
 cd tests/conformance
@@ -85,14 +85,14 @@ downloads). The test environment itself never touches the internet —
 | `oidcc-implicit-certification-test-plan[…static_client]` | `configs/issuerd-implicit-op.json` | Implicit flow (id_token, id_token token) — **PASSED** |
 | `oidcc-hybrid-certification-test-plan[…static_client]` | `configs/issuerd-hybrid-op.json` | All three hybrid types — **PASSED** |
 | `oidcc-formpost-{basic,implicit,hybrid}-certification-test-plan[…static_client]` | `configs/issuerd-formpost{-implicit,-hybrid}-op.json` | form_post variants — **PASSED** |
-| `oidcc-dynamic-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-dynamic-op.json` (+ initial-access token) | DCR (RFC 7591/7592), per-client algs, signed userinfo, JAR-by-reference — **PASSED** (`oidcc-server-rotate-keys` is the expected in-plan failure; real evidence via `run-rotation-check.sh`. The three `oidcc-registration-{logo,policy,tos}-uri` branding modules are also expected failures on suite 5.3.3: its placeholder wake-up finishes them mid-flow and the late inbound request crashes on `runInBackground after runFinalisationTaskInBackground()` — deterministic instance of the long-known upstream race [openid/conformance-suite#854](https://gitlab.com/openid/conformance-suite/-/issues/854); their real conditions, including the screenshot REVIEW entries, still run; `run-conformance.sh` sets `CONFORMANCE_MAX_CONSECUTIVE_FAILURES=4` (pristine runner knob) so the adjacent INTERRUPTED triple cannot trip the runner's server-health circuit breaker before the expected-failure analysis) |
+| `oidcc-dynamic-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-dynamic-op.json` (+ initial-access token) | DCR (RFC 7591/7592), per-client algs, signed userinfo, JAR-by-reference — **PASSED** (`oidcc-server-rotate-keys` is the expected in-plan failure; real evidence via `run-rotation-check.sh`. The three `oidcc-registration-{logo,policy,tos}-uri` branding modules are also expected failures on suite 5.3.4: its placeholder wake-up finishes them mid-flow and the late inbound request crashes on `runInBackground after runFinalisationTaskInBackground()` — deterministic instance of the long-known upstream race [openid/conformance-suite#854](https://gitlab.com/openid/conformance-suite/-/issues/854); their real conditions, including the screenshot REVIEW entries, still run; `run-conformance.sh` sets `CONFORMANCE_MAX_CONSECUTIVE_FAILURES=4` (pristine runner knob) so the adjacent INTERRUPTED triple cannot trip the runner's server-health circuit breaker before the expected-failure analysis) |
 | `oidcc-3rdparty-init-login-certification-test-plan[response_type=…]` ×6 | `configs/issuerd-3rdparty-init-op.json` (rendered) | `initiate_login_uri` DCR handling — **PASSED** |
 | `oidcc-rp-initiated-logout-certification-test-plan[…static_client][response_type=…]` ×6 | `configs/issuerd-rpinitiated-logout-op.json` | RP-initiated logout — **PASSED** |
 | `oidcc-session-management-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-session-op.json` | `session_state` + `check_session_iframe` — **PASSED** |
 | `oidcc-frontchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-frontchannel-logout-op.json` | front-channel iframes with iss+sid — **PASSED** |
 | `oidcc-backchannel-rp-initiated-logout-certification-test-plan[…][response_type=…]` ×6 | `configs/issuerd-backchannel-logout-op.json` | signed logout tokens — **PASSED** (2 expected TLS-header warnings per run — the suite's nginx-proxy header cannot exist in the proxy-less stack) |
 
-Latest full self-hosted run on **2026-10-31** used suite `release-v5.3.3`: **all plans OK, 0 unexpected failures and 0 unexpected warnings** across all 43 invocations. The 24 failures and 12 warnings are the declared expected sets described above; standalone key rotation passed. Current evidence is at `results/html-reports-20261031-033356/index.html`; per-module analysis is in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
+Latest full self-hosted run on **2026-11-14** used suite `release-v5.3.4`: **all plans OK, 0 unexpected failures and 0 unexpected warnings** across all 43 invocations. The 24 failures and 12 warnings are the declared expected sets described above; standalone key rotation passed. Current evidence is at `results/html-reports-20261114-183237/index.html`; per-module analysis is in `COVERAGE.md`. The two request-object modules are expected skips (a signed-only OP must not advertise `none` in `request_object_signing_alg_values_supported`).
 
 ## Files
 
@@ -123,7 +123,7 @@ tests/conformance/
 
 ```bash
 conformance)
-  git clone --depth 1 --branch release-v5.3.3 https://gitlab.com/openid/conformance-suite.git
+  git clone --depth 1 --branch release-v5.3.4 https://gitlab.com/openid/conformance-suite.git
   tests/conformance/run.sh   # exits non-zero on unexpected failures
   ;;
 ```

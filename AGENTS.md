@@ -465,7 +465,7 @@ Multi-node contract: `cluster.enabled = true` requires PostgreSQL storage and Re
 ```bash
 # One-time prerequisite: clone the suite (gitignored)
 git clone https://gitlab.com/openid/conformance-suite.git tests/conformance/conformance-suite
-cd tests/conformance/conformance-suite && git checkout release-v5.3.3
+cd tests/conformance/conformance-suite && git checkout release-v5.3.4
 
 # Run everything (builds images, generates PKI, bootstraps, runs all plans, exports reports)
 cd tests/conformance && docker compose up        # interactive
@@ -981,7 +981,7 @@ The Issuerd admin SPA (`webclientsrc/`) **must be fully dynamic**: every dropdow
 
 ### Implemented Features
 
-One-line as-built summaries of the major feature areas. Behavior divergences from Keycloak are documented in `tests/KEYCLOAK_DIFFS.md`; conformance evidence lives in `tests/conformance/README.md` + `tests/conformance/COVERAGE.md` (the full OIDF OP certification matrix — Config, Basic, Implicit, Hybrid, Form Post (basic/implicit/hybrid), Dynamic (×6 response types), 3rd-Party-Init (×6), and all four logout profiles RP-Initiated/Session/Front-Channel/Back-Channel (×6 each) — all plans OK with 0 unexpected failures and 0 unexpected warnings across all 43 plan invocations, suite release-v5.3.3, hermetic pristine harness; raw run logs land in the gitignored `tests/conformance/results/`).
+One-line as-built summaries of the major feature areas. Behavior divergences from Keycloak are documented in `tests/KEYCLOAK_DIFFS.md`; conformance evidence lives in `tests/conformance/README.md` + `tests/conformance/COVERAGE.md` (the full OIDF OP certification matrix — Config, Basic, Implicit, Hybrid, Form Post (basic/implicit/hybrid), Dynamic (×6 response types), 3rd-Party-Init (×6), and all four logout profiles RP-Initiated/Session/Front-Channel/Back-Channel (×6 each) — all plans OK with 0 unexpected failures and 0 unexpected warnings across all 43 plan invocations, suite release-v5.3.4, hermetic pristine harness; raw run logs land in the gitignored `tests/conformance/results/`).
 
 - **Core platform** — `issuerd-core` types/errors/models/traits; pure OIDC/OAuth2 parsing in `issuerd-protocol`; JWT issuance/validation, key rotation, introspection in `issuerd-token`; flow engine with pluggable authenticators and required actions in `issuerd-auth-flow`.
 - **Storage** — `PostgresStorage` and embedded single-node `SqliteStorage` (sqlx), `InMemoryStorage`, `JsonFileStorage`; schema migrations under `crates/issuerd-storage/migrations/` and `migrations-sqlite/`.
