@@ -19,6 +19,7 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     coverage: {
       provider: 'v8',
+      thresholds: { lines: 92 },
       // json-summary feeds scripts/coverage_badges.py (CI coverage job);
       // lcov.info + lcov-report/ (HTML) go into the CI artifacts; cobertura
       // feeds GitHub Code Quality's native pull-request coverage check.
@@ -32,6 +33,15 @@ export default defineConfig({
         'src/account/App.tsx',
         'src/App.tsx',
         'src/pages/Callback.tsx',
+        // Vendored shadcn layout primitives; Issuerd application wrappers stay measured.
+        'src/components/ui/avatar.tsx',
+        'src/components/ui/breadcrumb.tsx',
+        'src/components/ui/dropdown-menu.tsx',
+        'src/components/ui/input-field.tsx',
+        'src/components/ui/separator.tsx',
+        'src/components/ui/sheet.tsx',
+        'src/components/ui/sidebar.tsx',
+        'src/components/ui/tabs.tsx',
         'src/vite-env.d.ts',
         'src/**/index.ts',
       ],

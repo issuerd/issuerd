@@ -65,4 +65,23 @@ describe('ConsentsPage', () => {
     ).toBeInTheDocument()
     expect(mockListConsents).toHaveBeenCalledTimes(2)
   })
+
+  it('shows an error when consents cannot be loaded', async () => {
+    mockListConsents.mockRejectedValue(new Error('Could not load consents'))
+    render(<ConsentsPage />)
+
+    expect(await screen.findByText('Could not load consents')).toBeInTheDocument()
+  })
+
+  it('shows an error and stops the pending state when revocation fails', async () => {
+    mockListConsents.mockResolvedValue(resolved([consent]))
+    mockDeleteConsent.mockRejectedValue(new Error('Could not revoke consent'))
+    render(<ConsentsPage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }))
+
+    expect(await screen.findByText('Could not revoke consent')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Revoke' })).toBeEnabled()
+    expect(mockListConsents).toHaveBeenCalledOnce()
+  })
 })
