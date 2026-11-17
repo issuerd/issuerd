@@ -153,4 +153,26 @@ describe('IdPListPage', () => {
       }),
     )
   })
+
+  it('bulk deletes selected providers after confirmation', () => {
+    window.confirm = vi.fn(() => true)
+    renderWithProviders(<IdPListPage />)
+
+    fireEvent.click(screen.getByLabelText('Select row google'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(mockDelete).toHaveBeenCalledWith({ realm: 'master', alias: 'google' })
+  })
+
+  it('closes the create modal through both close actions', async () => {
+    renderWithProviders(<IdPListPage />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
 })

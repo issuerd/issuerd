@@ -111,4 +111,26 @@ describe('GroupListPage', () => {
       }),
     )
   })
+
+  it('bulk deletes selected groups after confirmation', () => {
+    window.confirm = vi.fn(() => true)
+    renderWithProviders(<GroupListPage />)
+
+    fireEvent.click(screen.getByLabelText('Select row g1'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(mockDelete).toHaveBeenCalledWith({ realm: 'master', id: 'g1' })
+  })
+
+  it('closes the create modal through both close actions', async () => {
+    renderWithProviders(<GroupListPage />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Create Group/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: /Create Group/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
 })

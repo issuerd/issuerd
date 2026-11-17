@@ -113,4 +113,16 @@ describe('RoleListPage', () => {
       }),
     )
   })
+
+  it('closes the create modal through both close actions', async () => {
+    renderWithProviders(<RoleListPage />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Create Role/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: /Create Role/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
 })

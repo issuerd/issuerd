@@ -315,6 +315,7 @@ The source of truth for available enums is the backend: `issuerd-admin-api/src/e
 - DOM: **jsdom**
 - Helpers: `@testing-library/react`, `@testing-library/jest-dom`
 - Mock server: **MSW** (Mock Service Worker)
+- Coverage: `npm run test -- --coverage` writes the V8 reports and enforces at least **92% line coverage**.
 
 **Wrapper for tests:**
 ```typescript
