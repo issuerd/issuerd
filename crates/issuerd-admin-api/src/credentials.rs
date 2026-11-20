@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use issuerd_core::{Credential, OperationType, RealmId, ResourceType, UserId};
+use issuerd_core::{Credential, CredentialId, OperationType, RealmId, ResourceType, UserId};
 use std::sync::Arc;
 
 use crate::{
@@ -63,9 +63,10 @@ fn find_credentials(
     creds: &[Credential],
     credential_id: &str,
 ) -> Result<Credential, AdminApiError> {
+    let credential_id = CredentialId::new(credential_id).map_err(AdminApiError::from)?;
     creds
         .iter()
-        .find(|c| c.id.as_ref() == credential_id)
+        .find(|c| c.id == credential_id)
         .cloned()
         .ok_or(AdminApiError::NotFound)
 }
@@ -231,21 +232,16 @@ pub async fn move_credential_after(
     require_roles(&auth, &["manage-users"])?;
     let (realm_id, user) = load_user(&state, &realm, &id).await?;
     let mut creds = sorted_credentials(&state, &realm_id, &user.id).await?;
-    let moved_idx = creds
-        .iter()
-        .position(|c| c.id.as_ref() == credential_id.as_str())
-        .ok_or(AdminApiError::NotFound)?;
-    let target_idx = creds
-        .iter()
-        .position(|c| c.id.as_ref() == new_previous_credential_id.as_str())
-        .ok_or(AdminApiError::NotFound)?;
-    if moved_idx == target_idx {
+    let moved = find_credentials(&creds, &credential_id)?;
+    let target = find_credentials(&creds, &new_previous_credential_id)?;
+    if moved.id == target.id {
         return Err(AdminApiError::BadRequest("cannot move a credential after itself".to_string()));
     }
+    let moved_idx = creds.iter().position(|c| c.id == moved.id).expect("moved credential present");
     let moved = creds.remove(moved_idx);
     let insert_idx = creds
         .iter()
-        .position(|c| c.id.as_ref() == new_previous_credential_id.as_str())
+        .position(|c| c.id == target.id)
         .expect("target credential still present")
         + 1;
     creds.insert(insert_idx, moved);
@@ -526,6 +522,65 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn uuid_credential_path_ids_match_case_insensitively() {
+        let state =
+            crate::test_utils::tests::test_state(vec![
+                issuerd_core::RoleName::new("manage-users").unwrap()
+            ]);
+        let app = credential_routes(state.clone());
+        let (realm, user_id) = realm_and_user(&state).await;
+        let first = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        add_credential(&state, &user_id, first, CredentialType::Password, 1, "s1").await;
+        add_credential(&state, &user_id, second, CredentialType::Totp, 2, "s2").await;
+
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            format!(
+                "/admin/realms/{realm}/users/{user_id}/credentials/AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+            ),
+            Some(r#"{"userLabel":"Imported"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            format!(
+                "/admin/realms/{realm}/users/{user_id}/credentials/AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA/moveAfter/BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = call(
+            app,
+            "DELETE",
+            format!(
+                "/admin/realms/{realm}/users/{user_id}/credentials/BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let remaining = state
+            .storage
+            .list_credentials(
+                &issuerd_core::RealmId::new("realm-1").unwrap(),
+                &UserId::new(&user_id).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.as_ref(), first);
+        assert_eq!(remaining[0].user_label.as_deref(), Some("Imported"));
+        assert_eq!(remaining[0].priority, 2);
     }
 
     #[tokio::test]
