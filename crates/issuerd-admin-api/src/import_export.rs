@@ -162,16 +162,27 @@ async fn validate_credential_ids(
         return Ok(());
     }
     let mut existing = HashMap::new();
-    for user in state
+    for existing_realm in state
         .storage
-        .list_users(realm_id, "", &Pagination { first: 0, max: i32::MAX })
+        .list_realms(&Pagination { first: 0, max: i32::MAX })
         .await?
     {
-        for credential in state.storage.list_credentials(realm_id, &user.id).await? {
-            existing.insert(
-                credential.id.to_string(),
-                (user.username.clone(), credential.credential_type),
-            );
+        for user in state
+            .storage
+            .list_users(&existing_realm.id, "", &Pagination { first: 0, max: i32::MAX })
+            .await?
+        {
+            for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
+                existing.insert(
+                    credential.id.to_string(),
+                    (
+                        existing_realm.id.clone(),
+                        existing_realm.name.to_string(),
+                        user.username.clone(),
+                        credential.credential_type,
+                    ),
+                );
+            }
         }
     }
     for rep in body.users.as_deref().unwrap_or_default() {
@@ -179,12 +190,12 @@ async fn validate_credential_ids(
             let Some(id) = credential.id.as_deref() else {
                 continue;
             };
-            let Some((owner, existing_type)) = existing.get(id) else {
+            let Some((owner_realm, realm_name, owner, existing_type)) = existing.get(id) else {
                 continue;
             };
-            if owner.as_str() != rep.username {
+            if owner_realm != realm_id || owner.as_str() != rep.username {
                 return Err(AdminApiError::BadRequest(format!(
-                    "credential id '{id}' already belongs to user '{owner}'"
+                    "credential id '{id}' already belongs to user '{owner}' in realm '{realm_name}'"
                 )));
             }
             if strategy == IfResourceExists::Overwrite
@@ -1619,6 +1630,51 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cross_realm_credential_id_collisions_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let mut other_realm = state.storage.get_realm_by_name("master").await.unwrap().unwrap();
+        other_realm.id = issuerd_core::RealmId::new("other-realm").unwrap();
+        other_realm.name = issuerd_core::RealmName::new("other-realm").unwrap();
+        state.storage.create_realm(&other_realm).await.unwrap();
+        let other_user = seed_user(&state, &other_realm.id, "other-user", None).await;
+        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("cross-realm-credential-id").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&other_realm.id, &other_user.id, &credential)
+            .await
+            .unwrap();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "cross-realm-target",
+                "credentials": [{
+                    "id": "cross-realm-credential-id",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&master_realm_id(), "cross-realm-target")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
