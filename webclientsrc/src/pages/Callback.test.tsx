@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import Callback from './Callback'
+import Callback, { adminDestination } from './Callback'
 import { useAuthStore } from '../state/authStore'
 
 const tokenEndpointMock = vi.fn()
@@ -180,5 +180,10 @@ describe('Callback', () => {
     await waitFor(() => expect(loc.href).toBe('/realms/master/account'))
     expect(useAuthStore.getState().tokenSet?.accessToken).toBe(ts.accessToken)
     expect(tokenEndpointMock).not.toHaveBeenCalled()
+  })
+
+  it('routes a single-realm admin directly to users instead of the master-only realm picker', () => {
+    expect(adminDestination('user-f9d47444701facd5')).toBe('/users')
+    expect(adminDestination('master')).toBe('/realm-picker')
   })
 })

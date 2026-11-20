@@ -75,9 +75,10 @@ const navSections = [
 
 function RealmSwitcher() {
   const realm = useAuthStore((s) => s.currentRealm)
+  const isMasterAdmin = useAuthStore((s) => s.tokenSet?.realm === 'master')
   const setRealm = useAuthStore((s) => s.setRealm)
   const { state } = useSidebar()
-  const { data: realms } = useRealms()
+  const { data: realms } = useRealms(undefined, isMasterAdmin)
   const navigate = useNavigate()
 
   function handleSwitch(next: string) {
@@ -111,7 +112,16 @@ function RealmSwitcher() {
         align="start"
         sideOffset={4}
       >
-        {realms && realms.length > 0 ? (
+        {!isMasterAdmin ? (
+          <DropdownMenuItem
+            disabled={!realm}
+            onClick={() => realm && navigate(`/realms/${encodeURIComponent(realm)}/settings`)}
+          >
+            <Globe className="size-4" />
+            <span>Realm Settings</span>
+            <Check className="ml-auto size-4" />
+          </DropdownMenuItem>
+        ) : realms && realms.length > 0 ? (
           realms.map((r) => (
             <DropdownMenuItem key={r.realm} onClick={() => handleSwitch(r.realm)}>
               <Globe className="size-4" />
@@ -130,6 +140,8 @@ function RealmSwitcher() {
 function NavItems() {
   const location = useLocation()
   const { setOpenMobile } = useSidebar()
+  const isMasterAdmin = useAuthStore((s) => s.tokenSet?.realm === 'master')
+  const currentRealm = useAuthStore((s) => s.currentRealm)
 
   return (
     <>
@@ -139,19 +151,25 @@ function NavItems() {
           <SidebarGroupContent>
             <SidebarMenu>
               {section.items.map((item) => {
+                if (item.to === '/realms' && !isMasterAdmin && !currentRealm) return null
+                const ownRealmSettings = item.to === '/realms' && !isMasterAdmin
+                const target = ownRealmSettings
+                  ? `/realms/${encodeURIComponent(currentRealm!)}/settings`
+                  : item.to
+                const label = ownRealmSettings ? 'Realm Settings' : item.label
                 const isActive =
-                  location.pathname === item.to ||
-                  location.pathname.startsWith(`${item.to}/`)
+                  location.pathname === target ||
+                  location.pathname.startsWith(`${target}/`)
                 return (
                   <SidebarMenuItem key={item.to}>
                     <SidebarMenuButton
                       asChild
                       isActive={isActive}
-                      tooltip={item.label}
+                      tooltip={label}
                     >
-                      <NavLink to={item.to} onClick={() => setOpenMobile(false)}>
+                      <NavLink to={target} onClick={() => setOpenMobile(false)}>
                         <item.icon className="size-4" />
-                        <span>{item.label}</span>
+                        <span>{label}</span>
                       </NavLink>
                     </SidebarMenuButton>
                   </SidebarMenuItem>

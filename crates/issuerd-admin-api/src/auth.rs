@@ -141,8 +141,9 @@ async fn enforce_realm_binding(
         // view-realm/manage-realm on top). The exemption is method-scoped to
         // GET: a future non-GET route under these prefixes must not silently
         // inherit it.
+        let metadata_path = path.strip_prefix("/admin").unwrap_or(path);
         if *method == axum::http::Method::GET
-            && (path == "/admin/serverinfo" || path.starts_with("/admin/enums/"))
+            && (metadata_path == "/serverinfo" || metadata_path.starts_with("/enums/"))
         {
             return Ok(());
         }
@@ -665,13 +666,14 @@ mod tests {
     }
 
     fn binding_app(state: Arc<AdminApiState>) -> Router {
-        Router::new()
-            .route("/admin/realms", get(|| async { StatusCode::OK }))
-            .route("/admin/realms/{realm}/users", get(|| async { StatusCode::OK }))
-            .route("/admin/serverinfo", get(|| async { StatusCode::OK }))
-            .route("/admin/enums/protocols", get(|| async { StatusCode::OK }))
+        let routes = Router::new()
+            .route("/realms", get(|| async { StatusCode::OK }))
+            .route("/realms/{realm}/users", get(|| async { StatusCode::OK }))
+            .route("/serverinfo", get(|| async { StatusCode::OK }))
+            .route("/enums/protocols", get(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn_with_state(state.clone(), admin_auth_middleware))
-            .with_state(state)
+            .with_state(state.clone());
+        Router::new().nest_service("/admin", routes).with_state(state)
     }
 
     async fn call(app: Router, uri: &str) -> StatusCode {

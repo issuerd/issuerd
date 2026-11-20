@@ -145,6 +145,19 @@ describe('authStore', () => {
     localStorage.setItem('issuerd_realm', 'other')
     useAuthStore.getState().hydrate()
     expect(useAuthStore.getState().tokenSet).toEqual({ ...ts, clientId: 'admin-cli', realm: 'demo' })
+    expect(useAuthStore.getState().currentRealm).toBe('demo')
+  })
+
+  it('hydrate selects the issuer of a realm-scoped token when no realm is pinned', () => {
+    const ts = {
+      accessToken: 'owner-token',
+      refreshToken: 'rt',
+      idToken: 'id',
+      expiresAt: Date.now() + 300_000,
+    }
+    sessionStorage.setItem('issuerd_tokens', JSON.stringify({ 'user-sandbox': ts }))
+    useAuthStore.getState().hydrate()
+    expect(useAuthStore.getState().currentRealm).toBe('user-sandbox')
   })
 
   it('hydrate stays null when no tokens exist at all', () => {
