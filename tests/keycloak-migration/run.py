@@ -1675,9 +1675,10 @@ def source_export_and_oracle(harness):
         "docker", "compose", "-p", harness.compose_project,
         "-f", str(harness.work / "compose.yaml"),
         "run", "--rm", "--no-deps",
+        "--user", f"{os.getuid()}:{os.getgid()}",
         "-v", f"{export_dir}:/export",
         "keycloak", "export", "--dir", "/export", "--realm", REALM, "--users", "realm_file",
-    ], secret_output=True, timeout=600)
+    ], secret_output=False, timeout=600)
     export_path = export_dir / f"{REALM}-realm.json"
     raw = export_path.read_bytes()
     document = json.loads(raw)
