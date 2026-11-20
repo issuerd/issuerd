@@ -171,12 +171,22 @@ async fn validate_credential_ids(
     let mut existing = HashMap::new();
     for existing_realm in state
         .storage
-        .list_realms(&Pagination { first: 0, max: i32::MAX })
+        .list_realms(&Pagination {
+            first: 0,
+            max: i32::MAX,
+        })
         .await?
     {
         for user in state
             .storage
-            .list_users(&existing_realm.id, "", &Pagination { first: 0, max: i32::MAX })
+            .list_users(
+                &existing_realm.id,
+                "",
+                &Pagination {
+                    first: 0,
+                    max: i32::MAX,
+                },
+            )
             .await?
         {
             for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
@@ -1682,7 +1692,8 @@ mod tests {
         other_realm.name = issuerd_core::RealmName::new("other-realm").unwrap();
         state.storage.create_realm(&other_realm).await.unwrap();
         let other_user = seed_user(&state, &other_realm.id, "other-user", None).await;
-        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
         let credential = issuerd_core::Credential {
             id: issuerd_core::CredentialId::new("66666666-6666-4666-8666-666666666666").unwrap(),
             credential_type: issuerd_core::CredentialType::Password,
@@ -1723,7 +1734,8 @@ mod tests {
         let state = manage_realm_state();
         let app = test_app(state.clone());
         let realm_id = master_realm_id();
-        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
         let id = "77777777-7777-4777-8777-777777777777";
         for username in ["first-target-user", "second-target-user"] {
             let user = seed_user(&state, &realm_id, username, None).await;
@@ -1773,7 +1785,8 @@ mod tests {
             .create_credential(&realm_id, &existing_user.id, &existing_credential)
             .await
             .unwrap();
-        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
         for username in ["new-user", "existing-user"] {
             let document = serde_json::json!({
                 "users": [{
@@ -1837,7 +1850,8 @@ mod tests {
         let state = manage_realm_state();
         let app = test_app(state.clone());
         let realm_id = master_realm_id();
-        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
         let document = serde_json::json!({
             "users": [{
                 "username": "duplicate-credential-user",
