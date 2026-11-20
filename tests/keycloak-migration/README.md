@@ -1,9 +1,9 @@
 # Keycloak migration acceptance harness
 
 This directory contains a stdlib-Python acceptance harness for mixed-credential
-Keycloak realm migration. It is **in development** until the real Keycloak and
-backend-matrix runs are green; it is not an external MLabs certification or a
-production-cutover claim.
+Keycloak realm migration. Its real-Keycloak lane produces reproducible engineering
+acceptance evidence, not an external MLabs certification or a production-cutover
+guarantee.
 
 ## Real Keycloak 26.7.1 export
 
