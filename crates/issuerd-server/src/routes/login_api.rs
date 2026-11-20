@@ -68,27 +68,24 @@ pub(crate) fn dummy_password_verify(password: &str) {
     }
 }
 
-/// Check `password` against the user's stored Argon2 password credentials.
-/// When no credential holds a parseable hash, a dummy verify runs instead so
-/// the rejection is not measurably faster than a wrong password.
+/// Check `password` against supported local password credentials. When no
+/// credential holds a supported hash, a dummy verify runs instead so the
+/// rejection is not measurably faster than a wrong password.
 pub(crate) fn verify_password_credentials(
     creds: &[issuerd_core::Credential],
     password: &str,
 ) -> bool {
-    let mut hashed = false;
+    let mut verified_any = false;
     for cred in creds {
-        let Ok(hash_str) = std::str::from_utf8(&cred.secret_data) else {
-            continue;
-        };
-        let Ok(parsed) = argon2::PasswordHash::new(hash_str) else {
-            continue;
-        };
-        hashed = true;
-        if argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
-            return true;
+        match issuerd_auth_flow::password_hash::verify_password(password, cred) {
+            issuerd_auth_flow::password_hash::PasswordVerification::Match => return true,
+            issuerd_auth_flow::password_hash::PasswordVerification::NoMatch => {
+                verified_any = true;
+            }
+            issuerd_auth_flow::password_hash::PasswordVerification::Unsupported => {}
         }
     }
-    if !hashed {
+    if !verified_any {
         dummy_password_verify(password);
     }
     false
@@ -2993,6 +2990,12 @@ pub(crate) mod tests {
         assert!(!verify_password_credentials(&[junk.clone(), real.clone()], "wrong"));
         assert!(verify_password_credentials(&[junk, real], "secret"));
         assert_eq!(dummy_verify_count(), before, "a real verify ran → no dummy");
+
+        let pbkdf2 = cred(b"$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE".to_vec());
+        let before = dummy_verify_count();
+        assert!(!verify_password_credentials(std::slice::from_ref(&pbkdf2), "wrong"));
+        assert!(verify_password_credentials(&[pbkdf2], "correct horse battery staple"));
+        assert_eq!(dummy_verify_count(), before, "PBKDF2 verifies without an Argon2 dummy");
     }
 
     #[tokio::test]

@@ -459,7 +459,13 @@ impl TestHarness {
         let code = login_json["code"].as_str().unwrap();
 
         // Step 5: Get client secret for token request
-        let realm_id = issuerd_core::RealmId::new(realm).unwrap();
+        let realm_id = self
+            .storage
+            .get_realm_by_name(realm)
+            .await
+            .unwrap()
+            .expect("token realm must exist")
+            .id;
         let client = self
             .storage
             .get_client_by_client_id(
@@ -537,7 +543,13 @@ impl TestHarness {
         let login_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let code = login_json["code"].as_str().unwrap();
 
-        let realm_id = issuerd_core::RealmId::new(realm).unwrap();
+        let realm_id = self
+            .storage
+            .get_realm_by_name(realm)
+            .await
+            .unwrap()
+            .expect("token realm must exist")
+            .id;
         let client = self
             .storage
             .get_client_by_client_id(
@@ -625,6 +637,22 @@ impl TestHarness {
     ) -> Response {
         let req = Request::builder()
             .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        self.app.clone().oneshot(self.add_connect_info(req)).await.unwrap()
+    }
+
+    pub async fn put_json_auth(
+        &self,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        let req = Request::builder()
+            .method("PUT")
             .uri(path)
             .header("content-type", "application/json")
             .header("Authorization", format!("Bearer {}", token))
