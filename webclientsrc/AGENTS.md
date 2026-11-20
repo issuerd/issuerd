@@ -361,6 +361,7 @@ Because the page and its script are served as static files, it is deterministic 
 5. Form submits to `/api/v1/auth/login` as `application/x-www-form-urlencoded`
 6. Server returns `302 Found` + `Set-Cookie` + `Location: redirect_uri` on success
 7. Browser follows redirect to `/admin/console/callback` (SPA route) which exchanges the code for tokens
+8. Callback keeps the original realm for the whole exchange: login-attempt storage is cleared on success, so re-reading its realm key must not reset the callback to `master` during completion and navigation.
 
 **Passwordless email-code mode:** when the realm sets the `email_code_login` attribute, `GET /realms/{realm}/login/context` returns `email_code_login: true` and `login.html` switches to an email-only form (password field, remember-me and forgot-password link are hidden; the submit button becomes "Send code"). The code-entry and resend pages are server-rendered by the daemon (like the TOTP challenge page), so `login.html` itself only handles the email step.
 

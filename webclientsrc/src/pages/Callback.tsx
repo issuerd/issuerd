@@ -50,7 +50,8 @@ export default function Callback() {
   const getTokenSet = useAuthStore((s) => s.getTokenSet)
   const [error, setError] = useState('')
   const exchangeStarted = useRef(false)
-  const realm = sessionStorage.getItem('issuerd_oidc_realm') || CONFIG.REALM
+  // Login-attempt keys are removed on success; keep this callback's issuer stable.
+  const [realm] = useState(() => sessionStorage.getItem('issuerd_oidc_realm') || CONFIG.REALM)
 
   useEffect(() => {
     // A stale login attempt (restored tab, a parallel sign-in in another tab,
