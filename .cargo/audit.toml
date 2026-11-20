@@ -37,6 +37,13 @@
 # testcontainers 0.28.0 and is not shipped in the daemon. No patched
 # testcontainers release exists yet; remove this ignore when
 # https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
+#
+# RUSTSEC-2026-0543 is an informational unmaintained notice, not a
+# vulnerability. No safe chrono upgrade exists. This bugfix keeps the public
+# timestamp types unchanged; rmcp also still requires chrono until
+# https://github.com/modelcontextprotocol/rust-sdk/pull/1474 is released.
+# A future timestamp migration needs its own compatibility review.
 ignore = [
     "RUSTSEC-2026-0440",
+    "RUSTSEC-2026-0543",
 ]
