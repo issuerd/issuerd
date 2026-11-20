@@ -1675,7 +1675,7 @@ def source_export_and_oracle(harness):
         "docker", "compose", "-p", harness.compose_project,
         "-f", str(harness.work / "compose.yaml"),
         "run", "--rm", "--no-deps",
-        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--user", "0:0",
         "-v", f"{export_dir}:/export",
         "keycloak", "export", "--dir", "/export", "--realm", REALM, "--users", "realm_file",
     ], secret_output=False, timeout=600)
