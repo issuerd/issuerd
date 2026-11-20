@@ -180,15 +180,23 @@ async fn validate_credential_ids(
             .await?
         {
             for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
-                existing.insert(
-                    credential.id.to_string(),
-                    (
-                        existing_realm.id.clone(),
-                        existing_realm.name.to_string(),
-                        user.username.clone(),
-                        credential.credential_type,
-                    ),
-                );
+                let id = credential.id.to_string();
+                if existing
+                    .insert(
+                        id.clone(),
+                        (
+                            existing_realm.id.clone(),
+                            existing_realm.name.to_string(),
+                            user.username.clone(),
+                            credential.credential_type,
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "duplicate existing credential id '{id}' in target storage"
+                    )));
+                }
             }
         }
     }
@@ -1708,6 +1716,41 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_target_credential_ids_fail_closed_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let id = "77777777-7777-4777-8777-777777777777";
+        for username in ["first-target-user", "second-target-user"] {
+            let user = seed_user(&state, &realm_id, username, None).await;
+            let credential = issuerd_core::Credential {
+                id: issuerd_core::CredentialId::new(id).unwrap(),
+                credential_type: issuerd_core::CredentialType::Password,
+                user_label: None,
+                created_date: chrono::Utc::now(),
+                secret_data: secret.as_bytes().to_vec(),
+                credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+                priority: 1,
+            };
+            state.storage.create_credential(&realm_id, &user.id, &credential).await.unwrap();
+        }
+        let document = serde_json::json!({
+            "users": [{
+                "username": "second-target-user",
+                "credentials": [{"id": id, "type": "password", "secretData": secret}]
+            }]
+        });
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(document),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     }
 
     #[tokio::test]
