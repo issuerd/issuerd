@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-20
+
 ### Added
 
 - **Keycloak-compatible password verification and import.** Verify and import Argon2id, PBKDF2-HMAC-SHA256, and PBKDF2-HMAC-SHA512 credentials from direct PHC strings or Keycloak credential JSON pairs, preserving per-row work parameters and enforcing resource limits before hashing. `partialImport` validates every credential before any resource write, accepts camelCase/snake_case, `algorithmData`/`additionalParameters`, and object/JSON-string forms, never accepts plaintext migration passwords, and preserves non-password credentials on overwrite. Relative Keycloak redirect URIs and web origins resolve against the target issuer base URL. Login and password-history checks share the same fail-closed verifier; ordinary password changes continue to write Argon2id. ([#9](https://github.com/issuerd/issuerd/issues/9), [#10](https://github.com/issuerd/issuerd/issues/10))
