@@ -60,6 +60,14 @@ fn is_imported_password_type(credential_type: &issuerd_core::CredentialType) -> 
         )
 }
 
+fn password_credential_uuid(username: &str, id: &str) -> Result<uuid::Uuid, AdminApiError> {
+    uuid::Uuid::parse_str(id).map_err(|_| {
+        AdminApiError::BadRequest(format!(
+            "user '{username}': imported password credential id must be a UUID"
+        ))
+    })
+}
+
 fn credential_json_field(value: Option<&str>) -> serde_json::Value {
     value
         .map(|value| {
@@ -83,13 +91,10 @@ fn prepare_credential(
         .and_then(chrono::DateTime::from_timestamp_millis)
         .unwrap_or_else(chrono::Utc::now);
     if is_imported_password_type(&rep.credential_type) {
-        if let Some(id) = rep.id.as_deref() {
-            uuid::Uuid::parse_str(id).map_err(|_| {
-                AdminApiError::BadRequest(format!(
-                    "user '{username}': imported password credential id must be a UUID"
-                ))
-            })?;
-        }
+        let id = match rep.id.as_deref() {
+            Some(id) => password_credential_uuid(username, id)?.to_string(),
+            None => issuerd_core::utils::generate_id(),
+        };
         let secret = rep.secret_data.as_deref().ok_or_else(|| {
             AdminApiError::BadRequest(format!(
                 "user '{username}': an imported password credential requires secretData"
@@ -113,9 +118,7 @@ fn prepare_credential(
             credential_data["temporary"] = serde_json::Value::Bool(true);
         }
         return Ok(issuerd_core::Credential {
-            id: issuerd_core::CredentialId::new(
-                rep.id.clone().unwrap_or_else(issuerd_core::utils::generate_id),
-            )?,
+            id: issuerd_core::CredentialId::new(id)?,
             credential_type: rep.credential_type.clone(),
             user_label: rep.user_label.clone(),
             created_date,
@@ -149,10 +152,17 @@ async fn validate_credential_ids(
     let mut document_owners = HashMap::new();
     for rep in body.users.as_deref().unwrap_or_default() {
         for credential in rep.credentials.as_deref().unwrap_or_default() {
-            let Some(id) = credential.id.as_deref() else {
+            let Some(raw_id) = credential.id.as_deref() else {
                 continue;
             };
-            if let Some(owner) = document_owners.insert(id, rep.username.as_str()) {
+            let id = if is_imported_password_type(&credential.credential_type) {
+                password_credential_uuid(&rep.username, raw_id)?.to_string()
+            } else {
+                uuid::Uuid::parse_str(raw_id)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| raw_id.to_string())
+            };
+            if let Some(owner) = document_owners.insert(id.clone(), rep.username.as_str()) {
                 let message = if owner == rep.username {
                     format!("user '{}': duplicate credential id '{id}'", rep.username)
                 } else {
@@ -190,7 +200,9 @@ async fn validate_credential_ids(
             .await?
         {
             for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
-                let id = credential.id.to_string();
+                let id = uuid::Uuid::parse_str(&credential.id.to_string())
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| credential.id.to_string());
                 if existing
                     .insert(
                         id.clone(),
@@ -212,10 +224,17 @@ async fn validate_credential_ids(
     }
     for rep in body.users.as_deref().unwrap_or_default() {
         for credential in rep.credentials.as_deref().unwrap_or_default() {
-            let Some(id) = credential.id.as_deref() else {
+            let Some(raw_id) = credential.id.as_deref() else {
                 continue;
             };
-            let Some((owner_realm, realm_name, owner, existing_type)) = existing.get(id) else {
+            let id = if is_imported_password_type(&credential.credential_type) {
+                password_credential_uuid(&rep.username, raw_id)?.to_string()
+            } else {
+                uuid::Uuid::parse_str(raw_id)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| raw_id.to_string())
+            };
+            let Some((owner_realm, realm_name, owner, existing_type)) = existing.get(&id) else {
                 continue;
             };
             if owner_realm != realm_id || owner.as_str() != rep.username {
@@ -1655,6 +1674,94 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn uuid_case_is_canonicalized_for_collision_checks() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let existing_user = seed_user(&state, &realm_id, "uuid-owner", None).await;
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let existing = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &existing_user.id, &existing)
+            .await
+            .unwrap();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "uppercase-target",
+                "credentials": [{
+                    "id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "uppercase-target")
+            .await
+            .unwrap()
+            .is_none());
+
+        let duplicate_document = serde_json::json!({
+            "users": [{
+                "username": "case-document-user",
+                "credentials": [
+                    {"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "type": "password", "secretData": secret},
+                    {"id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "type": "password-history", "secretData": secret}
+                ]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(duplicate_document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "case-document-user")
+            .await
+            .unwrap()
+            .is_none());
+
+        let canonical_document = serde_json::json!({
+            "users": [{
+                "username": "canonical-uppercase-user",
+                "credentials": [{
+                    "id": "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(canonical_document)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let user = state
+            .storage
+            .get_user_by_username(&realm_id, "canonical-uppercase-user")
+            .await
+            .unwrap()
+            .unwrap();
+        let credentials = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(credentials[0].id.to_string(), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
     }
 
     #[tokio::test]
