@@ -603,7 +603,9 @@ class Harness:
             raw = pathlib.Path(self.args.fixture).read_bytes()
             self.fixture = json.loads(raw)
             manifest_path = self.args.manifest or pathlib.Path(self.args.fixture).with_name("fixture-manifest.json")
-            secrets_path = self.args.secrets or pathlib.Path(self.args.fixture).with_name("fixture-secrets.json")
+            secrets_path = pathlib.Path(self.args.secrets or pathlib.Path(self.args.fixture).with_name("fixture-secrets.json"))
+            if os.name == "posix" and (secrets_path.stat().st_mode & 0o777) != 0o600:
+                raise Failure("fixture secret input must have mode 0600")
             self.manifest = load_json(manifest_path)
             self.secrets = load_json(secrets_path)
         elif self.args.synthetic:
@@ -1112,7 +1114,7 @@ def parse_args():
     parser.add_argument("--manifest", help="fixture manifest (default: fixture-manifest.json beside fixture)")
     parser.add_argument("--secrets", help="local-only secret input (default: fixture-secrets.json beside fixture)")
     parser.add_argument("--backend", choices=["in-memory", "json-file", "sqlite", "postgres", "postgres-redis"], default="in-memory")
-    parser.add_argument("--issuerd-bin", help="Issuerd binary to test (default: target/debug/issuerd, built when missing)")
+    parser.add_argument("--issuerd-bin", help="Issuerd binary to test (default: rebuild target/debug/issuerd)")
     parser.add_argument("--evidence-dir", type=pathlib.Path, help="sanitized evidence output directory")
     return parser.parse_args()
 
