@@ -1723,6 +1723,7 @@ mod tests {
                 "clientId": "migration-check",
                 "publicClient": true,
                 "redirectUris": ["/*"],
+                "webOrigins": ["/"],
                 "defaultClientScopes": ["custom-default"],
                 "optionalClientScopes": ["custom-optional"]
             }],
@@ -1768,6 +1769,7 @@ mod tests {
             .unwrap();
         assert!(client.public_client);
         assert_eq!(client.redirect_uris[0].as_str(), "http://localhost:8080/*");
+        assert_eq!(client.web_origins[0].as_str(), "http://localhost:8080/");
         let assignments = state
             .storage
             .list_client_scope_assignments(&realm_id, &client.id)
@@ -2134,6 +2136,19 @@ mod tests {
         });
         let (status, _) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let keycloak_doc = serde_json::json!({
+            "groups": [{"name": "keycloak-nested", "subGroups": [{"name": "sub"}]}]
+        });
+        let (status, _) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(keycloak_doc)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .storage
+            .get_group_by_name(&master_realm_id(), "keycloak-nested")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

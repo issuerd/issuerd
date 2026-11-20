@@ -228,8 +228,28 @@ impl KeycloakClientRepresentation {
                     .collect::<Result<Vec<_>, AdminApiError>>()?,
             );
         }
-        if self.web_origins.is_some() {
-            self.base.web_origins = self.web_origins;
+        if let Some(web_origins) = self.web_origins {
+            let base_url = if target_base_url.is_empty() {
+                self.root_url
+                    .as_deref()
+                    .or(self.base_url.as_deref())
+                    .or(self.admin_url.as_deref())
+                    .unwrap_or_default()
+            } else {
+                target_base_url
+            };
+            self.base.web_origins = Some(
+                web_origins
+                    .iter()
+                    .map(|origin| {
+                        if origin == "*" {
+                            Ok(origin.clone())
+                        } else {
+                            resolve_redirect_uri(&self.base.client_id, origin, base_url)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, AdminApiError>>()?,
+            );
         }
         if self.consent_required.is_some() {
             self.base.consent_required = self.consent_required;
