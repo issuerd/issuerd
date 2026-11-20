@@ -39,6 +39,12 @@ describe('useRealms', () => {
     expect(result.current.data).toHaveLength(1)
   })
 
+  it('does not fetch the master-only realm list when disabled', async () => {
+    const { result } = renderHook(() => useRealms(undefined, false), { wrapper })
+    await waitFor(() => expect(result.current.fetchStatus).toBe('idle'))
+    expect(mockListRealms).not.toHaveBeenCalled()
+  })
+
   it('throws on useRealms error', async () => {
     mockListRealms.mockResolvedValue({ data: undefined, error: { errorMessage: 'db down' }, response: { status: 503 } })
     const { result } = renderHook(() => useRealms(), { wrapper })

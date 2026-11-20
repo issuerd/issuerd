@@ -361,6 +361,7 @@ Because the page and its script are served as static files, it is deterministic 
 5. Form submits to `/api/v1/auth/login` as `application/x-www-form-urlencoded`
 6. Server returns `302 Found` + `Set-Cookie` + `Location: redirect_uri` on success
 7. Browser follows redirect to `/admin/console/callback` (SPA route) which exchanges the code for tokens
+8. Callback keeps the original realm for the whole exchange: login-attempt storage is cleared on success, so re-reading its realm key must not reset the callback to `master` during completion and navigation.
 
 **Passwordless email-code mode:** when the realm sets the `email_code_login` attribute, `GET /realms/{realm}/login/context` returns `email_code_login: true` and `login.html` switches to an email-only form (password field, remember-me and forgot-password link are hidden; the submit button becomes "Send code"). The code-entry and resend pages are server-rendered by the daemon (like the TOTP challenge page), so `login.html` itself only handles the email step.
 
@@ -370,7 +371,8 @@ Because the page and its script are served as static files, it is deterministic 
 - On success, the JWT is stored in `sessionStorage` and the Zustand store.
 - The generated API client (`src/api/client.ts`) attaches the token to every request automatically.
 - Token refresh is proactive and activity-gated (`src/api/tokenRefresh.ts`): while the user interacts with the console, the access token is refreshed ~30 s before expiry (each refresh slides the server-side SSO idle window). With no user interaction the refresh stops, the access token lapses, and once the realm's SSO idle timeout passes the server answers the next refresh with `invalid_grant` → the session ends.
-- Each token set records its issuer realm; refresh targets that issuer but preserves the selected admin realm, including master-issued cross-realm administration. Legacy snapshots infer the issuer from their storage keys.
+- Each token set records its issuer realm; refresh targets that issuer but preserves the selected admin realm, including master-issued cross-realm administration. Legacy snapshots infer the issuer from their storage keys. When hydration falls back to a realm-bound token, the active realm follows that token's issuer; only a master token retains an independently pinned admin realm.
+- Global realm listing and the realm picker are limited to master-issued admin tokens. Realm-bound administrators navigate to their own realm settings, and the sidebar does not query the master-only realm list. Read-only server metadata and enum catalogs remain available to administrators with `view-realm` or `manage-realm`.
 - On 401, the client interceptor (`src/api/client.ts`) attempts one token refresh and retries the original request; only if the refresh fails with `invalid_grant` (or the retry still 401s) does it call `logout()` and redirect to `/login.html?logged_out=1`.
 - Admin API endpoints require realm-management roles (`view-realm`, `manage-realm`, `view-users`, `manage-users`, etc.). The backend returns 403 if roles are missing.
 

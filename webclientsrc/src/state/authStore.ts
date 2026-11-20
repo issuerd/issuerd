@@ -124,7 +124,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // per-tab (sessionStorage): after a realm switch in another tab, this tab
     // may have no token for the pinned realm. Fall back to any stored token for
     // this client — the console's primary realm first — so the console does not
-    // bounce to the login page despite holding a valid session.
+    // bounce to the login page despite holding a valid session. A realm-bound
+    // fallback must select its own issuer; only a master token can administer
+    // the independently pinned realm.
     const tokenSet =
       (realm ? tokens[realm]?.[clientId] : undefined) ??
       tokens['master']?.[clientId] ?? // mirrors CONFIG.REALM (importing it would cycle)
@@ -132,7 +134,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         .map((byClient) => byClient[clientId])
         .find((candidate) => candidate !== undefined) ??
       null
-    set({ tokenSet, currentRealm: realm })
+    set({
+      tokenSet,
+      currentRealm: tokenSet?.realm === 'master' && realm
+        ? realm
+        : (tokenSet?.realm ?? realm ?? null),
+    })
   },
 
   isAuthenticated: (realm, clientId = DEFAULT_CLIENT_ID) => {

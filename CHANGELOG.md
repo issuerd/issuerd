@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Single-realm admin console login.** Route administrators of non-master realms directly to `/users` after sign-in instead of the master-only realm picker, so realm-scoped owner accounts can reach their own administration UI. Keep the callback's realm stable after clearing login-attempt storage, preventing a transient missing-code error from appearing during navigation to the admin console.
+- **Realm-admin navigation and server metadata.** Link realm-scoped administrators to their own realm settings instead of the master-only realm list, and stop querying that list from the sidebar. Preserve the global list for master-issued admin tokens. Recognize the nested router paths of `GET /admin/serverinfo` and `GET /admin/enums/*`, so authorized realm administrators can load server metadata and realm settings.
+- **Container healthcheck.** Add an exec-form `HEALTHCHECK` using the existing `issuerd healthcheck` command. Readiness probes work without adding a shell to the distroless runtime image or requiring a Compose-specific shell command.
+
 ### Security
 
 - **Dependency advisories.** Upgrade `lettre` to 0.11.24 for RUSTSEC-2026-0560 through RUSTSEC-2026-0565. Upgrade SQLx to 0.9.1 and `libsqlite3-sys` to 0.40.0, removing the temporary RUSTSEC-2026-0459 exception. Upgrade `rustix` to 1.1.6 for RUSTSEC-2026-0486.

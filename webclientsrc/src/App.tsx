@@ -59,7 +59,7 @@ function AnimatedOutlet() {
           <Routes location={location}>
             <Route index element={<Navigate to="dashboard" replace />} />
             <Route path="dashboard" element={<DashboardPage />} />
-            <Route path="realms" element={<RealmListPage />} />
+            <Route path="realms" element={<MasterRealmRoute><RealmListPage /></MasterRealmRoute>} />
             <Route path="realms/:realm/edit" element={<RealmEditPage />} />
             <Route path="realms/:realm/settings" element={<RealmSettingsPage />} />
             <Route path="users" element={<UserListPage />} />
@@ -89,14 +89,28 @@ function AnimatedOutlet() {
   )
 }
 
+function MasterRealmRoute({ children }: { children: React.ReactNode }) {
+  const tokenRealm = useAuthStore((s) => s.tokenSet?.realm)
+  const currentRealm = useAuthStore((s) => s.currentRealm)
+
+  if (tokenRealm === CONFIG.REALM) return children
+  const realm = currentRealm ?? tokenRealm
+  if (realm && realm !== CONFIG.REALM) {
+    return <Navigate to={`/realms/${encodeURIComponent(realm)}/settings`} replace />
+  }
+  return <Navigate to="/users" replace />
+}
+
 function App() {
-  const isAuthenticated = useAuthStore((s) => s.isAuthenticated(CONFIG.REALM))
+  const isAuthenticated = useAuthStore((s) =>
+    s.isAuthenticated(s.tokenSet?.realm ?? s.currentRealm ?? CONFIG.REALM)
+  )
 
   return (
     <Routes>
       <Route path="/" element={isAuthenticated ? <Navigate to="/realm-picker" replace /> : <LoginRedirect />} />
       <Route path="/callback" element={<Callback />} />
-      <Route path="/realm-picker" element={<RealmPicker />} />
+      <Route path="/realm-picker" element={<MasterRealmRoute><RealmPicker /></MasterRealmRoute>} />
       <Route
         path="/*"
         element={
