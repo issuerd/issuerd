@@ -3,10 +3,7 @@
 //
 // User management endpoints: CRUD, password reset, and role mappings.
 
-use argon2::{
-    password_hash::rand_core::OsRng, password_hash::PasswordHash, password_hash::SaltString,
-    Argon2, PasswordHasher, PasswordVerifier,
-};
+use argon2::{password_hash::rand_core::OsRng, password_hash::SaltString, Argon2, PasswordHasher};
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
@@ -638,20 +635,9 @@ pub async fn reset_password(
 /// flattened `IssuerdError`.
 const PASSWORD_HISTORY_CREDENTIAL_TYPE: &str = "password-history";
 
-/// Verify a candidate password against a stored credential's hash.
-///
-/// Only argon2id PHC strings are verified; unknown or foreign hash formats
-/// return `false` (they simply cannot match for history-reuse purposes).
 fn verify_password_hash(candidate: &str, cred: &Credential) -> bool {
-    let hash_str = match std::str::from_utf8(&cred.secret_data) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let parsed = match PasswordHash::new(hash_str) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    Argon2::default().verify_password(candidate.as_bytes(), &parsed).is_ok()
+    issuerd_auth_flow::password_hash::verify_password(candidate, cred)
+        == issuerd_auth_flow::password_hash::PasswordVerification::Match
 }
 
 /// Set a user's password with password-history handling.
