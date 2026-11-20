@@ -37,6 +37,10 @@ function hasAdminRoles(token: string): boolean {
   return roles.some((r) => adminRoles.includes(r))
 }
 
+export function adminDestination(realm: string): string {
+  return realm === CONFIG.REALM ? '/realm-picker' : '/users'
+}
+
 // One-shot flag marking that a stale callback already restarted sign-in once.
 const RESTART_FLAG = 'issuerd_callback_restart'
 
@@ -46,7 +50,8 @@ export default function Callback() {
   const getTokenSet = useAuthStore((s) => s.getTokenSet)
   const [error, setError] = useState('')
   const exchangeStarted = useRef(false)
-  const realm = sessionStorage.getItem('issuerd_oidc_realm') || CONFIG.REALM
+  // Login-attempt keys are removed on success; keep this callback's issuer stable.
+  const [realm] = useState(() => sessionStorage.getItem('issuerd_oidc_realm') || CONFIG.REALM)
 
   useEffect(() => {
     // A stale login attempt (restored tab, a parallel sign-in in another tab,
@@ -71,7 +76,7 @@ export default function Callback() {
       // which would bounce guarded pages straight back to the login page.
       setTokenSet(realm, tokenSet)
       if (hasAdminRoles(tokenSet.accessToken)) {
-        navigate('/realm-picker')
+        navigate(adminDestination(realm))
       } else {
         window.location.href = `/realms/${realm}/account`
       }
@@ -170,7 +175,7 @@ export default function Callback() {
         startSessionRefresh()
 
         if (hasAdminRoles(accessToken)) {
-          navigate('/realm-picker')
+          navigate(adminDestination(realm))
         } else {
           window.location.href = `/realms/${realm}/account`
         }

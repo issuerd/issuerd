@@ -14,8 +14,10 @@ let mockRealmsData: any = [
   { realm: 'demo', display_name: 'Demo', enabled: true },
 ]
 
+const mockUseRealms = vi.fn((..._args: unknown[]) => ({ data: mockRealmsData, isLoading: false, error: null }))
+
 vi.mock('@/api/hooks/useRealms', () => ({
-  useRealms: () => ({ data: mockRealmsData, isLoading: false, error: null }),
+  useRealms: (...args: unknown[]) => mockUseRealms(...args),
 }))
 
 beforeAll(() => {
@@ -50,6 +52,7 @@ function wrapper({ children }: { children: React.ReactNode }) {
 
 describe('AppSidebar RealmSwitcher', () => {
   beforeEach(() => {
+    mockUseRealms.mockClear()
     mockRealmsData = [
       { realm: 'master', display_name: 'Master', enabled: true },
       { realm: 'demo', display_name: 'Demo', enabled: true },
@@ -60,6 +63,7 @@ describe('AppSidebar RealmSwitcher', () => {
         refreshToken: 'r',
         idToken: 'i',
         expiresAt: Date.now() + 300_000,
+        realm: 'master',
       },
       currentRealm: 'master',
     })
@@ -70,6 +74,20 @@ describe('AppSidebar RealmSwitcher', () => {
     // The user-menu footer also renders the realm name; the switcher is first
     // in DOM order (sidebar header precedes footer).
     expect(screen.getAllByText('master')[0]).toBeInTheDocument()
+  })
+
+  it('offers own realm settings without fetching the global realm list', () => {
+    useAuthStore.setState({
+      currentRealm: 'user-sandbox',
+      tokenSet: { ...useAuthStore.getState().tokenSet!, realm: 'user-sandbox' },
+    })
+    render(<AppSidebar />, { wrapper })
+
+    expect(screen.getByRole('link', { name: 'Realm Settings' })).toHaveAttribute(
+      'href', '/realms/user-sandbox/settings'
+    )
+    expect(screen.queryByRole('link', { name: 'Realms', exact: true })).not.toBeInTheDocument()
+    expect(mockUseRealms).toHaveBeenCalledWith(undefined, false)
   })
 
   it('falls back to Issuerd when no realm is selected', () => {

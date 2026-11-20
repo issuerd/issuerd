@@ -97,3 +97,5 @@ EXPOSE 8080
 
 ENTRYPOINT ["issuerd"]
 CMD ["daemon", "-c", "/etc/issuerd/issuerd.toml"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["issuerd", "healthcheck"]

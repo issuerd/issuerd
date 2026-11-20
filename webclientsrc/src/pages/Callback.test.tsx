@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Dmitry Andreev. <da@issuerd.org>
 
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
-import Callback from './Callback'
+import { BrowserRouter, MemoryRouter, Route, Routes } from 'react-router-dom'
+import Callback, { adminDestination } from './Callback'
 import { useAuthStore } from '../state/authStore'
 
 const tokenEndpointMock = vi.fn()
@@ -34,6 +35,8 @@ function stubLocation(search: string): LocationStub {
   Object.defineProperty(window, 'location', { value: loc, writable: true, configurable: true })
   return loc
 }
+
+const initialWindowLocation = window.location
 
 describe('Callback', () => {
   beforeEach(() => {
@@ -180,5 +183,42 @@ describe('Callback', () => {
     await waitFor(() => expect(loc.href).toBe('/realms/master/account'))
     expect(useAuthStore.getState().tokenSet?.accessToken).toBe(ts.accessToken)
     expect(tokenEndpointMock).not.toHaveBeenCalled()
+  })
+
+  it('routes a single-realm admin directly to users instead of the master-only realm picker', () => {
+    expect(adminDestination('user-f9d47444701facd5')).toBe('/users')
+    expect(adminDestination('master')).toBe('/realm-picker')
+  })
+
+  it('does not flash an authentication error while navigating to users after a successful exchange', async () => {
+    Object.defineProperty(window, 'location', { value: initialWindowLocation, writable: true, configurable: true })
+    window.history.replaceState({}, '', '/admin/console/callback?code=abc&state=matching-state')
+    sessionStorage.setItem('issuerd_oidc_state', 'matching-state')
+    sessionStorage.setItem('issuerd_code_verifier', 'verifier123')
+    sessionStorage.setItem('issuerd_oidc_realm', 'user-sandbox')
+    tokenEndpointMock.mockResolvedValue({
+      data: { access_token: fakeJwt(['view-users']), refresh_token: 'rt', id_token: '', expires_in: 300 },
+    })
+    const authenticationErrors: string[] = []
+    const observer = new MutationObserver(() => {
+      const text = document.body.textContent || ''
+      if (text.includes('Authentication Error')) authenticationErrors.push(text)
+    })
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+
+    render(
+      <StrictMode>
+        <BrowserRouter basename="/admin/console">
+          <Routes>
+            <Route path="/callback" element={<Callback />} />
+            <Route path="/users" element={<div>Users</div>} />
+          </Routes>
+        </BrowserRouter>
+      </StrictMode>
+    )
+
+    await screen.findByText('Users')
+    observer.disconnect()
+    expect(authenticationErrors).toEqual([])
   })
 })

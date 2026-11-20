@@ -53,6 +53,7 @@ export default function Sidebar() {
   const location = useLocation()
   const { isCollapsed, isMobileOpen, toggleCollapse, closeMobile } = useSidebarStore()
   const realm = useAuthStore((s) => s.currentRealm)
+  const isMasterAdmin = useAuthStore((s) => s.tokenSet?.realm === 'master')
 
   const sidebarClasses = `
     fixed top-top-nav left-0 h-[calc(100vh-var(--top-nav))] z-sidebar bg-surface-dark border-r border-border-custom overflow-y-auto transition-all duration-300 ease-smooth
@@ -79,23 +80,29 @@ export default function Sidebar() {
                 </div>
               )}
               {section.items.map((item) => {
+                if (item.to === '/realms' && !isMasterAdmin && !realm) return null
+                const ownRealmSettings = item.to === '/realms' && !isMasterAdmin
+                const target = ownRealmSettings
+                  ? `/realms/${encodeURIComponent(realm!)}/settings`
+                  : item.to
+                const label = ownRealmSettings ? 'Realm Settings' : item.label
                 const isActive =
-                  location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
+                  location.pathname === target || location.pathname.startsWith(`${target}/`)
                 return (
                   <NavLink
                     key={item.to}
-                    to={item.to}
+                    to={target}
                     onClick={(e) => e.stopPropagation()}
                     className={`flex items-center gap-3 h-10 px-4 rounded-lg transition-all duration-200 group ${
                       isActive
                         ? 'nav-active text-cyan-neon'
                         : 'text-text-secondary hover:text-text-primary hover:bg-white/[0.03]'
                     } ${isCollapsed ? 'justify-center px-0' : ''}`}
-                    title={isCollapsed ? item.label : undefined}
+                    title={isCollapsed ? label : undefined}
                   >
                     <item.icon className="w-[18px] h-[18px] flex-shrink-0" />
                     {!isCollapsed && (
-                      <span className="text-sm font-medium">{item.label}</span>
+                      <span className="text-sm font-medium">{label}</span>
                     )}
                   </NavLink>
                 )

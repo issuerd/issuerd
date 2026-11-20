@@ -21,7 +21,7 @@ export interface RealmListOptions {
 
 const key = 'realms'
 
-export function useRealms(options?: RealmListOptions) {
+export function useRealms(options?: RealmListOptions, enabled = true) {
   const { first, max } = options ?? {}
   return useQuery({
     queryKey: [key, 'list', { first, max }],
@@ -35,6 +35,7 @@ export function useRealms(options?: RealmListOptions) {
       if (res.error) throw new Error(res.error.errorMessage)
       return res.data!
     },
+    enabled,
   })
 }
 
