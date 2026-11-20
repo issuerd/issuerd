@@ -83,6 +83,13 @@ fn prepare_credential(
         .and_then(chrono::DateTime::from_timestamp_millis)
         .unwrap_or_else(chrono::Utc::now);
     if is_imported_password_type(&rep.credential_type) {
+        if let Some(id) = rep.id.as_deref() {
+            uuid::Uuid::parse_str(id).map_err(|_| {
+                AdminApiError::BadRequest(format!(
+                    "user '{username}': imported password credential id must be a UUID"
+                ))
+            })?;
+        }
         let secret = rep.secret_data.as_deref().ok_or_else(|| {
             AdminApiError::BadRequest(format!(
                 "user '{username}': an imported password credential requires secretData"
@@ -1633,6 +1640,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_uuid_password_credential_ids_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "non-uuid-credential-user",
+                "credentials": [{
+                    "id": "not-a-uuid",
+                    "type": "password",
+                    "secretData": "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE"
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "non-uuid-credential-user")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn cross_realm_credential_id_collisions_are_rejected_before_writes() {
         let state = manage_realm_state();
         let app = test_app(state.clone());
@@ -1643,7 +1676,7 @@ mod tests {
         let other_user = seed_user(&state, &other_realm.id, "other-user", None).await;
         let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
         let credential = issuerd_core::Credential {
-            id: issuerd_core::CredentialId::new("cross-realm-credential-id").unwrap(),
+            id: issuerd_core::CredentialId::new("66666666-6666-4666-8666-666666666666").unwrap(),
             credential_type: issuerd_core::CredentialType::Password,
             user_label: None,
             created_date: chrono::Utc::now(),
@@ -1660,7 +1693,7 @@ mod tests {
             "users": [{
                 "username": "cross-realm-target",
                 "credentials": [{
-                    "id": "cross-realm-credential-id",
+                    "id": "66666666-6666-4666-8666-666666666666",
                     "type": "password",
                     "secretData": secret
                 }]
@@ -1684,7 +1717,7 @@ mod tests {
         let realm_id = master_realm_id();
         let existing_user = seed_user(&state, &realm_id, "existing-user", None).await;
         let existing_credential = issuerd_core::Credential {
-            id: issuerd_core::CredentialId::new("existing-credential-id").unwrap(),
+            id: issuerd_core::CredentialId::new("55555555-5555-4555-8555-555555555555").unwrap(),
             credential_type: issuerd_core::CredentialType::Totp,
             user_label: None,
             created_date: chrono::Utc::now(),
@@ -1703,7 +1736,7 @@ mod tests {
                 "users": [{
                     "username": username,
                     "credentials": [{
-                        "id": "existing-credential-id",
+                        "id": "55555555-5555-4555-8555-555555555555",
                         "type": "password",
                         "secretData": secret
                     }]
@@ -1734,7 +1767,7 @@ mod tests {
             "users": [{
                 "username": "existing-user",
                 "credentials": [{
-                    "id": "existing-credential-id",
+                    "id": "55555555-5555-4555-8555-555555555555",
                     "type": "totp",
                     "secretData": "new-totp-secret",
                     "credentialData": {"digits": 6}
@@ -1766,8 +1799,8 @@ mod tests {
             "users": [{
                 "username": "duplicate-credential-user",
                 "credentials": [
-                    {"id": "duplicate-credential-id", "type": "password", "secretData": secret},
-                    {"id": "duplicate-credential-id", "type": "password-history", "secretData": secret}
+                    {"id": "11111111-1111-4111-8111-111111111111", "type": "password", "secretData": secret},
+                    {"id": "11111111-1111-4111-8111-111111111111", "type": "password-history", "secretData": secret}
                 ]
             }]
         });
@@ -1784,10 +1817,10 @@ mod tests {
         let cross_user = serde_json::json!({
             "users": [
                 {"username": "first-user", "credentials": [
-                    {"id": "shared-credential-id", "type": "password", "secretData": secret}
+                    {"id": "22222222-2222-4222-8222-222222222222", "type": "password", "secretData": secret}
                 ]},
                 {"username": "second-user", "credentials": [
-                    {"id": "shared-credential-id", "type": "password-history", "secretData": secret}
+                    {"id": "22222222-2222-4222-8222-222222222222", "type": "password-history", "secretData": secret}
                 ]}
             ]
         });

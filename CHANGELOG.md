@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Keycloak origin and scope migration.** Expand `webOrigins: ["+"]` into the deduplicated origins of the resolved redirect URIs, normalizing default ports instead of treating it as a relative `/+` URL. Validate client representations and client/realm-default MCP scope policy before any resource write, preventing partial imports on those validation failures. ([#10](https://github.com/issuerd/issuerd/issues/10))
-- **Credential identity validation.** Reject duplicate credential IDs across the import document and cross-user or type-incompatible collisions with existing credentials across all realms before any resource write, eliminating backend-dependent partial imports while preserving compatible same-user overwrites and `SKIP`/`FAIL` behavior. ([#10](https://github.com/issuerd/issuerd/issues/10))
+- **Credential identity validation.** Reject non-UUID password credential IDs, duplicate credential IDs across the import document, and cross-user or type-incompatible collisions with existing credentials across all realms before any resource write, eliminating backend-dependent partial imports while preserving compatible same-user overwrites and `SKIP`/`FAIL` behavior. ([#10](https://github.com/issuerd/issuerd/issues/10))
 
 ## [0.2.5] - 2026-11-14
 
