@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Keycloak role and membership restoration.** Resolve full-export `scopeMappings` and `clientScopeMappings` by role-owner and receiving client/scope name, restore user realm/client roles and top-level group memberships, map group roles to target client UUIDs, and resolve composite roles in a second pass. Dangling, duplicate, cross-client, or ambiguous references fail before writes instead of being dropped or rebound to the wrong role. ([#10](https://github.com/issuerd/issuerd/issues/10))
 - **Keycloak migration acceptance harness.** Add a one-command real-Keycloak 26.7.1 full-export/import/login rehearsal with mixed credentials, composite roles, public/confidential clients, scope and group claim checks, restart and two-node coverage across all storage backends, plus read-only no-rehash oracles. Reusable sanitized-fixture and explicitly synthetic modes support independent evaluation without production secrets. Nightly and release heavy suites publish sanitized JSON/JUnit and redacted logs with finite retention; this is engineering evidence, not external certification or a production-cutover guarantee. ([#9](https://github.com/issuerd/issuerd/issues/9), [#10](https://github.com/issuerd/issuerd/issues/10))
 
+### Fixed
+
+- **Keycloak origin and scope migration.** Expand `webOrigins: ["+"]` into the deduplicated origins of the resolved redirect URIs, normalizing default ports instead of treating it as a relative `/+` URL. Validate client representations and client/realm-default MCP scope policy before any resource write, preventing partial imports on those validation failures. ([#10](https://github.com/issuerd/issuerd/issues/10))
+
 ## [0.2.5] - 2026-11-14
 
 ### Fixed

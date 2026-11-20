@@ -324,7 +324,7 @@ class Harness:
             binary = pathlib.Path(self.args.issuerd_bin).resolve()
         else:
             binary = self.root / "target" / "debug" / "issuerd"
-            self.run_command(["cargo", "build", "--bin", "issuerd"], timeout=1200)
+            self.run_command(["cargo", "build", "--locked", "--bin", "issuerd"], timeout=1200)
         if not binary.is_file():
             raise Failure(f"Issuerd binary not found: {binary}")
         return binary
@@ -413,17 +413,22 @@ class Harness:
             self.target_lock = None
 
     def stop_target(self):
-        stop_second_target(self)
-        if self.target_process is None:
-            return
-        if self.target_process.poll() is None:
-            self.target_process.send_signal(signal.SIGTERM)
-            try:
-                self.target_process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                self.target_process.kill()
-                self.target_process.wait(timeout=10)
-        self.target_process = None
+        second_error = None
+        try:
+            stop_second_target(self)
+        except Exception as error:
+            second_error = error
+        if self.target_process is not None:
+            if self.target_process.poll() is None:
+                self.target_process.send_signal(signal.SIGTERM)
+                try:
+                    self.target_process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.target_process.kill()
+                    self.target_process.wait(timeout=10)
+            self.target_process = None
+        if second_error is not None:
+            raise second_error
 
     def admin(self, method, path, body=None, expected=(200,)):
         return self.http(
@@ -472,7 +477,7 @@ class Harness:
 
     def argon2_hash(self, password, salt):
         process = subprocess.run(
-            ["cargo", "run", "--quiet", "--example", "keycloak_migration_hash"],
+            ["cargo", "run", "--locked", "--quiet", "--example", "keycloak_migration_hash"],
             cwd=self.root,
             input=json.dumps({"password": password, "salt": b64(salt)}).encode(),
             stdout=subprocess.PIPE,
@@ -562,8 +567,8 @@ class Harness:
                 "fullScopeAllowed": False,
                 "standardFlowEnabled": True,
                 "directAccessGrantsEnabled": True,
-                "redirectUris": ["http://localhost:8080/public-cb"],
-                "webOrigins": ["http://localhost:8080"],
+                "redirectUris": ["/public-cb"],
+                "webOrigins": ["+"],
                 "defaultClientScopes": ["migration-default"],
                 "optionalClientScopes": ["migration-optional"],
             }],
@@ -598,6 +603,36 @@ class Harness:
         self.add_secret(secret_input["client_secret"], "SOURCE_CLIENT_SECRET")
         return document, manifest, secret_input
 
+    def register_fixture_secrets(self):
+        for user in self.fixture.get("users", []):
+            for credential in user.get("credentials", []):
+                for key in ("secretData", "secret_data"):
+                    secret = credential.get(key)
+                    if isinstance(secret, str):
+                        self.add_secret(secret, "FIXTURE_SECRET_DATA")
+                    elif isinstance(secret, dict):
+                        self.add_secret(
+                            json.dumps(secret, separators=(",", ":"), sort_keys=True),
+                            "FIXTURE_SECRET_DATA",
+                        )
+                        for field in ("value", "salt"):
+                            if isinstance(secret.get(field), str):
+                                self.add_secret(secret[field], f"FIXTURE_SECRET_{field.upper()}")
+                if isinstance(credential.get("value"), str):
+                    self.add_secret(credential["value"], "FIXTURE_PLAINTEXT_VALUE")
+        for client in self.fixture.get("clients", []):
+            if isinstance(client.get("secret"), str):
+                self.add_secret(client["secret"], "FIXTURE_CLIENT_SECRET")
+        identity_providers = self.fixture.get(
+            "identityProviders",
+            self.fixture.get("identity_providers", []),
+        )
+        for provider in identity_providers:
+            config = provider.get("config", {})
+            for key in ("clientSecret", "client_secret", "password", "privateKey", "private_key"):
+                if isinstance(config.get(key), str):
+                    self.add_secret(config[key], "FIXTURE_IDP_SECRET")
+
     def prepare_fixture(self):
         if self.args.fixture:
             raw = pathlib.Path(self.args.fixture).read_bytes()
@@ -613,6 +648,7 @@ class Harness:
             raw = json.dumps(self.fixture, separators=(",", ":"), sort_keys=True).encode()
         else:
             raw = generate_keycloak_fixture(self)
+        self.register_fixture_secrets()
         write_private(self.work / "realm-export.json", self.fixture)
         write_private(self.work / "fixture-manifest.json", self.manifest)
         write_private(self.work / "fixture-secrets.json", self.secrets)
@@ -692,11 +728,20 @@ class Harness:
             raise Failure("confidential migration client became public")
         if public_client.get("public_client", public_client.get("publicClient")) is not True:
             raise Failure("public migration client lost its public-client flag")
+        redirect_uris = public_client.get("redirect_uris") or public_client.get("redirectUris")
+        expected_redirect = f"http://127.0.0.1:{self.target_port}/public-cb"
+        if redirect_uris != [expected_redirect]:
+            raise Failure(f"public client relative redirect URI was not resolved: {redirect_uris}")
+        web_origins = public_client.get("web_origins") or public_client.get("webOrigins")
+        expected_origins = [f"http://127.0.0.1:{self.target_port}"]
+        if web_origins != expected_origins:
+            raise Failure(f"public client '+' web origins were not expanded: {web_origins}")
         self.report["target"]["inventory"] = {
             "users": len(expected_users),
             "client_scopes": len([scope for scope in scopes if scope.get("name", "").startswith("migration-")]),
             "clients_present": True,
             "public_client_present": True,
+            "public_web_origins": web_origins,
             "protocol_mappers": expected_mappers,
             "role_and_group_assignments": "PASS",
             "scope_assignments": {
@@ -1004,6 +1049,11 @@ class Harness:
                 encoding="utf-8",
             )
 
+    def record_cleanup_error(self, error):
+        if not self.report.get("error"):
+            self.report["error"] = self.sanitize(str(error))
+        self.report["status"] = "FAIL"
+
     def cleanup_compose(self):
         if not self.compose_project:
             return
@@ -1011,33 +1061,39 @@ class Harness:
             "docker", "compose", "-p", self.compose_project,
             "-f", str(self.work / "compose.yaml"),
         ]
-        logs = subprocess.run(
-            base + ["logs", "--no-color"],
-            cwd=self.root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-            check=False,
-        )
-        (self.evidence / "keycloak-redacted.log").write_text(
-            self.sanitize(logs.stdout.decode(errors="replace")),
-            encoding="utf-8",
-        )
-        down = subprocess.run(
-            base + ["down", "-v", "--remove-orphans"],
-            cwd=self.root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=120,
-            check=False,
-        )
-        if down.returncode != 0 and self.report["status"] == "PASS":
-            self.report["status"] = "FAIL"
-            self.report["error"] = "failed to remove the disposable Keycloak stack"
+        try:
+            logs = subprocess.run(
+                base + ["logs", "--no-color"],
+                cwd=self.root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=60,
+                check=False,
+            )
+            (self.evidence / "keycloak-redacted.log").write_text(
+                self.sanitize(logs.stdout.decode(errors="replace")),
+                encoding="utf-8",
+            )
+        except Exception as error:
+            self.record_cleanup_error(error)
+        try:
+            down = subprocess.run(
+                base + ["down", "-v", "--remove-orphans"],
+                cwd=self.root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+            if down.returncode != 0:
+                self.record_cleanup_error("failed to remove the disposable Keycloak stack")
+        except Exception as error:
+            self.record_cleanup_error(error)
 
     def write_evidence(self):
         self.report["target"]["commit"] = self.run_command(["git", "rev-parse", "HEAD"]).decode().strip()
-        self.report["target"]["version"] = self.build_target().name
+        binary = pathlib.Path(self.args.issuerd_bin) if self.args.issuerd_bin else self.root / "target" / "debug" / "issuerd"
+        self.report["target"]["version"] = binary.name
         result_path = self.evidence / "keycloak-migration-result.json"
         result_path.write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         suite = ET.Element("testsuite", {
@@ -1096,21 +1152,25 @@ class Harness:
             self.report["status"] = "FAIL"
             self.report["error"] = self.sanitize(str(error))
         finally:
-            self.stop_target()
-            self.release_target_lock()
-            self.cleanup_compose()
-            try:
-                self.scan_logs()
-            except Exception as error:
-                self.report["status"] = "FAIL"
-                self.report["error"] = self.sanitize(str(error))
-            self.write_evidence()
+            for action in (
+                self.stop_target,
+                self.release_target_lock,
+                self.cleanup_compose,
+                self.scan_logs,
+                self.write_evidence,
+            ):
+                try:
+                    action()
+                except Exception as error:
+                    self.record_cleanup_error(error)
             try:
                 self.verify_evidence_sanitized()
             except Exception as error:
-                self.report["status"] = "FAIL"
-                self.report["error"] = self.sanitize(str(error))
-                self.write_evidence()
+                self.record_cleanup_error(error)
+                try:
+                    self.write_evidence()
+                except Exception as write_error:
+                    self.record_cleanup_error(write_error)
             self.temp.cleanup()
         return self.report["status"] == "PASS"
 
@@ -1249,8 +1309,8 @@ def source_client_and_scopes(harness):
         "directAccessGrantsEnabled": True,
         "standardFlowEnabled": True,
         "fullScopeAllowed": False,
-        "redirectUris": ["http://localhost:8080/public-cb"],
-        "webOrigins": ["http://localhost:8080"],
+        "redirectUris": ["/public-cb"],
+        "webOrigins": ["+"],
     }, expected=(201,))
     public_client = source_list(harness, f"/realms/{REALM}/clients?clientId={PUBLIC_CLIENT_ID}")[0]
     client = source_list(harness, f"/realms/{REALM}/clients?clientId={CLIENT_ID}")[0]

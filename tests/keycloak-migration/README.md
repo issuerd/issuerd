@@ -22,16 +22,19 @@ Keycloak 26.7.1 writes without enabling end-user writes.
 
 The realm includes confidential and public clients, top-level group membership,
 direct composite realm/client role assignments, a non-member control, all nine
-supported mappers, and default/optional scopes. Source claim checks prove that the
-composite-derived roles and group membership are present, the non-member does not
-receive `developers`, and the optional claim appears only when requested.
+supported mappers, and default/optional scopes. The public client exercises a
+relative redirect URI and Keycloak `webOrigins: ["+"]`; target inventory must
+contain the origin derived from that redirect, not a literal `/+` URL. Source
+claim checks prove that the composite-derived roles and group membership are
+present, the non-member does not receive `developers`, and the optional claim
+appears only when requested.
 
 The lane then starts a fresh Issuerd target, imports the export through
 `partialImport`, and verifies inventory, every enabled user's login, PKCE,
 UserInfo claims, negative cases, and an ordinary password change. The target uses
 a fresh target-only client secret; source client secrets are never reused.
 
-`target/debug/issuerd` is rebuilt with `cargo build --bin issuerd` by default.
+`target/debug/issuerd` is rebuilt with `cargo build --locked --bin issuerd` by default.
 Override it with `--issuerd-bin /path/to/issuerd` to test a particular release
 binary instead.
 
