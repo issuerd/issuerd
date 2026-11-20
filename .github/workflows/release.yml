@@ -143,10 +143,10 @@ jobs:
           path: release-notes.md
 
   heavy:
-    name: heavy suites (federation, cluster E2E, parity, conformance)
+    name: heavy suites (federation, cluster, parity, migration, conformance)
     needs: validate
     # Reusable-workflow call — the heavy jobs run inside THIS run, so the
-    # conformance-evidence artifact is downloadable by the release job below.
+    # sanitized evidence artifacts are downloadable by the release job below.
     # Skipped under act (rehearsing hours of Docker suites locally is
     # pointless); the release job tolerates that skip via its `if`. Gate uses
     # vars.ACT — job-level `if` has NO `env` context (GitHub rejects it, as

@@ -337,6 +337,27 @@ Kubernetes deployment is the container image plus the multi-node contract; there
 - **Shutdown:** pods receive SIGTERM and the daemon drains in-flight requests gracefully (a 30-second cap applies when built-in `[tls]` is enabled). Size `terminationGracePeriodSeconds` accordingly.
 - **Metrics** are per-pod — scrape every pod's `/metrics` (see [monitoring.md](monitoring.md)).
 
+## Keycloak realm migration
+
+Use a full realm export made while Keycloak is stopped; `partial-export` is not a credential-complete migration path. The disposable acceptance harness implements the same sequence automatically:
+
+```bash
+# Source side, against a stopped Keycloak 26.7.1 with PostgreSQL running:
+kc.sh export --dir /export --realm migration-lab --users realm_file
+
+# Reusable sanitized-fixture acceptance against a fresh Issuerd target:
+python3 tests/keycloak-migration/run.py \
+  --fixture /secure/path/migration-lab-realm.json \
+  --manifest /secure/path/fixture-manifest.json \
+  --secrets /secure/path/fixture-secrets.json
+```
+
+`fixture-secrets.json` is local-only, mode `0600`, and contains only disposable credentials. Replace masked source confidential-client secrets with fresh target-only values before authentication checks. Do not put production exports, hashes, salts, passwords, tokens, or private keys in CI artifacts. `tests/keycloak-migration/README.md` documents the manifest schema, source oracle, evidence JSON/JUnit, and cleanup.
+
+The Admin API migration endpoint is `POST /admin/realms/{realm}/partialImport?ifResourceExists=OVERWRITE`. It accepts full-export `users` (including Argon2id/PBKDF2 credentials), top-level groups, clients, realm/client roles and assignments, client scopes, all nine supported mapper types, default/optional scope assignments, `scopeMappings`, `clientScopeMappings`, and composites. Relative redirect URIs and web origins resolve against the target `issuer_url`. Nested groups, unsupported mapper types, dangling references, and ambiguous cross-client composites fail before any resource write; they are not silently dropped. Existing `FAIL` conflicts remain non-transactional, while `SKIP` leaves existing resources and assignments unchanged and absent credential fields preserve existing credentials.
+
+For the full real-Keycloak export/oracle/login acceptance, run `python3 tests/keycloak-migration/run.py` with no fixture arguments. Backend selection is available through `--backend in-memory|json-file|sqlite|postgres|postgres-redis`; the last mode verifies a second node on the shared Compose network. Use `--synthetic` only for a local compatible fixture, never as evidence that a real Keycloak export worked. Always verify every enabled user login, wrong-password rejection, required client scopes, and actual UserInfo claims before cutover.
+
 ## Production checklist
 
 - [ ] **`issuer_url` is the public base URL** clients use (e.g. `https://id.example.com`), with the correct scheme/host/port. It is baked into `iss` and discovery; treat it as permanent once realms are in use — changing it later invalidates outstanding tokens, sessions, and stored client configs.

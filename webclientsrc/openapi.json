@@ -12858,7 +12858,7 @@
           "Realms"
         ],
         "summary": "Partially import realm resources",
-        "description": "Imports users, groups, clients, roles, and identity providers from a realm-partial document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), groups by name, identity providers by alias. Users are imported WITHOUT credentials — credential fields in the document are ignored entirely and password hashes are never accepted through this endpoint; user role/group assignments and realm default groups are not applied. Groups are imported as top-level only (`sub_groups` is rejected). Requires `manage-realm` role.",
+        "description": "Imports users, groups, clients, roles, client scopes, scope mappings, user assignments, and identity providers from a realm-partial or full Keycloak export document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources and their assignments untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching is name-based: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), client scopes by name, groups by name, and identity providers by alias. Credentials, scope references, role mappings, and composite references are validated before any resource write. Supported Keycloak Argon2id/PBKDF2 password hashes are normalized and imported without a reset; plaintext migration passwords are rejected. OVERWRITE replaces only password/password-history credentials while preserving other credential types. Default/optional client scopes, realm/client role scope mappings, user role/group assignments, group roles, and composite roles are restored in second passes after the catalogs exist. Groups are top-level only (`sub_groups`/`subGroups` is rejected). Requires `manage-realm` role.",
         "operationId": "partial_import",
         "parameters": [
           {
@@ -20982,6 +20982,30 @@
         "type": "object",
         "description": "Realm-partial document accepted by\n`POST /admin/realms/{realm}/partialImport`. Unknown fields are ignored.",
         "properties": {
+          "clientScopeMappings": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ScopeMappingRepresentation"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "clientScopes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ClientScopeRepresentation"
+            }
+          },
           "clients": {
             "type": [
               "array",
@@ -20991,6 +21015,24 @@
               "$ref": "#/components/schemas/ClientRepresentation"
             },
             "description": "Clients to import."
+          },
+          "defaultDefaultClientScopes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "defaultOptionalClientScopes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           },
           "groups": {
             "type": [
@@ -21034,6 +21076,15 @@
               }
             ]
           },
+          "scopeMappings": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ScopeMappingRepresentation"
+            }
+          },
           "users": {
             "type": [
               "array",
@@ -21042,7 +21093,7 @@
             "items": {
               "$ref": "#/components/schemas/UserRepresentation"
             },
-            "description": "Users to import. Credentials are never accepted here (see the endpoint\ndocumentation)."
+            "description": "Users to import. Keycloak password hashes are normalized and validated\nbefore any resource write; plaintext password values are rejected."
           }
         }
       },
@@ -21896,6 +21947,39 @@
             "format": "int32",
             "description": "RSA key size in bits (2048..=8192); ignored for EC/OKP algorithms.\nSymmetric (HMAC) algorithms are rejected outright.",
             "minimum": 0
+          }
+        }
+      },
+      "ScopeMappingRepresentation": {
+        "type": "object",
+        "description": "Realm-role mapping granted to a client or a client scope. In Keycloak's\n`clientScopeMappings` map, the outer key owns the client roles and `client`\nor `clientScope` identifies the receiving resource.",
+        "properties": {
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clientScope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clientTemplate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "roles": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
