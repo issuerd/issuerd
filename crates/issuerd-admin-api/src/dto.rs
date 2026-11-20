@@ -19,6 +19,19 @@ use issuerd_core::{
     SslRequired, ThemeName, User, UserId, UserSession, Username, WebOrigin,
 };
 
+fn deserialize_optional_json_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    value
+        .map(|value| match value {
+            serde_json::Value::String(text) => Ok(text),
+            other => serde_json::to_string(&other).map_err(serde::de::Error::custom),
+        })
+        .transpose()
+}
+
 // ---------------------------------------------------------------------------
 // Representations
 // ---------------------------------------------------------------------------
@@ -337,12 +350,24 @@ pub struct CredentialRepresentation {
     #[serde(rename = "type")]
     pub credential_type: CredentialType,
     /// Human-readable label shown to the user (e.g. "My laptop").
+    #[serde(alias = "userLabel")]
     pub user_label: Option<String>,
     /// Creation timestamp in milliseconds since the Unix epoch (Keycloak `createdDate`).
+    #[serde(alias = "createdDate")]
     pub created_date: Option<i64>,
     /// Encrypted or hashed secret data.
+    #[serde(
+        alias = "secretData",
+        default,
+        deserialize_with = "deserialize_optional_json_text"
+    )]
     pub secret_data: Option<String>,
     /// Additional credential metadata in JSON format.
+    #[serde(
+        alias = "credentialData",
+        default,
+        deserialize_with = "deserialize_optional_json_text"
+    )]
     pub credential_data: Option<String>,
     /// Priority order when multiple credentials of the same type exist.
     pub priority: Option<i32>,
@@ -2210,8 +2235,8 @@ pub struct PartialImportRepresentation {
         skip_serializing_if = "Option::is_none"
     )]
     pub if_resource_exists: Option<IfResourceExists>,
-    /// Users to import. Credentials are never accepted here (see the endpoint
-    /// documentation).
+    /// Users to import. Keycloak password hashes are normalized and validated
+    /// before any resource write; plaintext password values are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<UserRepresentation>>,
     /// Top-level groups to import.

@@ -51,19 +51,134 @@ fn conflict(resource: &str, name: &str) -> AdminApiError {
     ))
 }
 
-/// Import one user, matched by username.
-///
-/// Users are imported **without credentials**: the [`issuerd_core::User`] model
-/// carries no credential fields, so converting the representation drops
-/// `credentials` (and the `realm_roles`/`client_roles`/`groups` assignment
-/// lists, which stay the job of the role-mappings/groups endpoints) entirely.
-/// Realm default groups are intentionally not resolved — they belong to
-/// interactive user creation.
+fn is_imported_password_type(credential_type: &issuerd_core::CredentialType) -> bool {
+    matches!(credential_type, issuerd_core::CredentialType::Password)
+        || matches!(
+            credential_type,
+            issuerd_core::CredentialType::Custom(name)
+                if name == issuerd_auth_flow::built_in::PASSWORD_HISTORY_CREDENTIAL_TYPE
+        )
+}
+
+fn credential_json_field(value: Option<&str>) -> serde_json::Value {
+    value
+        .map(|value| {
+            serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn prepare_credential(
+    username: &str,
+    rep: &crate::dto::CredentialRepresentation,
+) -> Result<issuerd_core::Credential, AdminApiError> {
+    if rep.value.is_some() {
+        return Err(AdminApiError::BadRequest(format!(
+            "user '{username}': plaintext credential values are not accepted during migration"
+        )));
+    }
+    let created_date = rep
+        .created_date
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    if is_imported_password_type(&rep.credential_type) {
+        let secret = rep.secret_data.as_deref().ok_or_else(|| {
+            AdminApiError::BadRequest(format!(
+                "user '{username}': an imported password credential requires secretData"
+            ))
+        })?;
+        let normalized = if secret.starts_with('$') {
+            issuerd_auth_flow::password_hash::normalize_password_hash(secret)
+        } else {
+            issuerd_auth_flow::password_hash::normalize_keycloak_password(
+                &credential_json_field(rep.credential_data.as_deref()),
+                &credential_json_field(Some(secret)),
+            )
+        }
+        .map_err(|error| {
+            AdminApiError::BadRequest(format!(
+                "user '{username}': invalid imported password credential: {error}"
+            ))
+        })?;
+        let mut credential_data = normalized.credential_data;
+        if rep.temporary == Some(true) {
+            credential_data["temporary"] = serde_json::Value::Bool(true);
+        }
+        return Ok(issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(
+                rep.id.clone().unwrap_or_else(issuerd_core::utils::generate_id),
+            )?,
+            credential_type: rep.credential_type.clone(),
+            user_label: rep.user_label.clone(),
+            created_date,
+            secret_data: normalized.secret_data,
+            credential_data,
+            priority: rep.priority.unwrap_or(0),
+        });
+    }
+    let mut credential: issuerd_core::Credential = rep.clone().try_into()?;
+    credential.created_date = created_date;
+    Ok(credential)
+}
+
+fn prepare_user_import(
+    rep: &UserRepresentation,
+) -> Result<Option<Vec<issuerd_core::Credential>>, AdminApiError> {
+    rep.credentials
+        .as_deref()
+        .map(|credentials| {
+            credentials.iter().map(|cred| prepare_credential(&rep.username, cred)).collect()
+        })
+        .transpose()
+}
+
+async fn create_credentials(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    user_id: &issuerd_core::UserId,
+    credentials: Vec<issuerd_core::Credential>,
+) -> Result<(), AdminApiError> {
+    for credential in credentials {
+        state.storage.create_credential(realm_id, user_id, &credential).await?;
+    }
+    Ok(())
+}
+
+async fn replace_password_credentials(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    user_id: &issuerd_core::UserId,
+    credentials: Vec<issuerd_core::Credential>,
+) -> Result<(), AdminApiError> {
+    let existing = state.storage.list_credentials(realm_id, user_id).await?;
+    for credential in
+        existing.iter().filter(|cred| is_imported_password_type(&cred.credential_type))
+    {
+        state.storage.delete_credential(realm_id, user_id, &credential.id).await?;
+    }
+    for credential in credentials {
+        if !is_imported_password_type(&credential.credential_type)
+            && existing.iter().any(|old| {
+                old.id == credential.id && old.credential_type == credential.credential_type
+            })
+        {
+            state.storage.update_credential(realm_id, user_id, &credential).await?;
+        } else {
+            state.storage.create_credential(realm_id, user_id, &credential).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Import one user, matched by username. Credential parsing is completed by
+/// [`prepare_user_import`] before any resource in the document is written.
 async fn import_user(
     state: &Arc<AdminApiState>,
     realm_id: &issuerd_core::RealmId,
     strategy: IfResourceExists,
     rep: UserRepresentation,
+    credentials: Option<Vec<issuerd_core::Credential>>,
     summary: &mut PartialImportResultRepresentation,
 ) -> Result<(), AdminApiError> {
     let name = rep.username.clone();
@@ -73,6 +188,9 @@ async fn import_user(
             let mut user: issuerd_core::User = rep.try_into()?;
             user.realm_id = realm_id.clone();
             state.storage.create_user(realm_id, &user).await?;
+            if let Some(credentials) = credentials {
+                create_credentials(state, realm_id, &user.id, credentials).await?;
+            }
             record(summary, ResourceType::User, name, ImportAction::Added);
         }
         (Some(_), IfResourceExists::Fail) => return Err(conflict("user", &name)),
@@ -88,6 +206,9 @@ async fn import_user(
             updated.created_at = existing.created_at;
             updated.federation_link = existing.federation_link;
             state.storage.update_user(realm_id, &updated).await?;
+            if let Some(credentials) = credentials {
+                replace_password_credentials(state, realm_id, &updated.id, credentials).await?;
+            }
             record(summary, ResourceType::User, name, ImportAction::Updated);
         }
     }
@@ -305,7 +426,7 @@ async fn import_idp(
     path = "/admin/realms/{realm}/partialImport",
     tag = "Realms",
     summary = "Partially import realm resources",
-    description = "Imports users, groups, clients, roles, and identity providers from a realm-partial document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), groups by name, identity providers by alias. Users are imported WITHOUT credentials — credential fields in the document are ignored entirely and password hashes are never accepted through this endpoint; user role/group assignments and realm default groups are not applied. Groups are imported as top-level only (`sub_groups` is rejected). Requires `manage-realm` role.",
+    description = "Imports users, groups, clients, roles, and identity providers from a realm-partial document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), groups by name, identity providers by alias. When user `credentials` are present, every credential is validated before any resource write; supported Keycloak Argon2id/PBKDF2 password hashes are normalized and imported without a reset, plaintext password values are rejected, and OVERWRITE replaces only password/password-history credentials while preserving other credential types. Absent credentials preserve existing credentials. User role/group assignments and realm default groups are not applied. Groups are imported as top-level only (`sub_groups` is rejected). Requires `manage-realm` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         PartialImportParams
@@ -334,6 +455,13 @@ pub async fn partial_import(
     let realm_id = realm.id.clone();
     // The query parameter (Keycloak's spelling) wins over the body field.
     let strategy = params.if_resource_exists.or(body.if_resource_exists).unwrap_or_default();
+    let prepared_users = body
+        .users
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|rep| prepare_user_import(rep).map(|credentials| (rep.clone(), credentials)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut summary = PartialImportResultRepresentation {
         added: 0,
@@ -345,8 +473,8 @@ pub async fn partial_import(
     // roles (their owning clients must exist first), identity providers.
     // Under FAIL the first conflict aborts the run; resources imported before
     // it stay imported.
-    for rep in body.users.unwrap_or_default() {
-        import_user(&state, &realm_id, strategy, rep, &mut summary).await?;
+    for (rep, credentials) in prepared_users {
+        import_user(&state, &realm_id, strategy, rep, credentials, &mut summary).await?;
     }
     for rep in body.groups.unwrap_or_default() {
         import_group(&state, &realm_id, strategy, rep, &mut summary).await?;
@@ -1008,26 +1136,302 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn users_are_imported_without_credentials() {
+    async fn users_import_mixed_keycloak_credentials_without_plaintext() {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
         let state = manage_realm_state();
         let app = test_app(state.clone());
         let realm_id = master_realm_id();
+        let password = "correct horse battery staple";
+        let salt = SaltString::from_b64("a2V5Y2xvYWstc2FsdA").unwrap();
+        let argon2 = Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(7168, 5, 1, Some(32)).unwrap(),
+        );
+        let argon2_hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
+        let p256_current = "hsOJl3GhDYMSY6f/peJVng13yRqoAxMO43lSz7QOL3E";
+        let p512_current = "FENVvG2zqwkKUJN0i70N6PXF4rRKvd7Hv/P2Lvv086THElFQJfVPjeTdj4+DxfZ1ozzrmSLB1eOKVw2p001Ddw";
+        let p256_legacy = "R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let p256_data = serde_json::json!({"hashIterations": 600000, "algorithm": "pbkdf2-sha256"});
+        let p256_secret = serde_json::json!({"value": p256_current, "salt": "a2V5Y2xvYWstc2FsdA"});
+        let p512_data = serde_json::json!({"hashIterations": 210000, "algorithm": "pbkdf2-sha512"});
+        let p512_secret = serde_json::json!({"value": p512_current, "salt": "a2V5Y2xvYWstc2FsdA"});
+        let legacy_data =
+            serde_json::json!({"hashIterations": 27500, "algorithm": "pbkdf2-sha256"});
+        let legacy_secret = serde_json::json!({"value": p256_legacy, "salt": "a2V5Y2xvYWstc2FsdA"});
 
         let doc = serde_json::json!({
-            "users": [{
-                "username": "u1",
-                "credentials": [{
-                    "type": "password",
-                    "value": "plaintext-pw",
-                    "secret_data": "pretend-hash"
-                }]
-            }]
+            "users": [
+                {
+                    "username": "alice-argon2id",
+                    "credentials": [
+                        {"type": "password", "secretData": argon2_hash},
+                        {
+                            "type": "password-history",
+                            "credentialData": legacy_data,
+                            "secretData": legacy_secret
+                        }
+                    ]
+                },
+                {
+                    "username": "bob-p256-current",
+                    "credentials": [
+                        {
+                            "type": "password",
+                            "createdDate": 1700000000123i64,
+                            "credentialData": p256_data,
+                            "secretData": p256_secret
+                        },
+                        {"type": "totp", "secretData": {"value": "synthetic-totp"}}
+                    ]
+                },
+                {
+                    "username": "carol-p512-current",
+                    "credentials": [{
+                        "type": "password",
+                        "credentialData": p512_data.to_string(),
+                        "secretData": p512_secret.to_string()
+                    }]
+                },
+                {
+                    "username": "dave-p256-legacy",
+                    "credentials": [{
+                        "type": "password",
+                        "secretData": format!("$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA${p256_legacy}")
+                    }]
+                }
+            ]
         });
         let (status, body) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        let user = state.storage.get_user_by_username(&realm_id, "u1").await.unwrap().unwrap();
-        // No credential of any type was stored for the imported user.
-        assert!(state.storage.list_credentials(&realm_id, &user.id).await.unwrap().is_empty());
+        assert_eq!(body["added"], 4);
+
+        for username in [
+            "alice-argon2id",
+            "bob-p256-current",
+            "carol-p512-current",
+            "dave-p256-legacy",
+        ] {
+            let user =
+                state.storage.get_user_by_username(&realm_id, username).await.unwrap().unwrap();
+            let credentials = state
+                .storage
+                .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(credentials.len(), 1, "{username}");
+            assert_eq!(
+                issuerd_auth_flow::password_hash::verify_password(password, &credentials[0]),
+                issuerd_auth_flow::password_hash::PasswordVerification::Match,
+                "{username}"
+            );
+            assert_eq!(
+                issuerd_auth_flow::password_hash::verify_password("wrong", &credentials[0]),
+                issuerd_auth_flow::password_hash::PasswordVerification::NoMatch,
+                "{username}"
+            );
+            let metadata = credentials[0].credential_data.to_string();
+            assert!(!metadata.contains(p256_current));
+            assert!(!metadata.contains(p512_current));
+            assert!(!metadata.contains("a2V5Y2xvYWstc2FsdA"));
+        }
+
+        let alice = state
+            .storage
+            .get_user_by_username(&realm_id, "alice-argon2id")
+            .await
+            .unwrap()
+            .unwrap();
+        let history = state
+            .storage
+            .get_credentials(
+                &realm_id,
+                &alice.id,
+                issuerd_core::CredentialType::Custom("password-history".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let bob = state
+            .storage
+            .get_user_by_username(&realm_id, "bob-p256-current")
+            .await
+            .unwrap()
+            .unwrap();
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &bob.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords[0].created_date.timestamp_millis(), 1700000000123);
+        assert_eq!(
+            state
+                .storage
+                .get_credentials(&realm_id, &bob.id, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_credential_prevalidation_prevents_every_resource_write() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let canary = "raw-secret-canary";
+        let doc = serde_json::json!({
+            "users": [
+                {"username": "would-be-written"},
+                {
+                    "username": "invalid-credential",
+                    "credentials": [{
+                        "type": "password",
+                        "credentialData": {"algorithm": "pbkdf2-sha256", "hashIterations": 1},
+                        "secretData": {"value": canary, "salt": "a2V5Y2xvYWstc2FsdA"}
+                    }]
+                }
+            ]
+        });
+        let (status, body) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains(canary));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "would-be-written")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "invalid-credential")
+            .await
+            .unwrap()
+            .is_none());
+
+        let plaintext = serde_json::json!({
+            "users": [{
+                "username": "plaintext-user",
+                "credentials": [{"type": "password", "value": canary, "secretData": "not-a-hash"}]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(plaintext)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains(canary));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "plaintext-user")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_conflict_strategies_preserve_non_password_credentials() {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let user = seed_user(&state, &realm_id, "existing", None).await;
+        let salt = SaltString::from_b64("a2V5Y2xvYWstc2FsdA").unwrap();
+        let old_hash = Argon2::default().hash_password(b"old-password", &salt).unwrap().to_string();
+        let old_password = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("old-password").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: old_hash.into_bytes(),
+            credential_data: serde_json::json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &user.id, &old_password)
+            .await
+            .unwrap();
+        let totp = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("totp-1").unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"preserve-totp".to_vec(),
+            credential_data: serde_json::json!({"digits": 6}),
+            priority: 1,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &totp).await.unwrap();
+        let imported = serde_json::json!({
+            "users": [{
+                "username": "existing",
+                "credentials": [{
+                    "type": "password",
+                    "credentialData": {"algorithm": "pbkdf2-sha256", "hashIterations": 27500},
+                    "secretData": {
+                        "value": "R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE",
+                        "salt": "a2V5Y2xvYWstc2FsdA"
+                    }
+                }]
+            }]
+        });
+
+        let (status, _) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=SKIP",
+            Some(imported.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords, vec![old_password.clone()]);
+
+        let without_credentials = serde_json::json!({"users": [{"username": "existing"}]});
+        let (status, _) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(without_credentials),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords, vec![old_password]);
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(imported),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(
+            issuerd_auth_flow::password_hash::verify_password(
+                "correct horse battery staple",
+                &passwords[0]
+            ),
+            issuerd_auth_flow::password_hash::PasswordVerification::Match
+        );
+        let preserved_totp = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(preserved_totp, vec![totp]);
     }
 
     #[tokio::test]

@@ -2571,6 +2571,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_password_history_reuse_checks_imported_pbkdf2() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        realm.password_policy.history_size = 3;
+        state.storage.update_realm(&realm).await.unwrap();
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let uid = issuerd_core::UserId::new(&user_id).unwrap();
+        let imported = Credential {
+            id: issuerd_core::CredentialId::new("imported-pbkdf2").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$fZsA3lrhB3Lu++1OVC26KsBFQNHNEbwPfTA1tUW4dEg".to_vec(),
+            credential_data: serde_json::json!({
+                "hash_algorithm": "pbkdf2-sha256",
+                "hash_iterations": 27500
+            }),
+            priority: 1,
+        };
+        state.storage.create_credential(&realm_id, &uid, &imported).await.unwrap();
+
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"First!pass1"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let current = state
+            .storage
+            .get_credentials(&realm_id, &uid, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(current, vec![imported]);
+    }
+
+    #[tokio::test]
     async fn reset_password_temporary_adds_update_password_action() {
         let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
         let app = user_routes(state.clone());
