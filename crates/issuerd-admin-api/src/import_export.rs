@@ -200,7 +200,7 @@ async fn validate_credential_ids(
             .await?
         {
             for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
-                let id = uuid::Uuid::parse_str(&credential.id.to_string())
+                let id = uuid::Uuid::parse_str(credential.id.as_ref())
                     .map(|uuid| uuid.to_string())
                     .unwrap_or_else(|_| credential.id.to_string());
                 if existing
