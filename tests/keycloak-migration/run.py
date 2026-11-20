@@ -389,6 +389,9 @@ class Harness:
             ], secret_output=True).decode().splitlines()
             if "admin" not in users:
                 raise Failure("PostgreSQL provisioning did not create the master admin user")
+        self.refresh_target_admin_token()
+
+    def refresh_target_admin_token(self):
         _, body, _ = self.http(
             "POST",
             self.target_url("/api/v1/auth/admin-token"),
@@ -430,6 +433,16 @@ class Harness:
             raise second_error
 
     def admin(self, method, path, body=None, expected=(200,)):
+        response = self.http(
+            method,
+            self.target_url(path),
+            body=body,
+            token=self.target_token,
+            expected=expected + (401,),
+        )
+        if response[0] != 401:
+            return response
+        self.refresh_target_admin_token()
         return self.http(
             method,
             self.target_url(path),
@@ -1675,9 +1688,10 @@ def source_export_and_oracle(harness):
         "docker", "compose", "-p", harness.compose_project,
         "-f", str(harness.work / "compose.yaml"),
         "run", "--rm", "--no-deps",
+        "--user", "0:0",
         "-v", f"{export_dir}:/export",
         "keycloak", "export", "--dir", "/export", "--realm", REALM, "--users", "realm_file",
-    ], secret_output=True, timeout=600)
+    ], secret_output=False, timeout=600)
     export_path = export_dir / f"{REALM}-realm.json"
     raw = export_path.read_bytes()
     document = json.loads(raw)

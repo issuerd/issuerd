@@ -157,6 +157,7 @@ jobs:
             count=$((count + 1))
           done
           test "$count" -eq 5
+          mkdir -p tests/keycloak-migration
           tar -czf tests/keycloak-migration/keycloak-migration-evidence.tar.gz \
             -C keycloak-migration-bundle .
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
