@@ -63,6 +63,8 @@ mod jar_jarm_form_post;
 mod jwt_client_auth;
 #[path = "integration/key_encryption.rs"]
 mod key_encryption;
+#[path = "integration/keycloak_migration.rs"]
+mod keycloak_migration;
 #[path = "integration/logout_channels.rs"]
 mod logout_channels;
 #[path = "integration/mcp.rs"]

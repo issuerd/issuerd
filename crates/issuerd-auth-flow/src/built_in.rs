@@ -20,6 +20,7 @@ use crate::email_code::REALM_ATTR_EMAIL_CODE_LOGIN;
 use crate::login_failures::{
     federated_failure_identifier, otp_failure_config, LoginFailureConfig, LoginFailureTracker,
 };
+use crate::password_hash::{verify_password, PasswordVerification};
 
 // ---------------------------------------------------------------------------
 // Authenticators
@@ -214,20 +215,14 @@ impl UsernamePasswordAuthenticator {
         let mut matched = false;
         let mut verified_any = false;
         for cred in &creds {
-            let hash_str = match String::from_utf8(cred.secret_data.clone()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            // Non-argon2 PHC strings would fail Argon2 verification before
-            // any hashing; skip them so they count as "no hash" below.
-            let parsed = match PasswordHash::new(&hash_str) {
-                Ok(p) if argon2::Algorithm::try_from(p.algorithm).is_ok() => p,
-                _ => continue,
-            };
-            verified_any = true;
-            if Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() {
-                matched = true;
-                break;
+            match verify_password(password, cred) {
+                PasswordVerification::Match => {
+                    matched = true;
+                    verified_any = true;
+                    break;
+                }
+                PasswordVerification::NoMatch => verified_any = true,
+                PasswordVerification::Unsupported => {}
             }
         }
         if !verified_any {
@@ -1347,20 +1342,10 @@ impl issuerd_core::Authenticator for RegistrationAuthenticator {
 /// `password-history` credential type.
 pub const PASSWORD_HISTORY_CREDENTIAL_TYPE: &str = "password-history";
 
-/// Verify a candidate password against a stored credential's hash.
-///
-/// Only argon2id PHC strings are verified; unknown or foreign hash formats
-/// return `false` (they simply cannot match for history-reuse purposes).
+/// Verify a candidate password against a supported stored credential.
+/// Malformed and unsupported stored values cannot match.
 pub fn verify_password_hash(candidate: &str, cred: &Credential) -> bool {
-    let hash_str = match std::str::from_utf8(&cred.secret_data) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let parsed = match PasswordHash::new(hash_str) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    Argon2::default().verify_password(candidate.as_bytes(), &parsed).is_ok()
+    verify_password(candidate, cred) == PasswordVerification::Match
 }
 
 /// Set a user's password with password-history handling.
@@ -6062,7 +6047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_user_without_argon2_hash_runs_dummy_verify() {
+    async fn password_user_without_supported_hash_runs_dummy_verify() {
         let pbkdf2 = "$pbkdf2-sha256$i=27500$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo";
         assert!(PasswordHash::new(pbkdf2).is_ok(), "fixture must be a parseable PHC string");
         for secret in [
@@ -6083,6 +6068,27 @@ mod tests {
             assert_auth_failure(result, IssuerdError::InvalidGrant);
             assert_eq!(dummy, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn password_user_with_pbkdf2_hash_skips_dummy_verify() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let user = test_user();
+        storage.create_user(&user.realm_id, &user).await.unwrap();
+        let pbkdf2 =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let mut cred = password_cred(pbkdf2.as_bytes().to_vec());
+        cred.credential_data = json!({"hash_algorithm": "pbkdf2-sha256", "hash_iterations": 27500});
+        storage.create_credential(&user.realm_id, &user.id, &cred).await.unwrap();
+
+        let auth = UsernamePasswordAuthenticator::new(storage);
+        let (result, dummy) = login_counting_dummy_verifies(&auth, "alice", "wrong").await;
+        assert_auth_failure(result, IssuerdError::InvalidGrant);
+        assert_eq!(dummy, 0);
+        let (result, dummy) =
+            login_counting_dummy_verifies(&auth, "alice", "correct horse battery staple").await;
+        assert_auth_success(result);
+        assert_eq!(dummy, 0);
     }
 
     #[tokio::test]

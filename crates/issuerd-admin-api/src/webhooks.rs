@@ -541,6 +541,14 @@ mod tests {
     }
 
     #[test]
+    fn uuid_path_parameters_are_canonicalized() {
+        let upper = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+        let lower = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(subscription_id(upper).unwrap().as_ref(), lower);
+        assert_eq!(delivery_id(upper).unwrap().as_ref(), lower);
+    }
+
+    #[test]
     fn create_secret_is_required_write_only_and_non_nullable() {
         use utoipa::OpenApi;
 

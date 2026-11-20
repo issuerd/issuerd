@@ -6,26 +6,28 @@
 use crate::IssuerdError;
 use serde::{Deserialize, Serialize};
 
+fn canonicalize_identifier(id: String) -> String {
+    uuid::Uuid::parse_str(&id).map(|uuid| uuid.to_string()).unwrap_or(id)
+}
+
+fn preserve_identifier(id: String) -> String {
+    id
+}
+
 macro_rules! id_type {
     ($name:ident) => {
+        id_type!($name, canonicalize_identifier);
+    };
+    ($name:ident, $normalize:ident) => {
         #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            Hash,
-            Serialize,
-            Deserialize,
-            PartialOrd,
-            Ord,
-            utoipa::ToSchema,
+            Debug, Clone, PartialEq, Eq, Hash, Serialize, PartialOrd, Ord, utoipa::ToSchema,
         )]
         pub struct $name(pub String);
 
         impl $name {
             /// Create a new identifier, rejecting empty strings.
             pub fn new(id: impl Into<String>) -> Result<Self, IssuerdError> {
-                let s = id.into();
+                let s = $normalize(id.into());
                 if s.is_empty() {
                     Err(IssuerdError::InvalidRequest(format!(
                         "{} cannot be empty",
@@ -34,6 +36,16 @@ macro_rules! id_type {
                 } else {
                     Ok(Self(s))
                 }
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let id = <String as Deserialize>::deserialize(deserializer)?;
+                Ok(Self($normalize(id)))
             }
         }
 
@@ -79,7 +91,7 @@ id_type!(RealmId);
 id_type!(UserId);
 id_type!(ClientId);
 id_type!(SessionId);
-id_type!(KeyId);
+id_type!(KeyId, preserve_identifier);
 id_type!(EventId);
 id_type!(RoleId);
 id_type!(GroupId);
@@ -87,7 +99,7 @@ id_type!(IdentityProviderId);
 id_type!(CredentialId);
 id_type!(ClientSessionId);
 id_type!(FlowStageId);
-id_type!(JwtId);
+id_type!(JwtId, preserve_identifier);
 id_type!(ClientScopeId);
 id_type!(MapperId);
 id_type!(WebhookSubscriptionId);
@@ -208,5 +220,38 @@ mod tests {
     fn id_new_rejects_empty() {
         let err = RealmId::new("").unwrap_err();
         assert!(matches!(err, IssuerdError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn uuid_ids_are_canonicalized_but_legacy_strings_are_unchanged() {
+        let upper = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+        let lower = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(RealmId::new(upper).unwrap().0, lower);
+        assert_eq!(CredentialId::new(format!("{{{upper}}}")).unwrap().0, lower);
+        assert_eq!(UserId::new(format!("urn:uuid:{upper}")).unwrap().0, lower);
+        let decoded: CredentialId = serde_json::from_str(&format!("\"{upper}\"")).unwrap();
+        assert_eq!(decoded.0, lower);
+        assert_eq!(
+            std::collections::HashSet::from([
+                RealmId::new(upper).unwrap(),
+                RealmId::new(lower).unwrap(),
+            ])
+            .len(),
+            1
+        );
+        assert_eq!(RealmId::new("not-a-uuid").unwrap().0, "not-a-uuid");
+        let empty: RealmId = serde_json::from_str("\"\"").unwrap();
+        assert!(empty.0.is_empty());
+    }
+
+    #[test]
+    fn protocol_kid_and_jti_preserve_case() {
+        let upper = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+        assert_eq!(KeyId::new(upper).unwrap().0, upper);
+        assert_eq!(JwtId::new(upper).unwrap().0, upper);
+        let decoded: KeyId = serde_json::from_str(&format!("\"{upper}\"")).unwrap();
+        assert_eq!(decoded.0, upper);
+        let decoded: JwtId = serde_json::from_str(&format!("\"{upper}\"")).unwrap();
+        assert_eq!(decoded.0, upper);
     }
 }

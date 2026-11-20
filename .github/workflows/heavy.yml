@@ -2,14 +2,14 @@ name: Heavy suites
 
 # Heavy Docker-based suites that are too slow for per-commit CI (and skip
 # gracefully there): federation against real Samba AD DC + OpenLDAP, the
-# two-node cluster E2E, the Keycloak dual-target parity run, the OIDF
-# conformance suite (with the run reports uploaded as evidence artifacts),
-# and the release binary build (which embeds the web client). Runs nightly
-# at 03:17 UTC (off the top-of-hour herd), on manual trigger (Actions →
-# "Heavy suites" → Run workflow), and as a reusable workflow called by
-# release.yml on v* tag pushes — in that mode the jobs run inside the release
-# run, so the conformance evidence artifact lands where the release job can
-# attach it to the GitHub Release. Scheduled runs only fire on the default
+# two-node cluster E2E, the Keycloak dual-target parity run, the real-Keycloak
+# migration/backend matrix, the OIDF conformance suite, and the release binary
+# build (which embeds the web client). Runs nightly at 03:17 UTC (off the
+# top-of-hour herd), on manual trigger (Actions → "Heavy suites" → Run
+# workflow), and as a reusable workflow called by release.yml on v* tag pushes
+# — in that mode the jobs run inside the release run, so the sanitized evidence
+# artifacts land where the release job can attach them to the GitHub Release.
+# Scheduled runs only fire on the default
 # branch, and GitHub disables them after 60 days of repository inactivity.
 on:
   schedule:
@@ -93,6 +93,78 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.integration.yml down -v
+
+  keycloak-migration:
+    name: Keycloak 26.7.1 migration (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [in-memory, json-file, sqlite, postgres, postgres-redis]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: System dependencies (libgssapi, openssl)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config libclang-dev
+      - name: Real Keycloak export and migration acceptance
+        run: >
+          python3 tests/keycloak-migration/run.py
+          --backend ${{ matrix.backend }}
+          --evidence-dir tests/keycloak-migration/results/${{ matrix.backend }}
+      - name: Preserve missing-evidence diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          directory="tests/keycloak-migration/results/${{ matrix.backend }}"
+          if [ ! -d "$directory" ]; then
+            mkdir -p "$directory"
+            printf '%s\n' 'The migration harness exited before creating its evidence directory.' \
+              > "$directory/MISSING.txt"
+          fi
+      - name: Upload sanitized backend evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: keycloak-migration-evidence-${{ matrix.backend }}
+          path: tests/keycloak-migration/results/${{ matrix.backend }}/
+          retention-days: 30
+          if-no-files-found: error
+
+  keycloak-migration-evidence:
+    name: Pack Keycloak migration evidence
+    needs: keycloak-migration
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: keycloak-migration-evidence-*
+          path: keycloak-migration-parts
+      - name: Assemble the five-backend evidence bundle
+        run: |
+          set -euo pipefail
+          mkdir keycloak-migration-bundle
+          for part in keycloak-migration-parts/keycloak-migration-evidence-*; do
+            backend="${part##*keycloak-migration-evidence-}"
+            mkdir "keycloak-migration-bundle/$backend"
+            cp -a "$part"/. "keycloak-migration-bundle/$backend"/
+          done
+          count=0
+          for result in keycloak-migration-bundle/*/keycloak-migration-result.json; do
+            test -f "$result"
+            count=$((count + 1))
+          done
+          test "$count" -eq 5
+          tar -czf tests/keycloak-migration/keycloak-migration-evidence.tar.gz \
+            -C keycloak-migration-bundle .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: keycloak-migration-evidence
+          path: tests/keycloak-migration/keycloak-migration-evidence.tar.gz
+          retention-days: 30
+          if-no-files-found: error
 
   mcp-admin-rig:
     name: MCP admin external client rig

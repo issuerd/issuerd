@@ -3,10 +3,7 @@
 //
 // User management endpoints: CRUD, password reset, and role mappings.
 
-use argon2::{
-    password_hash::rand_core::OsRng, password_hash::PasswordHash, password_hash::SaltString,
-    Argon2, PasswordHasher, PasswordVerifier,
-};
+use argon2::{password_hash::rand_core::OsRng, password_hash::SaltString, Argon2, PasswordHasher};
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
@@ -638,20 +635,9 @@ pub async fn reset_password(
 /// flattened `IssuerdError`.
 const PASSWORD_HISTORY_CREDENTIAL_TYPE: &str = "password-history";
 
-/// Verify a candidate password against a stored credential's hash.
-///
-/// Only argon2id PHC strings are verified; unknown or foreign hash formats
-/// return `false` (they simply cannot match for history-reuse purposes).
 fn verify_password_hash(candidate: &str, cred: &Credential) -> bool {
-    let hash_str = match std::str::from_utf8(&cred.secret_data) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let parsed = match PasswordHash::new(hash_str) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    Argon2::default().verify_password(candidate.as_bytes(), &parsed).is_ok()
+    issuerd_auth_flow::password_hash::verify_password(candidate, cred)
+        == issuerd_auth_flow::password_hash::PasswordVerification::Match
 }
 
 /// Set a user's password with password-history handling.
@@ -2582,6 +2568,46 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.get("code").and_then(|c| c.as_str()) == Some("password_history")));
+    }
+
+    #[tokio::test]
+    async fn reset_password_history_reuse_checks_imported_pbkdf2() {
+        let state = test_state(vec![issuerd_core::RoleName::new("manage-users").unwrap()]);
+        let app = user_routes(state.clone());
+        let (realm_name, user_id) = create_test_realm_and_user(&state).await;
+        let mut realm = state.storage.get_realm_by_name(&realm_name).await.unwrap().unwrap();
+        realm.password_policy.history_size = 3;
+        state.storage.update_realm(&realm).await.unwrap();
+        let realm_id = issuerd_core::RealmId::new("realm-1").unwrap();
+        let uid = issuerd_core::UserId::new(&user_id).unwrap();
+        let imported = Credential {
+            id: issuerd_core::CredentialId::new("imported-pbkdf2").unwrap(),
+            credential_type: CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$fZsA3lrhB3Lu++1OVC26KsBFQNHNEbwPfTA1tUW4dEg".to_vec(),
+            credential_data: serde_json::json!({
+                "hash_algorithm": "pbkdf2-sha256",
+                "hash_iterations": 27500
+            }),
+            priority: 1,
+        };
+        state.storage.create_credential(&realm_id, &uid, &imported).await.unwrap();
+
+        let response = do_reset_password(
+            &app,
+            &realm_name,
+            &user_id,
+            r#"{"type":"password","value":"First!pass1"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let current = state
+            .storage
+            .get_credentials(&realm_id, &uid, CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(current, vec![imported]);
     }
 
     #[tokio::test]

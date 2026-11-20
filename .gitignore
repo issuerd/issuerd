@@ -55,6 +55,7 @@ tests/mcp-conformance/node_modules/
 # Perf rig artifacts (tests/perf)
 /tests/perf/results/
 /tests/perf/keycloak/realm-perf.json
+/tests/keycloak-migration/results/
 
 # Python
 __pycache__/

@@ -51,19 +51,257 @@ fn conflict(resource: &str, name: &str) -> AdminApiError {
     ))
 }
 
-/// Import one user, matched by username.
-///
-/// Users are imported **without credentials**: the [`issuerd_core::User`] model
-/// carries no credential fields, so converting the representation drops
-/// `credentials` (and the `realm_roles`/`client_roles`/`groups` assignment
-/// lists, which stay the job of the role-mappings/groups endpoints) entirely.
-/// Realm default groups are intentionally not resolved — they belong to
-/// interactive user creation.
+fn is_imported_password_type(credential_type: &issuerd_core::CredentialType) -> bool {
+    matches!(credential_type, issuerd_core::CredentialType::Password)
+        || matches!(
+            credential_type,
+            issuerd_core::CredentialType::Custom(name)
+                if name == issuerd_auth_flow::built_in::PASSWORD_HISTORY_CREDENTIAL_TYPE
+        )
+}
+
+fn password_credential_uuid(username: &str, id: &str) -> Result<uuid::Uuid, AdminApiError> {
+    uuid::Uuid::parse_str(id).map_err(|_| {
+        AdminApiError::BadRequest(format!(
+            "user '{username}': imported password credential id must be a UUID"
+        ))
+    })
+}
+
+fn credential_json_field(value: Option<&str>) -> serde_json::Value {
+    value
+        .map(|value| {
+            serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn prepare_credential(
+    username: &str,
+    rep: &crate::dto::CredentialRepresentation,
+) -> Result<issuerd_core::Credential, AdminApiError> {
+    if rep.value.is_some() {
+        return Err(AdminApiError::BadRequest(format!(
+            "user '{username}': plaintext credential values are not accepted during migration"
+        )));
+    }
+    let created_date = rep
+        .created_date
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    if is_imported_password_type(&rep.credential_type) {
+        let id = match rep.id.as_deref() {
+            Some(id) => password_credential_uuid(username, id)?.to_string(),
+            None => issuerd_core::utils::generate_id(),
+        };
+        let secret = rep.secret_data.as_deref().ok_or_else(|| {
+            AdminApiError::BadRequest(format!(
+                "user '{username}': an imported password credential requires secretData"
+            ))
+        })?;
+        let normalized = if secret.starts_with('$') {
+            issuerd_auth_flow::password_hash::normalize_password_hash(secret)
+        } else {
+            issuerd_auth_flow::password_hash::normalize_keycloak_password(
+                &credential_json_field(rep.credential_data.as_deref()),
+                &credential_json_field(Some(secret)),
+            )
+        }
+        .map_err(|error| {
+            AdminApiError::BadRequest(format!(
+                "user '{username}': invalid imported password credential: {error}"
+            ))
+        })?;
+        let mut credential_data = normalized.credential_data;
+        if rep.temporary == Some(true) {
+            credential_data["temporary"] = serde_json::Value::Bool(true);
+        }
+        return Ok(issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new(id)?,
+            credential_type: rep.credential_type.clone(),
+            user_label: rep.user_label.clone(),
+            created_date,
+            secret_data: normalized.secret_data,
+            credential_data,
+            priority: rep.priority.unwrap_or(0),
+        });
+    }
+    let mut credential: issuerd_core::Credential = rep.clone().try_into()?;
+    credential.created_date = created_date;
+    Ok(credential)
+}
+
+fn prepare_user_import(
+    rep: &UserRepresentation,
+) -> Result<Option<Vec<issuerd_core::Credential>>, AdminApiError> {
+    rep.credentials
+        .as_deref()
+        .map(|credentials| {
+            credentials.iter().map(|cred| prepare_credential(&rep.username, cred)).collect()
+        })
+        .transpose()
+}
+
+async fn validate_credential_ids(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    body: &PartialImportRepresentation,
+    strategy: IfResourceExists,
+) -> Result<(), AdminApiError> {
+    let mut document_owners = HashMap::new();
+    for rep in body.users.as_deref().unwrap_or_default() {
+        for credential in rep.credentials.as_deref().unwrap_or_default() {
+            let Some(raw_id) = credential.id.as_deref() else {
+                continue;
+            };
+            let id = if is_imported_password_type(&credential.credential_type) {
+                password_credential_uuid(&rep.username, raw_id)?.to_string()
+            } else {
+                uuid::Uuid::parse_str(raw_id)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| raw_id.to_string())
+            };
+            if let Some(owner) = document_owners.insert(id.clone(), rep.username.as_str()) {
+                let message = if owner == rep.username {
+                    format!("user '{}': duplicate credential id '{id}'", rep.username)
+                } else {
+                    format!(
+                        "credential id '{id}' is duplicated in users '{owner}' and '{}'",
+                        rep.username
+                    )
+                };
+                return Err(AdminApiError::BadRequest(message));
+            }
+        }
+    }
+    if document_owners.is_empty() {
+        return Ok(());
+    }
+    let mut existing = HashMap::new();
+    for existing_realm in state
+        .storage
+        .list_realms(&Pagination {
+            first: 0,
+            max: i32::MAX,
+        })
+        .await?
+    {
+        for user in state
+            .storage
+            .list_users(
+                &existing_realm.id,
+                "",
+                &Pagination {
+                    first: 0,
+                    max: i32::MAX,
+                },
+            )
+            .await?
+        {
+            for credential in state.storage.list_credentials(&existing_realm.id, &user.id).await? {
+                let id = uuid::Uuid::parse_str(credential.id.as_ref())
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| credential.id.to_string());
+                if existing
+                    .insert(
+                        id.clone(),
+                        (
+                            existing_realm.id.clone(),
+                            existing_realm.name.to_string(),
+                            user.username.clone(),
+                            credential.credential_type,
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "duplicate existing credential id '{id}' in target storage"
+                    )));
+                }
+            }
+        }
+    }
+    for rep in body.users.as_deref().unwrap_or_default() {
+        for credential in rep.credentials.as_deref().unwrap_or_default() {
+            let Some(raw_id) = credential.id.as_deref() else {
+                continue;
+            };
+            let id = if is_imported_password_type(&credential.credential_type) {
+                password_credential_uuid(&rep.username, raw_id)?.to_string()
+            } else {
+                uuid::Uuid::parse_str(raw_id)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| raw_id.to_string())
+            };
+            let Some((owner_realm, realm_name, owner, existing_type)) = existing.get(&id) else {
+                continue;
+            };
+            if owner_realm != realm_id || owner.as_str() != rep.username {
+                return Err(AdminApiError::BadRequest(format!(
+                    "credential id '{id}' already belongs to user '{owner}' in realm '{realm_name}'"
+                )));
+            }
+            if strategy == IfResourceExists::Overwrite
+                && !is_imported_password_type(existing_type)
+                && existing_type != &credential.credential_type
+            {
+                return Err(AdminApiError::BadRequest(format!(
+                    "user '{}': credential id '{id}' has an incompatible existing type",
+                    rep.username
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn create_credentials(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    user_id: &issuerd_core::UserId,
+    credentials: Vec<issuerd_core::Credential>,
+) -> Result<(), AdminApiError> {
+    for credential in credentials {
+        state.storage.create_credential(realm_id, user_id, &credential).await?;
+    }
+    Ok(())
+}
+
+async fn replace_password_credentials(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    user_id: &issuerd_core::UserId,
+    credentials: Vec<issuerd_core::Credential>,
+) -> Result<(), AdminApiError> {
+    let existing = state.storage.list_credentials(realm_id, user_id).await?;
+    for credential in
+        existing.iter().filter(|cred| is_imported_password_type(&cred.credential_type))
+    {
+        state.storage.delete_credential(realm_id, user_id, &credential.id).await?;
+    }
+    for credential in credentials {
+        if !is_imported_password_type(&credential.credential_type)
+            && existing.iter().any(|old| {
+                old.id == credential.id && old.credential_type == credential.credential_type
+            })
+        {
+            state.storage.update_credential(realm_id, user_id, &credential).await?;
+        } else {
+            state.storage.create_credential(realm_id, user_id, &credential).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Import one user, matched by username. Credential parsing is completed by
+/// [`prepare_user_import`] before any resource in the document is written.
 async fn import_user(
     state: &Arc<AdminApiState>,
     realm_id: &issuerd_core::RealmId,
     strategy: IfResourceExists,
     rep: UserRepresentation,
+    credentials: Option<Vec<issuerd_core::Credential>>,
     summary: &mut PartialImportResultRepresentation,
 ) -> Result<(), AdminApiError> {
     let name = rep.username.clone();
@@ -73,6 +311,9 @@ async fn import_user(
             let mut user: issuerd_core::User = rep.try_into()?;
             user.realm_id = realm_id.clone();
             state.storage.create_user(realm_id, &user).await?;
+            if let Some(credentials) = credentials {
+                create_credentials(state, realm_id, &user.id, credentials).await?;
+            }
             record(summary, ResourceType::User, name, ImportAction::Added);
         }
         (Some(_), IfResourceExists::Fail) => return Err(conflict("user", &name)),
@@ -88,6 +329,9 @@ async fn import_user(
             updated.created_at = existing.created_at;
             updated.federation_link = existing.federation_link;
             state.storage.update_user(realm_id, &updated).await?;
+            if let Some(credentials) = credentials {
+                replace_password_credentials(state, realm_id, &updated.id, credentials).await?;
+            }
             record(summary, ResourceType::User, name, ImportAction::Updated);
         }
     }
@@ -117,9 +361,11 @@ async fn import_group(
             group.realm_id = realm_id.clone();
             // Imports create top-level groups only; the path is derived from
             // the name (a document path like "/parent/child" would lie about
-            // the stored hierarchy).
+            // the stored hierarchy). Role ownership is resolved in the second pass.
             group.parent_id = None;
             group.path = issuerd_core::GroupPath::new(format!("/{}", group.name))?;
+            group.realm_roles.clear();
+            group.client_roles.clear();
             state.storage.create_group(realm_id, &group).await?;
             record(summary, ResourceType::Group, name, ImportAction::Added);
         }
@@ -128,10 +374,8 @@ async fn import_group(
             record(summary, ResourceType::Group, name, ImportAction::Skipped);
         }
         (Some(existing), IfResourceExists::Overwrite) => {
-            // Same omitted-means-keep rules as `PUT /groups/{id}`; import
-            // never re-parents or re-paths an existing group.
-            let keep_realm_roles = rep.realm_roles.is_none();
-            let keep_client_roles = rep.client_roles.is_none();
+            // Import never re-parents or re-paths an existing group. Role
+            // assignments are restored after all clients and roles exist.
             let keep_attributes = rep.attributes.is_none();
             let mut updated: issuerd_core::Group = rep.try_into()?;
             updated.id = existing.id;
@@ -139,12 +383,8 @@ async fn import_group(
             updated.parent_id = existing.parent_id;
             updated.path = existing.path;
             updated.sub_groups = existing.sub_groups;
-            if keep_realm_roles {
-                updated.realm_roles = existing.realm_roles;
-            }
-            if keep_client_roles {
-                updated.client_roles = existing.client_roles;
-            }
+            updated.realm_roles = existing.realm_roles;
+            updated.client_roles = existing.client_roles;
             if keep_attributes {
                 updated.attributes = existing.attributes;
             }
@@ -219,7 +459,6 @@ async fn import_role(
         Some(c) => format!("{}/{}", c.client_id, rep.name),
         None => rep.name.clone(),
     };
-    let keep_composites = rep.composites.is_none();
     let keep_attributes = rep.attributes.is_none();
     let existing = match client {
         Some(c) => state.storage.get_client_role_by_name(realm_id, &c.id, &rep.name).await?,
@@ -238,6 +477,8 @@ async fn import_role(
             role.realm_id = realm_id.clone();
             role.client_role = client.is_some();
             role.client_id = client.map(|c| c.id.clone());
+            role.composite = false;
+            role.composites.clear();
             state.storage.create_role(realm_id, &role).await?;
             record(summary, ResourceType::Role, resource_name, ImportAction::Added);
         }
@@ -246,21 +487,279 @@ async fn import_role(
             record(summary, ResourceType::Role, resource_name, ImportAction::Skipped);
         }
         (Some(existing), IfResourceExists::Overwrite) => {
-            // Same omitted-means-keep rules as the role update endpoints;
-            // the owning container (realm vs client) is never reassigned.
+            // The owning container is never reassigned. Composite references
+            // are resolved in the second pass after every role exists.
             let mut updated: issuerd_core::Role = rep.try_into()?;
             updated.id = existing.id;
             updated.realm_id = existing.realm_id;
             updated.client_role = existing.client_role;
             updated.client_id = existing.client_id;
-            if keep_composites {
-                updated.composites = existing.composites;
-            }
+            updated.composite = existing.composite;
+            updated.composites = existing.composites;
             if keep_attributes {
                 updated.attributes = existing.attributes;
             }
             state.storage.update_role(realm_id, &updated).await?;
             record(summary, ResourceType::Role, resource_name, ImportAction::Updated);
+        }
+    }
+    Ok(())
+}
+
+async fn validate_client_scope_document(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    body: &PartialImportRepresentation,
+) -> Result<(), AdminApiError> {
+    let existing = state
+        .storage
+        .list_client_scopes(
+            realm_id,
+            &Pagination {
+                first: 0,
+                max: i32::MAX,
+            },
+        )
+        .await?;
+    let mut available: std::collections::HashSet<String> =
+        existing.into_iter().map(|scope| scope.name).collect();
+    available.insert("openid".to_string());
+    let mut document_names = std::collections::HashSet::new();
+    for scope in body.client_scopes.as_deref().unwrap_or_default() {
+        if scope.name.trim().is_empty() {
+            return Err(AdminApiError::BadRequest("client scope name is required".to_string()));
+        }
+        if !document_names.insert(scope.name.clone()) {
+            return Err(AdminApiError::BadRequest(format!(
+                "duplicate client scope '{}' in the import document",
+                scope.name
+            )));
+        }
+        available.insert(scope.name.clone());
+        let converted: issuerd_core::ClientScope = scope.clone().try_into().map_err(|error| {
+            AdminApiError::BadRequest(format!("client scope '{}': {error}", scope.name))
+        })?;
+        let mut mapper_names = std::collections::HashSet::new();
+        for mapper in converted.protocol_mappers {
+            if !mapper_names.insert(mapper.name.clone()) {
+                return Err(AdminApiError::BadRequest(format!(
+                    "client scope '{}': duplicate protocol mapper '{}'",
+                    scope.name, mapper.name
+                )));
+            }
+        }
+    }
+
+    fn validate_names(
+        available: &std::collections::HashSet<String>,
+        owner: &str,
+        default: Option<&Vec<String>>,
+        optional: Option<&Vec<String>>,
+    ) -> Result<(), AdminApiError> {
+        let mut seen = std::collections::HashSet::new();
+        for (kind, names) in [("default", default), ("optional", optional)] {
+            for name in names.into_iter().flatten() {
+                if !seen.insert(name.clone()) {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "{owner}: duplicate or overlapping client scope reference '{name}'"
+                    )));
+                }
+                if !available.contains(name) {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "{owner}: references unknown {kind} client scope '{name}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    for client in body.clients.as_deref().unwrap_or_default() {
+        validate_names(
+            &available,
+            &format!("client '{}'", client.client_id),
+            client.default_scopes.as_ref(),
+            client.optional_scopes.as_ref(),
+        )?;
+        let converted: issuerd_core::Client = client.clone().try_into().map_err(|error| {
+            AdminApiError::BadRequest(format!("client '{}': {error}", client.client_id))
+        })?;
+        issuerd_core::validate_no_default_mcp_scopes(
+            converted.default_scopes.as_slice(),
+            state.mcp_enabled,
+        )?;
+    }
+    validate_names(
+        &available,
+        "realm defaults",
+        body.default_default_client_scopes.as_ref(),
+        body.default_optional_client_scopes.as_ref(),
+    )?;
+    if let Some(default_scopes) = body.default_default_client_scopes.as_deref() {
+        issuerd_core::validate_no_default_mcp_scopes(default_scopes, state.mcp_enabled)?;
+    }
+    Ok(())
+}
+
+/// Import one client scope, matched by name.
+async fn import_client_scope(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    strategy: IfResourceExists,
+    rep: ClientScopeRepresentation,
+    summary: &mut PartialImportResultRepresentation,
+) -> Result<(), AdminApiError> {
+    let name = rep.name.clone();
+    let existing = state.storage.get_client_scope_by_name(realm_id, &rep.name).await?;
+    match (existing, strategy) {
+        (None, _) => {
+            let mut scope: issuerd_core::ClientScope = rep.try_into()?;
+            scope.realm_id = realm_id.clone();
+            state.storage.create_client_scope(realm_id, &scope).await?;
+            record(summary, ResourceType::ClientScope, name, ImportAction::Added);
+        }
+        (Some(_), IfResourceExists::Fail) => return Err(conflict("client scope", &name)),
+        (Some(_), IfResourceExists::Skip) => {
+            record(summary, ResourceType::ClientScope, name, ImportAction::Skipped);
+        }
+        (Some(existing), IfResourceExists::Overwrite) => {
+            let keep_mappers = rep.protocol_mappers.is_none();
+            let keep_attributes = rep.attributes.is_none();
+            let keep_protocol = rep.protocol.is_none();
+            let mut updated: issuerd_core::ClientScope = rep.try_into()?;
+            updated.id = existing.id;
+            updated.realm_id = existing.realm_id;
+            updated.scope_mappings = existing.scope_mappings;
+            if keep_mappers {
+                updated.protocol_mappers = existing.protocol_mappers;
+            }
+            if keep_attributes {
+                updated.attributes = existing.attributes;
+            }
+            if keep_protocol {
+                updated.protocol = existing.protocol;
+            }
+            state.storage.update_client_scope(realm_id, &updated).await?;
+            record(summary, ResourceType::ClientScope, name, ImportAction::Updated);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resource_was_skipped(
+    summary: &PartialImportResultRepresentation,
+    resource_type: ResourceType,
+    name: &str,
+) -> bool {
+    summary.results.iter().any(|result| {
+        result.resource_type == resource_type
+            && result.resource_name == name
+            && result.action == ImportAction::Skipped
+    })
+}
+
+async fn restore_client_scope_assignments(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    clients: &[ClientRepresentation],
+    summary: &PartialImportResultRepresentation,
+) -> Result<(), AdminApiError> {
+    for rep in clients {
+        if resource_was_skipped(summary, ResourceType::Client, &rep.client_id)
+            || (rep.default_scopes.is_none() && rep.optional_scopes.is_none())
+        {
+            continue;
+        }
+        let identifier = issuerd_core::ClientIdentifier::new(rep.client_id.clone())?;
+        let client =
+            state.storage.get_client_by_client_id(realm_id, &identifier).await?.ok_or_else(
+                || {
+                    AdminApiError::BadRequest(format!(
+                        "client scope assignment references unknown client '{}'",
+                        rep.client_id
+                    ))
+                },
+            )?;
+        let current = state.storage.list_client_scope_assignments(realm_id, &client.id).await?;
+        for (scope_id, is_default) in current {
+            let scope =
+                state.storage.get_client_scope(realm_id, &scope_id).await?.ok_or_else(|| {
+                    AdminApiError::BadRequest(
+                        "stored client scope assignment is dangling".to_string(),
+                    )
+                })?;
+            let desired = if is_default {
+                &rep.default_scopes
+            } else {
+                &rep.optional_scopes
+            };
+            if desired.as_ref().is_some_and(|names| !names.contains(&scope.name)) {
+                state.storage.unassign_client_scope(realm_id, &client.id, &scope_id).await?;
+            }
+        }
+        for (is_default, names) in [
+            (true, rep.default_scopes.as_ref()),
+            (false, rep.optional_scopes.as_ref()),
+        ] {
+            for name in names.into_iter().flatten() {
+                if name == "openid" {
+                    continue;
+                }
+                let scope =
+                    state.storage.get_client_scope_by_name(realm_id, name).await?.ok_or_else(
+                        || {
+                            AdminApiError::BadRequest(format!(
+                                "client '{}': references unknown client scope '{name}'",
+                                rep.client_id
+                            ))
+                        },
+                    )?;
+                state
+                    .storage
+                    .assign_client_scope(realm_id, &client.id, &scope.id, is_default)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn restore_realm_default_scopes(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    default: Option<&Vec<String>>,
+    optional: Option<&Vec<String>>,
+) -> Result<(), AdminApiError> {
+    if default.is_none() && optional.is_none() {
+        return Ok(());
+    }
+    for (scope_id, is_default) in state.storage.list_realm_default_client_scopes(realm_id).await? {
+        let scope =
+            state.storage.get_client_scope(realm_id, &scope_id).await?.ok_or_else(|| {
+                AdminApiError::BadRequest(
+                    "stored realm default scope assignment is dangling".to_string(),
+                )
+            })?;
+        let desired = if is_default { default } else { optional };
+        if desired.is_some_and(|names| !names.contains(&scope.name)) {
+            state.storage.remove_realm_default_client_scope(realm_id, &scope_id).await?;
+        }
+    }
+    for (is_default, names) in [(true, default), (false, optional)] {
+        for name in names.into_iter().flatten() {
+            if name == "openid" {
+                continue;
+            }
+            let scope =
+                state.storage.get_client_scope_by_name(realm_id, name).await?.ok_or_else(|| {
+                    AdminApiError::BadRequest(format!(
+                        "realm defaults reference unknown client scope '{name}'"
+                    ))
+                })?;
+            state
+                .storage
+                .add_realm_default_client_scope(realm_id, &scope.id, is_default)
+                .await?;
         }
     }
     Ok(())
@@ -305,7 +804,7 @@ async fn import_idp(
     path = "/admin/realms/{realm}/partialImport",
     tag = "Realms",
     summary = "Partially import realm resources",
-    description = "Imports users, groups, clients, roles, and identity providers from a realm-partial document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), groups by name, identity providers by alias. Users are imported WITHOUT credentials — credential fields in the document are ignored entirely and password hashes are never accepted through this endpoint; user role/group assignments and realm default groups are not applied. Groups are imported as top-level only (`sub_groups` is rejected). Requires `manage-realm` role.",
+    description = "Imports users, groups, clients, roles, client scopes, scope mappings, user assignments, and identity providers from a realm-partial or full Keycloak export document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources and their assignments untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching is name-based: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), client scopes by name, groups by name, and identity providers by alias. Credentials, scope references, role mappings, and composite references are validated before any resource write. Supported Keycloak Argon2id/PBKDF2 password hashes are normalized and imported without a reset; plaintext migration passwords are rejected. OVERWRITE replaces only password/password-history credentials while preserving other credential types. Default/optional client scopes, realm/client role scope mappings, user role/group assignments, group roles, and composite roles are restored in second passes after the catalogs exist. Groups are top-level only (`sub_groups`/`subGroups` is rejected). Requires `manage-realm` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         PartialImportParams
@@ -327,13 +826,24 @@ pub async fn partial_import(
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path(realm): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PartialImportParams>,
-    Json(body): Json<PartialImportRepresentation>,
+    Json(body): Json<crate::keycloak_import::KeycloakImportRepresentation>,
 ) -> Result<Json<PartialImportResultRepresentation>, AdminApiError> {
     require_roles(&auth, &["manage-realm"])?;
+    let body = body.into_partial(&state.base_url)?;
     let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let realm_id = realm.id.clone();
     // The query parameter (Keycloak's spelling) wins over the body field.
     let strategy = params.if_resource_exists.or(body.if_resource_exists).unwrap_or_default();
+    validate_client_scope_document(&state, &realm_id, &body).await?;
+    crate::migration::validate_references(&state, &realm_id, &body).await?;
+    validate_credential_ids(&state, &realm_id, &body, strategy).await?;
+    let prepared_users = body
+        .users
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|rep| prepare_user_import(rep).map(|credentials| (rep.clone(), credentials)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut summary = PartialImportResultRepresentation {
         added: 0,
@@ -345,16 +855,16 @@ pub async fn partial_import(
     // roles (their owning clients must exist first), identity providers.
     // Under FAIL the first conflict aborts the run; resources imported before
     // it stay imported.
-    for rep in body.users.unwrap_or_default() {
-        import_user(&state, &realm_id, strategy, rep, &mut summary).await?;
+    for (rep, credentials) in prepared_users {
+        import_user(&state, &realm_id, strategy, rep, credentials, &mut summary).await?;
     }
-    for rep in body.groups.unwrap_or_default() {
+    for rep in body.groups.clone().unwrap_or_default() {
         import_group(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
-    for rep in body.clients.unwrap_or_default() {
+    for rep in body.clients.clone().unwrap_or_default() {
         import_client(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
-    if let Some(roles) = body.roles {
+    if let Some(roles) = body.roles.clone() {
         for rep in roles.realm.unwrap_or_default() {
             import_role(&state, &realm_id, strategy, None, rep, &mut summary).await?;
         }
@@ -374,7 +884,25 @@ pub async fn partial_import(
             }
         }
     }
-    for rep in body.identity_providers.unwrap_or_default() {
+    for rep in body.client_scopes.clone().unwrap_or_default() {
+        import_client_scope(&state, &realm_id, strategy, rep, &mut summary).await?;
+    }
+    restore_client_scope_assignments(
+        &state,
+        &realm_id,
+        body.clients.as_deref().unwrap_or_default(),
+        &summary,
+    )
+    .await?;
+    restore_realm_default_scopes(
+        &state,
+        &realm_id,
+        body.default_default_client_scopes.as_ref(),
+        body.default_optional_client_scopes.as_ref(),
+    )
+    .await?;
+    crate::migration::restore_mappings(&state, &realm_id, &body, &summary).await?;
+    for rep in body.identity_providers.clone().unwrap_or_default() {
         import_idp(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
 
@@ -1008,26 +1536,1074 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn users_are_imported_without_credentials() {
+    async fn users_import_mixed_keycloak_credentials_without_plaintext() {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
         let state = manage_realm_state();
         let app = test_app(state.clone());
         let realm_id = master_realm_id();
+        let password = "correct horse battery staple";
+        let salt = SaltString::from_b64("a2V5Y2xvYWstc2FsdA").unwrap();
+        let argon2 = Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(7168, 5, 1, Some(32)).unwrap(),
+        );
+        let argon2_hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
+        let p256_current = "hsOJl3GhDYMSY6f/peJVng13yRqoAxMO43lSz7QOL3E";
+        let p512_current = "FENVvG2zqwkKUJN0i70N6PXF4rRKvd7Hv/P2Lvv086THElFQJfVPjeTdj4+DxfZ1ozzrmSLB1eOKVw2p001Ddw";
+        let p256_legacy = "R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let p256_data = serde_json::json!({"hashIterations": 600000, "algorithm": "pbkdf2-sha256"});
+        let p256_secret = serde_json::json!({"value": p256_current, "salt": "a2V5Y2xvYWstc2FsdA"});
+        let p512_data = serde_json::json!({"hashIterations": 210000, "algorithm": "pbkdf2-sha512"});
+        let p512_secret = serde_json::json!({"value": p512_current, "salt": "a2V5Y2xvYWstc2FsdA"});
+        let legacy_data =
+            serde_json::json!({"hashIterations": 27500, "algorithm": "pbkdf2-sha256"});
+        let legacy_secret = serde_json::json!({"value": p256_legacy, "salt": "a2V5Y2xvYWstc2FsdA"});
 
         let doc = serde_json::json!({
-            "users": [{
-                "username": "u1",
-                "credentials": [{
-                    "type": "password",
-                    "value": "plaintext-pw",
-                    "secret_data": "pretend-hash"
-                }]
-            }]
+            "users": [
+                {
+                    "username": "alice-argon2id",
+                    "credentials": [
+                        {"type": "password", "secretData": argon2_hash},
+                        {
+                            "type": "password-history",
+                            "credentialData": legacy_data,
+                            "secretData": legacy_secret
+                        }
+                    ]
+                },
+                {
+                    "username": "bob-p256-current",
+                    "credentials": [
+                        {
+                            "type": "password",
+                            "createdDate": 1700000000123i64,
+                            "credentialData": p256_data,
+                            "secretData": p256_secret
+                        },
+                        {"type": "totp", "secretData": {"value": "synthetic-totp"}}
+                    ]
+                },
+                {
+                    "username": "carol-p512-current",
+                    "credentials": [{
+                        "type": "password",
+                        "credentialData": p512_data.to_string(),
+                        "secretData": p512_secret.to_string()
+                    }]
+                },
+                {
+                    "username": "dave-p256-legacy",
+                    "credentials": [{
+                        "type": "password",
+                        "secretData": format!("$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA${p256_legacy}")
+                    }]
+                }
+            ]
         });
         let (status, body) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        let user = state.storage.get_user_by_username(&realm_id, "u1").await.unwrap().unwrap();
-        // No credential of any type was stored for the imported user.
-        assert!(state.storage.list_credentials(&realm_id, &user.id).await.unwrap().is_empty());
+        assert_eq!(body["added"], 4);
+
+        for username in [
+            "alice-argon2id",
+            "bob-p256-current",
+            "carol-p512-current",
+            "dave-p256-legacy",
+        ] {
+            let user =
+                state.storage.get_user_by_username(&realm_id, username).await.unwrap().unwrap();
+            let credentials = state
+                .storage
+                .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+                .await
+                .unwrap();
+            assert_eq!(credentials.len(), 1, "{username}");
+            assert_eq!(
+                issuerd_auth_flow::password_hash::verify_password(password, &credentials[0]),
+                issuerd_auth_flow::password_hash::PasswordVerification::Match,
+                "{username}"
+            );
+            assert_eq!(
+                issuerd_auth_flow::password_hash::verify_password("wrong", &credentials[0]),
+                issuerd_auth_flow::password_hash::PasswordVerification::NoMatch,
+                "{username}"
+            );
+            let metadata = credentials[0].credential_data.to_string();
+            assert!(!metadata.contains(p256_current));
+            assert!(!metadata.contains(p512_current));
+            assert!(!metadata.contains("a2V5Y2xvYWstc2FsdA"));
+        }
+
+        let alice = state
+            .storage
+            .get_user_by_username(&realm_id, "alice-argon2id")
+            .await
+            .unwrap()
+            .unwrap();
+        let history = state
+            .storage
+            .get_credentials(
+                &realm_id,
+                &alice.id,
+                issuerd_core::CredentialType::Custom("password-history".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let bob = state
+            .storage
+            .get_user_by_username(&realm_id, "bob-p256-current")
+            .await
+            .unwrap()
+            .unwrap();
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &bob.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords[0].created_date.timestamp_millis(), 1700000000123);
+        assert_eq!(
+            state
+                .storage
+                .get_credentials(&realm_id, &bob.id, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn uuid_case_is_canonicalized_for_collision_checks() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let existing_user = seed_user(&state, &realm_id, "uuid-owner", None).await;
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let existing = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &existing_user.id, &existing)
+            .await
+            .unwrap();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "uppercase-target",
+                "credentials": [{
+                    "id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "uppercase-target")
+            .await
+            .unwrap()
+            .is_none());
+
+        let duplicate_document = serde_json::json!({
+            "users": [{
+                "username": "case-document-user",
+                "credentials": [
+                    {"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "type": "password", "secretData": secret},
+                    {"id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "type": "password-history", "secretData": secret}
+                ]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(duplicate_document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "case-document-user")
+            .await
+            .unwrap()
+            .is_none());
+
+        let canonical_document = serde_json::json!({
+            "users": [{
+                "username": "canonical-uppercase-user",
+                "credentials": [{
+                    "id": "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(canonical_document)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let user = state
+            .storage
+            .get_user_by_username(&realm_id, "canonical-uppercase-user")
+            .await
+            .unwrap()
+            .unwrap();
+        let credentials = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(credentials[0].id.to_string(), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    }
+
+    #[tokio::test]
+    async fn non_uuid_password_credential_ids_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "non-uuid-credential-user",
+                "credentials": [{
+                    "id": "not-a-uuid",
+                    "type": "password",
+                    "secretData": "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE"
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "non-uuid-credential-user")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_realm_credential_id_collisions_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let mut other_realm = state.storage.get_realm_by_name("master").await.unwrap().unwrap();
+        other_realm.id = issuerd_core::RealmId::new("other-realm").unwrap();
+        other_realm.name = issuerd_core::RealmName::new("other-realm").unwrap();
+        state.storage.create_realm(&other_realm).await.unwrap();
+        let other_user = seed_user(&state, &other_realm.id, "other-user", None).await;
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("66666666-6666-4666-8666-666666666666").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: secret.as_bytes().to_vec(),
+            credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&other_realm.id, &other_user.id, &credential)
+            .await
+            .unwrap();
+        let document = serde_json::json!({
+            "users": [{
+                "username": "cross-realm-target",
+                "credentials": [{
+                    "id": "66666666-6666-4666-8666-666666666666",
+                    "type": "password",
+                    "secretData": secret
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&master_realm_id(), "cross-realm-target")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_target_credential_ids_fail_closed_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let id = "77777777-7777-4777-8777-777777777777";
+        for username in ["first-target-user", "second-target-user"] {
+            let user = seed_user(&state, &realm_id, username, None).await;
+            let credential = issuerd_core::Credential {
+                id: issuerd_core::CredentialId::new(id).unwrap(),
+                credential_type: issuerd_core::CredentialType::Password,
+                user_label: None,
+                created_date: chrono::Utc::now(),
+                secret_data: secret.as_bytes().to_vec(),
+                credential_data: serde_json::json!({"hash_algorithm": "pbkdf2-sha256"}),
+                priority: 1,
+            };
+            state.storage.create_credential(&realm_id, &user.id, &credential).await.unwrap();
+        }
+        let document = serde_json::json!({
+            "users": [{
+                "username": "second-target-user",
+                "credentials": [{"id": id, "type": "password", "secretData": secret}]
+            }]
+        });
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(document),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn existing_credential_id_collisions_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let existing_user = seed_user(&state, &realm_id, "existing-user", None).await;
+        let existing_credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("55555555-5555-4555-8555-555555555555").unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"totp-secret".to_vec(),
+            credential_data: serde_json::json!({"digits": 6}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &existing_user.id, &existing_credential)
+            .await
+            .unwrap();
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        for username in ["new-user", "existing-user"] {
+            let document = serde_json::json!({
+                "users": [{
+                    "username": username,
+                    "credentials": [{
+                        "id": "55555555-5555-4555-8555-555555555555",
+                        "type": "password",
+                        "secretData": secret
+                    }]
+                }]
+            });
+            let (status, body) = post_json(
+                &app,
+                "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+                Some(document),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{username}: {body}");
+            assert!(state
+                .storage
+                .get_user_by_username(&realm_id, "new-user")
+                .await
+                .unwrap()
+                .is_none());
+            let preserved = state
+                .storage
+                .get_credentials(&realm_id, &existing_user.id, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap();
+            assert_eq!(preserved, vec![existing_credential.clone()]);
+        }
+
+        let compatible = serde_json::json!({
+            "users": [{
+                "username": "existing-user",
+                "credentials": [{
+                    "id": "55555555-5555-4555-8555-555555555555",
+                    "type": "totp",
+                    "secretData": "new-totp-secret",
+                    "credentialData": {"digits": 6}
+                }]
+            }]
+        });
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(compatible),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let updated = state
+            .storage
+            .get_credentials(&realm_id, &existing_user.id, issuerd_core::CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(updated[0].secret_data, b"new-totp-secret");
+    }
+
+    #[tokio::test]
+    async fn duplicate_credential_ids_are_rejected_before_any_resource_write() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let secret =
+            "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let document = serde_json::json!({
+            "users": [{
+                "username": "duplicate-credential-user",
+                "credentials": [
+                    {"id": "11111111-1111-4111-8111-111111111111", "type": "password", "secretData": secret},
+                    {"id": "11111111-1111-4111-8111-111111111111", "type": "password-history", "secretData": secret}
+                ]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "duplicate-credential-user")
+            .await
+            .unwrap()
+            .is_none());
+
+        let cross_user = serde_json::json!({
+            "users": [
+                {"username": "first-user", "credentials": [
+                    {"id": "22222222-2222-4222-8222-222222222222", "type": "password", "secretData": secret}
+                ]},
+                {"username": "second-user", "credentials": [
+                    {"id": "22222222-2222-4222-8222-222222222222", "type": "password-history", "secretData": secret}
+                ]}
+            ]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(cross_user)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        for username in ["first-user", "second-user"] {
+            assert!(state
+                .storage
+                .get_user_by_username(&realm_id, username)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_credential_prevalidation_prevents_every_resource_write() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let canary = "raw-secret-canary";
+        let doc = serde_json::json!({
+            "users": [
+                {"username": "would-be-written"},
+                {
+                    "username": "invalid-credential",
+                    "credentials": [{
+                        "type": "password",
+                        "credentialData": {"algorithm": "pbkdf2-sha256", "hashIterations": 1},
+                        "secretData": {"value": canary, "salt": "a2V5Y2xvYWstc2FsdA"}
+                    }]
+                }
+            ]
+        });
+        let (status, body) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains(canary));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "would-be-written")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "invalid-credential")
+            .await
+            .unwrap()
+            .is_none());
+
+        let plaintext = serde_json::json!({
+            "users": [{
+                "username": "plaintext-user",
+                "credentials": [{"type": "password", "value": canary, "secretData": "not-a-hash"}]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(plaintext)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains(canary));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "plaintext-user")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_conflict_strategies_preserve_non_password_credentials() {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let user = seed_user(&state, &realm_id, "existing", None).await;
+        let salt = SaltString::from_b64("a2V5Y2xvYWstc2FsdA").unwrap();
+        let old_hash = Argon2::default().hash_password(b"old-password", &salt).unwrap().to_string();
+        let old_password = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("old-password").unwrap(),
+            credential_type: issuerd_core::CredentialType::Password,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: old_hash.into_bytes(),
+            credential_data: serde_json::json!({"hash_algorithm": "argon2id"}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &user.id, &old_password)
+            .await
+            .unwrap();
+        let totp = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("totp-1").unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"preserve-totp".to_vec(),
+            credential_data: serde_json::json!({"digits": 6}),
+            priority: 1,
+        };
+        state.storage.create_credential(&realm_id, &user.id, &totp).await.unwrap();
+        let imported = serde_json::json!({
+            "users": [{
+                "username": "existing",
+                "credentials": [{
+                    "type": "password",
+                    "credentialData": {"algorithm": "pbkdf2-sha256", "hashIterations": 27500},
+                    "secretData": {
+                        "value": "R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE",
+                        "salt": "a2V5Y2xvYWstc2FsdA"
+                    }
+                }]
+            }]
+        });
+
+        let (status, _) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=SKIP",
+            Some(imported.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords, vec![old_password.clone()]);
+
+        let without_credentials = serde_json::json!({"users": [{"username": "existing"}]});
+        let (status, _) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(without_credentials),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords, vec![old_password]);
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(imported),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let passwords = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Password)
+            .await
+            .unwrap();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(
+            issuerd_auth_flow::password_hash::verify_password(
+                "correct horse battery staple",
+                &passwords[0]
+            ),
+            issuerd_auth_flow::password_hash::PasswordVerification::Match
+        );
+        let preserved_totp = state
+            .storage
+            .get_credentials(&realm_id, &user.id, issuerd_core::CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(preserved_totp, vec![totp]);
+    }
+
+    #[tokio::test]
+    async fn keycloak_client_scopes_mappers_and_assignments_survive_import() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let mappers: Vec<serde_json::Value> = issuerd_core::MapperType::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, mapper_type)| {
+                serde_json::json!({
+                    "id": format!("mapper-{index}"),
+                    "name": format!("mapper-{index}"),
+                    "protocol": "openid-connect",
+                    "protocolMapper": serde_json::to_value(mapper_type).unwrap(),
+                    "config": {"userinfo.token.claim": "true"}
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "clients": [{
+                "clientId": "migration-check",
+                "publicClient": true,
+                "redirectUris": ["/*"],
+                "webOrigins": ["/"],
+                "defaultClientScopes": ["custom-default"],
+                "optionalClientScopes": ["custom-optional"]
+            }],
+            "clientScopes": [
+                {
+                    "id": "custom-default-id",
+                    "name": "custom-default",
+                    "protocol": "openid-connect",
+                    "protocolMappers": mappers
+                },
+                {
+                    "id": "custom-optional-id",
+                    "name": "custom-optional",
+                    "protocol": "openid-connect",
+                    "protocolMappers": []
+                }
+            ],
+            "defaultDefaultClientScopes": ["custom-default"],
+            "defaultOptionalClientScopes": ["custom-optional"]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(doc.clone())).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["added"], 3);
+
+        let scope = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-default")
+            .await
+            .unwrap()
+            .unwrap();
+        let actual_types: Vec<issuerd_core::MapperType> =
+            scope.protocol_mappers.iter().map(|mapper| mapper.mapper_type).collect();
+        assert_eq!(actual_types, issuerd_core::MapperType::ALL);
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("migration-check").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.public_client);
+        assert_eq!(client.redirect_uris[0].as_str(), "http://localhost:8080/*");
+        assert_eq!(client.web_origins[0].as_str(), "http://localhost:8080/");
+        let assignments = state
+            .storage
+            .list_client_scope_assignments(&realm_id, &client.id)
+            .await
+            .unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.iter().any(|(id, default)| *id == scope.id && *default));
+        let optional = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-optional")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(assignments.iter().any(|(id, default)| *id == optional.id && !*default));
+        let realm_defaults =
+            state.storage.list_realm_default_client_scopes(&realm_id).await.unwrap();
+        assert_eq!(realm_defaults.len(), 2);
+        assert!(realm_defaults.iter().any(|(id, default)| *id == scope.id && *default));
+        assert!(realm_defaults.iter().any(|(id, default)| *id == optional.id && !*default));
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(doc),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["updated"], 3);
+        assert_eq!(
+            state
+                .storage
+                .list_client_scope_assignments(&realm_id, &client.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_plus_web_origins_expand_redirect_origins() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let document = serde_json::json!({
+            "clients": [{
+                "clientId": "plus-origins",
+                "redirectUris": ["/cb", "https://second.example:443/path", "/other"],
+                "webOrigins": ["+"]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("plus-origins").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let origins: Vec<&str> = client.web_origins.iter().map(|origin| origin.as_str()).collect();
+        assert_eq!(origins, ["http://localhost:8080", "https://second.example"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_default_scope_validation_precedes_every_resource_write() {
+        let documents = [
+            serde_json::json!({
+                "users": [{"username": "must-not-import"}],
+                "clients": [{"client_id": "agent", "default_scopes": ["mcp:write"]}]
+            }),
+            serde_json::json!({
+                "users": [{"username": "must-not-import"}],
+                "defaultDefaultClientScopes": ["mcp:read"]
+            }),
+        ];
+        for document in documents {
+            let mut state = manage_realm_state();
+            std::sync::Arc::get_mut(&mut state).unwrap().mcp_enabled = true;
+            let app = test_app(state.clone());
+            let (status, body) =
+                post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+            assert!(body.to_string().contains("optional scope"), "body: {body}");
+            assert!(state
+                .storage
+                .get_user_by_username(&master_realm_id(), "must-not-import")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn keycloak_role_scope_user_and_group_mappings_are_restored() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let doc = serde_json::json!({
+            "users": [
+                {
+                    "username": "alice",
+                    "realmRoles": ["migration-realm-role", "realm-composite"],
+                    "clientRoles": {
+                        "migration-check": ["migration-client-role", "client-composite"]
+                    },
+                    "groups": ["/developers"]
+                },
+                {"username": "control-user", "realmRoles": [], "clientRoles": {}, "groups": []}
+            ],
+            "groups": [{
+                "name": "developers",
+                "path": "/developers",
+                "realmRoles": ["group-realm-role"],
+                "clientRoles": {"migration-check": ["group-client-role"]}
+            }],
+            "clients": [{
+                "clientId": "migration-check",
+                "fullScopeAllowed": false,
+                "defaultClientScopes": ["custom-scope"]
+            }],
+            "roles": {
+                "realm": [
+                    {"name": "migration-realm-role"},
+                    {"name": "group-realm-role"},
+                    {
+                        "name": "realm-composite",
+                        "composite": true,
+                        "composites": {
+                            "realm": ["migration-realm-role"],
+                            "client": {"migration-check": ["migration-client-role"]}
+                        }
+                    }
+                ],
+                "client": {
+                    "migration-check": [
+                        {"name": "migration-client-role"},
+                        {"name": "group-client-role"},
+                        {
+                            "name": "client-composite",
+                            "composite": true,
+                            "composites": {
+                                "realm": ["migration-realm-role"],
+                                "client": {"migration-check": ["group-client-role"]}
+                            }
+                        }
+                    ]
+                }
+            },
+            "clientScopes": [{"name": "custom-scope", "protocolMappers": []}],
+            "scopeMappings": [
+                {"client": "migration-check", "roles": ["migration-realm-role"]},
+                {"clientScope": "custom-scope", "roles": ["group-realm-role"]}
+            ],
+            "clientScopeMappings": {
+                "migration-check": [
+                    {"client": "migration-check", "roles": ["migration-client-role"]},
+                    {"clientScope": "custom-scope", "roles": ["group-client-role"]}
+                ]
+            }
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(doc.clone())).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["added"], 11);
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("migration-check").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!client.full_scope_allowed);
+        assert_eq!(client.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(client.scope_mappings.client_roles[&client.id].len(), 1);
+        let scope = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-scope")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(scope.scope_mappings.client_roles[&client.id].len(), 1);
+        let group =
+            state.storage.get_group_by_name(&realm_id, "developers").await.unwrap().unwrap();
+        assert_eq!(group.realm_roles.len(), 1);
+        assert_eq!(group.client_roles[&client.id].len(), 1);
+        let alice = state.storage.get_user_by_username(&realm_id, "alice").await.unwrap().unwrap();
+        assert_eq!(
+            state.storage.list_user_realm_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_client_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_groups(&realm_id, &alice.id).await.unwrap(),
+            vec![group.id.clone()]
+        );
+        let effective =
+            issuerd_core::effective_user_roles(state.storage.as_ref(), &realm_id, &alice.id)
+                .await
+                .unwrap();
+        let effective_names: std::collections::HashSet<String> =
+            effective.iter().map(|role| role.name.to_string()).collect();
+        for expected in [
+            "migration-realm-role",
+            "migration-client-role",
+            "group-realm-role",
+            "group-client-role",
+            "realm-composite",
+            "client-composite",
+        ] {
+            assert!(effective_names.contains(expected), "missing {expected}: {effective_names:?}");
+        }
+        let control = state
+            .storage
+            .get_user_by_username(&realm_id, "control-user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .storage
+            .list_user_realm_roles(&realm_id, &control.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .storage
+            .list_user_client_roles(&realm_id, &control.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state.storage.list_user_groups(&realm_id, &control.id).await.unwrap().is_empty());
+        let realm_composite = state
+            .storage
+            .get_role_by_name(&realm_id, "realm-composite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(realm_composite.composite);
+        assert_eq!(realm_composite.composites.len(), 2);
+        let client_composite = state
+            .storage
+            .get_client_role_by_name(&realm_id, &client.id, "client-composite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client_composite.composite);
+        assert_eq!(client_composite.composites.len(), 2);
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(doc),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["updated"], 11);
+        let client_after = state.storage.get_client(&realm_id, &client.id).await.unwrap().unwrap();
+        assert_eq!(client_after.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(client_after.scope_mappings.client_roles[&client.id].len(), 1);
+        assert_eq!(
+            state.storage.list_user_realm_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_client_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_and_ambiguous_role_references_fail_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let dangling = serde_json::json!({
+            "users": [
+                {"username": "must-not-exist"},
+                {"username": "bad-user", "realmRoles": ["missing-role"]}
+            ]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(dangling)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("missing-role"));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "must-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+
+        let cross_client = serde_json::json!({
+            "clients": [{"clientId": "client-a"}, {"clientId": "client-b"}],
+            "roles": {"client": {
+                "client-a": [{
+                    "name": "composite",
+                    "composite": true,
+                    "composites": {"client": {"client-b": ["role-b"]}}
+                }],
+                "client-b": [{"name": "role-b"}]
+            }}
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(cross_client)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("unsupported"));
+        for client_id in ["client-a", "client-b"] {
+            assert!(state
+                .storage
+                .get_client_by_client_id(
+                    &realm_id,
+                    &issuerd_core::ClientIdentifier::new(client_id).unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_and_mapper_validation_fail_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let unsupported = serde_json::json!({
+            "users": [{"username": "must-not-exist"}],
+            "clientScopes": [{
+                "name": "bad-scope",
+                "protocolMappers": [{
+                    "name": "hardcoded",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-hardcoded-claim-mapper",
+                    "config": {}
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(unsupported)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body["errorMessage"].as_str().unwrap();
+        assert!(message.contains("bad-scope"), "{message}");
+        assert!(message.contains("oidc-hardcoded-claim-mapper"), "{message}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "must-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+
+        let dangling = serde_json::json!({
+            "clients": [{"clientId": "bad-client", "defaultClientScopes": ["missing-scope"]}]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(dangling)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("missing-scope"));
+        assert!(state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("bad-client").unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1077,6 +2653,19 @@ mod tests {
         });
         let (status, _) = post_json(&app, "/admin/realms/master/partialImport", Some(doc)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let keycloak_doc = serde_json::json!({
+            "groups": [{"name": "keycloak-nested", "subGroups": [{"name": "sub"}]}]
+        });
+        let (status, _) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(keycloak_doc)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .storage
+            .get_group_by_name(&master_realm_id(), "keycloak-nested")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Issuerd Keycloak migration fixture manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "keycloak_version",
+    "realm",
+    "provenance",
+    "users",
+    "client_scopes",
+    "claim_checks",
+    "negative_users"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "keycloak_version": {"type": "string"},
+    "realm": {"type": "string"},
+    "provenance": {"type": "string"},
+    "users": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["username", "algorithm", "enabled", "parameters"],
+        "properties": {
+          "username": {"type": "string"},
+          "algorithm": {"enum": ["argon2id", "pbkdf2-sha256", "pbkdf2-sha512"]},
+          "enabled": {"type": "boolean"},
+          "parameters": {"type": "object"},
+          "source_login": {"enum": ["PASS"]},
+          "oracle": {"enum": ["PASS"]}
+        },
+        "additionalProperties": true
+      }
+    },
+    "client_scopes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "assignment", "mapper_count"],
+        "properties": {
+          "name": {"type": "string"},
+          "assignment": {"enum": ["default", "optional"]},
+          "mapper_count": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "claim_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["username", "scope", "expect", "forbid"],
+        "properties": {
+          "username": {"type": "string"},
+          "scope": {"type": "string"},
+          "expect": {"type": "object"},
+          "forbid": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "negative_users": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "additionalProperties": true
+}
