@@ -125,12 +125,24 @@ struct KeycloakProtocolMapperRepresentation {
     config: Option<HashMap<String, String>>,
 }
 
+fn parse_mapper_type(value: &str) -> Option<MapperType> {
+    match value {
+        "oidc-usermodel-attribute-mapper" => Some(MapperType::UserAttribute),
+        "oidc-usermodel-property-mapper" => Some(MapperType::UserProperty),
+        "oidc-full-name-mapper" => Some(MapperType::FullName),
+        "oidc-address-mapper" => Some(MapperType::Address),
+        "oidc-group-membership-mapper" => Some(MapperType::GroupMembership),
+        "oidc-usermodel-realm-role-mapper" => Some(MapperType::RealmRoleList),
+        "oidc-usermodel-client-role-mapper" => Some(MapperType::ClientRoleList),
+        "oidc-audience-mapper" => Some(MapperType::Audience),
+        "oidc-allowed-origins-mapper" => Some(MapperType::AllowedWebOrigins),
+        _ => None,
+    }
+}
+
 impl KeycloakProtocolMapperRepresentation {
     fn into_base(self, parent: &str) -> Result<ProtocolMapperRepresentation, AdminApiError> {
-        let mapper_type = serde_json::from_value::<MapperType>(serde_json::Value::String(
-            self.protocol_mapper.clone(),
-        ))
-        .map_err(|_| {
+        let mapper_type = parse_mapper_type(&self.protocol_mapper).ok_or_else(|| {
             AdminApiError::BadRequest(format!(
                 "{parent}: unsupported protocol mapper type '{}'",
                 self.protocol_mapper
@@ -471,5 +483,30 @@ impl KeycloakImportRepresentation {
             default_optional_client_scopes: self.default_optional_client_scopes,
             composite_references,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapper_type_allowlist_accepts_exact_supported_ids() {
+        let cases = [
+            ("oidc-usermodel-attribute-mapper", MapperType::UserAttribute),
+            ("oidc-usermodel-property-mapper", MapperType::UserProperty),
+            ("oidc-full-name-mapper", MapperType::FullName),
+            ("oidc-address-mapper", MapperType::Address),
+            ("oidc-group-membership-mapper", MapperType::GroupMembership),
+            ("oidc-usermodel-realm-role-mapper", MapperType::RealmRoleList),
+            ("oidc-usermodel-client-role-mapper", MapperType::ClientRoleList),
+            ("oidc-audience-mapper", MapperType::Audience),
+            ("oidc-allowed-origins-mapper", MapperType::AllowedWebOrigins),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(parse_mapper_type(id), Some(expected));
+        }
+        assert!(parse_mapper_type("oidc-unsupported-mapper").is_none());
+        assert!(parse_mapper_type("").is_none());
     }
 }

@@ -6,7 +6,6 @@
 
 import argparse
 import base64
-import copy
 import datetime
 import hashlib
 import json
@@ -1216,6 +1215,7 @@ def main():
     print("role_and_group_assignments=PASS")
     print("negative_cases=PASS")
     print(f"evidence={harness.evidence}")
+    return 0
 
 
 def source_admin(harness, method, path, body=None, expected=(200, 204)):
