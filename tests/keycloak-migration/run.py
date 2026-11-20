@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 
 REALM = "migration-lab"
 CLIENT_ID = "migration-check"
+PUBLIC_CLIENT_ID = "migration-public"
 KEYCLOAK_VERSION = "26.7.1"
 KEYCLOAK_IMAGE = f"quay.io/keycloak/keycloak:{KEYCLOAK_VERSION}"
 POSTGRES_IMAGE = "postgres:16.10-alpine"
@@ -121,10 +122,23 @@ def role_resources():
             "clientRoles": {CLIENT_ID: ["group-client-role"]},
         }],
         "roles": {
-            "realm": [{"name": "migration-realm-role"}, {"name": "group-realm-role"}],
+            "realm": [
+                {"name": "migration-realm-role"},
+                {"name": "group-realm-role"},
+                {
+                    "name": "migration-realm-composite",
+                    "composite": True,
+                    "composites": {"realm": ["migration-realm-role"]},
+                },
+            ],
             "client": {CLIENT_ID: [
                 {"name": "migration-client-role"},
                 {"name": "group-client-role"},
+                {
+                    "name": "migration-client-composite",
+                    "composite": True,
+                    "composites": {"client": {CLIENT_ID: ["migration-client-role"]}},
+                },
             ]},
         },
         "clientScopes": [
@@ -175,8 +189,8 @@ def user_representation(username, password, credential=None, enabled=True):
     }
     if username == "alice-argon2id":
         result.update({
-            "realmRoles": ["migration-realm-role"],
-            "clientRoles": {CLIENT_ID: ["migration-client-role"]},
+            "realmRoles": ["migration-realm-composite"],
+            "clientRoles": {CLIENT_ID: ["migration-client-composite"]},
             "groups": ["/developers"],
         })
     return result
@@ -542,6 +556,16 @@ class Harness:
                 "webOrigins": ["http://localhost:8080"],
                 "defaultClientScopes": ["migration-default"],
                 "optionalClientScopes": ["migration-optional"],
+            }, {
+                "clientId": PUBLIC_CLIENT_ID,
+                "publicClient": True,
+                "fullScopeAllowed": False,
+                "standardFlowEnabled": True,
+                "directAccessGrantsEnabled": True,
+                "redirectUris": ["http://localhost:8080/public-cb"],
+                "webOrigins": ["http://localhost:8080"],
+                "defaultClientScopes": ["migration-default"],
+                "optionalClientScopes": ["migration-optional"],
             }],
             **role_resources(),
         }
@@ -654,10 +678,23 @@ class Harness:
         client = next((client for client in clients if client.get("client_id") == CLIENT_ID or client.get("clientId") == CLIENT_ID), None)
         if client is None:
             raise Failure(f"imported client missing: {CLIENT_ID}")
+        public_client = next(
+            (candidate for candidate in clients
+             if candidate.get("client_id") == PUBLIC_CLIENT_ID
+             or candidate.get("clientId") == PUBLIC_CLIENT_ID),
+            None,
+        )
+        if public_client is None:
+            raise Failure(f"imported public client missing: {PUBLIC_CLIENT_ID}")
+        if client.get("public_client", client.get("publicClient")) is not False:
+            raise Failure("confidential migration client became public")
+        if public_client.get("public_client", public_client.get("publicClient")) is not True:
+            raise Failure("public migration client lost its public-client flag")
         self.report["target"]["inventory"] = {
             "users": len(expected_users),
             "client_scopes": len([scope for scope in scopes if scope.get("name", "").startswith("migration-")]),
             "clients_present": True,
+            "public_client_present": True,
             "protocol_mappers": "PASS",
             "role_and_group_assignments": "PASS",
             "scope_assignments": {
@@ -692,6 +729,24 @@ class Harness:
                 actual_audience = [actual_audience]
             if audience not in actual_audience:
                 raise Failure(f"missing audience claim for {context}: {audience}")
+
+    def verify_non_member(self, source=False):
+        username = "bob-p256-current"
+        if source:
+            spec = next(spec for spec in self.manifest["users"] if spec["username"] == username)
+            source_policy_for_spec(self, spec)
+        status, token = self.password_grant(
+            username,
+            self.secrets["users"][username],
+            source=source,
+        )
+        if status != 200:
+            raise Failure("non-member control login failed")
+        claims = self.userinfo(token["access_token"], source=source)
+        if "developers" in claims.get("groups", []):
+            raise Failure("non-member control unexpectedly received the developers group")
+        section = "source" if source else "target"
+        self.report[section]["non_member_group_control"] = "PASS"
 
     def browser_pkce(self, username, password):
         verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
@@ -786,6 +841,7 @@ class Harness:
             for forbidden in check.get("forbid", []):
                 if forbidden in claims:
                     raise Failure(f"unexpected optional claim for {username}: {forbidden}")
+        self.verify_non_member()
         if not restart:
             self.browser_pkce("alice-argon2id", passwords["alice-argon2id"])
             self.browser_pkce("bob-p256-current", passwords["bob-p256-current"])
@@ -1177,6 +1233,16 @@ def source_client_and_scopes(harness):
         "redirectUris": ["http://localhost:8080/cb"],
         "webOrigins": ["http://localhost:8080"],
     }, expected=(201,))
+    source_admin(harness, "POST", f"/realms/{REALM}/clients", body={
+        "clientId": PUBLIC_CLIENT_ID,
+        "publicClient": True,
+        "directAccessGrantsEnabled": True,
+        "standardFlowEnabled": True,
+        "fullScopeAllowed": False,
+        "redirectUris": ["http://localhost:8080/public-cb"],
+        "webOrigins": ["http://localhost:8080"],
+    }, expected=(201,))
+    public_client = source_list(harness, f"/realms/{REALM}/clients?clientId={PUBLIC_CLIENT_ID}")[0]
     client = source_list(harness, f"/realms/{REALM}/clients?clientId={CLIENT_ID}")[0]
     scope_ids = {}
     for scope in role_resources()["clientScopes"]:
@@ -1207,48 +1273,68 @@ def source_client_and_scopes(harness):
                 raise Failure(
                     f"could not create mapper {protocol_mapper['name']} on {scope['name']}: {error}"
                 )
-    source_admin(
-        harness,
-        "PUT",
-        f"/realms/{REALM}/clients/{client['id']}/default-client-scopes/{scope_ids['migration-default']}",
-        expected=(204,),
-    )
-    source_admin(
-        harness,
-        "PUT",
-        f"/realms/{REALM}/clients/{client['id']}/optional-client-scopes/{scope_ids['migration-optional']}",
-        expected=(204,),
-    )
+    for target_client in (client, public_client):
+        source_admin(
+            harness,
+            "PUT",
+            f"/realms/{REALM}/clients/{target_client['id']}/default-client-scopes/{scope_ids['migration-default']}",
+            expected=(204,),
+        )
+        source_admin(
+            harness,
+            "PUT",
+            f"/realms/{REALM}/clients/{target_client['id']}/optional-client-scopes/{scope_ids['migration-optional']}",
+            expected=(204,),
+        )
     source_admin(harness, "PUT", f"/realms/{REALM}/default-default-client-scopes/{scope_ids['migration-default']}", expected=(204,))
     source_admin(harness, "PUT", f"/realms/{REALM}/default-optional-client-scopes/{scope_ids['migration-optional']}", expected=(204,))
     return client, scope_ids
 
 
 def source_roles_and_group(harness, client, scope_ids):
+    definitions = role_resources()["roles"]
     realm_roles = {}
-    for role in role_resources()["roles"]["realm"]:
-        source_admin(harness, "POST", f"/realms/{REALM}/roles", body=role, expected=(201,))
+    for role in definitions["realm"]:
+        source_admin(harness, "POST", f"/realms/{REALM}/roles", body={"name": role["name"]}, expected=(201,))
         realm_roles[role["name"]] = source_list(harness, f"/realms/{REALM}/roles/{role['name']}")
     client_roles = {}
-    for role in role_resources()["roles"]["client"][CLIENT_ID]:
-        source_admin(harness, "POST", f"/realms/{REALM}/clients/{client['id']}/roles", body=role, expected=(201,))
+    for role in definitions["client"][CLIENT_ID]:
+        source_admin(
+            harness,
+            "POST",
+            f"/realms/{REALM}/clients/{client['id']}/roles",
+            body={"name": role["name"]},
+            expected=(201,),
+        )
         client_roles[role["name"]] = source_list(
             harness,
             f"/realms/{REALM}/clients/{client['id']}/roles/{role['name']}",
         )
+    source_admin(
+        harness,
+        "POST",
+        f"/realms/{REALM}/roles/migration-realm-composite/composites",
+        body=[realm_roles["migration-realm-role"]],
+    )
+    source_admin(
+        harness,
+        "POST",
+        f"/realms/{REALM}/clients/{client['id']}/roles/migration-client-composite/composites",
+        body=[client_roles["migration-client-role"]],
+    )
     source_admin(harness, "POST", f"/realms/{REALM}/groups", body={"name": "developers"}, expected=(201,))
     group = source_list(harness, f"/realms/{REALM}/groups?search=developers")[0]
-    for role in realm_roles.values():
+    realm_mapping = [realm_roles["migration-realm-role"], realm_roles["group-realm-role"]]
+    client_mapping = [client_roles["migration-client-role"], client_roles["group-client-role"]]
+    for role in realm_mapping:
         source_admin(harness, "POST", f"/realms/{REALM}/groups/{group['id']}/role-mappings/realm", body=[role])
-    for role in client_roles.values():
+    for role in client_mapping:
         source_admin(
             harness,
             "POST",
             f"/realms/{REALM}/groups/{group['id']}/role-mappings/clients/{client['id']}",
             body=[role],
         )
-    realm_mapping = list(realm_roles.values())
-    client_mapping = list(client_roles.values())
     source_admin(
         harness,
         "POST",
@@ -1358,13 +1444,13 @@ def source_users(harness, realm_roles, client_roles, group):
                 harness,
                 "POST",
                 f"/realms/{REALM}/users/{user['id']}/role-mappings/realm",
-                body=[realm_roles["migration-realm-role"]],
+                body=[realm_roles["migration-realm-composite"]],
             )
             source_admin(
                 harness,
                 "POST",
                 f"/realms/{REALM}/users/{user['id']}/role-mappings/clients/{harness.source_client['id']}",
-                body=[client_roles["migration-client-role"]],
+                body=[client_roles["migration-client-composite"]],
             )
             source_admin(
                 harness,
@@ -1503,6 +1589,7 @@ def source_login_checks(harness):
         "expect": {"optional_claim": "optional-value"},
         "forbid": [],
     }]
+    harness.verify_non_member(source=True)
 
 
 def source_export_and_oracle(harness):
