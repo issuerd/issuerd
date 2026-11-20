@@ -18,14 +18,14 @@ for dir in linux-dist linux-glibc228-dist linux-arm64-dist windows-dist windows-
     fi
   done
 done
-for file in issuerd_*_conformance-evidence.tar.gz* SHA256SUMS.txt*; do
+for file in issuerd_*_conformance-evidence.tar.gz* issuerd_*_keycloak-migration-evidence.tar.gz* SHA256SUMS.txt*; do
   if [[ -f "$file" ]]; then
     assets+=("$file")
   fi
 done
 
-if [[ "${ACT:-}" != true && "${#assets[@]}" -ne 48 ]]; then
-  echo "::error::Expected 48 release assets, found ${#assets[@]}"
+if [[ "${ACT:-}" != true && "${#assets[@]}" -ne 51 ]]; then
+  echo "::error::Expected 51 release assets, found ${#assets[@]}"
   exit 1
 fi
 if [[ "${#assets[@]}" -eq 0 ]]; then
