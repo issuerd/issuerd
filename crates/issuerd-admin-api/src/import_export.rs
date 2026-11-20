@@ -133,6 +133,74 @@ fn prepare_user_import(
         .transpose()
 }
 
+async fn validate_credential_ids(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    body: &PartialImportRepresentation,
+    strategy: IfResourceExists,
+) -> Result<(), AdminApiError> {
+    let mut document_owners = HashMap::new();
+    for rep in body.users.as_deref().unwrap_or_default() {
+        for credential in rep.credentials.as_deref().unwrap_or_default() {
+            let Some(id) = credential.id.as_deref() else {
+                continue;
+            };
+            if let Some(owner) = document_owners.insert(id, rep.username.as_str()) {
+                let message = if owner == rep.username {
+                    format!("user '{}': duplicate credential id '{id}'", rep.username)
+                } else {
+                    format!(
+                        "credential id '{id}' is duplicated in users '{owner}' and '{}'",
+                        rep.username
+                    )
+                };
+                return Err(AdminApiError::BadRequest(message));
+            }
+        }
+    }
+    if document_owners.is_empty() {
+        return Ok(());
+    }
+    let mut existing = HashMap::new();
+    for user in state
+        .storage
+        .list_users(realm_id, "", &Pagination { first: 0, max: i32::MAX })
+        .await?
+    {
+        for credential in state.storage.list_credentials(realm_id, &user.id).await? {
+            existing.insert(
+                credential.id.to_string(),
+                (user.username.clone(), credential.credential_type),
+            );
+        }
+    }
+    for rep in body.users.as_deref().unwrap_or_default() {
+        for credential in rep.credentials.as_deref().unwrap_or_default() {
+            let Some(id) = credential.id.as_deref() else {
+                continue;
+            };
+            let Some((owner, existing_type)) = existing.get(id) else {
+                continue;
+            };
+            if owner.as_str() != rep.username {
+                return Err(AdminApiError::BadRequest(format!(
+                    "credential id '{id}' already belongs to user '{owner}'"
+                )));
+            }
+            if strategy == IfResourceExists::Overwrite
+                && !is_imported_password_type(existing_type)
+                && existing_type != &credential.credential_type
+            {
+                return Err(AdminApiError::BadRequest(format!(
+                    "user '{}': credential id '{id}' has an incompatible existing type",
+                    rep.username
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn create_credentials(
     state: &Arc<AdminApiState>,
     realm_id: &issuerd_core::RealmId,
@@ -713,6 +781,7 @@ pub async fn partial_import(
     let strategy = params.if_resource_exists.or(body.if_resource_exists).unwrap_or_default();
     validate_client_scope_document(&state, &realm_id, &body).await?;
     crate::migration::validate_references(&state, &realm_id, &body).await?;
+    validate_credential_ids(&state, &realm_id, &body, strategy).await?;
     let prepared_users = body
         .users
         .as_deref()
@@ -1550,6 +1619,133 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn existing_credential_id_collisions_are_rejected_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let existing_user = seed_user(&state, &realm_id, "existing-user", None).await;
+        let existing_credential = issuerd_core::Credential {
+            id: issuerd_core::CredentialId::new("existing-credential-id").unwrap(),
+            credential_type: issuerd_core::CredentialType::Totp,
+            user_label: None,
+            created_date: chrono::Utc::now(),
+            secret_data: b"totp-secret".to_vec(),
+            credential_data: serde_json::json!({"digits": 6}),
+            priority: 1,
+        };
+        state
+            .storage
+            .create_credential(&realm_id, &existing_user.id, &existing_credential)
+            .await
+            .unwrap();
+        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        for username in ["new-user", "existing-user"] {
+            let document = serde_json::json!({
+                "users": [{
+                    "username": username,
+                    "credentials": [{
+                        "id": "existing-credential-id",
+                        "type": "password",
+                        "secretData": secret
+                    }]
+                }]
+            });
+            let (status, body) = post_json(
+                &app,
+                "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+                Some(document),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{username}: {body}");
+            assert!(state
+                .storage
+                .get_user_by_username(&realm_id, "new-user")
+                .await
+                .unwrap()
+                .is_none());
+            let preserved = state
+                .storage
+                .get_credentials(&realm_id, &existing_user.id, issuerd_core::CredentialType::Totp)
+                .await
+                .unwrap();
+            assert_eq!(preserved, vec![existing_credential.clone()]);
+        }
+
+        let compatible = serde_json::json!({
+            "users": [{
+                "username": "existing-user",
+                "credentials": [{
+                    "id": "existing-credential-id",
+                    "type": "totp",
+                    "secretData": "new-totp-secret",
+                    "credentialData": {"digits": 6}
+                }]
+            }]
+        });
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(compatible),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let updated = state
+            .storage
+            .get_credentials(&realm_id, &existing_user.id, issuerd_core::CredentialType::Totp)
+            .await
+            .unwrap();
+        assert_eq!(updated[0].secret_data, b"new-totp-secret");
+    }
+
+    #[tokio::test]
+    async fn duplicate_credential_ids_are_rejected_before_any_resource_write() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let secret = "$pbkdf2-sha256$i=27500$a2V5Y2xvYWstc2FsdA$R9/y5pwOp8WGpqw1oD3GDq/9FE00ll8Rzm9iRfM7paE";
+        let document = serde_json::json!({
+            "users": [{
+                "username": "duplicate-credential-user",
+                "credentials": [
+                    {"id": "duplicate-credential-id", "type": "password", "secretData": secret},
+                    {"id": "duplicate-credential-id", "type": "password-history", "secretData": secret}
+                ]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "duplicate-credential-user")
+            .await
+            .unwrap()
+            .is_none());
+
+        let cross_user = serde_json::json!({
+            "users": [
+                {"username": "first-user", "credentials": [
+                    {"id": "shared-credential-id", "type": "password", "secretData": secret}
+                ]},
+                {"username": "second-user", "credentials": [
+                    {"id": "shared-credential-id", "type": "password-history", "secretData": secret}
+                ]}
+            ]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(cross_user)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        for username in ["first-user", "second-user"] {
+            assert!(state
+                .storage
+                .get_user_by_username(&realm_id, username)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]
