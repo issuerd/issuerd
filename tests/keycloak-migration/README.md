@@ -58,9 +58,10 @@ after restart, including the ordinary changed password.
 Durable backends are restarted before a second login pass. A read-only backend
 oracle proves that login did not rewrite any imported hash and that changing one
 password left every other imported hash unchanged. In-memory no-rehash behavior
-is covered by the Rust integration acceptance. Temporary raw exports, secret
-inputs, configs, database files, and logs are removed. Sanitized JSON and JUnit
-evidence plus redacted target logs are written to
+is covered by the Rust integration acceptance. Every JSON report, including
+failure evidence, is passed through the same redaction layer as the logs.
+Temporary raw exports, secret inputs, configs, database files, and logs are
+removed. Sanitized JSON and JUnit evidence plus redacted target logs are written to
 `tests/keycloak-migration/results/<UTC timestamp>/` (gitignored), or to
 `--evidence-dir`.
 

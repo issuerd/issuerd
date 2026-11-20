@@ -1095,7 +1095,8 @@ class Harness:
         binary = pathlib.Path(self.args.issuerd_bin) if self.args.issuerd_bin else self.root / "target" / "debug" / "issuerd"
         self.report["target"]["version"] = binary.name
         result_path = self.evidence / "keycloak-migration-result.json"
-        result_path.write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        serialized = self.sanitize(json.dumps(self.report, indent=2, sort_keys=True)) + "\n"
+        result_path.write_text(serialized, encoding="utf-8")
         suite = ET.Element("testsuite", {
             "name": "keycloak-migration",
             "tests": str(max(1, len(self.report["users"]) + len(self.report["negative_cases"]))),
