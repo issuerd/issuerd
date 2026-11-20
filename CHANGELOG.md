@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency advisories.** Upgrade `lettre` to 0.11.24 for RUSTSEC-2026-0560 through RUSTSEC-2026-0565. Upgrade SQLx to 0.9.1 and `libsqlite3-sys` to 0.40.0, removing the temporary RUSTSEC-2026-0459 exception. Upgrade `rustix` to 1.1.6 for RUSTSEC-2026-0486.
+
 ## [0.2.5] - 2026-11-14
 
 ### Fixed
