@@ -1283,6 +1283,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_uppercase_uuid_ids_load_with_canonical_lookup() {
+        let path = std::env::temp_dir()
+            .join(format!("issuerd-json-uppercase-uuid-{}.json", uuid::Uuid::new_v4()));
+        let upper = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+        let lower = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        {
+            let storage = JsonFileStorage::new(&path).unwrap();
+            let realm = test_realm();
+            storage.create_realm(&realm).await.unwrap();
+            let mut user = test_user();
+            user.id = UserId::new(lower).unwrap();
+            storage.create_user(&realm.id, &user).await.unwrap();
+        }
+
+        let data = std::fs::read_to_string(&path).unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&data).unwrap();
+        snapshot["users"][0]["id"] = serde_json::Value::String(upper.to_string());
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let storage = JsonFileStorage::new(&path).unwrap();
+        let user = storage
+            .get_user(&RealmId::new("realm-1").unwrap(), &UserId::new(lower).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.id.as_ref(), lower);
+        assert!(storage
+            .get_user(&RealmId::new("realm-1").unwrap(), &UserId::new(upper).unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        drop(storage);
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(!data.contains(upper));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn json_storage_update_and_delete_persist() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("issuerd-json-test-{}.json", uuid::Uuid::new_v4()));

@@ -2515,6 +2515,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn uuid_lookup_is_case_insensitive() {
+        let storage = InMemoryStorage::new();
+        let realm = test_realm();
+        storage.create_realm(&realm).await.unwrap();
+        let mut user = test_user("realm-1");
+        user.id = UserId::new("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA").unwrap();
+        storage.create_user(&realm.id, &user).await.unwrap();
+        assert!(storage
+            .get_user(&realm.id, &UserId::new("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .get_user(&realm.id, &UserId::new("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA").unwrap())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     fn test_client(realm_id: &str) -> Client {
         Client {
             id: ClientId::new("client-1").unwrap(),
