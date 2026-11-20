@@ -458,6 +458,13 @@ async fn validate_client_scope_document(
             client.default_scopes.as_ref(),
             client.optional_scopes.as_ref(),
         )?;
+        let converted: issuerd_core::Client = client.clone().try_into().map_err(|error| {
+            AdminApiError::BadRequest(format!("client '{}': {error}", client.client_id))
+        })?;
+        issuerd_core::validate_no_default_mcp_scopes(
+            converted.default_scopes.as_slice(),
+            state.mcp_enabled,
+        )?;
     }
     validate_names(
         &available,
@@ -465,6 +472,9 @@ async fn validate_client_scope_document(
         body.default_default_client_scopes.as_ref(),
         body.default_optional_client_scopes.as_ref(),
     )?;
+    if let Some(default_scopes) = body.default_default_client_scopes.as_deref() {
+        issuerd_core::validate_no_default_mcp_scopes(default_scopes, state.mcp_enabled)?;
+    }
     Ok(())
 }
 
@@ -1807,6 +1817,64 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn keycloak_plus_web_origins_expand_redirect_origins() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let document = serde_json::json!({
+            "clients": [{
+                "clientId": "plus-origins",
+                "redirectUris": ["/cb", "https://second.example:443/path", "/other"],
+                "webOrigins": ["+"]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("plus-origins").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let origins: Vec<&str> = client.web_origins.iter().map(|origin| origin.as_str()).collect();
+        assert_eq!(origins, ["http://localhost:8080", "https://second.example"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_default_scope_validation_precedes_every_resource_write() {
+        let documents = [
+            serde_json::json!({
+                "users": [{"username": "must-not-import"}],
+                "clients": [{"client_id": "agent", "default_scopes": ["mcp:write"]}]
+            }),
+            serde_json::json!({
+                "users": [{"username": "must-not-import"}],
+                "defaultDefaultClientScopes": ["mcp:read"]
+            }),
+        ];
+        for document in documents {
+            let mut state = manage_realm_state();
+            std::sync::Arc::get_mut(&mut state).unwrap().mcp_enabled = true;
+            let app = test_app(state.clone());
+            let (status, body) =
+                post_json(&app, "/admin/realms/master/partialImport", Some(document)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+            assert!(body.to_string().contains("optional scope"), "body: {body}");
+            assert!(state
+                .storage
+                .get_user_by_username(&master_realm_id(), "must-not-import")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

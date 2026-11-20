@@ -200,6 +200,42 @@ fn resolve_redirect_uri(
     })
 }
 
+fn redirect_origin(client_id: &str, uri: &str) -> Result<String, AdminApiError> {
+    url::Url::parse(uri)
+        .map(|url| url.origin().ascii_serialization())
+        .map_err(|error| {
+            AdminApiError::BadRequest(format!(
+                "client '{client_id}': cannot derive a web origin from a redirect URI: {error}"
+            ))
+        })
+}
+
+fn resolve_web_origins(
+    client_id: &str,
+    redirect_uris: &[String],
+    web_origins: &[String],
+    base_url: &str,
+) -> Result<Vec<String>, AdminApiError> {
+    let mut resolved = Vec::new();
+    let mut push = |origin: String| {
+        if !resolved.contains(&origin) {
+            resolved.push(origin);
+        }
+    };
+    for origin in web_origins {
+        match origin.as_str() {
+            "*" => push(origin.clone()),
+            "+" => {
+                for redirect_uri in redirect_uris {
+                    push(redirect_origin(client_id, redirect_uri)?);
+                }
+            }
+            _ => push(resolve_redirect_uri(client_id, origin, base_url)?),
+        }
+    }
+    Ok(resolved)
+}
+
 impl KeycloakClientRepresentation {
     fn into_base(mut self, target_base_url: &str) -> Result<ClientRepresentation, AdminApiError> {
         if self.public_client.is_some() {
@@ -238,18 +274,12 @@ impl KeycloakClientRepresentation {
             } else {
                 target_base_url
             };
-            self.base.web_origins = Some(
-                web_origins
-                    .iter()
-                    .map(|origin| {
-                        if origin == "*" {
-                            Ok(origin.clone())
-                        } else {
-                            resolve_redirect_uri(&self.base.client_id, origin, base_url)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, AdminApiError>>()?,
-            );
+            self.base.web_origins = Some(resolve_web_origins(
+                &self.base.client_id,
+                self.base.redirect_uris.as_deref().unwrap_or_default(),
+                &web_origins,
+                base_url,
+            )?);
         }
         if self.consent_required.is_some() {
             self.base.consent_required = self.consent_required;
