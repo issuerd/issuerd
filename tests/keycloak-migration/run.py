@@ -697,7 +697,7 @@ class Harness:
             "client_scopes": len([scope for scope in scopes if scope.get("name", "").startswith("migration-")]),
             "clients_present": True,
             "public_client_present": True,
-            "protocol_mappers": "PASS",
+            "protocol_mappers": expected_mappers,
             "role_and_group_assignments": "PASS",
             "scope_assignments": {
                 "default": client.get("default_scopes") or client.get("defaultClientScopes"),
@@ -843,6 +843,14 @@ class Harness:
             for forbidden in check.get("forbid", []):
                 if forbidden in claims:
                     raise Failure(f"unexpected optional claim for {username}: {forbidden}")
+            if not restart:
+                self.report["target"].setdefault("claim_comparisons", []).append({
+                    "username": username,
+                    "scope": check["scope"],
+                    "expected": check.get("expect", {}),
+                    "forbidden_absent": check.get("forbid", []),
+                    "result": "PASS",
+                })
         self.verify_non_member()
         if not restart:
             self.browser_pkce("alice-argon2id", passwords["alice-argon2id"])
@@ -1591,6 +1599,7 @@ def source_login_checks(harness):
         "expect": {"optional_claim": "optional-value"},
         "forbid": [],
     }]
+    harness.report["source"]["claim_expectations"] = harness.manifest["claim_checks"]
     harness.verify_non_member(source=True)
 
 
