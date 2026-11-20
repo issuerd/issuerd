@@ -159,7 +159,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # 0.9: the combined `runtime-tokio-rustls` feature was deleted upstream — it is
 # now `runtime-tokio` + `tls-rustls` (= tls-rustls-ring → webpki-roots ^1, which
 # drops the unpatched webpki-roots 0.26 line, RUSTSEC-2026-0381).
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "migrate", "uuid", "chrono", "json"] }
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "migrate", "uuid", "chrono", "json"] }
 
 # Cache / Cluster
 # 0.29: drops rustls-pemfile (RUSTSEC-2025-0134) from the tree — native-certs
@@ -211,7 +211,7 @@ subtle = "2.6"
 zeroize = "1.8"
 
 # Email (SMTP)
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1", "tokio1-rustls-tls"] }
+lettre = { version = "0.11.24", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1", "tokio1-rustls-tls"] }
 
 # Base64
 base64 = "0.23"

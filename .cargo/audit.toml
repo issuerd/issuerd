@@ -28,18 +28,22 @@
 #   lockfile nor the build graph. No ignore.
 
 [advisories]
-# RUSTSEC-2026-0459 requires a less-trusted local writer to supply a crafted
-# database and sibling WAL; Issuerd maintains these files with owner-only 0600
-# permissions. SQLx 0.9.0 requires libsqlite3-sys <0.38 while the fix requires
-# 0.39. The compatibility change is merged but unreleased upstream; upgrade and
-# remove this ignore when https://github.com/transact-rs/sqlx/pull/4502 ships.
+# RUSTSEC-2026-0459 is resolved for real: SQLx 0.9.1 includes the upstream
+# compatibility change, and the lockfile selects libsqlite3-sys 0.40.0, beyond
+# the required 0.39 fix. No ignore remains for this advisory.
 #
 # RUSTSEC-2026-0440 is an informational unmaintained notice, not a
 # vulnerability. astral-tokio-tar is reachable only through dev-only
 # testcontainers 0.28.0 and is not shipped in the daemon. No patched
 # testcontainers release exists yet; remove this ignore when
 # https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
+#
+# RUSTSEC-2026-0543 is an informational unmaintained notice, not a
+# vulnerability. No safe chrono upgrade exists. This bugfix keeps the public
+# timestamp types unchanged; rmcp also still requires chrono until
+# https://github.com/modelcontextprotocol/rust-sdk/pull/1474 is released.
+# A future timestamp migration needs its own compatibility review.
 ignore = [
-    "RUSTSEC-2026-0459",
     "RUSTSEC-2026-0440",
+    "RUSTSEC-2026-0543",
 ]
