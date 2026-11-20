@@ -31,6 +31,7 @@ pub mod import_export;
 pub mod initial_access;
 pub mod keycloak_import;
 pub mod keys;
+pub mod migration;
 pub mod realms;
 pub mod roles;
 pub mod scope_mappings;

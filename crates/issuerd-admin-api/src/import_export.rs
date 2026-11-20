@@ -238,9 +238,11 @@ async fn import_group(
             group.realm_id = realm_id.clone();
             // Imports create top-level groups only; the path is derived from
             // the name (a document path like "/parent/child" would lie about
-            // the stored hierarchy).
+            // the stored hierarchy). Role ownership is resolved in the second pass.
             group.parent_id = None;
             group.path = issuerd_core::GroupPath::new(format!("/{}", group.name))?;
+            group.realm_roles.clear();
+            group.client_roles.clear();
             state.storage.create_group(realm_id, &group).await?;
             record(summary, ResourceType::Group, name, ImportAction::Added);
         }
@@ -249,10 +251,8 @@ async fn import_group(
             record(summary, ResourceType::Group, name, ImportAction::Skipped);
         }
         (Some(existing), IfResourceExists::Overwrite) => {
-            // Same omitted-means-keep rules as `PUT /groups/{id}`; import
-            // never re-parents or re-paths an existing group.
-            let keep_realm_roles = rep.realm_roles.is_none();
-            let keep_client_roles = rep.client_roles.is_none();
+            // Import never re-parents or re-paths an existing group. Role
+            // assignments are restored after all clients and roles exist.
             let keep_attributes = rep.attributes.is_none();
             let mut updated: issuerd_core::Group = rep.try_into()?;
             updated.id = existing.id;
@@ -260,12 +260,8 @@ async fn import_group(
             updated.parent_id = existing.parent_id;
             updated.path = existing.path;
             updated.sub_groups = existing.sub_groups;
-            if keep_realm_roles {
-                updated.realm_roles = existing.realm_roles;
-            }
-            if keep_client_roles {
-                updated.client_roles = existing.client_roles;
-            }
+            updated.realm_roles = existing.realm_roles;
+            updated.client_roles = existing.client_roles;
             if keep_attributes {
                 updated.attributes = existing.attributes;
             }
@@ -340,7 +336,6 @@ async fn import_role(
         Some(c) => format!("{}/{}", c.client_id, rep.name),
         None => rep.name.clone(),
     };
-    let keep_composites = rep.composites.is_none();
     let keep_attributes = rep.attributes.is_none();
     let existing = match client {
         Some(c) => state.storage.get_client_role_by_name(realm_id, &c.id, &rep.name).await?,
@@ -359,6 +354,8 @@ async fn import_role(
             role.realm_id = realm_id.clone();
             role.client_role = client.is_some();
             role.client_id = client.map(|c| c.id.clone());
+            role.composite = false;
+            role.composites.clear();
             state.storage.create_role(realm_id, &role).await?;
             record(summary, ResourceType::Role, resource_name, ImportAction::Added);
         }
@@ -367,16 +364,15 @@ async fn import_role(
             record(summary, ResourceType::Role, resource_name, ImportAction::Skipped);
         }
         (Some(existing), IfResourceExists::Overwrite) => {
-            // Same omitted-means-keep rules as the role update endpoints;
-            // the owning container (realm vs client) is never reassigned.
+            // The owning container is never reassigned. Composite references
+            // are resolved in the second pass after every role exists.
             let mut updated: issuerd_core::Role = rep.try_into()?;
             updated.id = existing.id;
             updated.realm_id = existing.realm_id;
             updated.client_role = existing.client_role;
             updated.client_id = existing.client_id;
-            if keep_composites {
-                updated.composites = existing.composites;
-            }
+            updated.composite = existing.composite;
+            updated.composites = existing.composites;
             if keep_attributes {
                 updated.attributes = existing.attributes;
             }
@@ -517,7 +513,7 @@ async fn import_client_scope(
     Ok(())
 }
 
-fn resource_was_skipped(
+pub(crate) fn resource_was_skipped(
     summary: &PartialImportResultRepresentation,
     resource_type: ResourceType,
     name: &str,
@@ -675,7 +671,7 @@ async fn import_idp(
     path = "/admin/realms/{realm}/partialImport",
     tag = "Realms",
     summary = "Partially import realm resources",
-    description = "Imports users, groups, clients, roles, and identity providers from a realm-partial document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), groups by name, identity providers by alias. When user `credentials` are present, every credential is validated before any resource write; supported Keycloak Argon2id/PBKDF2 password hashes are normalized and imported without a reset, plaintext password values are rejected, and OVERWRITE replaces only password/password-history credentials while preserving other credential types. Absent credentials preserve existing credentials. User role/group assignments and realm default groups are not applied. Groups are imported as top-level only (`sub_groups` is rejected). Requires `manage-realm` role.",
+    description = "Imports users, groups, clients, roles, client scopes, scope mappings, user assignments, and identity providers from a realm-partial or full Keycloak export document. `ifResourceExists` (query parameter, or the same field in the body) selects the conflict strategy: `FAIL` (default) stops at the first already-existing resource with 409 naming it — resources imported before the conflict stay imported, there is no transactional rollback; `SKIP` leaves existing resources and their assignments untouched and imports the rest; `OVERWRITE` updates existing resources with the document's fields. Identity matching is name-based: users by username, clients by clientId, realm roles by name, client roles by (clientId, name), client scopes by name, groups by name, and identity providers by alias. Credentials, scope references, role mappings, and composite references are validated before any resource write. Supported Keycloak Argon2id/PBKDF2 password hashes are normalized and imported without a reset; plaintext migration passwords are rejected. OVERWRITE replaces only password/password-history credentials while preserving other credential types. Default/optional client scopes, realm/client role scope mappings, user role/group assignments, group roles, and composite roles are restored in second passes after the catalogs exist. Groups are top-level only (`sub_groups`/`subGroups` is rejected). Requires `manage-realm` role.",
     params(
         ("realm" = String, Path, description = "Realm name"),
         PartialImportParams
@@ -706,7 +702,7 @@ pub async fn partial_import(
     // The query parameter (Keycloak's spelling) wins over the body field.
     let strategy = params.if_resource_exists.or(body.if_resource_exists).unwrap_or_default();
     validate_client_scope_document(&state, &realm_id, &body).await?;
-    let imported_clients = body.clients.clone().unwrap_or_default();
+    crate::migration::validate_references(&state, &realm_id, &body).await?;
     let prepared_users = body
         .users
         .as_deref()
@@ -728,13 +724,13 @@ pub async fn partial_import(
     for (rep, credentials) in prepared_users {
         import_user(&state, &realm_id, strategy, rep, credentials, &mut summary).await?;
     }
-    for rep in body.groups.unwrap_or_default() {
+    for rep in body.groups.clone().unwrap_or_default() {
         import_group(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
-    for rep in body.clients.unwrap_or_default() {
+    for rep in body.clients.clone().unwrap_or_default() {
         import_client(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
-    if let Some(roles) = body.roles {
+    if let Some(roles) = body.roles.clone() {
         for rep in roles.realm.unwrap_or_default() {
             import_role(&state, &realm_id, strategy, None, rep, &mut summary).await?;
         }
@@ -754,10 +750,16 @@ pub async fn partial_import(
             }
         }
     }
-    for rep in body.client_scopes.unwrap_or_default() {
+    for rep in body.client_scopes.clone().unwrap_or_default() {
         import_client_scope(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
-    restore_client_scope_assignments(&state, &realm_id, &imported_clients, &summary).await?;
+    restore_client_scope_assignments(
+        &state,
+        &realm_id,
+        body.clients.as_deref().unwrap_or_default(),
+        &summary,
+    )
+    .await?;
     restore_realm_default_scopes(
         &state,
         &realm_id,
@@ -765,7 +767,8 @@ pub async fn partial_import(
         body.default_optional_client_scopes.as_ref(),
     )
     .await?;
-    for rep in body.identity_providers.unwrap_or_default() {
+    crate::migration::restore_mappings(&state, &realm_id, &body, &summary).await?;
+    for rep in body.identity_providers.clone().unwrap_or_default() {
         import_idp(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
 
@@ -1800,6 +1803,238 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn keycloak_role_scope_user_and_group_mappings_are_restored() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let doc = serde_json::json!({
+            "users": [
+                {
+                    "username": "alice",
+                    "realmRoles": ["migration-realm-role", "realm-composite"],
+                    "clientRoles": {
+                        "migration-check": ["migration-client-role", "client-composite"]
+                    },
+                    "groups": ["/developers"]
+                },
+                {"username": "control-user", "realmRoles": [], "clientRoles": {}, "groups": []}
+            ],
+            "groups": [{
+                "name": "developers",
+                "path": "/developers",
+                "realmRoles": ["group-realm-role"],
+                "clientRoles": {"migration-check": ["group-client-role"]}
+            }],
+            "clients": [{
+                "clientId": "migration-check",
+                "fullScopeAllowed": false,
+                "defaultClientScopes": ["custom-scope"]
+            }],
+            "roles": {
+                "realm": [
+                    {"name": "migration-realm-role"},
+                    {"name": "group-realm-role"},
+                    {
+                        "name": "realm-composite",
+                        "composite": true,
+                        "composites": {
+                            "realm": ["migration-realm-role"],
+                            "client": {"migration-check": ["migration-client-role"]}
+                        }
+                    }
+                ],
+                "client": {
+                    "migration-check": [
+                        {"name": "migration-client-role"},
+                        {"name": "group-client-role"},
+                        {
+                            "name": "client-composite",
+                            "composite": true,
+                            "composites": {
+                                "realm": ["migration-realm-role"],
+                                "client": {"migration-check": ["group-client-role"]}
+                            }
+                        }
+                    ]
+                }
+            },
+            "clientScopes": [{"name": "custom-scope", "protocolMappers": []}],
+            "scopeMappings": [
+                {"client": "migration-check", "roles": ["migration-realm-role"]},
+                {"clientScope": "custom-scope", "roles": ["group-realm-role"]}
+            ],
+            "clientScopeMappings": {
+                "migration-check": [
+                    {"client": "migration-check", "roles": ["migration-client-role"]},
+                    {"clientScope": "custom-scope", "roles": ["group-client-role"]}
+                ]
+            }
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(doc.clone())).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["added"], 11);
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("migration-check").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!client.full_scope_allowed);
+        assert_eq!(client.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(client.scope_mappings.client_roles[&client.id].len(), 1);
+        let scope = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-scope")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(scope.scope_mappings.client_roles[&client.id].len(), 1);
+        let group =
+            state.storage.get_group_by_name(&realm_id, "developers").await.unwrap().unwrap();
+        assert_eq!(group.realm_roles.len(), 1);
+        assert_eq!(group.client_roles[&client.id].len(), 1);
+        let alice = state.storage.get_user_by_username(&realm_id, "alice").await.unwrap().unwrap();
+        assert_eq!(
+            state.storage.list_user_realm_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_client_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_groups(&realm_id, &alice.id).await.unwrap(),
+            vec![group.id.clone()]
+        );
+        let effective =
+            issuerd_core::effective_user_roles(state.storage.as_ref(), &realm_id, &alice.id)
+                .await
+                .unwrap();
+        let effective_names: std::collections::HashSet<String> =
+            effective.iter().map(|role| role.name.to_string()).collect();
+        for expected in [
+            "migration-realm-role",
+            "migration-client-role",
+            "group-realm-role",
+            "group-client-role",
+            "realm-composite",
+            "client-composite",
+        ] {
+            assert!(effective_names.contains(expected), "missing {expected}: {effective_names:?}");
+        }
+        let control = state
+            .storage
+            .get_user_by_username(&realm_id, "control-user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .storage
+            .list_user_realm_roles(&realm_id, &control.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .storage
+            .list_user_client_roles(&realm_id, &control.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state.storage.list_user_groups(&realm_id, &control.id).await.unwrap().is_empty());
+        let realm_composite = state
+            .storage
+            .get_role_by_name(&realm_id, "realm-composite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(realm_composite.composite);
+        assert_eq!(realm_composite.composites.len(), 2);
+        let client_composite = state
+            .storage
+            .get_client_role_by_name(&realm_id, &client.id, "client-composite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client_composite.composite);
+        assert_eq!(client_composite.composites.len(), 2);
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(doc),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["updated"], 11);
+        let client_after = state.storage.get_client(&realm_id, &client.id).await.unwrap().unwrap();
+        assert_eq!(client_after.scope_mappings.realm_roles.len(), 1);
+        assert_eq!(client_after.scope_mappings.client_roles[&client.id].len(), 1);
+        assert_eq!(
+            state.storage.list_user_realm_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            state.storage.list_user_client_roles(&realm_id, &alice.id).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_and_ambiguous_role_references_fail_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let dangling = serde_json::json!({
+            "users": [
+                {"username": "must-not-exist"},
+                {"username": "bad-user", "realmRoles": ["missing-role"]}
+            ]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(dangling)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("missing-role"));
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "must-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+
+        let cross_client = serde_json::json!({
+            "clients": [{"clientId": "client-a"}, {"clientId": "client-b"}],
+            "roles": {"client": {
+                "client-a": [{
+                    "name": "composite",
+                    "composite": true,
+                    "composites": {"client": {"client-b": ["role-b"]}}
+                }],
+                "client-b": [{"name": "role-b"}]
+            }}
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(cross_client)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("unsupported"));
+        for client_id in ["client-a", "client-b"] {
+            assert!(state
+                .storage
+                .get_client_by_client_id(
+                    &realm_id,
+                    &issuerd_core::ClientIdentifier::new(client_id).unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

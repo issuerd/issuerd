@@ -320,7 +320,7 @@ impl KeycloakImportRepresentation {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|role| {
-                        let key = format!("realm:{}", role.base.name);
+                        let key = format!("R\0{}", role.base.name);
                         role.into_base(key, &mut composite_references)
                     })
                     .collect::<Result<Vec<_>, AdminApiError>>()?;
@@ -332,7 +332,7 @@ impl KeycloakImportRepresentation {
                         roles
                             .into_iter()
                             .map(|role| {
-                                let key = format!("client:{client_id}:{}", role.base.name);
+                                let key = format!("C\0{client_id}\0{}", role.base.name);
                                 role.into_base(key, &mut composite_references)
                             })
                             .collect::<Result<Vec<_>, AdminApiError>>()
