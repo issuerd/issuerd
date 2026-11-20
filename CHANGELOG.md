@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Realm-admin navigation and server metadata.** Link realm-scoped administrators to their own realm settings instead of the master-only realm list, and stop querying that list from the sidebar. Preserve the global list for master-issued admin tokens. Recognize the nested router paths of `GET /admin/serverinfo` and `GET /admin/enums/*`, so authorized realm administrators can load server metadata and realm settings.
 - **Container healthcheck.** Add an exec-form `HEALTHCHECK` using the existing `issuerd healthcheck` command. Readiness probes work without adding a shell to the distroless runtime image or requiring a Compose-specific shell command.
 
+### Security
+
+- **Dependency advisories.** Upgrade `lettre` to 0.11.24 for RUSTSEC-2026-0560 through RUSTSEC-2026-0565. Upgrade SQLx to 0.9.1 and `libsqlite3-sys` to 0.40.0, removing the temporary RUSTSEC-2026-0459 exception. Upgrade `rustix` to 1.1.6 for RUSTSEC-2026-0486.
+- **Temporary chrono advisory exception.** Allow RUSTSEC-2026-0543 as an informational unmaintained notice, not a vulnerability, without changing public timestamp models. Optional-chrono support in `rmcp` is pending in `modelcontextprotocol/rust-sdk#1474`; a future timestamp migration requires separate compatibility work.
+
 ## [0.2.5] - 2026-11-14
 
 ### Fixed
