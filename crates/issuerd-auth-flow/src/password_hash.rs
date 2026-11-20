@@ -287,19 +287,19 @@ fn algorithm_data_value<'a>(
     data: &'a Map<String, Value>,
     key: &str,
 ) -> Result<&'a str, IssuerdError> {
-    let values = data
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("Argon2 algorithmData must contain single-value arrays"))?;
-    if values.len() != 1 {
-        return Err(invalid("Argon2 algorithmData must contain single-value arrays"));
+    match data.get(key) {
+        Some(Value::String(value)) => Ok(value),
+        Some(Value::Array(values)) if values.len() == 1 => values[0]
+            .as_str()
+            .ok_or_else(|| invalid("Argon2 algorithmData values must be strings")),
+        _ => Err(invalid("Argon2 algorithmData must contain single-value fields")),
     }
-    values[0]
-        .as_str()
-        .ok_or_else(|| invalid("Argon2 algorithmData values must be strings"))
 }
 
 fn algorithm_data_u32(data: &Map<String, Value>, key: &str) -> Result<u32, IssuerdError> {
+    if let Some(value) = data.get(key).and_then(Value::as_u64) {
+        return u32::try_from(value).map_err(|_| invalid("Argon2 numeric parameter is too large"));
+    }
     algorithm_data_value(data, key)?
         .parse::<u32>()
         .map_err(|_| invalid("invalid Argon2 numeric algorithmData"))
@@ -313,18 +313,22 @@ fn normalize_keycloak_argon2(
     if iterations == 0 || iterations > MAX_ARGON2_ITERATIONS {
         return Err(invalid("Argon2 iteration count exceeds the supported limit"));
     }
-    let data = credential
+    let data_value = credential
         .get("algorithmData")
-        .and_then(Value::as_object)
+        .filter(|value| value.is_object() || value.is_string())
+        .or_else(|| credential.get("additionalParameters"))
         .ok_or_else(|| invalid("Keycloak Argon2 algorithmData is missing"))?;
-    if algorithm_data_value(data, "version")? != "1.3"
-        || algorithm_data_value(data, "type")? != "id"
+    let data = json_object(data_value).map_err(|_| {
+        invalid("Keycloak Argon2 algorithmData is not an object or JSON object string")
+    })?;
+    if algorithm_data_value(&data, "version")? != "1.3"
+        || algorithm_data_value(&data, "type")? != "id"
     {
         return Err(invalid("unsupported Keycloak Argon2 type or version"));
     }
-    let memory = algorithm_data_u32(data, "memory")?;
-    let parallelism = algorithm_data_u32(data, "parallelism")?;
-    let hash_length = algorithm_data_u32(data, "hashLength")? as usize;
+    let memory = algorithm_data_u32(&data, "memory")?;
+    let parallelism = algorithm_data_u32(&data, "parallelism")?;
+    let hash_length = algorithm_data_u32(&data, "hashLength")? as usize;
     if memory > MAX_ARGON2_MEMORY_KIB || parallelism == 0 || parallelism > MAX_ARGON2_PARALLELISM {
         return Err(invalid("Argon2 memory or parallelism exceeds the supported limit"));
     }
@@ -520,6 +524,14 @@ mod tests {
             "salt": general_purpose::STANDARD.encode(b"keycloak-salt"),
         });
         let normalized = normalize_keycloak_password(&credential_data, &secret_data).unwrap();
+        let mut database_credential_data = credential_data.clone();
+        let algorithm_data = database_credential_data["algorithmData"].take();
+        database_credential_data["additionalParameters"] =
+            Value::String(algorithm_data.to_string());
+        assert_eq!(
+            normalize_keycloak_password(&database_credential_data, &secret_data).unwrap(),
+            normalized
+        );
         let encoded = std::str::from_utf8(&normalized.secret_data).unwrap();
         assert!(encoded.starts_with("$argon2id$v=19$m=7168,t=5,p=1$"));
         assert_eq!(verify_normalized(PASSWORD, &normalized), PasswordVerification::Match);

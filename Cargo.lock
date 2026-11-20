@@ -2329,6 +2329,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "utoipa",
  "uuid",
 ]

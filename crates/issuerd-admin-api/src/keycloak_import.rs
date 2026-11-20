@@ -172,10 +172,36 @@ struct KeycloakClientRepresentation {
     optional_client_scopes: Option<Vec<String>>,
     #[serde(rename = "protocolMappers")]
     protocol_mappers: Option<Vec<KeycloakProtocolMapperRepresentation>>,
+    #[serde(rename = "rootUrl")]
+    root_url: Option<String>,
+    #[serde(rename = "baseUrl")]
+    base_url: Option<String>,
+    #[serde(rename = "adminUrl")]
+    admin_url: Option<String>,
+}
+
+fn resolve_redirect_uri(
+    client_id: &str,
+    uri: &str,
+    base_url: &str,
+) -> Result<String, AdminApiError> {
+    if url::Url::parse(uri).is_ok() {
+        return Ok(uri.to_string());
+    }
+    let base = url::Url::parse(base_url).map_err(|_| {
+        AdminApiError::BadRequest(format!(
+            "client '{client_id}': relative redirect URI has no valid target base URL"
+        ))
+    })?;
+    base.join(uri).map(|url| url.to_string()).map_err(|error| {
+        AdminApiError::BadRequest(format!(
+            "client '{client_id}': cannot resolve relative redirect URI: {error}"
+        ))
+    })
 }
 
 impl KeycloakClientRepresentation {
-    fn into_base(mut self) -> Result<ClientRepresentation, AdminApiError> {
+    fn into_base(mut self, target_base_url: &str) -> Result<ClientRepresentation, AdminApiError> {
         if self.public_client.is_some() {
             self.base.public_client = self.public_client;
         }
@@ -185,8 +211,22 @@ impl KeycloakClientRepresentation {
         if self.client_authenticator_type.is_some() {
             self.base.client_authenticator_type = self.client_authenticator_type;
         }
-        if self.redirect_uris.is_some() {
-            self.base.redirect_uris = self.redirect_uris;
+        if let Some(redirect_uris) = self.redirect_uris {
+            let base_url = if target_base_url.is_empty() {
+                self.root_url
+                    .as_deref()
+                    .or(self.base_url.as_deref())
+                    .or(self.admin_url.as_deref())
+                    .unwrap_or_default()
+            } else {
+                target_base_url
+            };
+            self.base.redirect_uris = Some(
+                redirect_uris
+                    .iter()
+                    .map(|uri| resolve_redirect_uri(&self.base.client_id, uri, base_url))
+                    .collect::<Result<Vec<_>, AdminApiError>>()?,
+            );
         }
         if self.web_origins.is_some() {
             self.base.web_origins = self.web_origins;
@@ -310,7 +350,10 @@ struct KeycloakRolesRepresentation {
 }
 
 impl KeycloakImportRepresentation {
-    pub fn into_partial(self) -> Result<PartialImportRepresentation, AdminApiError> {
+    pub fn into_partial(
+        self,
+        target_base_url: &str,
+    ) -> Result<PartialImportRepresentation, AdminApiError> {
         let mut composite_references = HashMap::new();
         let roles = self
             .roles
@@ -361,7 +404,7 @@ impl KeycloakImportRepresentation {
             clients: self
                 .clients
                 .map(|clients| {
-                    clients.into_iter().map(KeycloakClientRepresentation::into_base).collect()
+                    clients.into_iter().map(|client| client.into_base(target_base_url)).collect()
                 })
                 .transpose()?,
             roles,

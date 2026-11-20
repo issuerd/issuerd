@@ -696,7 +696,7 @@ pub async fn partial_import(
     Json(body): Json<crate::keycloak_import::KeycloakImportRepresentation>,
 ) -> Result<Json<PartialImportResultRepresentation>, AdminApiError> {
     require_roles(&auth, &["manage-realm"])?;
-    let body = body.into_partial()?;
+    let body = body.into_partial(&state.base_url)?;
     let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let realm_id = realm.id.clone();
     // The query parameter (Keycloak's spelling) wins over the body field.
@@ -1722,6 +1722,7 @@ mod tests {
             "clients": [{
                 "clientId": "migration-check",
                 "publicClient": true,
+                "redirectUris": ["/*"],
                 "defaultClientScopes": ["custom-default"],
                 "optionalClientScopes": ["custom-optional"]
             }],
@@ -1766,6 +1767,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(client.public_client);
+        assert_eq!(client.redirect_uris[0].as_str(), "http://localhost:8080/*");
         let assignments = state
             .storage
             .list_client_scope_assignments(&realm_id, &client.id)
