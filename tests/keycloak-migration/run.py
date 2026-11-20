@@ -389,6 +389,9 @@ class Harness:
             ], secret_output=True).decode().splitlines()
             if "admin" not in users:
                 raise Failure("PostgreSQL provisioning did not create the master admin user")
+        self.refresh_target_admin_token()
+
+    def refresh_target_admin_token(self):
         _, body, _ = self.http(
             "POST",
             self.target_url("/api/v1/auth/admin-token"),
@@ -430,6 +433,16 @@ class Harness:
             raise second_error
 
     def admin(self, method, path, body=None, expected=(200,)):
+        response = self.http(
+            method,
+            self.target_url(path),
+            body=body,
+            token=self.target_token,
+            expected=expected + (401,),
+        )
+        if response[0] != 401:
+            return response
+        self.refresh_target_admin_token()
         return self.http(
             method,
             self.target_url(path),
