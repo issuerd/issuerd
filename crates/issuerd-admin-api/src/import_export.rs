@@ -387,6 +387,255 @@ async fn import_role(
     Ok(())
 }
 
+async fn validate_client_scope_document(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    body: &PartialImportRepresentation,
+) -> Result<(), AdminApiError> {
+    let existing = state
+        .storage
+        .list_client_scopes(
+            realm_id,
+            &Pagination {
+                first: 0,
+                max: i32::MAX,
+            },
+        )
+        .await?;
+    let mut available: std::collections::HashSet<String> =
+        existing.into_iter().map(|scope| scope.name).collect();
+    available.insert("openid".to_string());
+    let mut document_names = std::collections::HashSet::new();
+    for scope in body.client_scopes.as_deref().unwrap_or_default() {
+        if scope.name.trim().is_empty() {
+            return Err(AdminApiError::BadRequest("client scope name is required".to_string()));
+        }
+        if !document_names.insert(scope.name.clone()) {
+            return Err(AdminApiError::BadRequest(format!(
+                "duplicate client scope '{}' in the import document",
+                scope.name
+            )));
+        }
+        available.insert(scope.name.clone());
+        let converted: issuerd_core::ClientScope = scope.clone().try_into().map_err(|error| {
+            AdminApiError::BadRequest(format!("client scope '{}': {error}", scope.name))
+        })?;
+        let mut mapper_names = std::collections::HashSet::new();
+        for mapper in converted.protocol_mappers {
+            if !mapper_names.insert(mapper.name.clone()) {
+                return Err(AdminApiError::BadRequest(format!(
+                    "client scope '{}': duplicate protocol mapper '{}'",
+                    scope.name, mapper.name
+                )));
+            }
+        }
+    }
+
+    fn validate_names(
+        available: &std::collections::HashSet<String>,
+        owner: &str,
+        default: Option<&Vec<String>>,
+        optional: Option<&Vec<String>>,
+    ) -> Result<(), AdminApiError> {
+        let mut seen = std::collections::HashSet::new();
+        for (kind, names) in [("default", default), ("optional", optional)] {
+            for name in names.into_iter().flatten() {
+                if !seen.insert(name.clone()) {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "{owner}: duplicate or overlapping client scope reference '{name}'"
+                    )));
+                }
+                if !available.contains(name) {
+                    return Err(AdminApiError::BadRequest(format!(
+                        "{owner}: references unknown {kind} client scope '{name}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    for client in body.clients.as_deref().unwrap_or_default() {
+        validate_names(
+            &available,
+            &format!("client '{}'", client.client_id),
+            client.default_scopes.as_ref(),
+            client.optional_scopes.as_ref(),
+        )?;
+    }
+    validate_names(
+        &available,
+        "realm defaults",
+        body.default_default_client_scopes.as_ref(),
+        body.default_optional_client_scopes.as_ref(),
+    )?;
+    Ok(())
+}
+
+/// Import one client scope, matched by name.
+async fn import_client_scope(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    strategy: IfResourceExists,
+    rep: ClientScopeRepresentation,
+    summary: &mut PartialImportResultRepresentation,
+) -> Result<(), AdminApiError> {
+    let name = rep.name.clone();
+    let existing = state.storage.get_client_scope_by_name(realm_id, &rep.name).await?;
+    match (existing, strategy) {
+        (None, _) => {
+            let mut scope: issuerd_core::ClientScope = rep.try_into()?;
+            scope.realm_id = realm_id.clone();
+            state.storage.create_client_scope(realm_id, &scope).await?;
+            record(summary, ResourceType::ClientScope, name, ImportAction::Added);
+        }
+        (Some(_), IfResourceExists::Fail) => return Err(conflict("client scope", &name)),
+        (Some(_), IfResourceExists::Skip) => {
+            record(summary, ResourceType::ClientScope, name, ImportAction::Skipped);
+        }
+        (Some(existing), IfResourceExists::Overwrite) => {
+            let keep_mappers = rep.protocol_mappers.is_none();
+            let keep_attributes = rep.attributes.is_none();
+            let keep_protocol = rep.protocol.is_none();
+            let mut updated: issuerd_core::ClientScope = rep.try_into()?;
+            updated.id = existing.id;
+            updated.realm_id = existing.realm_id;
+            updated.scope_mappings = existing.scope_mappings;
+            if keep_mappers {
+                updated.protocol_mappers = existing.protocol_mappers;
+            }
+            if keep_attributes {
+                updated.attributes = existing.attributes;
+            }
+            if keep_protocol {
+                updated.protocol = existing.protocol;
+            }
+            state.storage.update_client_scope(realm_id, &updated).await?;
+            record(summary, ResourceType::ClientScope, name, ImportAction::Updated);
+        }
+    }
+    Ok(())
+}
+
+fn resource_was_skipped(
+    summary: &PartialImportResultRepresentation,
+    resource_type: ResourceType,
+    name: &str,
+) -> bool {
+    summary.results.iter().any(|result| {
+        result.resource_type == resource_type
+            && result.resource_name == name
+            && result.action == ImportAction::Skipped
+    })
+}
+
+async fn restore_client_scope_assignments(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    clients: &[ClientRepresentation],
+    summary: &PartialImportResultRepresentation,
+) -> Result<(), AdminApiError> {
+    for rep in clients {
+        if resource_was_skipped(summary, ResourceType::Client, &rep.client_id)
+            || (rep.default_scopes.is_none() && rep.optional_scopes.is_none())
+        {
+            continue;
+        }
+        let identifier = issuerd_core::ClientIdentifier::new(rep.client_id.clone())?;
+        let client =
+            state.storage.get_client_by_client_id(realm_id, &identifier).await?.ok_or_else(
+                || {
+                    AdminApiError::BadRequest(format!(
+                        "client scope assignment references unknown client '{}'",
+                        rep.client_id
+                    ))
+                },
+            )?;
+        let current = state.storage.list_client_scope_assignments(realm_id, &client.id).await?;
+        for (scope_id, is_default) in current {
+            let scope =
+                state.storage.get_client_scope(realm_id, &scope_id).await?.ok_or_else(|| {
+                    AdminApiError::BadRequest(
+                        "stored client scope assignment is dangling".to_string(),
+                    )
+                })?;
+            let desired = if is_default {
+                &rep.default_scopes
+            } else {
+                &rep.optional_scopes
+            };
+            if desired.as_ref().is_some_and(|names| !names.contains(&scope.name)) {
+                state.storage.unassign_client_scope(realm_id, &client.id, &scope_id).await?;
+            }
+        }
+        for (is_default, names) in [
+            (true, rep.default_scopes.as_ref()),
+            (false, rep.optional_scopes.as_ref()),
+        ] {
+            for name in names.into_iter().flatten() {
+                if name == "openid" {
+                    continue;
+                }
+                let scope =
+                    state.storage.get_client_scope_by_name(realm_id, name).await?.ok_or_else(
+                        || {
+                            AdminApiError::BadRequest(format!(
+                                "client '{}': references unknown client scope '{name}'",
+                                rep.client_id
+                            ))
+                        },
+                    )?;
+                state
+                    .storage
+                    .assign_client_scope(realm_id, &client.id, &scope.id, is_default)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn restore_realm_default_scopes(
+    state: &Arc<AdminApiState>,
+    realm_id: &issuerd_core::RealmId,
+    default: Option<&Vec<String>>,
+    optional: Option<&Vec<String>>,
+) -> Result<(), AdminApiError> {
+    if default.is_none() && optional.is_none() {
+        return Ok(());
+    }
+    for (scope_id, is_default) in state.storage.list_realm_default_client_scopes(realm_id).await? {
+        let scope =
+            state.storage.get_client_scope(realm_id, &scope_id).await?.ok_or_else(|| {
+                AdminApiError::BadRequest(
+                    "stored realm default scope assignment is dangling".to_string(),
+                )
+            })?;
+        let desired = if is_default { default } else { optional };
+        if desired.is_some_and(|names| !names.contains(&scope.name)) {
+            state.storage.remove_realm_default_client_scope(realm_id, &scope_id).await?;
+        }
+    }
+    for (is_default, names) in [(true, default), (false, optional)] {
+        for name in names.into_iter().flatten() {
+            if name == "openid" {
+                continue;
+            }
+            let scope =
+                state.storage.get_client_scope_by_name(realm_id, name).await?.ok_or_else(|| {
+                    AdminApiError::BadRequest(format!(
+                        "realm defaults reference unknown client scope '{name}'"
+                    ))
+                })?;
+            state
+                .storage
+                .add_realm_default_client_scope(realm_id, &scope.id, is_default)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Import one identity provider, matched by alias.
 async fn import_idp(
     state: &Arc<AdminApiState>,
@@ -448,13 +697,16 @@ pub async fn partial_import(
     Extension(auth): Extension<AdminAuth>,
     axum::extract::Path(realm): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PartialImportParams>,
-    Json(body): Json<PartialImportRepresentation>,
+    Json(body): Json<crate::keycloak_import::KeycloakImportRepresentation>,
 ) -> Result<Json<PartialImportResultRepresentation>, AdminApiError> {
     require_roles(&auth, &["manage-realm"])?;
+    let body = body.into_partial()?;
     let realm = state.storage.get_realm_by_name(&realm).await?.ok_or(AdminApiError::NotFound)?;
     let realm_id = realm.id.clone();
     // The query parameter (Keycloak's spelling) wins over the body field.
     let strategy = params.if_resource_exists.or(body.if_resource_exists).unwrap_or_default();
+    validate_client_scope_document(&state, &realm_id, &body).await?;
+    let imported_clients = body.clients.clone().unwrap_or_default();
     let prepared_users = body
         .users
         .as_deref()
@@ -502,6 +754,17 @@ pub async fn partial_import(
             }
         }
     }
+    for rep in body.client_scopes.unwrap_or_default() {
+        import_client_scope(&state, &realm_id, strategy, rep, &mut summary).await?;
+    }
+    restore_client_scope_assignments(&state, &realm_id, &imported_clients, &summary).await?;
+    restore_realm_default_scopes(
+        &state,
+        &realm_id,
+        body.default_default_client_scopes.as_ref(),
+        body.default_optional_client_scopes.as_ref(),
+    )
+    .await?;
     for rep in body.identity_providers.unwrap_or_default() {
         import_idp(&state, &realm_id, strategy, rep, &mut summary).await?;
     }
@@ -1432,6 +1695,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(preserved_totp, vec![totp]);
+    }
+
+    #[tokio::test]
+    async fn keycloak_client_scopes_mappers_and_assignments_survive_import() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let mappers: Vec<serde_json::Value> = issuerd_core::MapperType::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, mapper_type)| {
+                serde_json::json!({
+                    "id": format!("mapper-{index}"),
+                    "name": format!("mapper-{index}"),
+                    "protocol": "openid-connect",
+                    "protocolMapper": serde_json::to_value(mapper_type).unwrap(),
+                    "config": {"userinfo.token.claim": "true"}
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "clients": [{
+                "clientId": "migration-check",
+                "publicClient": true,
+                "defaultClientScopes": ["custom-default"],
+                "optionalClientScopes": ["custom-optional"]
+            }],
+            "clientScopes": [
+                {
+                    "id": "custom-default-id",
+                    "name": "custom-default",
+                    "protocol": "openid-connect",
+                    "protocolMappers": mappers
+                },
+                {
+                    "id": "custom-optional-id",
+                    "name": "custom-optional",
+                    "protocol": "openid-connect",
+                    "protocolMappers": []
+                }
+            ],
+            "defaultDefaultClientScopes": ["custom-default"],
+            "defaultOptionalClientScopes": ["custom-optional"]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(doc.clone())).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["added"], 3);
+
+        let scope = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-default")
+            .await
+            .unwrap()
+            .unwrap();
+        let actual_types: Vec<issuerd_core::MapperType> =
+            scope.protocol_mappers.iter().map(|mapper| mapper.mapper_type).collect();
+        assert_eq!(actual_types, issuerd_core::MapperType::ALL);
+        let client = state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("migration-check").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.public_client);
+        let assignments = state
+            .storage
+            .list_client_scope_assignments(&realm_id, &client.id)
+            .await
+            .unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.iter().any(|(id, default)| *id == scope.id && *default));
+        let optional = state
+            .storage
+            .get_client_scope_by_name(&realm_id, "custom-optional")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(assignments.iter().any(|(id, default)| *id == optional.id && !*default));
+        let realm_defaults =
+            state.storage.list_realm_default_client_scopes(&realm_id).await.unwrap();
+        assert_eq!(realm_defaults.len(), 2);
+        assert!(realm_defaults.iter().any(|(id, default)| *id == scope.id && *default));
+        assert!(realm_defaults.iter().any(|(id, default)| *id == optional.id && !*default));
+
+        let (status, body) = post_json(
+            &app,
+            "/admin/realms/master/partialImport?ifResourceExists=OVERWRITE",
+            Some(doc),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["updated"], 3);
+        assert_eq!(
+            state
+                .storage
+                .list_client_scope_assignments(&realm_id, &client.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_and_mapper_validation_fail_before_writes() {
+        let state = manage_realm_state();
+        let app = test_app(state.clone());
+        let realm_id = master_realm_id();
+        let unsupported = serde_json::json!({
+            "users": [{"username": "must-not-exist"}],
+            "clientScopes": [{
+                "name": "bad-scope",
+                "protocolMappers": [{
+                    "name": "hardcoded",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-hardcoded-claim-mapper",
+                    "config": {}
+                }]
+            }]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(unsupported)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body["errorMessage"].as_str().unwrap();
+        assert!(message.contains("bad-scope"), "{message}");
+        assert!(message.contains("oidc-hardcoded-claim-mapper"), "{message}");
+        assert!(state
+            .storage
+            .get_user_by_username(&realm_id, "must-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+
+        let dangling = serde_json::json!({
+            "clients": [{"clientId": "bad-client", "defaultClientScopes": ["missing-scope"]}]
+        });
+        let (status, body) =
+            post_json(&app, "/admin/realms/master/partialImport", Some(dangling)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["errorMessage"].as_str().unwrap().contains("missing-scope"));
+        assert!(state
+            .storage
+            .get_client_by_client_id(
+                &realm_id,
+                &issuerd_core::ClientIdentifier::new("bad-client").unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

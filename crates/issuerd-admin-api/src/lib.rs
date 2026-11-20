@@ -29,6 +29,7 @@ pub mod groups;
 pub mod idp;
 pub mod import_export;
 pub mod initial_access;
+pub mod keycloak_import;
 pub mod keys;
 pub mod realms;
 pub mod roles;

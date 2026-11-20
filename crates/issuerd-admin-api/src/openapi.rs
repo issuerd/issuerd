@@ -317,6 +317,7 @@ impl utoipa::Modify for SecurityAddon {
         crate::dto::IfResourceExists,
         crate::dto::PartialImportRepresentation,
         crate::dto::PartialImportRolesRepresentation,
+        crate::dto::ScopeMappingRepresentation,
         crate::dto::ImportAction,
         crate::dto::PartialImportResultEntry,
         crate::dto::PartialImportResultRepresentation,
