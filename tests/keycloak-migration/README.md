@@ -1,0 +1,74 @@
+# Keycloak migration acceptance harness
+
+This directory contains a stdlib-Python acceptance harness for mixed-credential
+Keycloak realm migration. It is **in development** until the real Keycloak and
+backend-matrix runs are green; it is not an external MLabs certification or a
+production-cutover claim.
+
+## Real Keycloak 26.7.1 export
+
+```bash
+python3 tests/keycloak-migration/run.py
+```
+
+The default lane starts a disposable PostgreSQL + `quay.io/keycloak/keycloak:26.7.1`
+stack, provisions the realm exclusively through Keycloak's Admin API, changes the
+realm password policy between user creations, verifies source logins, stops
+Keycloak, runs `kc.sh export --dir /export --realm migration-lab --users realm_file`,
+and checks every credential row through a read-only PostgreSQL oracle. It then
+starts a fresh Issuerd target, imports the export through `partialImport`, and
+verifies inventory, logins, PKCE, UserInfo claims, negative cases, and an ordinary
+password change. The target uses a fresh target-only client secret; source client
+secrets are never reused.
+
+`target/debug/issuerd` is used by default and built when missing. Override it with
+`--issuerd-bin /path/to/issuerd` to test a release binary.
+
+## Local compatible fixture (no source Keycloak)
+
+```bash
+python3 tests/keycloak-migration/run.py --synthetic --backend in-memory
+python3 tests/keycloak-migration/run.py --synthetic --backend json-file
+python3 tests/keycloak-migration/run.py --synthetic --backend sqlite
+```
+
+The synthetic lane generates unique disposable passwords, salts, PBKDF2 digests,
+and an Argon2id PHC value using the workspace's existing `argon2` crate. Its
+manifest explicitly says it is not Keycloak-produced. Only the default lane is
+evidence for a real Keycloak export.
+
+Durable backends are restarted before a second login pass. Temporary raw exports,
+secret inputs, configs, database files, and logs are removed. Sanitized JSON and
+JUnit evidence plus redacted target logs are written to
+`tests/keycloak-migration/results/<UTC timestamp>/` (gitignored), or to
+`--evidence-dir`.
+
+## Independently supplied sanitized fixture
+
+```bash
+python3 tests/keycloak-migration/run.py \
+  --fixture /path/to/sanitized-keycloak-realm.json \
+  --manifest /path/to/fixture-manifest.json \
+  --secrets /path/to/fixture-secrets.json
+```
+
+If `--manifest` and `--secrets` are omitted, the harness looks for
+`fixture-manifest.json` and `fixture-secrets.json` beside the fixture. The secret
+input must be local-only with mode `0600` and follows
+`fixture-secrets.schema.json`:
+
+```json
+{
+  "users": {"alice-argon2id": "disposable-password"},
+  "client_secret": "disposable-source-client-secret"
+}
+```
+
+The manifest follows `fixture-manifest.schema.json`: it records algorithms and
+per-row parameters, scope/mapper expectations, and semantic claim checks, never
+hashes, salts, passwords, tokens, or private keys. All enabled manifest users
+must have a disposable password in the secret input. The fixture itself must
+contain full `users`, `credentials`, `clientScopes`, and mapper definitions.
+
+A green run prints `KEYCLOAK_MIGRATION_OK`. A failure exits nonzero, identifies
+the stage/resource without printing secrets, and leaves only sanitized evidence.
