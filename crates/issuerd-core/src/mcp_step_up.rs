@@ -100,9 +100,10 @@ pub fn has_primary_sign_in_method(
                 .iter()
                 .any(|link| link.user_id == user.id && link.provider_alias == alias);
     }
+    let federation_id = crate::IdentityProviderId::new(federation_link).ok();
     identity_providers.iter().any(|provider| {
         provider.enabled
-            && provider.id.as_ref() == federation_link
+            && federation_id.as_ref() == Some(&provider.id)
             && matches!(provider.provider_id.as_str(), "ldap" | "kerberos")
     })
 }
@@ -527,6 +528,15 @@ mod tests {
             assert!(!is_second_factor_credential_type(&credential_type));
             assert!(!is_primary_sign_in_credential_type(&credential_type));
         }
+    }
+
+    #[test]
+    fn federation_link_accepts_uuid_case_variants() {
+        let realm = Realm::default();
+        let mut user = user(&realm);
+        user.federation_link = Some("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into());
+        let provider = provider("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "ldap", true);
+        assert!(has_primary_sign_in_method(&user, &realm, &[], &[provider], &[], &[]));
     }
 
     #[test]

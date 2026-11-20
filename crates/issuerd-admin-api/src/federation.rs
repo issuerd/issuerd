@@ -8,7 +8,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use issuerd_core::{OperationType, ResourceType};
+use issuerd_core::{IdentityProviderId, OperationType, ResourceType};
 use std::sync::Arc;
 
 use crate::{
@@ -63,9 +63,13 @@ pub async fn sync_users(
         .list_identity_providers(&realm_id)
         .await
         .map_err(|e| AdminApiError::Internal(anyhow::anyhow!("{e}")))?;
+    let provider_internal_id = IdentityProviderId::new(&provider_id).ok();
     let matched_config = idps
         .into_iter()
-        .find(|idp| idp.id.as_ref() == provider_id || idp.alias.as_ref() == provider_id.as_str())
+        .find(|idp| {
+            provider_internal_id.as_ref() == Some(&idp.id)
+                || idp.alias.as_ref() == provider_id.as_str()
+        })
         .ok_or(AdminApiError::NotFound)?;
 
     let providers = state
@@ -368,6 +372,26 @@ mod tests {
         assert!(result.is_ok());
         let json = result.unwrap().0;
         assert_eq!(json.added, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_users_accepts_uuid_case_variants() {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let state = state_with_provider(Arc::new(MockProvider { id: id.to_string() })).await;
+        let realm = RealmId::new("realm-1").unwrap();
+        let mut idp = state.storage.list_identity_providers(&realm).await.unwrap().remove(0);
+        state.storage.delete_identity_provider(&realm, &idp.id).await.unwrap();
+        idp.id = issuerd_core::IdentityProviderId::new(id).unwrap();
+        state.storage.create_identity_provider(&realm, &idp).await.unwrap();
+
+        let result = sync_users(
+            State(state),
+            Extension(admin_auth()),
+            axum::extract::Path(("test".to_string(), id.to_uppercase())),
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

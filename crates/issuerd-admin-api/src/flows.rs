@@ -67,10 +67,11 @@ fn validate_post_mutation_set(
 /// Locate a stage by id across the realm's flows, returning the owning flow's
 /// index in `flows` and the stage's index within it.
 fn find_stage(flows: &[FlowConfig], execution_id: &str) -> Option<(usize, usize)> {
+    let execution_id = FlowStageId::new(execution_id).ok()?;
     flows.iter().enumerate().find_map(|(flow_idx, flow)| {
         flow.stages
             .iter()
-            .position(|s| s.id.as_ref() == execution_id)
+            .position(|s| s.id == execution_id)
             .map(|stage_idx| (flow_idx, stage_idx))
     })
 }
@@ -670,10 +671,11 @@ pub async fn update_execution(
         .ok_or(AdminApiError::NotFound)?;
     ensure_not_built_in(&flow)?;
     let representation = serde_json::to_string(&body).ok();
+    let stage_id = FlowStageId::new(&body.id).map_err(|_| AdminApiError::NotFound)?;
     let stage = flow
         .stages
         .iter_mut()
-        .find(|s| s.id.as_ref() == body.id)
+        .find(|s| s.id == stage_id)
         .ok_or(AdminApiError::NotFound)?;
     if let Some(requirement) = body.requirement {
         stage.requirement = requirement;
@@ -1506,6 +1508,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn uuid_execution_ids_match_case_insensitively() {
+        let state = manage_state();
+        let app = flow_routes(state.clone());
+        let realm = seeded_realm(&state).await;
+        create_custom_flow(&app, "custom").await;
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/admin/realms/test/authentication/flows/custom/executions/execution",
+                Some(serde_json::json!({"provider": "auth-otp-form"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response).await;
+        let id = created["id"].as_str().unwrap();
+        let uppercase = id.to_uppercase();
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                "GET",
+                &format!("/admin/realms/test/authentication/executions/{uppercase}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(authed_request(
+                "PUT",
+                "/admin/realms/test/authentication/flows/custom/executions",
+                Some(serde_json::json!({"id": uppercase, "priority": 7})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let stored = state.storage.get_flow_config(&realm.id, "custom").await.unwrap().unwrap();
+        let stage = stored.stages.iter().find(|stage| stage.id.as_ref() == id).unwrap();
+        assert_eq!(stage.priority, 7);
     }
 
     #[tokio::test]
