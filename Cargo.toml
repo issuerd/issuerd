@@ -130,7 +130,7 @@ schemars = "1.0"
 
 # Model Context Protocol SDK (features are selected by each consumer)
 # 3.9 bounds Streamable HTTP client response bodies (RUSTSEC-2026-0462).
-rmcp = { version = "~3.9.0", default-features = false }
+rmcp = { version = "~3.11.0", default-features = false }
 
 # Crypto
 ring = "0.17"
