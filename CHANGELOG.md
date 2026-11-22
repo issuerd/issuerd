@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP completion with rmcp 3.11.** Declare the completions capability and return the specification-compliant empty result for `completion/complete`, restoring official MCP conformance after the SDK began rejecting requests without that capability.
+
 ## [0.2.6] - 2026-11-20
 
 ### Added
