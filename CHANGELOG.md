@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **MCP completion with rmcp 3.11.** Declare the completions capability and return the specification-compliant empty result for `completion/complete`, restoring official MCP conformance after the SDK began rejecting requests without that capability.
 
+### Security
+
+- **URL dependency advisory.** Upgrade `url` to 2.5.9 to address RUSTSEC-2026-0592, a stack overflow when calling `Url::origin()` on nested `blob:` URLs.
+
 ## [0.2.6] - 2026-11-20
 
 ### Added
