@@ -5,10 +5,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
-    Implementation, ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
-    ServerCapabilities, ServerConfig, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CompleteRequestParams,
+    CompleteResult, ContentBlock, ErrorCode, Implementation, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -43,21 +43,35 @@ impl IssuerdMcpServer {
 
 impl ServerHandler for IssuerdMcpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
-            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
-            .with_server_info(
-                Implementation::new("issuerd", env!("CARGO_PKG_VERSION"))
-                    .with_title("Issuerd")
-                    .with_description("Issuerd realm administration MCP tools and resources")
-                    .with_website_url("https://issuerd.org"),
-            )
-            .with_instructions(
-                "Curated realm tools and resources. Scope and realm-role policy is evaluated per request.",
-            )
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_completions()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+        .with_server_info(
+            Implementation::new("issuerd", env!("CARGO_PKG_VERSION"))
+                .with_title("Issuerd")
+                .with_description("Issuerd realm administration MCP tools and resources")
+                .with_website_url("https://issuerd.org"),
+        )
+        .with_instructions(
+            "Curated realm tools and resources. Scope and realm-role policy is evaluated per request.",
+        )
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
+    async fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        Ok(CompleteResult::default())
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -246,6 +260,7 @@ mod tests {
         let resources = info.capabilities.resources.as_ref().unwrap();
         assert_eq!(resources.list_changed, None);
         assert_eq!(resources.subscribe, None);
+        assert!(info.capabilities.completions.is_some());
         assert!(info.capabilities.prompts.is_none());
         let supported = server.supported_protocol_versions();
         let versions: Vec<_> = supported.iter().map(ProtocolVersion::as_str).collect();
@@ -625,5 +640,28 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"]["code"], -32002);
+    }
+
+    #[tokio::test]
+    async fn completion_returns_an_empty_result_instead_of_method_not_found() {
+        let mut service = service(60).await.service;
+        let (_, response) = call_service(
+            &mut service,
+            request(
+                "POST",
+                json!({
+                    "jsonrpc":"2.0","id":35,"method":"completion/complete",
+                    "params":{
+                        "ref":{"type":"ref/prompt","name":"test_prompt_with_arguments"},
+                        "argument":{"name":"arg1","value":"par"}
+                    }
+                }),
+                auth("mcp:read", &[]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response["result"]["completion"], json!({"values": []}));
+        assert!(response.get("error").is_none());
     }
 }
