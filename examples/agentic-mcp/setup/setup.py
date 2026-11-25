@@ -1,12 +1,11 @@
 """One-shot post-provision step for the agentic MCP example.
 
-Runs after Issuerd is healthy (compose `service_healthy` dependency) and does
-the two things `provision.yaml` cannot express:
+Runs after Issuerd is healthy (compose `service_healthy` dependency) and:
 
-1. Sets the `token.exchange.enabled=true` attribute on the `mcp-server`
-   client — client attributes are not provisionable, and without it RFC 8693
-   exchanges with audience=mcp-server are rejected (token_exchange.rs
-   resolve_target_client). Idempotent.
+1. Ensures the `token.exchange.enabled=true` attribute is set on the
+   `mcp-server` client. New deployments provision it directly; this idempotent
+   check also upgrades older demo volumes. Without it, RFC 8693 exchanges with
+   audience=mcp-server are rejected (token_exchange.rs resolve_target_client).
 2. Seeds `shop.orders` with the REAL subs of alice/bob — user subs are random
    UUIDs generated at provision time, so rows cannot ship in
    apps/McpServer/db-init/01-shop.sql. Full reseed (DELETE + INSERT).

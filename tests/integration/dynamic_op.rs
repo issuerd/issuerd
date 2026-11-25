@@ -457,3 +457,90 @@ async fn login_context_exposes_client_branding() {
         assert!(json.get(field).is_none(), "{field} must be omitted: {json}");
     }
 }
+
+#[tokio::test]
+async fn provisioned_client_attributes_reach_login_context() {
+    let harness = TestHarness::new().await;
+    let path = std::env::temp_dir().join(format!(
+        "issuerd-provision-client-attributes-{}.yaml",
+        issuerd_core::utils::generate_id()
+    ));
+    std::fs::write(
+        &path,
+        r#"
+marker: provision-client-attributes
+realms:
+  - name: provision-brand
+clients:
+  - realm: provision-brand
+    client_id: provisioned-app
+    name: Provisioned App
+    public_client: true
+    redirect_uris:
+      - http://localhost:8080/cb
+    default_scopes: [openid]
+    attributes:
+      logo_uri: https://app.example.com/provisioned-logo.png
+      policy_uri: https://app.example.com/provisioned-policy
+      tos_uri: https://app.example.com/provisioned-tos
+      post_logout_redirect_uris: '["https://app.example.com/logged-out"]'
+  - realm: provision-brand
+    client_id: plain-app
+    public_client: true
+    redirect_uris:
+      - http://localhost:8080/cb
+"#,
+    )
+    .unwrap();
+    let provisioner = issuerd_server::provisioner::Provisioner::from_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    provisioner
+        .apply_once(harness.storage.as_ref(), &harness.base_url)
+        .await
+        .unwrap();
+
+    let realm = harness.storage.get_realm_by_name("provision-brand").await.unwrap().unwrap();
+    let client = harness
+        .storage
+        .get_client_by_client_id(
+            &realm.id,
+            &issuerd_core::ClientIdentifier::new("provisioned-app").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.attributes.get("post_logout_redirect_uris").map(String::as_str),
+        Some("[\"https://app.example.com/logged-out\"]")
+    );
+    let plain = harness
+        .storage
+        .get_client_by_client_id(
+            &realm.id,
+            &issuerd_core::ClientIdentifier::new("plain-app").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(plain.attributes.is_empty());
+
+    let code_challenge = issuerd_protocol::pkce::PkceVerifier::s256_challenge(
+        "provisioned-client-attributes-verifier-12345678901234567890",
+    );
+    let resp = harness
+        .get(&format!("/realms/provision-brand/protocol/openid-connect/auth?response_type=code&client_id=provisioned-app&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb&scope=openid&state=provisioned-branding&code_challenge={code_challenge}&code_challenge_method=S256"))
+        .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap();
+    let execution_id = TestHarness::extract_query_param(location, "execution_id")
+        .unwrap_or_else(|| panic!("missing execution_id in redirect: {location}"));
+    let resp = harness
+        .get(&format!("/realms/provision-brand/login/context?execution_id={execution_id}"))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["client_logo_uri"], "https://app.example.com/provisioned-logo.png");
+    assert_eq!(json["client_policy_uri"], "https://app.example.com/provisioned-policy");
+    assert_eq!(json["client_tos_uri"], "https://app.example.com/provisioned-tos");
+    assert_eq!(json["client_name"], "Provisioned App");
+}

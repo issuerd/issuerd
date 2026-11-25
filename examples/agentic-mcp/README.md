@@ -152,9 +152,9 @@ and [Human step-up approval with CIBA](../../docs/ciba-step-up.md).
   enforces the invariant at its own edge: DPoP scheme only, `cnf.jkt`
   required in the token, proof thumbprint must match — no Bearer fallback.
 - The `mcp-server` client needs the `token.exchange.enabled=true` attribute
-  before it accepts exchanges; client attributes are not expressible in
-  `provision.yaml`, so the `setup` container sets it via the Admin REST API
-  (idempotent — safe to re-run).
+  before it accepts exchanges. `provision.yaml` sets it on new deployments; the
+  `setup` container also applies it through the Admin REST API as an idempotent
+  backfill for older demo volumes.
 - User `sub`s are random UUIDs minted at provisioning; `setup` resolves them
   through the admin API and seeds `shop.orders` to match. Issuerd runs on
   PostgreSQL here so those subs (and the seeded rows) survive restarts.

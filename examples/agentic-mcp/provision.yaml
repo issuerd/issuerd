@@ -8,9 +8,8 @@
 #   - chat-app (the ChatApp client: orders:read is a DEFAULT scope so ordinary
 #     logins carry it; refunds:execute is OPTIONAL so it only ever appears in
 #     CIBA step-up tokens)
-#   - mcp-server (audience target for RFC 8693 exchanges; the setup container
-#     flips its `token.exchange.enabled` attribute post-provision — client
-#     attributes are not expressible in this file)
+#   - mcp-server (audience target for RFC 8693 exchanges, with its
+#     `token.exchange.enabled` attribute provisioned below)
 #
 # All URLs point at http://localhost:8080 (issuerd) and http://localhost:5108
 # (ChatApp).
@@ -114,8 +113,8 @@ clients:
     full_scope_allowed: true
 
   # Pure audience target for RFC 8693 exchanges (no flows of its own). The
-  # `token.exchange.enabled=true` attribute is applied post-provision by the
-  # setup container — client attributes are not provisionable. The optional
+  # `token.exchange.enabled=true` attribute is provisioned below; the setup
+  # container idempotently backfills it on older demo volumes. The optional
   # scopes keep orders:read / refunds:execute from being dropped by the
   # exchange's target-client scope intersection.
   - realm: demo
@@ -135,6 +134,8 @@ clients:
       - refunds:execute
     consent_required: false
     full_scope_allowed: true
+    attributes:
+      token.exchange.enabled: "true"
 
 users:
   - realm: master

@@ -308,6 +308,7 @@ groups:
 | `optional_scopes` | list\<string\> | `[]` | Scopes the client may request optionally. |
 | `consent_required` | bool | `false` | Require a user consent screen. |
 | `full_scope_allowed` | bool | `true` | When `true`, tokens contain the user's full role set; when `false`, only scope mappings apply. |
+| `attributes` | map\<string, string\> | `{}` | Free-form client attributes stored verbatim. List-valued attributes such as `post_logout_redirect_uris` and `request_uris` are JSON-encoded strings. Values support `${ENV}` substitution. |
 
 The protocol is always `openid-connect`. Not settable here: service accounts,
 protocol mappers, client roles, client-scope assignments beyond the two scope
@@ -328,7 +329,18 @@ clients:
     optional_scopes: [email]
     consent_required: false
     full_scope_allowed: true
+    attributes:
+      logo_uri: https://app.example.com/logo.svg
+      policy_uri: https://app.example.com/policy
+      tos_uri: https://app.example.com/terms
+      post_logout_redirect_uris: '["https://app.example.com/logged-out"]'
+      token.exchange.enabled: "true"
 ```
+
+Attribute keys and values are operator-controlled and stored verbatim; validation
+specific to open dynamic client registration does not apply here. Like every other
+client field, attributes are applied only when the client is first created. Changing
+the map later does not update an existing client, even under a new provision marker.
 
 > **Note:** A confidential client provisioned without `secret` ends up with a random
 > secret that appears nowhere in your configuration — retrieve or rotate it via the
