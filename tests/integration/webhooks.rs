@@ -325,6 +325,56 @@ async fn registration_admin_logout_and_revocation_reach_webhook_outbox() {
     }
 }
 
+#[tokio::test]
+async fn admin_resource_filter_shorthand_drives_subscription_delivery() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("webhook-group-filters").await;
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    for (suffix, filter) in [
+        ("group-wildcard", "GROUP.*"),
+        ("group-create", "GROUP.CREATE"),
+        ("role-wildcard", "ROLE.*"),
+    ] {
+        let response = harness
+            .post_json_auth(
+                "/admin/realms/webhook-group-filters/webhooks",
+                &admin,
+                serde_json::json!({
+                    "url": format!("https://receiver.example/{suffix}"),
+                    "secret": "test-secret",
+                    "eventTypes": [filter]
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED, "{filter}");
+    }
+
+    let response = harness
+        .post_json_auth(
+            "/admin/realms/webhook-group-filters/groups",
+            &admin,
+            serde_json::json!({"name": "shared-mailboxes"}),
+        )
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    let deliveries = harness
+        .storage
+        .list_webhook_deliveries(&realm.id, None, &Pagination::new(0, 100))
+        .await
+        .unwrap();
+    let payloads: Vec<serde_json::Value> = deliveries
+        .iter()
+        .map(|delivery| serde_json::from_str(&delivery.payload).unwrap())
+        .collect();
+    assert_eq!(payloads.len(), 2, "{payloads:?}");
+    assert!(payloads.iter().all(|payload| {
+        payload["kind"] == "ADMIN"
+            && payload["operationType"] == "CREATE"
+            && payload["resourceType"] == "GROUP"
+    }));
+}
+
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&body).unwrap()

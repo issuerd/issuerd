@@ -263,10 +263,21 @@ impl WebhookEvent {
     pub fn matches(&self, filters: &[String]) -> bool {
         let key = self.filter_key();
         filters.iter().any(|filter| {
-            filter == "*"
-                || filter == &key
-                || (self.kind == WebhookEventKind::User && filter == "USER.*")
-                || (self.kind == WebhookEventKind::Admin && filter == "ADMIN.*")
+            if filter == "*" || filter == &key {
+                return true;
+            }
+            match &self.data {
+                WebhookEventData::User(_) => filter == "USER.*",
+                WebhookEventData::Admin(event) => {
+                    let resource = resource_type_name(event.resource_type);
+                    let operation = operation_type_name(event.operation_type);
+                    filter == "ADMIN.*"
+                        || filter == &format!("ADMIN.{resource}.*")
+                        || filter == &format!("{resource}.{operation}")
+                        || (event.resource_type != ResourceType::User
+                            && filter == &format!("{resource}.*"))
+                }
+            }
         })
     }
 
@@ -357,11 +368,13 @@ fn validate_filter(filter: &str) -> Result<(), IssuerdError> {
             let mut parts = suffix.split('.');
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(resource), Some(operation), None) => {
-                    valid_filter_segment(resource) && valid_filter_segment(operation)
+                    valid_filter_segment(resource)
+                        && (operation == "*" || valid_filter_segment(operation))
                 }
                 _ => false,
             }
-        });
+        })
+        || valid_resource_filter(filter);
     if filter.is_empty()
         || filter.len() > MAX_FILTER_LEN
         || !filter
@@ -374,6 +387,28 @@ fn validate_filter(filter: &str) -> Result<(), IssuerdError> {
         )));
     }
     Ok(())
+}
+
+fn valid_resource_filter(filter: &str) -> bool {
+    let Some((resource, operation)) = filter.split_once('.') else {
+        return false;
+    };
+    if operation.contains('.') {
+        return false;
+    }
+    matches!(
+        resource,
+        "REALM"
+            | "USER"
+            | "CLIENT"
+            | "CLIENT_SCOPE"
+            | "GROUP"
+            | "ROLE"
+            | "SESSION"
+            | "IDENTITY_PROVIDER"
+            | "USER_FEDERATION"
+            | "INITIAL_ACCESS_TOKEN"
+    ) && (operation == "*" || matches!(operation, "CREATE" | "UPDATE" | "DELETE" | "ACTION"))
 }
 
 fn valid_filter_segment(segment: &str) -> bool {
@@ -499,6 +534,8 @@ mod tests {
         );
         assert_eq!(event.filter_key(), "ADMIN.USER.CREATE");
         assert!(event.matches(&["ADMIN.USER.CREATE".to_string()]));
+        assert!(event.matches(&["USER.CREATE".to_string()]));
+        assert!(event.matches(&["ADMIN.USER.*".to_string()]));
         assert!(event.matches(&["ADMIN.*".to_string()]));
         assert!(event.matches(&["*".to_string()]));
         assert!(!event.matches(&["USER.*".to_string()]));
@@ -521,6 +558,24 @@ mod tests {
     }
 
     #[test]
+    fn admin_resource_filter_shorthand_matches_only_that_resource() {
+        let mut raw = admin_event();
+        raw.resource_type = ResourceType::Group;
+        let event = WebhookEvent::from_admin_event(&raw, "demo", None, false);
+        for filter in [
+            "GROUP.*",
+            "GROUP.CREATE",
+            "ADMIN.GROUP.*",
+            "ADMIN.GROUP.CREATE",
+        ] {
+            assert!(event.matches(&[filter.to_string()]), "{filter}");
+        }
+        for filter in ["ROLE.*", "ROLE.CREATE", "ADMIN.ROLE.*", "USER.*"] {
+            assert!(!event.matches(&[filter.to_string()]), "{filter}");
+        }
+    }
+
+    #[test]
     fn custom_user_events_have_a_stable_filter_name() {
         let mut event = user_event();
         event.event_type = EventType::Custom("custom_event".to_string());
@@ -531,8 +586,40 @@ mod tests {
 
     #[test]
     fn filter_validation_accepts_only_the_documented_grammar() {
-        for valid in ["*", "USER.*", "ADMIN.*", "USER.LOGIN", "ADMIN.USER.CREATE"] {
+        for valid in [
+            "*",
+            "USER.*",
+            "ADMIN.*",
+            "USER.LOGIN",
+            "ADMIN.USER.CREATE",
+            "GROUP.UPDATE",
+            "GROUP.DELETE",
+            "GROUP.ACTION",
+        ] {
             validate_webhook_filters(&[valid.to_string()]).unwrap();
+        }
+        for resource in [
+            "REALM",
+            "USER",
+            "CLIENT",
+            "CLIENT_SCOPE",
+            "GROUP",
+            "ROLE",
+            "SESSION",
+            "IDENTITY_PROVIDER",
+            "USER_FEDERATION",
+            "INITIAL_ACCESS_TOKEN",
+        ] {
+            for filter in [
+                format!("{resource}.*"),
+                format!("{resource}.CREATE"),
+                format!("ADMIN.{resource}.*"),
+                format!("ADMIN.{resource}.CREATE"),
+            ] {
+                validate_webhook_filters(std::slice::from_ref(&filter)).unwrap_or_else(|error| {
+                    panic!("{filter} should be accepted: {error}");
+                });
+            }
         }
         for invalid in [
             "",
@@ -545,6 +632,11 @@ mod tests {
             "USER.login",
             "ADMIN.USER.CREATE.EXTRA",
             "USER.LOGIN EXTRA",
+            "UNKNOWN.*",
+            "GROUP.",
+            "GROUP.login",
+            "GROUP.CREATE.EXTRA",
+            "ADMIN.GROUP.*.EXTRA",
         ] {
             assert!(validate_webhook_filters(&[invalid.to_string()]).is_err(), "{invalid}");
         }
