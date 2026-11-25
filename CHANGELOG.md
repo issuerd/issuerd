@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-25
+
 ### Added
 
 - **Client attributes in declarative provisioning.** Optional `clients[].attributes` maps now seed branding, logout, token-exchange, signing, and other attribute-backed client settings on creation, with environment-variable substitution and JSON-encoded strings for list-valued attributes. Existing provision files and create-only re-provision semantics are unchanged. ([#32](https://github.com/issuerd/issuerd/issues/32))
