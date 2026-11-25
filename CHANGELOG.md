@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Service accounts.** Honor `service_accounts_enabled` in provision YAML and use deterministic UUID-based service-account user IDs compatible with SQLite and PostgreSQL, while preserving existing linked legacy IDs. Lazy service-account lookup and `client_credentials` role propagation now work across storage backends. ([#227](https://github.com/issuerd/issuerd/issues/227))
 - **Webhook resource filters.** Accept resource wildcards and exact-operation shorthand such as `GROUP.*`, `GROUP.CREATE`, and `ADMIN.GROUP.*` for every admin resource type in both the Admin API and provisioning, while preserving the existing `USER.*` authentication-event behavior. ([#228](https://github.com/issuerd/issuerd/issues/228))
 - **MCP completion with rmcp 3.11.** Declare the completions capability and return the specification-compliant empty result for `completion/complete`, restoring official MCP conformance after the SDK began rejecting requests without that capability.
 

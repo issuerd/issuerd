@@ -6,17 +6,34 @@
 use crate::{Client, IssuerdError, RealmId, Storage, User, Username};
 
 /// Load the service-account user linked to `client`, rejecting an ID or
-/// back-link mismatch instead of falling back to a username lookup.
+/// back-link mismatch. Legacy IDs are located by reserved username only after
+/// checking the new deterministic ID, and are never adopted by username alone.
 pub async fn find_service_account_user(
     storage: &dyn Storage,
     realm_id: &RealmId,
     client: &Client,
 ) -> Result<Option<User>, IssuerdError> {
-    let Some(user) = storage.get_user(realm_id, &client.service_account_user_id()).await? else {
-        return Ok(None);
-    };
+    if let Some(user) = storage.get_user(realm_id, &client.service_account_user_id()).await? {
+        return validate_service_account_user(client, user).map(Some);
+    }
+
+    let legacy_id = client.legacy_service_account_user_id();
+    let conventional = client.service_account_username();
+    let fallback = format!("{}{}", Username::SERVICE_ACCOUNT_PREFIX, client.id);
+    for username in [conventional, fallback] {
+        let Some(user) = storage.get_user_by_username(realm_id, &username).await? else {
+            continue;
+        };
+        if user.id == legacy_id {
+            return validate_service_account_user(client, user).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn validate_service_account_user(client: &Client, user: User) -> Result<User, IssuerdError> {
     if client.is_service_account_user(&user) {
-        return Ok(Some(user));
+        return Ok(user);
     }
     Err(IssuerdError::ServerError(format!(
         "service-account identity linkage mismatch for client {}",

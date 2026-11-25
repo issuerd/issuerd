@@ -72,6 +72,7 @@ clients:
   - email
   consent_required: false
   full_scope_allowed: true
+  service_accounts_enabled: false
   attributes: {}
   # Optional: replace the empty map with flat string attributes (lists are JSON strings).
   # attributes:
@@ -94,6 +95,7 @@ clients:
   optional_scopes: []
   consent_required: false
   full_scope_allowed: true
+  service_accounts_enabled: false
   attributes: {}
 users:
 - realm: myrealm

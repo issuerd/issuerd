@@ -563,6 +563,149 @@ async fn service_account_backs_client_credentials_grant() {
 }
 
 #[tokio::test]
+async fn provisioned_service_account_can_call_admin_api() {
+    let harness = TestHarness::new().await;
+    let path = std::env::temp_dir().join(format!(
+        "issuerd-provision-service-account-{}.yaml",
+        issuerd_core::utils::generate_id()
+    ));
+    std::fs::write(
+        &path,
+        r#"
+marker: provision-service-account
+realms:
+  - name: cs-provision-sa
+clients:
+  - realm: cs-provision-sa
+    client_id: sync-service
+    public_client: false
+    secret: sec
+    service_accounts_enabled: true
+    default_scopes: [openid]
+    attributes:
+      admin_api_access: "true"
+"#,
+    )
+    .unwrap();
+    let provisioner = issuerd_server::provisioner::Provisioner::from_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    provisioner
+        .apply_once(harness.storage.as_ref(), &harness.base_url)
+        .await
+        .unwrap();
+
+    let realm = harness.storage.get_realm_by_name("cs-provision-sa").await.unwrap().unwrap();
+    let client = harness
+        .storage
+        .get_client_by_client_id(
+            &realm.id,
+            &issuerd_core::ClientIdentifier::new("sync-service").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(client.service_accounts_enabled);
+
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    let response = harness
+        .get_auth(
+            &format!("/admin/realms/cs-provision-sa/clients/{}/service-account-user", client.id),
+            &admin,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let service_account = json_body(response).await;
+    let service_account_id = service_account["id"].as_str().unwrap();
+    assert_eq!(service_account["username"], "service-account-sync-service");
+
+    let role = realm_role(&realm.id, "view-users");
+    harness.storage.create_role(&realm.id, &role).await.unwrap();
+    harness
+        .storage
+        .add_user_realm_role(
+            &realm.id,
+            &issuerd_core::UserId::new(service_account_id).unwrap(),
+            &role.id,
+        )
+        .await
+        .unwrap();
+
+    let response = harness
+        .post_form(
+            "/realms/cs-provision-sa/protocol/openid-connect/token",
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", "sync-service"),
+                ("client_secret", "sec"),
+                ("scope", "openid"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let token = json_body(response).await;
+    let access_token = token["access_token"].as_str().unwrap();
+    let claims = jwt_claims(access_token);
+    assert_eq!(claims["sub"], service_account_id);
+    assert!(claims["realm_access"]["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|role| role == "view-users"));
+
+    let response = harness.get_auth("/admin/realms/cs-provision-sa/users", access_token).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn legacy_service_account_identity_remains_linked() {
+    let harness = TestHarness::new().await;
+    let realm = harness.create_realm("cs-legacy-sa").await;
+    let mut client = harness.create_client("cs-legacy-sa", false).await;
+    client.service_accounts_enabled = true;
+    harness.storage.update_client(&realm.id, &client).await.unwrap();
+
+    let now = chrono::Utc::now();
+    let legacy = issuerd_core::User {
+        id: issuerd_core::UserId::new(format!("service-account-{}", client.id)).unwrap(),
+        realm_id: realm.id.clone(),
+        username: issuerd_core::Username::new(client.service_account_username()).unwrap(),
+        email: None,
+        email_verified: false,
+        first_name: None,
+        last_name: None,
+        enabled: true,
+        federation_link: None,
+        attributes: HashMap::from([(
+            issuerd_core::Client::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE.to_string(),
+            vec![client.id.to_string()],
+        )]),
+        required_actions: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    let legacy_id = legacy.id.clone();
+    harness.storage.create_user(&realm.id, &legacy).await.unwrap();
+
+    let found = issuerd_core::service_account::find_service_account_user(
+        harness.storage.as_ref(),
+        &realm.id,
+        &client,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.id, legacy_id);
+    let ensured = issuerd_core::service_account::ensure_service_account_user(
+        harness.storage.as_ref(),
+        &realm.id,
+        &client,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ensured.id, legacy_id);
+}
+
+#[tokio::test]
 async fn client_credentials_without_service_account_keeps_legacy_shape() {
     let harness = TestHarness::new().await;
     let realm = harness.create_realm("cs-cc-legacy").await;
@@ -1021,6 +1164,59 @@ async fn admin_service_account_user_lifecycle() {
     assert_eq!(claims["sub"], serde_json::json!(sa_id));
     let roles = claims["realm_access"]["roles"].as_array().unwrap();
     assert!(roles.iter().any(|r| r == "svc-role"));
+}
+
+#[tokio::test]
+async fn admin_created_service_account_is_lazy_and_token_ready() {
+    let harness = TestHarness::new().await;
+    let admin = harness.get_admin_token("master", "admin", "admin").await;
+    harness.create_realm("cs-admin-create-sa").await;
+
+    let response = harness
+        .post_json_auth(
+            "/admin/realms/cs-admin-create-sa/clients",
+            &admin,
+            serde_json::json!({
+                "client_id": "sa-test",
+                "public_client": false,
+                "secret": "sec",
+                "service_accounts_enabled": true
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let client = json_body(response).await;
+    assert_eq!(client["service_accounts_enabled"], true);
+
+    let response = harness
+        .get_auth(
+            &format!(
+                "/admin/realms/cs-admin-create-sa/clients/{}/service-account-user",
+                client["id"].as_str().unwrap()
+            ),
+            &admin,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let service_account = json_body(response).await;
+    let service_account_id = service_account["id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(service_account_id).is_ok());
+
+    let response = harness
+        .post_form(
+            "/realms/cs-admin-create-sa/protocol/openid-connect/token",
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", "sa-test"),
+                ("client_secret", "sec"),
+                ("scope", "openid"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let token = json_body(response).await;
+    let claims = jwt_claims(token["access_token"].as_str().unwrap());
+    assert_eq!(claims["sub"], service_account_id);
 }
 
 #[tokio::test]

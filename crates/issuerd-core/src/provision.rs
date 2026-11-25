@@ -149,6 +149,7 @@ impl ProvisionConfig {
                     optional_scopes: vec!["email".to_string()],
                     consent_required: false,
                     full_scope_allowed: true,
+                    service_accounts_enabled: false,
                     attributes: HashMap::new(),
                 },
                 ProvisionClient {
@@ -166,6 +167,7 @@ impl ProvisionConfig {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    service_accounts_enabled: false,
                     attributes: HashMap::new(),
                 },
             ],
@@ -348,6 +350,9 @@ pub struct ProvisionClient {
     pub consent_required: bool,
     #[serde(default = "default_true")]
     pub full_scope_allowed: bool,
+    /// Back the client-credentials grant with a role-bearing service-account user.
+    #[serde(default)]
+    pub service_accounts_enabled: bool,
     /// Free-form client attributes. List-valued attributes are JSON-encoded strings.
     #[serde(default)]
     pub attributes: HashMap<String, String>,
@@ -531,6 +536,19 @@ attributes:
         let minimal: ProvisionClient =
             serde_saphyr::from_str("realm: myrealm\nclient_id: minimal").unwrap();
         assert!(minimal.attributes.is_empty());
+    }
+
+    #[test]
+    fn client_service_account_flag_parses_and_defaults_to_false() {
+        let enabled: ProvisionClient = serde_saphyr::from_str(
+            "realm: myrealm\nclient_id: sync\nservice_accounts_enabled: true",
+        )
+        .unwrap();
+        assert!(enabled.service_accounts_enabled);
+
+        let minimal: ProvisionClient =
+            serde_saphyr::from_str("realm: myrealm\nclient_id: minimal").unwrap();
+        assert!(!minimal.service_accounts_enabled);
     }
 
     #[test]
