@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Webhook resource filters.** Accept resource wildcards and exact-operation shorthand such as `GROUP.*`, `GROUP.CREATE`, and `ADMIN.GROUP.*` for every admin resource type in both the Admin API and provisioning, while preserving the existing `USER.*` authentication-event behavior. ([#228](https://github.com/issuerd/issuerd/issues/228))
 - **MCP completion with rmcp 3.11.** Declare the completions capability and return the specification-compliant empty result for `completion/complete`, restoring official MCP conformance after the SDK began rejecting requests without that capability.
 
 ### Security

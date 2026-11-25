@@ -1709,7 +1709,11 @@ mod webhook_tests {
             url: "https://receiver.example/events".to_string(),
             secret: "secret".to_string(),
             enabled: true,
-            event_types: vec!["USER.REGISTER".to_string()],
+            event_types: vec![
+                "USER.REGISTER".to_string(),
+                "GROUP.*".to_string(),
+                "GROUP.CREATE".to_string(),
+            ],
             include_representation: false,
         });
         let repeated_config = config.clone();
@@ -1720,7 +1724,14 @@ mod webhook_tests {
         let subscriptions = storage.list_webhook_subscriptions(&realm.id).await.unwrap();
         assert_eq!(subscriptions.len(), 1);
         assert_eq!(subscriptions[0].url, "https://receiver.example/events");
-        assert_eq!(subscriptions[0].event_types, vec!["USER.REGISTER".to_string()]);
+        assert_eq!(
+            subscriptions[0].event_types,
+            vec![
+                "USER.REGISTER".to_string(),
+                "GROUP.*".to_string(),
+                "GROUP.CREATE".to_string(),
+            ]
+        );
         assert!(subscriptions[0].enabled);
 
         let mut repeated = Provisioner {
