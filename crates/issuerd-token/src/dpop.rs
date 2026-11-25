@@ -756,31 +756,25 @@ mod tests {
     #[test]
     fn iat_window_enforced() {
         let key = gen_ec();
-        let now = chrono::Utc::now().timestamp();
+        let req = requirements();
 
         // Stale (beyond max_age).
         let mut claims = valid_claims();
-        claims["iat"] = serde_json::json!(now - 301);
+        claims["iat"] = serde_json::json!(req.now - req.max_age_secs - 1);
         let proof = key.proof(claims);
-        assert!(matches!(
-            validate_dpop_proof(&proof, &requirements()),
-            Err(IssuerdError::InvalidDpopProof)
-        ));
+        assert!(matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)));
 
         // Future beyond leeway.
         let mut claims = valid_claims();
-        claims["iat"] = serde_json::json!(now + 61);
+        claims["iat"] = serde_json::json!(req.now + req.leeway_secs + 1);
         let proof = key.proof(claims);
-        assert!(matches!(
-            validate_dpop_proof(&proof, &requirements()),
-            Err(IssuerdError::InvalidDpopProof)
-        ));
+        assert!(matches!(validate_dpop_proof(&proof, &req), Err(IssuerdError::InvalidDpopProof)));
 
         // Inside leeway both ways is fine.
         let mut claims = valid_claims();
-        claims["iat"] = serde_json::json!(now + 30);
+        claims["iat"] = serde_json::json!(req.now + req.leeway_secs / 2);
         let proof = key.proof(claims);
-        assert!(validate_dpop_proof(&proof, &requirements()).is_ok());
+        assert!(validate_dpop_proof(&proof, &req).is_ok());
     }
 
     #[test]
