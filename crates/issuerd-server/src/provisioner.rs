@@ -461,7 +461,7 @@ impl Provisioner {
                 service_accounts_enabled: false,
                 protocol_mappers: Vec::new(),
                 scope_mappings: Default::default(),
-                attributes: HashMap::new(),
+                attributes: p.attributes.clone(),
             };
 
             storage.create_client(&client.realm_id, &client).await?;
@@ -751,6 +751,9 @@ impl Provisioner {
             for origin in &mut client.web_origins {
                 *origin = substitute(origin, &mut errors);
             }
+            for value in client.attributes.values_mut() {
+                *value = substitute(value, &mut errors);
+            }
         }
 
         for user in &mut config.users {
@@ -968,6 +971,13 @@ mod tests {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    attributes: HashMap::from([
+                        ("logo_uri".to_string(), "https://app.example.com/logo.svg".to_string()),
+                        (
+                            "post_logout_redirect_uris".to_string(),
+                            "[\"https://app.example.com/logged-out\"]".to_string(),
+                        ),
+                    ]),
                 },
                 ProvisionClient {
                     realm: "testrealm".to_string(),
@@ -984,6 +994,7 @@ mod tests {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    attributes: HashMap::new(),
                 },
             ],
             users: vec![ProvisionUser {
@@ -1438,6 +1449,56 @@ mod tests {
             .unwrap();
         assert!(client.secret.is_some());
         assert!(!client.secret.as_ref().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_attributes_apply_on_create_but_not_update() {
+        let storage = InMemoryStorage::new();
+        let config = sample_config();
+        let expected = config.clients[0].attributes.clone();
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let identifier = ClientIdentifier::new("my-app").unwrap();
+        let client =
+            storage.get_client_by_client_id(&realm.id, &identifier).await.unwrap().unwrap();
+        assert_eq!(client.attributes, expected);
+        let public = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("public-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(public.attributes.is_empty());
+
+        let mut changed = sample_config();
+        changed.marker = Some("changed-client-attributes".to_string());
+        changed.clients[0]
+            .attributes
+            .insert("logo_uri".to_string(), "https://changed.example.com/logo.svg".to_string());
+        Provisioner { config: changed }
+            .apply_once(&storage, "http://localhost:8080")
+            .await
+            .unwrap();
+        let client =
+            storage.get_client_by_client_id(&realm.id, &identifier).await.unwrap().unwrap();
+        assert_eq!(client.attributes, expected);
+    }
+
+    #[test]
+    fn client_attribute_values_use_env_substitution() {
+        std::env::set_var("ISSUERD_TEST_CLIENT_LOGO", "https://env.example.com/logo.svg");
+        let mut config = sample_config();
+        config.clients[0]
+            .attributes
+            .insert("logo_uri".to_string(), "${ISSUERD_TEST_CLIENT_LOGO}".to_string());
+
+        Provisioner::substitute_env(&mut config).unwrap();
+        assert_eq!(
+            config.clients[0].attributes.get("logo_uri").map(String::as_str),
+            Some("https://env.example.com/logo.svg")
+        );
+        std::env::remove_var("ISSUERD_TEST_CLIENT_LOGO");
     }
 
     #[tokio::test]

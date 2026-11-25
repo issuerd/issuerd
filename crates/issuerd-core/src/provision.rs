@@ -149,6 +149,7 @@ impl ProvisionConfig {
                     optional_scopes: vec!["email".to_string()],
                     consent_required: false,
                     full_scope_allowed: true,
+                    attributes: HashMap::new(),
                 },
                 ProvisionClient {
                     realm: "myrealm".to_string(),
@@ -165,6 +166,7 @@ impl ProvisionConfig {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    attributes: HashMap::new(),
                 },
             ],
             users: vec![ProvisionUser {
@@ -346,6 +348,9 @@ pub struct ProvisionClient {
     pub consent_required: bool,
     #[serde(default = "default_true")]
     pub full_scope_allowed: bool,
+    /// Free-form client attributes. List-valued attributes are JSON-encoded strings.
+    #[serde(default)]
+    pub attributes: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +495,42 @@ mod tests {
         assert_eq!(original.roles.len(), loaded.roles.len());
         assert_eq!(original.groups.len(), loaded.groups.len());
         assert_eq!(original.clients.len(), loaded.clients.len());
+        assert_eq!(original.clients[0].attributes, loaded.clients[0].attributes);
         assert_eq!(original.users.len(), loaded.users.len());
         assert_eq!(original.identity_providers.len(), loaded.identity_providers.len());
         assert_eq!(original.flow_configs.len(), loaded.flow_configs.len());
+    }
+
+    #[test]
+    fn client_attributes_parse_and_default_to_empty() {
+        let client: ProvisionClient = serde_saphyr::from_str(
+            r#"
+realm: myrealm
+client_id: branded
+attributes:
+  logo_uri: https://app.example.com/logo.svg
+  post_logout_redirect_uris: '["https://app.example.com/logged-out"]'
+  token.exchange.enabled: "true"
+"#,
+        )
+        .unwrap();
+        assert_eq!(client.attributes.len(), 3);
+        assert_eq!(
+            client.attributes.get("logo_uri").map(String::as_str),
+            Some("https://app.example.com/logo.svg")
+        );
+        assert_eq!(
+            client.attributes.get("post_logout_redirect_uris").map(String::as_str),
+            Some("[\"https://app.example.com/logged-out\"]")
+        );
+        assert_eq!(
+            client.attributes.get("token.exchange.enabled").map(String::as_str),
+            Some("true")
+        );
+
+        let minimal: ProvisionClient =
+            serde_saphyr::from_str("realm: myrealm\nclient_id: minimal").unwrap();
+        assert!(minimal.attributes.is_empty());
     }
 
     #[test]
@@ -585,9 +623,8 @@ default_locale: en
     /// Verify the committed `examples/provision.example.yaml` is valid and matches the
     /// generated example struct. If this fails, regenerate with:
     ///   cargo run --bin issuerd -- example provision-config -o examples/provision.example.yaml
-    /// The committed file also carries a hand-maintained commented-out i18n
-    /// example block in the realm section — regeneration drops comments, so
-    /// restore that block after regenerating.
+    /// The committed file also carries hand-maintained comments in the realm and
+    /// client sections — regeneration drops comments, so restore them afterwards.
     #[test]
     fn committed_example_file_is_valid() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -608,6 +645,7 @@ default_locale: en
         assert_eq!(loaded.roles.len(), generated.roles.len());
         assert_eq!(loaded.groups.len(), generated.groups.len());
         assert_eq!(loaded.clients.len(), generated.clients.len());
+        assert_eq!(loaded.clients[0].attributes, generated.clients[0].attributes);
         assert_eq!(loaded.users.len(), generated.users.len());
         assert_eq!(loaded.identity_providers.len(), generated.identity_providers.len());
         assert_eq!(loaded.flow_configs.len(), generated.flow_configs.len());

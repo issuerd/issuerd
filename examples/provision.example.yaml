@@ -72,6 +72,11 @@ clients:
   - email
   consent_required: false
   full_scope_allowed: true
+  attributes: {}
+  # Optional: replace the empty map with flat string attributes (lists are JSON strings).
+  # attributes:
+  #   logo_uri: http://localhost:3000/logo.svg
+  #   post_logout_redirect_uris: '["http://localhost:3000/logged-out"]'
 - realm: myrealm
   client_id: public-app
   name: Public SPA
@@ -89,6 +94,7 @@ clients:
   optional_scopes: []
   consent_required: false
   full_scope_allowed: true
+  attributes: {}
 users:
 - realm: myrealm
   username: alice
