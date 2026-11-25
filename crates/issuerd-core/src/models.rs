@@ -2561,15 +2561,24 @@ impl Client {
     /// service-account user. It is set only by the service-account provisioner.
     pub const SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE: &'static str = "service_account_client_id";
 
-    /// Stable, client-bound ID of this client's service-account user.
+    /// Stable, SQL-compatible, client-bound ID of this client's service-account user.
     pub fn service_account_user_id(&self) -> UserId {
+        let id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("issuerd:service-account:{}", self.id).as_bytes(),
+        );
+        UserId::new(id.to_string()).expect("UUID v5 produces a valid service-account user id")
+    }
+
+    pub(crate) fn legacy_service_account_user_id(&self) -> UserId {
         UserId::new(format!("{}{}", Username::SERVICE_ACCOUNT_PREFIX, self.id))
-            .expect("a client UUID produces a non-empty service-account user id")
+            .expect("a client id produces a non-empty legacy service-account user id")
     }
 
     /// Whether `user` is the linked service-account identity of this client.
     pub fn is_service_account_user(&self, user: &User) -> bool {
-        user.id == self.service_account_user_id()
+        (user.id == self.service_account_user_id()
+            || user.id == self.legacy_service_account_user_id())
             && user
                 .attributes
                 .get(Self::SERVICE_ACCOUNT_CLIENT_ID_ATTRIBUTE)
@@ -4065,6 +4074,12 @@ mod tests {
             attributes: HashMap::new(),
         };
         roundtrip(&c);
+        let service_account_id = c.service_account_user_id();
+        assert!(uuid::Uuid::parse_str(service_account_id.as_ref()).is_ok());
+        assert_eq!(service_account_id, c.service_account_user_id());
+        let mut other = c.clone();
+        other.id = ClientId::new("client-2").unwrap();
+        assert_ne!(service_account_id, other.service_account_user_id());
     }
 
     #[test]

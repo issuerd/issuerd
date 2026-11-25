@@ -308,11 +308,11 @@ groups:
 | `optional_scopes` | list\<string\> | `[]` | Scopes the client may request optionally. |
 | `consent_required` | bool | `false` | Require a user consent screen. |
 | `full_scope_allowed` | bool | `true` | When `true`, tokens contain the user's full role set; when `false`, only scope mappings apply. |
+| `service_accounts_enabled` | bool | `false` | Back `client_credentials` with a service-account user whose role mappings flow into tokens. The user is created on first use. |
 | `attributes` | map\<string, string\> | `{}` | Free-form client attributes stored verbatim. List-valued attributes such as `post_logout_redirect_uris` and `request_uris` are JSON-encoded strings. Values support `${ENV}` substitution. |
 
-The protocol is always `openid-connect`. Not settable here: service accounts,
-protocol mappers, client roles, client-scope assignments beyond the two scope
-lists — use the Admin API.
+The protocol is always `openid-connect`. Not settable here: protocol mappers,
+client roles, client-scope assignments beyond the two scope lists — use the Admin API.
 
 ```yaml
 clients:
@@ -329,6 +329,7 @@ clients:
     optional_scopes: [email]
     consent_required: false
     full_scope_allowed: true
+    service_accounts_enabled: true
     attributes:
       logo_uri: https://app.example.com/logo.svg
       policy_uri: https://app.example.com/policy

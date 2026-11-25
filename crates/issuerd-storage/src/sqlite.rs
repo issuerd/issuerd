@@ -3254,6 +3254,30 @@ mod tests {
         assert!(storage.get_client(&realm.id, &client.id).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn sqlite_service_account_user_lifecycle() {
+        let (storage, _tempdir) = setup_sqlite().await;
+        let realm = test_realm();
+        storage.create_realm(&realm).await.unwrap();
+        let mut client = test_client(&realm.id);
+        client.service_accounts_enabled = true;
+        storage.create_client(&realm.id, &client).await.unwrap();
+
+        let user = issuerd_core::service_account::ensure_service_account_user(
+            &storage, &realm.id, &client,
+        )
+        .await
+        .unwrap();
+        assert!(uuid::Uuid::parse_str(user.id.as_ref()).is_ok());
+        assert_eq!(user.id, client.service_account_user_id());
+        let found =
+            issuerd_core::service_account::find_service_account_user(&storage, &realm.id, &client)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(found.id, user.id);
+    }
+
     // ------------------------------------------------------------------
     // Role / Group
     // ------------------------------------------------------------------

@@ -458,7 +458,7 @@ impl Provisioner {
                 },
                 consent_required: p.consent_required,
                 full_scope_allowed: p.full_scope_allowed,
-                service_accounts_enabled: false,
+                service_accounts_enabled: p.service_accounts_enabled,
                 protocol_mappers: Vec::new(),
                 scope_mappings: Default::default(),
                 attributes: p.attributes.clone(),
@@ -971,6 +971,7 @@ mod tests {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    service_accounts_enabled: false,
                     attributes: HashMap::from([
                         ("logo_uri".to_string(), "https://app.example.com/logo.svg".to_string()),
                         (
@@ -994,6 +995,7 @@ mod tests {
                     optional_scopes: vec![],
                     consent_required: false,
                     full_scope_allowed: true,
+                    service_accounts_enabled: false,
                     attributes: HashMap::new(),
                 },
             ],
@@ -1483,6 +1485,29 @@ mod tests {
         let client =
             storage.get_client_by_client_id(&realm.id, &identifier).await.unwrap().unwrap();
         assert_eq!(client.attributes, expected);
+    }
+
+    #[tokio::test]
+    async fn service_account_flag_applies_on_create() {
+        let storage = InMemoryStorage::new();
+        let mut config = sample_config();
+        config.clients[0].service_accounts_enabled = true;
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let enabled = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("my-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(enabled.service_accounts_enabled);
+        let disabled = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("public-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!disabled.service_accounts_enabled);
     }
 
     #[test]
