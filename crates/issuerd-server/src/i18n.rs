@@ -277,6 +277,27 @@ pub fn msg<'a>(bundle: &'a MessageBundle, key: &str, default: &'a str) -> String
     bundle.get(key).cloned().unwrap_or_else(|| default.to_string())
 }
 
+/// Browser-tab title for the realm's login page: the localized
+/// `login.title` next to the realm display name (falling back to the realm
+/// name), e.g. `Sign In · Amana`. A theme bundle key `login.pageTitle`
+/// overrides the composition entirely — `{0}` expands to the display name,
+/// and a template without the placeholder is used verbatim. Bundle values are
+/// trusted operator content, inserted without further escaping.
+pub fn login_page_title(bundle: &MessageBundle, realm: &Realm) -> String {
+    let display_name = realm
+        .display_name
+        .as_ref()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| realm.name.to_string());
+    if let Some(template) = bundle.get("login.pageTitle") {
+        if template.contains("{0}") {
+            return template.replace("{0}", &display_name);
+        }
+        return template.clone();
+    }
+    format!("{} · {}", msg(bundle, "login.title", "Sign In"), display_name)
+}
+
 /// Prefix of the `Display` rendering of
 /// [`issuerd_core::PasswordPolicyError`], which wraps every violation as
 /// `[code] message` segments joined by `"; "`.
@@ -432,6 +453,50 @@ mod tests {
     fn i18n_disabled_always_resolves_en() {
         let realm = realm_with(false, &["de"], Some("de"));
         assert_eq!(resolve_locale(&realm, &["de".to_string()], Some("de")), "en");
+    }
+
+    #[test]
+    fn login_page_title_uses_localized_sign_in_and_display_name() {
+        let realm = Realm {
+            display_name: Some(issuerd_core::DisplayName::new("Amana").unwrap()),
+            ..realm_with(false, &[], None)
+        };
+        let bundle = message_bundle(None, None, "en");
+        assert_eq!(login_page_title(&bundle, &realm), "Sign In · Amana");
+    }
+
+    #[test]
+    fn login_page_title_falls_back_to_realm_name() {
+        let realm = realm_with(false, &[], None);
+        let bundle = message_bundle(None, None, "en");
+        assert_eq!(login_page_title(&bundle, &realm), format!("Sign In · {}", realm.name));
+    }
+
+    #[test]
+    fn login_page_title_localized_sign_in_from_bundle() {
+        let realm = realm_with(false, &[], None);
+        let mut bundle = message_bundle(None, None, "en");
+        bundle.insert("login.title".to_string(), "Connexion".to_string());
+        assert_eq!(login_page_title(&bundle, &realm), format!("Connexion · {}", realm.name));
+    }
+
+    #[test]
+    fn login_page_title_theme_override_expands_placeholder() {
+        let realm = Realm {
+            display_name: Some(issuerd_core::DisplayName::new("Amana").unwrap()),
+            ..realm_with(false, &[], None)
+        };
+        let mut bundle = message_bundle(None, None, "en");
+        bundle.insert("login.pageTitle".to_string(), "{0} Identity".to_string());
+        assert_eq!(login_page_title(&bundle, &realm), "Amana Identity");
+    }
+
+    #[test]
+    fn login_page_title_theme_override_without_placeholder_is_verbatim() {
+        let realm = realm_with(false, &[], None);
+        let mut bundle = message_bundle(None, None, "en");
+        bundle.insert("login.pageTitle".to_string(), "Operator Portal".to_string());
+        assert_eq!(login_page_title(&bundle, &realm), "Operator Portal");
     }
 
     #[test]

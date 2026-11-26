@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Login-theme tab branding.** The browser tab now follows the realm and its login theme: the login page's title is the realm display name next to the localized "Sign In" (a theme bundle key `login.pageTitle` overrides it entirely, `{0}` expanding to the display name), and the login page plus every server-rendered login-flow page (consent, OTP/email-code/WebAuthn challenges, required actions, registration, reset-credentials) takes its tab icon from the theme route `/realms/{realm}/theme/favicon.svg` (dark mode: `favicon-dark.svg`). A custom theme ships just those files to re-icon the sign-in tab; the default theme carries the issuerd icons, compiled into the binary alongside `login.css`, so unthemed realms are unchanged. ([#235](https://github.com/issuerd/issuerd/issues/235))
+- **Service-account roles in declarative provisioning.** `clients[].service_account_realm_roles` and `clients[].service_account_client_roles` assign roles to a client's service account at provision time: the service-account user is created eagerly (no first-use bootstrap step, no bootstrap-admin credential), `service_accounts_enabled` is implied, and unknown roles or clients are skipped with a warning like `users[].realm_roles`. ([#234](https://github.com/issuerd/issuerd/issues/234))
+
+### Fixed
+
+- **Login page first-paint layout shift.** The sign-in card no longer changes size on first load: the webfonts it actually uses (Inter latin/cyrillic, Space Grotesk latin) are preloaded, the card's text rows carry font-independent line heights and control heights, and the realm line reserves its slot before the script runs — so a font swap or script race can no longer move the layout, on fast or throttled networks.
+
 ## [0.2.8] - 2026-11-25
 
 ### Added

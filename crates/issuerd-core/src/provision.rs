@@ -150,6 +150,8 @@ impl ProvisionConfig {
                     consent_required: false,
                     full_scope_allowed: true,
                     service_accounts_enabled: false,
+                    service_account_realm_roles: vec![],
+                    service_account_client_roles: HashMap::new(),
                     attributes: HashMap::new(),
                 },
                 ProvisionClient {
@@ -168,6 +170,8 @@ impl ProvisionConfig {
                     consent_required: false,
                     full_scope_allowed: true,
                     service_accounts_enabled: false,
+                    service_account_realm_roles: vec![],
+                    service_account_client_roles: HashMap::new(),
                     attributes: HashMap::new(),
                 },
             ],
@@ -353,6 +357,18 @@ pub struct ProvisionClient {
     /// Back the client-credentials grant with a role-bearing service-account user.
     #[serde(default)]
     pub service_accounts_enabled: bool,
+    /// Realm role names assigned to the client's service account when the
+    /// client is created. The service-account user is created eagerly (not on
+    /// first use) and `service_accounts_enabled` is implied. Unknown roles
+    /// are skipped with a warning.
+    #[serde(default)]
+    pub service_account_realm_roles: Vec<String>,
+    /// Client role names assigned to the client's service account, keyed by
+    /// `client_id`, when the client is created. Same semantics as
+    /// `service_account_realm_roles`; unknown clients or roles are skipped
+    /// with a warning.
+    #[serde(default)]
+    pub service_account_client_roles: HashMap<String, Vec<String>>,
     /// Free-form client attributes. List-valued attributes are JSON-encoded strings.
     #[serde(default)]
     pub attributes: HashMap<String, String>,
@@ -549,6 +565,29 @@ attributes:
         let minimal: ProvisionClient =
             serde_saphyr::from_str("realm: myrealm\nclient_id: minimal").unwrap();
         assert!(!minimal.service_accounts_enabled);
+    }
+
+    #[test]
+    fn client_service_account_roles_parse_and_default_to_empty() {
+        let yaml = r#"
+realm: myrealm
+client_id: directory-sync
+service_accounts_enabled: true
+service_account_realm_roles: [view-users, view-realm]
+service_account_client_roles:
+  some-client: [some-role]
+"#;
+        let client: ProvisionClient = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(client.service_account_realm_roles, vec!["view-users", "view-realm"]);
+        assert_eq!(
+            client.service_account_client_roles.get("some-client").map(Vec::as_slice),
+            Some(&["some-role".to_string()][..])
+        );
+
+        let minimal: ProvisionClient =
+            serde_saphyr::from_str("realm: myrealm\nclient_id: minimal").unwrap();
+        assert!(minimal.service_account_realm_roles.is_empty());
+        assert!(minimal.service_account_client_roles.is_empty());
     }
 
     #[test]

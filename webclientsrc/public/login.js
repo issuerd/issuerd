@@ -256,6 +256,21 @@
             document.documentElement.lang = ctx.locale;
         }
 
+        // Browser-tab branding: the realm's display name in the title and
+        // the realm theme's favicon(s). The theme route falls back to the
+        // default theme, so realms without a custom theme keep the issuerd
+        // icon; without a context the static /brand/ links stay as-is.
+        if (ctx.page_title) {
+            document.title = ctx.page_title;
+        }
+        var iconLinks = document.querySelectorAll('link[rel="icon"]');
+        if (iconLinks.length > 0) {
+            iconLinks[0].href = '/realms/' + encodeURIComponent(realm) + '/theme/favicon.svg';
+            if (iconLinks.length > 1) {
+                iconLinks[1].href = '/realms/' + encodeURIComponent(realm) + '/theme/favicon-dark.svg';
+            }
+        }
+
         var msg = function (key, fallback) {
             return (ctx.messages && ctx.messages[key]) || fallback;
         };

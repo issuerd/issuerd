@@ -115,7 +115,13 @@ fn render_reset_request_page(copy: &PageCopy, realm_name: &str) -> Response {
     body.push_str(RESET_FORM_SCRIPT_MID);
     body.push_str(&js_string_literal(&copy.msg("reset.confirmation", CONFIRMATION)));
     body.push_str(RESET_FORM_SCRIPT_POST);
-    page(&copy.msg("reset.requestTitle", "Reset password"), &body, &copy.lang).into_response()
+    page(
+        &copy.msg("reset.requestTitle", "Reset password"),
+        &body,
+        &copy.lang,
+        Some(realm_name),
+    )
+    .into_response()
 }
 
 /// Render the new-password form the emailed link opens. `token` is round-
@@ -147,7 +153,13 @@ fn render_update_credentials_page(
          </form>",
         html_escape(token),
     );
-    page(&copy.msg("reset.updateTitle", "Update password"), &body, &copy.lang).into_response()
+    page(
+        &copy.msg("reset.updateTitle", "Update password"),
+        &body,
+        &copy.lang,
+        Some(realm_name),
+    )
+    .into_response()
 }
 
 /// Error page for dead links (invalid/expired/already used), with a way back
@@ -167,6 +179,7 @@ fn link_error_page(copy: &PageCopy, realm_name: &str, msg: &str) -> Response {
                 copy.msg("reset.requestNewLink", "Request a new reset link"),
             ),
             &copy.lang,
+            Some(realm_name),
         ),
     )
         .into_response()
@@ -188,6 +201,7 @@ fn update_success_page(copy: &PageCopy, realm_name: &str) -> Response {
             copy.msg("reset.successContinue", "Continue to sign in"),
         ),
         &copy.lang,
+        Some(realm_name),
     )
     .into_response()
 }
@@ -794,6 +808,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: None,
         };
         let resp = render_reset_request_page(&copy, "master");
         let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();

@@ -22,6 +22,7 @@ interface LoadOptions {
   contextText?: string
   fetch?: unknown
   inlineStyle?: boolean
+  head?: string
   body?: string
   setup?: () => void
 }
@@ -40,7 +41,8 @@ function stubLocation(search: string): LocationStub {
 async function loadLoginPage(options: LoadOptions = {}) {
   const query = options.query ?? '?execution_id=exec-1&realm=test'
   document.body.innerHTML = options.body ?? BODY
-  document.head.innerHTML = options.inlineStyle ? '<style id="base-style"></style>' : ''
+  document.head.innerHTML =
+    options.head ?? (options.inlineStyle ? '<style id="base-style"></style>' : '')
   window.history.replaceState({}, '', `/login.html${query}`)
   const location = stubLocation(query)
   const contextFetch = vi.fn().mockResolvedValue({
@@ -331,6 +333,55 @@ describe('login page context loading', () => {
 
     expect((document.getElementById('realm') as HTMLInputElement).value).toBe('test')
     expect(document.head.querySelector('link')).toBeNull()
+  })
+})
+
+describe('login page tab branding', () => {
+  const ICON_HEAD =
+    '<link rel="icon" type="image/svg+xml" href="/brand/logo-small.svg" media="(prefers-color-scheme: light)" />' +
+    '<link rel="icon" type="image/svg+xml" href="/brand/logo-small-white.svg" media="(prefers-color-scheme: dark)" />'
+
+  it('applies the realm page title and realm-themed favicons from the context', async () => {
+    await loadLoginPage({
+      head: ICON_HEAD,
+      context: { page_title: 'Sign In · Amana' },
+    })
+
+    expect(document.title).toBe('Sign In · Amana')
+    const icons = document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]')
+    expect(icons[0].href).toBe('http://localhost:3000/realms/test/theme/favicon.svg')
+    expect(icons[1].href).toBe('http://localhost:3000/realms/test/theme/favicon-dark.svg')
+  })
+
+  it('rewrites only the first icon link when no dark variant is present', async () => {
+    await loadLoginPage({
+      head: '<link rel="icon" href="/brand/logo-small.svg" />',
+      context: { page_title: 'Sign In · test' },
+    })
+
+    const icons = document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]')
+    expect(icons).toHaveLength(1)
+    expect(icons[0].href).toBe('http://localhost:3000/realms/test/theme/favicon.svg')
+  })
+
+  it('points the tab icons at the realm theme route even without an explicit title', async () => {
+    await loadLoginPage({ head: ICON_HEAD })
+
+    // No page_title: the static document title stays; the icons still follow
+    // the realm (the theme route falls back to the default theme's icons).
+    expect(document.title).toBe('')
+    const icons = document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]')
+    expect(icons[0].getAttribute('href')).toBe('/realms/test/theme/favicon.svg')
+    expect(icons[1].getAttribute('href')).toBe('/realms/test/theme/favicon-dark.svg')
+  })
+
+  it('keeps the static title and icons when the context request fails', async () => {
+    await loadLoginPage({ head: ICON_HEAD, fetch: vi.fn().mockRejectedValue(new Error('offline')) })
+
+    expect(document.title).toBe('')
+    expect(document.querySelector('link[rel="icon"]')?.getAttribute('href')).toBe(
+      '/brand/logo-small.svg',
+    )
   })
 })
 

@@ -12,9 +12,10 @@ use issuerd_core::{
     validate_webhook_filters, validate_webhook_url, Alias, Client, ClientAuthenticatorType,
     ClientId, ClientIdentifier, ClientProtocol, Credential, CredentialId, CredentialType,
     DisplayName, Email, FlowConfig, FlowStage, FlowStageId, Group, GroupId, GroupName, GroupPath,
-    IdentityProviderConfig, IdentityProviderId, PasswordPolicy, ProvisionConfig, Realm, RealmId,
-    RealmName, RedirectUri, Requirement, Role, RoleId, RoleName, Scope, SecondsNonZero,
-    SslRequired, Storage, User, UserId, Username, WebOrigin, WebhookSecret, WebhookSubscription,
+    IdentityProviderConfig, IdentityProviderId, PasswordPolicy, ProvisionClient, ProvisionConfig,
+    Realm, RealmId, RealmName, RedirectUri, Requirement, Role, RoleId, RoleName, Scope,
+    SecondsNonZero, SslRequired, Storage, User, UserId, Username, WebOrigin, WebhookSecret,
+    WebhookSubscription,
 };
 use tracing::{info, warn};
 
@@ -392,6 +393,10 @@ impl Provisioner {
         storage: &dyn Storage,
         mcp_enabled: bool,
     ) -> Result<(), issuerd_core::IssuerdError> {
+        // Clients whose service account gets role assignments. Applied after
+        // the create loop so `service_account_client_roles` may reference
+        // clients defined later in the same file.
+        let mut service_account_jobs: Vec<(&ProvisionClient, ClientId, RealmId)> = Vec::new();
         for p in &self.config.clients {
             let realm_id = self.resolve_realm_id(storage, &p.realm).await?;
             let client_id = ClientIdentifier::new(&p.client_id).map_err(|e| {
@@ -403,6 +408,12 @@ impl Provisioner {
                 continue;
             }
             issuerd_core::validate_no_default_mcp_scopes(&p.default_scopes, mcp_enabled)?;
+
+            let wants_service_account_roles = !p.service_account_realm_roles.is_empty()
+                || !p.service_account_client_roles.is_empty();
+            if wants_service_account_roles && !p.service_accounts_enabled {
+                info!(realm = %p.realm, client = %p.client_id, "service-account roles requested; enabling service_accounts_enabled");
+            }
 
             let secret = p.secret.clone().or_else(|| {
                 if p.public_client {
@@ -458,7 +469,10 @@ impl Provisioner {
                 },
                 consent_required: p.consent_required,
                 full_scope_allowed: p.full_scope_allowed,
-                service_accounts_enabled: p.service_accounts_enabled,
+                // Role assignments imply a usable service account: the
+                // user must exist (created eagerly below) and the
+                // client-credentials grant must accept it.
+                service_accounts_enabled: p.service_accounts_enabled || wants_service_account_roles,
                 protocol_mappers: Vec::new(),
                 scope_mappings: Default::default(),
                 attributes: p.attributes.clone(),
@@ -466,6 +480,64 @@ impl Provisioner {
 
             storage.create_client(&client.realm_id, &client).await?;
             info!(realm = %p.realm, client = %p.client_id, "provisioned client");
+
+            if wants_service_account_roles {
+                service_account_jobs.push((p, client.id.clone(), client.realm_id.clone()));
+            }
+        }
+
+        for (p, created_client_id, realm_id) in service_account_jobs {
+            self.apply_service_account_roles(storage, p, &created_client_id, &realm_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Create the service-account user for a freshly provisioned client and
+    /// assign the requested realm/client roles. Unknown roles are skipped
+    /// with a warning, matching `users[].realm_roles`.
+    async fn apply_service_account_roles(
+        &self,
+        storage: &dyn Storage,
+        p: &ProvisionClient,
+        client_id: &ClientId,
+        realm_id: &RealmId,
+    ) -> Result<(), issuerd_core::IssuerdError> {
+        let Some(client) = storage.get_client(realm_id, client_id).await? else {
+            warn!(realm = %p.realm, client = %p.client_id, "provisioned client missing; skipping service-account roles");
+            return Ok(());
+        };
+        let user =
+            issuerd_core::service_account::ensure_service_account_user(storage, realm_id, &client)
+                .await?;
+        info!(realm = %p.realm, client = %p.client_id, "provisioned service-account user");
+
+        for role_name in &p.service_account_realm_roles {
+            if let Some(role) = storage.get_role_by_name(realm_id, role_name).await? {
+                storage.add_user_realm_role(realm_id, &user.id, &role.id).await?;
+            } else {
+                warn!(realm = %p.realm, client = %p.client_id, role = %role_name, "role not found; skipping service-account assignment");
+            }
+        }
+
+        for (target_client_id, role_names) in &p.service_account_client_roles {
+            let Ok(identifier) = ClientIdentifier::new(target_client_id) else {
+                warn!(realm = %p.realm, client = %p.client_id, target_client = %target_client_id, "invalid client_id; skipping service-account assignment");
+                continue;
+            };
+            let Some(target) = storage.get_client_by_client_id(realm_id, &identifier).await? else {
+                warn!(realm = %p.realm, client = %p.client_id, target_client = %target_client_id, "client not found; skipping service-account assignment");
+                continue;
+            };
+            for role_name in role_names {
+                if let Some(role) =
+                    storage.get_client_role_by_name(realm_id, &target.id, role_name).await?
+                {
+                    storage.add_user_client_role(realm_id, &user.id, &role.id).await?;
+                } else {
+                    warn!(realm = %p.realm, client = %p.client_id, target_client = %target_client_id, role = %role_name, "client role not found; skipping service-account assignment");
+                }
+            }
         }
         Ok(())
     }
@@ -972,6 +1044,8 @@ mod tests {
                     consent_required: false,
                     full_scope_allowed: true,
                     service_accounts_enabled: false,
+                    service_account_realm_roles: vec![],
+                    service_account_client_roles: HashMap::new(),
                     attributes: HashMap::from([
                         ("logo_uri".to_string(), "https://app.example.com/logo.svg".to_string()),
                         (
@@ -996,6 +1070,8 @@ mod tests {
                     consent_required: false,
                     full_scope_allowed: true,
                     service_accounts_enabled: false,
+                    service_account_realm_roles: vec![],
+                    service_account_client_roles: HashMap::new(),
                     attributes: HashMap::new(),
                 },
             ],
@@ -1508,6 +1584,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!disabled.service_accounts_enabled);
+    }
+
+    #[tokio::test]
+    async fn service_account_roles_assign_on_create() {
+        let storage = InMemoryStorage::new();
+        // Pre-create the realm plus a target client and its client role so the
+        // provisioner can resolve the client-role reference (the target may
+        // live outside the provision file entirely).
+        let realm = Realm {
+            id: RealmId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: RealmName::new("testrealm").unwrap(),
+            ..Realm::default()
+        };
+        storage.create_realm(&realm).await.unwrap();
+        let target = Client {
+            id: ClientId::new(issuerd_core::utils::generate_id()).unwrap(),
+            realm_id: realm.id.clone(),
+            client_id: ClientIdentifier::new("target-app").unwrap(),
+            name: None,
+            description: None,
+            enabled: true,
+            protocol: ClientProtocol::OpenIdConnect,
+            public_client: false,
+            bearer_only: false,
+            client_authenticator_type: ClientAuthenticatorType::ClientSecret,
+            secret: Some("s3cret".to_string()),
+            redirect_uris: vec![],
+            web_origins: vec![],
+            default_scopes: Scope::default(),
+            optional_scopes: Scope::default(),
+            consent_required: false,
+            full_scope_allowed: true,
+            service_accounts_enabled: false,
+            protocol_mappers: vec![],
+            scope_mappings: Default::default(),
+            attributes: HashMap::new(),
+        };
+        storage.create_client(&realm.id, &target).await.unwrap();
+        let publisher = Role {
+            id: RoleId::new(issuerd_core::utils::generate_id()).unwrap(),
+            name: RoleName::new("publisher").unwrap(),
+            description: None,
+            realm_id: realm.id.clone(),
+            client_role: true,
+            client_id: Some(target.id.clone()),
+            composite: false,
+            composites: vec![],
+            attributes: HashMap::new(),
+        };
+        storage.create_role(&realm.id, &publisher).await.unwrap();
+
+        let mut config = sample_config();
+        // sample_config re-creates testrealm; the existing one is kept, so the
+        // roles list still applies. Request one known and one unknown role on
+        // each axis, plus an unresolvable target client.
+        config.clients[0].service_account_realm_roles =
+            vec!["admin".to_string(), "ghost".to_string()];
+        config.clients[0].service_account_client_roles = HashMap::from([
+            ("target-app".to_string(), vec!["publisher".to_string(), "ghost".to_string()]),
+            ("missing-app".to_string(), vec!["publisher".to_string()]),
+        ]);
+        let provisioner = Provisioner { config };
+        provisioner.apply_once(&storage, "http://localhost:8080").await.unwrap();
+
+        let realm = storage.get_realm_by_name("testrealm").await.unwrap().unwrap();
+        let client = storage
+            .get_client_by_client_id(&realm.id, &ClientIdentifier::new("my-app").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // Role assignments imply a usable service account.
+        assert!(client.service_accounts_enabled);
+
+        // The service-account user exists eagerly, bound to the client.
+        let user =
+            issuerd_core::service_account::find_service_account_user(&storage, &realm.id, &client)
+                .await
+                .unwrap()
+                .expect("service-account user must be provisioned eagerly");
+
+        let realm_role_ids = storage.list_user_realm_roles(&realm.id, &user.id).await.unwrap();
+        let mut realm_role_names = Vec::new();
+        for id in &realm_role_ids {
+            realm_role_names.push(storage.get_role(&realm.id, id).await.unwrap().unwrap().name);
+        }
+        assert!(realm_role_names.contains(&RoleName::new("admin").unwrap()));
+        assert!(!realm_role_names.contains(&RoleName::new("ghost").unwrap()));
+
+        let client_role_ids = storage.list_user_client_roles(&realm.id, &user.id).await.unwrap();
+        assert_eq!(client_role_ids, vec![publisher.id]);
     }
 
     #[test]
