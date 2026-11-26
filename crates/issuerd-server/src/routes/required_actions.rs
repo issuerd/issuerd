@@ -352,12 +352,24 @@ font-size:22px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;outlin
 .otp-row .otp-digit:focus{border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.25);}\
 ";
 
-pub(crate) fn page(title: &str, body: &str, lang: &str) -> Html<String> {
+pub(crate) fn page(title: &str, body: &str, lang: &str, realm_name: Option<&str>) -> Html<String> {
     let mut html = String::with_capacity(PAGE_CSS.len() + title.len() + body.len() + 256);
     html.push_str("<!DOCTYPE html><html lang=\"");
     html.push_str(&html_escape(lang));
     html.push_str("\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    if let Some(realm_name) = realm_name {
+        // Tab icon follows the realm's login theme (theme → default fallback
+        // in the theme asset handler); without a realm the page carries no
+        // icon, as before.
+        let realm = html_escape(realm_name);
+        html.push_str(&format!(
+            "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/realms/{realm}/theme/favicon.svg\" \
+             media=\"(prefers-color-scheme: light)\">\
+             <link rel=\"icon\" type=\"image/svg+xml\" href=\"/realms/{realm}/theme/favicon-dark.svg\" \
+             media=\"(prefers-color-scheme: dark)\">"
+        ));
+    }
     html.push_str("<title>");
     html.push_str(&html_escape(title));
     html.push_str("</title><style>");
@@ -384,6 +396,9 @@ pub(crate) struct PageCopy {
     pub lang: String,
     /// Layered message bundle for `lang` (per-key English fallback).
     pub bundle: MessageBundle,
+    /// Realm name these pages are rendered for — drives the themed tab icon;
+    /// `None` when no realm is known (fallback copy).
+    pub realm_name: Option<String>,
 }
 
 impl PageCopy {
@@ -406,7 +421,11 @@ impl PageCopy {
             realm.login_theme.as_ref().map(|t| t.as_str()),
             &lang,
         );
-        Self { lang, bundle }
+        Self {
+            lang,
+            bundle,
+            realm_name: Some(realm.name.to_string()),
+        }
     }
 
     /// Copy for error pages rendered before any realm is known (missing or
@@ -416,7 +435,11 @@ impl PageCopy {
         let lang = crate::i18n::DEFAULT_LOCALE.to_string();
         let bundle =
             crate::i18n::message_bundle(Some(state.config.themes.dir.as_path()), None, &lang);
-        Self { lang, bundle }
+        Self {
+            lang,
+            bundle,
+            realm_name: None,
+        }
     }
 
     /// Built-in bundles only — page-render unit tests run without a state.
@@ -425,6 +448,7 @@ impl PageCopy {
         Self {
             lang: locale.to_string(),
             bundle: crate::i18n::message_bundle(None, None, locale),
+            realm_name: None,
         }
     }
 
@@ -449,6 +473,7 @@ pub(crate) fn error_response(copy: &PageCopy, status: StatusCode, msg: &str) -> 
             &title,
             &format!("<h1>{title}</h1><p class=\"error\">{}</p>", html_escape(msg)),
             &copy.lang,
+            copy.realm_name.as_deref(),
         ),
     )
         .into_response()
@@ -522,7 +547,7 @@ pub(crate) fn otp_challenge_page(
          <button type=\"submit\">{submit}</button>\
          </form>"
     );
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm_name)).into_response()
 }
 
 /// Inline script for the email-code challenge page. Keeps the digit boxes in
@@ -639,7 +664,7 @@ pub(crate) fn email_code_challenge_page(
          </form>\
          <script>{EMAIL_CODE_CHALLENGE_SCRIPT}</script>"
     );
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm_name)).into_response()
 }
 
 /// Inline script for the WebAuthn challenge page. Drives
@@ -722,7 +747,7 @@ pub(crate) fn webauthn_challenge_page(
          onclick=\"run();return false;\">{retry}</button>\
          <script>{script}</script>"
     );
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm_name)).into_response()
 }
 
 /// Render the CONFIGURE_TOTP enrollment page: QR code + manual setup key +
@@ -783,7 +808,7 @@ fn render_configure_totp_page(
          <button type=\"submit\">{submit}</button>\
          </form>"
     );
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm_name)).into_response()
 }
 
 fn render_action_page(
@@ -917,7 +942,7 @@ fn render_action_page(
         "VERIFY_EMAIL" => copy.msg("action.verifyEmail.title", "Verify email"),
         _ => copy.msg("action.unsupported.title", "Action required"),
     };
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm_name)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1684,7 @@ pub async fn verify_email_handler(
                 copy.msg("verifyEmail.continueToLogin", "Continue to sign-in"),
             ),
             &copy.lang,
+            Some(&realm_name),
         )
         .into_response();
     };
@@ -1714,6 +1740,7 @@ pub async fn verify_email_handler(
             copy.msg("verifyEmail.continueSignIn", "Continue sign-in"),
         ),
         &copy.lang,
+        Some(&realm_name),
     )
     .into_response()
 }
@@ -2182,6 +2209,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: None,
         };
         let response =
             webauthn_challenge_page(&copy, "master", "flow-9", r#"{"challenge":"Y2Fi"}"#, None);
@@ -2258,6 +2286,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: None,
         };
         let response = email_code_challenge_page(&copy, "master", "flow-1", None, None, 4);
         let body = body_string(response).await;
@@ -2275,6 +2304,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: None,
         };
         let response = otp_challenge_page(&copy, "master", "flow-7", None);
         let body = body_string(response).await;
@@ -2293,6 +2323,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: Some("testrealm".to_string()),
         };
         let resp = error_response(
             &copy,
@@ -2304,6 +2335,26 @@ mod tests {
         assert!(body.contains("<html lang=\"de\">"), "body: {body}");
         assert!(body.contains("<h1>Anmeldefehler</h1>"), "body: {body}");
         assert!(body.contains("Realm nicht gefunden."), "body: {body}");
+        // The themed tab icon follows the realm's login theme.
+        assert!(
+            body.contains(
+                "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/realms/testrealm/theme/favicon.svg\" \
+                 media=\"(prefers-color-scheme: light)\">"
+            ),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("href=\"/realms/testrealm/theme/favicon-dark.svg\""),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn page_without_realm_carries_no_icon_links() {
+        let html = page("Title", "<p>body</p>", "en", None).0;
+        assert!(!html.contains("rel=\"icon\""), "html: {html}");
+        let html = page("Title", "<p>body</p>", "en", Some("my realm")).0;
+        assert!(html.contains("href=\"/realms/my realm/theme/favicon.svg\""), "html: {html}");
     }
 
     #[test]

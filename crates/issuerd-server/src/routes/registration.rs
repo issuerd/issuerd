@@ -161,7 +161,8 @@ fn render_register_page(
         field("first_name"),
         field("last_name"),
     );
-    page(&copy.msg("register.title", "Register"), &body, &copy.lang).into_response()
+    page(&copy.msg("register.title", "Register"), &body, &copy.lang, Some(realm_name))
+        .into_response()
 }
 
 /// Absolute-path link to the login page for the realm. `execution_id` points
@@ -204,6 +205,7 @@ fn registration_success_page(
             copy.msg("register.continueToLogin", "Continue to sign-in"),
         ),
         &copy.lang,
+        Some(realm_name),
     )
     .into_response()
 }
@@ -1009,6 +1011,7 @@ mod tests {
         let copy = PageCopy {
             lang: "de".to_string(),
             bundle,
+            realm_name: None,
         };
         let resp =
             render_register_page(&copy, "master", "flow-1", None, &HashMap::new(), false, false);

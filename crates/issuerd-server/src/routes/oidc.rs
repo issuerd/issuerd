@@ -6561,7 +6561,11 @@ async fn logout_inner(
         // the browser continues to the post-logout target.
         if !frontchannel_urls.is_empty() {
             return with_session_state_cleared(
-                crate::routes::logout::frontchannel_logout_page(Some(&url), &frontchannel_urls),
+                crate::routes::logout::frontchannel_logout_page(
+                    Some(&url),
+                    &frontchannel_urls,
+                    Some(realm.name.as_str()),
+                ),
                 &realm,
                 state.config.secure_cookies(),
             );
@@ -6575,7 +6579,11 @@ async fn logout_inner(
 
     if !frontchannel_urls.is_empty() {
         return with_session_state_cleared(
-            crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+            crate::routes::logout::frontchannel_logout_page(
+                None,
+                &frontchannel_urls,
+                Some(realm.name.as_str()),
+            ),
             &realm,
             state.config.secure_cookies(),
         );
@@ -6587,7 +6595,11 @@ async fn logout_inner(
     // on the previous page — the OIDC RP-Initiated Logout negative modules
     // capture exactly this page). No links, no scripts, no further actions.
     with_session_state_cleared(
-        crate::routes::logout::frontchannel_logout_page(None, &frontchannel_urls),
+        crate::routes::logout::frontchannel_logout_page(
+            None,
+            &frontchannel_urls,
+            Some(realm.name.as_str()),
+        ),
         &realm,
         state.config.secure_cookies(),
     )
