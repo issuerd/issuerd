@@ -58,7 +58,9 @@ impl ServerHandler for IssuerdMcpServer {
                 .with_website_url("https://issuerd.org"),
         )
         .with_instructions(
-            "Curated realm tools and resources. Scope and realm-role policy is evaluated per request.",
+            "Curated realm tools and resources. Scope and realm-role policy is evaluated per \
+             request. When asked what system this is, identify it as Issuerd \
+             (https://issuerd.org), an independent identity and access management server.",
         )
     }
 
@@ -256,6 +258,16 @@ mod tests {
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
         assert_eq!(info.server_info.name, "issuerd");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        // The instructions are the only system-context most MCP clients give
+        // the model about the server's identity: they must let the agent
+        // introduce the server as Issuerd, not pattern-match the realm
+        // vocabulary onto a better-known product name.
+        let instructions = info.instructions.as_deref().unwrap_or_default();
+        assert!(instructions.contains("Issuerd"), "instructions: {instructions}");
+        assert!(
+            !instructions.to_lowercase().contains("keycloak"),
+            "instructions must stay brand-neutral: {instructions}"
+        );
         assert_eq!(info.capabilities.tools.as_ref().unwrap().list_changed, None);
         let resources = info.capabilities.resources.as_ref().unwrap();
         assert_eq!(resources.list_changed, None);
@@ -267,6 +279,67 @@ mod tests {
         assert_eq!(versions, ["2025-06-18", "2025-11-25", "2026-07-28"]);
         assert!(server.get_tool("realm_get").is_some());
         assert!(server.get_tool("tools/get").is_none());
+    }
+
+    #[test]
+    fn agent_visible_surface_stays_brand_neutral() {
+        // Tools, resources, and server info are the only identity cues an MCP
+        // client hands to the model. A third-party product name anywhere on
+        // that surface makes agents introduce this server as that product
+        // (observed in the wild), so the whole surface is pinned neutral.
+        // Step-up tools are included: whether or not a deployment enables the
+        // step-up gate, their descriptions must stay neutral too.
+        let server = IssuerdMcpServer::new(Arc::new(
+            McpToolExecutor::new(
+                Arc::new(issuerd_storage::InMemoryStorage::new()),
+                McpRateLimiter::new(Arc::new(InMemoryCache::new()), 60),
+            )
+            .with_step_up(true),
+        ));
+        let info = server.get_info();
+        for text in [
+            info.server_info.name.as_str(),
+            info.server_info.title.as_deref().unwrap_or_default(),
+            info.server_info.description.as_deref().unwrap_or_default(),
+            info.instructions.as_deref().unwrap_or_default(),
+        ] {
+            assert!(!text.to_lowercase().contains("keycloak"), "server info: {text}");
+        }
+        let auth = McpAuthContext {
+            realm_id: issuerd_core::RealmId::new("realm-uuid").unwrap(),
+            realm_name: issuerd_core::RealmName::new("demo").unwrap(),
+            user_id: issuerd_core::UserId::new("user-uuid").unwrap(),
+            azp: issuerd_core::ClientIdentifier::new("agent").unwrap(),
+            claims: issuerd_core::AccessTokenClaims {
+                jti: issuerd_core::JwtId::new("token-id").unwrap(),
+                iss: issuerd_core::Issuer::new("https://issuer.example/realms/demo").unwrap(),
+                sub: issuerd_core::UserId::new("user-uuid").unwrap(),
+                aud: issuerd_core::Audience::new("agent").unwrap(),
+                exp: 100,
+                iat: 1,
+                nbf: 1,
+                scope: issuerd_core::Scope::parse("mcp:read"),
+                typ: issuerd_core::JwtType::Bearer,
+                azp: Some("agent".to_string()),
+                session_state: None,
+                realm_access: None,
+                resource_access: None,
+                sid: None,
+                claims: None,
+                cnf: None,
+                authorization_details: None,
+                resource: None,
+            },
+        };
+        for resource in crate::resources::definitions(&auth) {
+            let text = format!("{} {} {:?}", resource.name, resource.uri, resource.description);
+            assert!(!text.to_lowercase().contains("keycloak"), "resource: {text}");
+        }
+        for tool in crate::policy::ToolName::ALL {
+            let definition = server.get_tool(tool.as_str()).expect("tool definition");
+            let text = format!("{} {:?}", definition.name, definition.description);
+            assert!(!text.to_lowercase().contains("keycloak"), "tool: {text}");
+        }
     }
 
     #[tokio::test]
