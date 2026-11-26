@@ -57,20 +57,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install Flux (z3 + liquid-fixpoint + cargo-flux)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FLUX_INSTALL_REF: 9fe62fab121a3b26f2fb4ffdf8fb39e44904e3c2
-          FLUX_INSTALL_SHA256: 40331a9b530926347005ffd55c72dd723f126d20c405aed8303e94040eb32809
-        run: |
-          # Fetch the pinned installer through the authenticated GitHub API,
-          # falling back to the raw URL if the API hiccups. Both sources must
-          # produce the same verified file before anything is executed.
-          gh api "repos/flux-rs/flux/contents/install.sh?ref=${FLUX_INSTALL_REF}" \
-            -H "Accept: application/vnd.github.raw" > flux-install.sh \
-            || curl -fsSL --retry 5 --retry-all-errors \
-                "https://raw.githubusercontent.com/flux-rs/flux/${FLUX_INSTALL_REF}/install.sh" > flux-install.sh
-          echo "${FLUX_INSTALL_SHA256}  flux-install.sh" | sha256sum -c -
-          bash < flux-install.sh
+        # Vendored installer: the upstream install.sh resolves the *latest* z3
+        # through the anonymous api.github.com, which intermittently 403s
+        # (rate limit) on shared runners — and GITHUB_TOKEN cannot help, it
+        # is scoped to this repository. scripts/flux-install.sh pins the z3
+        # release and downloads direct release assets instead (no GitHub API
+        # at all), with retries on the binary downloads.
+        run: bash scripts/flux-install.sh
       # Scoped to the annotated defs (SecondsNonZero, models.rs): the flux
       # driver ICEs on ordinary iterator chains elsewhere in the crate
       # (flux-rs/flux#1666 at projections.rs:382, plus infer.rs:484), so a

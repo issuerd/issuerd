@@ -291,7 +291,13 @@ As-run status (Kani 0.68 / CBMC 6.11, cargo-flux c460561, WSL):
   --only-check="def:models::SecondsNonZero"` (everything else is auto-trusted).
   The `SecondsNonZero` refinement annotations stay in place (inert under plain
   rustc); the job stays `continue-on-error` because flux installs from its
-  `main` branch. After a flux bump that fixes #1666, widen back to bare
+  `main` branch. The install step runs `scripts/flux-install.sh` — vendored
+  from upstream `install.sh` @ 9fe62fab (SHA-256-pinned) with the anonymous
+  `api.github.com/repos/Z3Prover/z3/releases/latest` resolution replaced by a
+  pinned z3 release (`z3-5.3.3`) via direct release-asset URL: the API call
+  intermittently returned 403 (rate limit) on shared runners, and
+  `GITHUB_TOKEN` is scoped to this repository, so it cannot authenticate
+  cross-repo API reads. After a flux bump that fixes #1666, widen back to bare
   `cargo flux` (full-crate) via `scripts/flux.sh`.
 - **MIRAI: hard-blocked upstream, cannot run at all.** MIRAI pins
   `nightly-2025-01-10` (~rustc 1.86) and bakes it into the `cargo-mirai`
