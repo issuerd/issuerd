@@ -13,9 +13,25 @@ WORKDIR /build
 COPY conformance-suite/ ./
 # BuildKit cache keeps the maven repository across builds on this host
 # (first build downloads the world; later builds are fast).
+# v0.2.9 release note: the fresh-runner build of this stage failed once with
+# "Non-resolvable parent POM ... could not be resolved" — a transient Maven
+# Central fetch failure with a cold ~/.m2. The wagon retry properties cover
+# per-request flakiness, and the shell loop re-runs the whole resolution for
+# anything retryHandler does not catch (5xx bodies, truncated metadata).
 RUN --mount=type=cache,target=/root/.m2 \
-    mvn -B -Dmaven.test.skip -Dpmd.skip -Dcheckstyle.skip -Dmaven.gitcommitid.skip=true \
-    clean package
+    rc=1; for attempt in 1 2 3; do \
+      if mvn -B \
+        -Dmaven.wagon.http.retryHandler.count=10 \
+        -Dmaven.wagon.http.retryHandler.requestSentEnabled=true \
+        -Dmaven.wagon.httpconnectionManager.maxPerRoute=20 \
+        -Dmaven.test.skip -Dpmd.skip -Dcheckstyle.skip -Dmaven.gitcommitid.skip=true \
+        clean package; then \
+        rc=0; break; \
+      fi; \
+      echo "maven attempt $attempt failed; retrying after cooldown"; \
+      [ "$attempt" -lt 3 ] && sleep 20; \
+    done; \
+    exit $rc
 
 # --- Stage 2: runtime ---
 FROM eclipse-temurin:25-jre@sha256:ecdc0adb37bde1a281c4d245a3cd535004b1fc8322d560f5b09463b248c81df0
