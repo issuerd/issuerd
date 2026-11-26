@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-11-26
+
 ### Added
 
 - **Login-theme tab branding.** The browser tab now follows the realm and its login theme: the login page's title is the realm display name next to the localized "Sign In" (a theme bundle key `login.pageTitle` overrides it entirely, `{0}` expanding to the display name), and the login page plus every server-rendered login-flow page (consent, OTP/email-code/WebAuthn challenges, required actions, registration, reset-credentials) takes its tab icon from the theme route `/realms/{realm}/theme/favicon.svg` (dark mode: `favicon-dark.svg`). A custom theme ships just those files to re-icon the sign-in tab; the default theme carries the issuerd icons, compiled into the binary alongside `login.css`, so unthemed realms are unchanged. ([#235](https://github.com/issuerd/issuerd/issues/235))
