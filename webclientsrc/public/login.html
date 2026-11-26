@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Issuerd — Sign In</title>
+    <link rel="preload" as="font" type="font/woff2" crossorigin href="/fonts/inter-latin.woff2" />
+    <link rel="preload" as="font" type="font/woff2" crossorigin href="/fonts/inter-cyrillic.woff2" />
+    <link rel="preload" as="font" type="font/woff2" crossorigin href="/fonts/space-grotesk-latin.woff2" />
     <link rel="icon" type="image/svg+xml" href="/brand/logo-small.svg" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/svg+xml" href="/brand/logo-small-white.svg" media="(prefers-color-scheme: dark)" />
     <link rel="stylesheet" href="/fonts/fonts.css">
@@ -48,6 +51,7 @@
             font-family: var(--issuerd-font-display, 'Space Grotesk', system-ui, sans-serif);
             font-size: 18px;
             font-weight: 500;
+            line-height: 23px;
             color: var(--issuerd-fg, #fafafa);
             text-align: center;
             margin-bottom: 8px;
@@ -55,13 +59,12 @@
         .realm-display {
             text-align: center;
             font-size: 13px;
+            line-height: 16px;
             color: var(--issuerd-accent, #00E5FF);
             font-weight: 600;
             margin-bottom: 20px;
             letter-spacing: 0.02em;
-        }
-        .realm-display:empty {
-            display: none;
+            min-height: 16px;
         }
         .banner {
             padding: 10px 16px;
@@ -87,6 +90,7 @@
             display: block;
             font-size: 12px;
             font-weight: 500;
+            line-height: 15px;
             color: var(--issuerd-muted, #a3a3a3);
             margin-bottom: 6px;
             text-transform: uppercase;
@@ -94,12 +98,14 @@
         }
         input {
             width: 100%;
+            height: 40px;
             padding: 10px 14px;
             background: var(--issuerd-input-bg, rgba(255, 255, 255, 0.03));
             border: 1px solid var(--issuerd-input-border, #262626);
             border-radius: var(--issuerd-input-radius, 8px);
             color: var(--issuerd-fg, #fafafa);
             font-size: 14px;
+            line-height: 18px;
             font-family: inherit;
             margin-bottom: 16px;
             transition: border-color 0.2s, box-shadow 0.2s;
@@ -116,12 +122,14 @@
         }
         button {
             width: 100%;
-            padding: 12px;
+            height: 40px;
+            padding: 0 14px;
             background: var(--issuerd-button-bg, #ffffff);
             color: var(--issuerd-button-fg, #0a0a0a);
             border: none;
             border-radius: var(--issuerd-button-radius, 8px);
             font-size: 13px;
+            line-height: 16px;
             font-weight: 600;
             font-family: inherit;
             text-transform: uppercase;
