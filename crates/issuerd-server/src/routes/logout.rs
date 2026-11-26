@@ -292,7 +292,12 @@ pub async fn frontchannel_logout_urls(
 /// session, then an automatic continuation to `continue_url` (the validated
 /// post-logout redirect target) once the iframes had a moment to load. When
 /// there is no redirect target the page itself confirms the sign-out.
-pub fn frontchannel_logout_page(continue_url: Option<&str>, iframe_urls: &[String]) -> Response {
+/// `realm_name` drives the themed tab icon; `None` only in tests.
+pub fn frontchannel_logout_page(
+    continue_url: Option<&str>,
+    iframe_urls: &[String],
+    realm_name: Option<&str>,
+) -> Response {
     let mut body = String::from("<h1>Signing you out</h1>");
     body.push_str("<p>You have been signed out.</p>");
     for url in iframe_urls {
@@ -314,7 +319,8 @@ pub fn frontchannel_logout_page(continue_url: Option<&str>, iframe_urls: &[Strin
              <noscript><meta http-equiv=\"refresh\" content=\"3;url={escaped}\"></noscript>"
         ));
     }
-    super::required_actions::page("Sign-out", &body, crate::i18n::DEFAULT_LOCALE).into_response()
+    super::required_actions::page("Sign-out", &body, crate::i18n::DEFAULT_LOCALE, realm_name)
+        .into_response()
 }
 
 /// The token issuer URL for a realm — must match `iss` in issued tokens
@@ -794,7 +800,8 @@ mod tests {
         let continue_url =
             "https://app.example/continue?x=\"></script><script>alert('continue')</script>&emoji=☃";
 
-        let response = frontchannel_logout_page(Some(continue_url), &[iframe_url.to_string()]);
+        let response =
+            frontchannel_logout_page(Some(continue_url), &[iframe_url.to_string()], Some("master"));
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
 

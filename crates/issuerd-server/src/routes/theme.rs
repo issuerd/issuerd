@@ -4,7 +4,8 @@
 //! Login theme asset serving.
 //!
 //! `GET /realms/{realm}/theme/{*path}` serves static assets (the login page
-//! CSS today) in three layers: `{themes.dir}/{theme}/{path}` first (where
+//! CSS and the `favicon.svg`/`favicon-dark.svg` tab icons today) in three
+//! layers: `{themes.dir}/{theme}/{path}` first (where
 //! `theme` is the realm's `login_theme` or the built-in [`DEFAULT_THEME`]),
 //! then `{themes.dir}/{default}/{path}`, and finally the default theme
 //! compiled into the binary (see `build.rs`) — so container deployments
@@ -30,14 +31,27 @@ pub const DEFAULT_THEME: &str = "issuerd";
 #[cfg(builtin_theme_present)]
 const BUILTIN_LOGIN_CSS: &str = include_str!(env!("ISSUERD_BUILTIN_LOGIN_CSS"));
 
+/// The default theme's tab icons, compiled into the binary by `build.rs` from
+/// the same sources as [`BUILTIN_LOGIN_CSS`]. Served at the theme route as
+/// `favicon.svg` / `favicon-dark.svg` so the login page and the
+/// server-rendered login-flow pages can point at realm-themed icons that fall
+/// back to the issuerd brand.
+#[cfg(builtin_theme_present)]
+const BUILTIN_FAVICON_SVG: &str = include_str!(env!("ISSUERD_BUILTIN_FAVICON_SVG"));
+#[cfg(builtin_theme_present)]
+const BUILTIN_FAVICON_DARK_SVG: &str = include_str!(env!("ISSUERD_BUILTIN_FAVICON_DARK_SVG"));
+
 /// Last-resort layer: assets of the built-in default theme that are compiled
 /// into the binary, served when neither the realm's theme nor the on-disk
 /// default theme ships the file (e.g. container images without a mounted
 /// themes directory).
 fn builtin_theme_asset(asset_path: &str) -> Option<&'static str> {
     #[cfg(builtin_theme_present)]
-    if asset_path == "login.css" {
-        return Some(BUILTIN_LOGIN_CSS);
+    match asset_path {
+        "login.css" => return Some(BUILTIN_LOGIN_CSS),
+        "favicon.svg" => return Some(BUILTIN_FAVICON_SVG),
+        "favicon-dark.svg" => return Some(BUILTIN_FAVICON_DARK_SVG),
+        _ => {}
     }
     let _ = asset_path;
     None
@@ -412,6 +426,73 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(builtin_theme_present)]
+    #[tokio::test]
+    async fn builtin_theme_serves_favicons_when_disk_is_empty() {
+        let base = std::env::temp_dir()
+            .join(format!("issuerd-theme-builtin-favicon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = ServerConfig::default();
+        cfg.themes.dir = base.clone();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        for (path, expected) in [
+            ("favicon.svg", BUILTIN_FAVICON_SVG.as_bytes()),
+            ("favicon-dark.svg", BUILTIN_FAVICON_DARK_SVG.as_bytes()),
+        ] {
+            let resp = theme_asset_handler(
+                State(state.clone()),
+                Path(("master".to_string(), path.to_string())),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(content_type.contains("svg"), "content-type: {content_type}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], expected, "{path}");
+        }
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_disk_favicon_wins_over_builtin() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-theme-favicon-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(themes.join("issuerd")).unwrap();
+        std::fs::write(themes.join("issuerd").join("favicon.svg"), b"<!-- on-disk -->").unwrap();
+
+        let state = state_with_login_theme(&themes, "issuerd").await;
+        let resp = theme_asset_handler(
+            State(state.clone()),
+            Path(("master".to_string(), "favicon.svg".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"<!-- on-disk -->", "the on-disk default theme must win");
+        // The dark variant is not on disk — the built-in copy answers instead.
+        let resp = theme_asset_handler(
+            State(state),
+            Path(("master".to_string(), "favicon-dark.svg".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        #[cfg(builtin_theme_present)]
+        assert_eq!(&body[..], BUILTIN_FAVICON_DARK_SVG.as_bytes());
 
         std::fs::remove_dir_all(&base).unwrap();
     }

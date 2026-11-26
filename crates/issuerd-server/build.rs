@@ -8,9 +8,10 @@
 //                               present in the packaged crates.io crate
 //   - <repo>/webclientsrc/dist  development workspace layout
 //
-// Also embeds the built-in default login theme (themes/issuerd/login.css) so
-// container deployments serve `/realms/{realm}/theme/login.css` without a
-// mounted themes directory. Candidate locations, first hit wins:
+// Also embeds the built-in default login theme (themes/issuerd/login.css plus
+// the favicon.svg/favicon-dark.svg tab icons) so container deployments serve
+// `/realms/{realm}/theme/{path}` without a mounted themes directory.
+// Candidate locations, first hit wins:
 //   - <crate>/builtin-theme/    crate-local copy staged by scripts/publish.py,
 //                               present in the packaged crates.io crate
 //   - <repo>/themes/            development workspace layout
@@ -20,7 +21,8 @@ use std::path::{Path, PathBuf};
 const DIST_MISSING: &str =
     "webclientsrc/dist is missing or empty; run `npm run build` in webclientsrc/ first";
 const THEME_MISSING: &str =
-    "themes/issuerd/login.css is missing; the built-in default login theme cannot be embedded";
+    "themes/issuerd/{login.css,favicon.svg,favicon-dark.svg} are missing; the built-in \
+     default login theme cannot be embedded";
 
 fn populated(dir: &Path) -> bool {
     match std::fs::read_dir(dir) {
@@ -54,19 +56,38 @@ fn main() {
         }
     }
 
-    let theme_candidates = [
-        manifest_dir.join("builtin-theme").join("issuerd").join("login.css"),
-        manifest_dir
-            .join("..")
-            .join("..")
-            .join("themes")
-            .join("issuerd")
-            .join("login.css"),
+    let theme_dir_candidates = [
+        manifest_dir.join("builtin-theme"),
+        manifest_dir.join("..").join("..").join("themes"),
     ];
+    let theme_files = ["login.css", "favicon.svg", "favicon-dark.svg"];
 
-    if let Some(css_path) = theme_candidates.iter().find(|p| p.is_file()) {
+    for candidate in &theme_dir_candidates {
+        println!("cargo:rerun-if-changed={}", candidate.join("issuerd").display());
+    }
+
+    let mut theme_dir: Option<&Path> = None;
+    'outer: for candidate in &theme_dir_candidates {
+        for file in &theme_files {
+            if !candidate.join("issuerd").join(file).is_file() {
+                continue 'outer;
+            }
+        }
+        theme_dir = Some(candidate);
+        break;
+    }
+
+    if let Some(dir) = theme_dir {
+        let css_path = dir.join("issuerd").join("login.css");
         println!("cargo:rerun-if-changed={}", css_path.display());
         println!("cargo:rustc-env=ISSUERD_BUILTIN_LOGIN_CSS={}", css_path.display());
+        let favicon_path = dir.join("issuerd").join("favicon.svg");
+        println!("cargo:rustc-env=ISSUERD_BUILTIN_FAVICON_SVG={}", favicon_path.display());
+        let favicon_dark_path = dir.join("issuerd").join("favicon-dark.svg");
+        println!(
+            "cargo:rustc-env=ISSUERD_BUILTIN_FAVICON_DARK_SVG={}",
+            favicon_dark_path.display()
+        );
         println!("cargo:rustc-cfg=builtin_theme_present");
     } else {
         println!("cargo:warning={THEME_MISSING}; the default login theme will not be embedded");

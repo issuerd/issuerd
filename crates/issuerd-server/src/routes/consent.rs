@@ -335,7 +335,7 @@ async fn render_consent_page(
         html_escape(client_display),
         html_escape(&lead),
     );
-    page(&title, &body, &locale).into_response()
+    page(&title, &body, &locale, Some(realm_name)).into_response()
 }
 
 /// `POST /realms/{realm}/login/consent/{execution}` — apply the decision.

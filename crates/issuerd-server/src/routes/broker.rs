@@ -1347,7 +1347,7 @@ pub async fn first_broker_login_page(
              {create_instead}</button>\
              </form>",
         );
-        return page(&title, &body, &copy.lang).into_response();
+        return page(&title, &body, &copy.lang, Some(realm.name.as_str())).into_response();
     }
 
     // Review mode: prefilled, editable profile.
@@ -1384,7 +1384,7 @@ pub async fn first_broker_login_page(
          <button type=\"submit\">{submit}</button>\
          </form>",
     );
-    page(&title, &body, &copy.lang).into_response()
+    page(&title, &body, &copy.lang, Some(realm.name.as_str())).into_response()
 }
 
 /// POST /realms/{realm}/broker/first-login/{execution}

@@ -1516,6 +1516,10 @@ pub struct LoginContextResponse {
     pub supported_locales: Vec<String>,
     /// Login theme name when the realm overrides the built-in default.
     pub login_theme: Option<String>,
+    /// Browser-tab title for the login page: the localized "Sign In" next to
+    /// the realm display name, unless the theme bundle overrides it with
+    /// `login.pageTitle`.
+    pub page_title: String,
     /// Message bundle for `locale` (per-key English fallback applied).
     pub messages: std::collections::HashMap<String, String>,
     /// Client branding (OIDC registration §2 metadata): present only when the
@@ -1651,6 +1655,7 @@ pub async fn login_context_handler(
                 locale,
                 supported_locales: realm.supported_locales.clone(),
                 login_theme: realm.login_theme.as_ref().map(|t| t.as_str().to_string()),
+                page_title: crate::i18n::login_page_title(&bundle, &realm),
                 messages: bundle,
                 client_name: branding_client.as_ref().map(|c| {
                     c.name
@@ -5351,5 +5356,62 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "/login.html?realm=master");
+    }
+
+    /// `GET /realms/{realm}/login/context` — the browser-tab title follows
+    /// the realm (display name, localized "Sign In") and yields entirely to
+    /// a theme bundle `login.pageTitle` override.
+    #[tokio::test]
+    async fn login_context_page_title_follows_realm_and_theme() {
+        let base =
+            std::env::temp_dir().join(format!("issuerd-login-title-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let themes = base.join("themes");
+        std::fs::create_dir_all(themes.join("issuerd")).unwrap();
+        std::fs::write(
+            themes.join("issuerd").join("messages_en.json"),
+            br#"{ "login.pageTitle": "{0} - Operator sign-in" }"#,
+        )
+        .unwrap();
+
+        let mut cfg = ServerConfig::default();
+        cfg.themes.dir = themes.clone();
+        let state = Arc::new(ServerState::from_config(&cfg).await.unwrap());
+        let realm_id = issuerd_core::RealmId::new("master").unwrap();
+        let mut realm = state.storage.get_realm(&realm_id).await.unwrap().unwrap();
+        realm.display_name = Some(issuerd_core::DisplayName::new("Amana").unwrap());
+        state.storage.update_realm(&realm).await.unwrap();
+        // Mirrors the admin route's synchronous realm-by-name invalidation.
+        state
+            .cache
+            .delete(&issuerd_cluster::cache_keys::realm_by_name("master"))
+            .await
+            .unwrap();
+
+        let fetch_title = |state: Arc<ServerState>| async move {
+            let response = login_context_handler(
+                State(state),
+                axum::extract::Extension(crate::middleware::realm::ResolvedRealm(Some(
+                    "master".to_string(),
+                ))),
+                Query(LoginContextQuery { execution_id: None }),
+                axum::http::HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["page_title"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        assert_eq!(fetch_title(state.clone()).await, "Amana - Operator sign-in");
+
+        // Without the override: localized "Sign In" next to the display name.
+        std::fs::write(themes.join("issuerd").join("messages_en.json"), br#"{}"#).unwrap();
+        assert_eq!(fetch_title(state).await, "Sign In · Amana");
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
