@@ -463,7 +463,7 @@ curl -s -X POST "$IC/admin/realms/acme/partialImport?ifResourceExists=SKIP" \
 # → {"added": 3, "skipped": 0, "updated": 0, "results": [...]}
 ```
 
-Strategy: `FAIL` (default — first conflict aborts with **409** and previously imported resources are **not** rolled back), `SKIP`, or `OVERWRITE`. The body accepts `users`, `groups` (top-level only), `clients`, `roles`, `identityProviders`. Import creates users **without credentials** — set passwords afterwards via `reset-password`.
+Strategy: `FAIL` (default — first conflict aborts with **409** and previously imported resources are **not** rolled back), `SKIP`, or `OVERWRITE`. The body accepts `users`, `groups` (top-level only), `clients`, `roles`, `identityProviders`. An ordinary partial document creates users **without credentials** — set passwords afterwards via `reset-password`. A full Keycloak realm export can additionally preserve supported password credentials, client scopes and protocol mappers, default/optional scope assignments, and role/group/composite mappings; see [Keycloak realm migration](deployment.md#keycloak-realm-migration).
 
 ```bash
 curl -s -X POST "$IC/admin/realms/acme/export" -H "Authorization: Bearer $TOKEN" > acme-export.json
