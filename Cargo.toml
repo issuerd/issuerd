@@ -115,7 +115,7 @@ tokio-util = "0.7"
 # HTTP server
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["timeout", "limit"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip", "compression-br", "metrics"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "compression-br", "metrics"] }
 hyper = { version = "1.4", features = ["full"] }
 ipnet = "2.11"
 
