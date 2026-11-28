@@ -79,7 +79,7 @@ fn sign_hs256(claims: &serde_json::Value, secret: &str) -> String {
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }

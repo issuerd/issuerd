@@ -40,13 +40,13 @@ yanked = "deny"
 #   https://github.com/testcontainers/testcontainers-rs/pull/1006.
 #   Remove this ignore when a release with the replacement lands.
 # - RUSTSEC-2026-0543 is an informational unmaintained-crate notice, not a
-#   vulnerability. No safe chrono upgrade exists. Public timestamp types stay
-#   unchanged in this bugfix; rmcp also requires chrono until
-#   https://github.com/modelcontextprotocol/rust-sdk/pull/1474 is released.
-#   A future timestamp migration needs its own compatibility review.
+#   vulnerability. No chrono release can resolve an all-versions unmaintained
+#   notice. rmcp 3.12.0 makes its chrono dependency optional, but Issuerd's
+#   public timestamp models and SQLx integration still use chrono. A future
+#   timestamp migration needs its own compatibility review.
 ignore = [
     { id = "RUSTSEC-2026-0440", reason = "Dev-only via testcontainers 0.28.0; unmaintained notice with replacement pending upstream in testcontainers#1006" },
-    { id = "RUSTSEC-2026-0543", reason = "Informational unmaintained notice only; no safe chrono upgrade; optional-chrono support is pending in rmcp#1474, with a separate timestamp migration outside this bugfix" },
+    { id = "RUSTSEC-2026-0543", reason = "Informational unmaintained notice only; no patched chrono release exists; rmcp 3.12 makes chrono optional, but Issuerd public models and SQLx still require a separate timestamp migration" },
 ]
 
 # --- License checks ---
