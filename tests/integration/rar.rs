@@ -585,7 +585,8 @@ async fn rar_jar_roundtrip() {
             "authorization_details": serde_json::from_str::<serde_json::Value>(DETAILS_NARROWED)
                 .unwrap(),
         }),
-        &jsonwebtoken::EncodingKey::from_secret(client.secret.as_deref().unwrap().as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(client.secret.as_deref().unwrap().as_bytes())
+            .unwrap(),
     )
     .unwrap();
 

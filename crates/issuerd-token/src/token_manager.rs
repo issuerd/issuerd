@@ -1089,7 +1089,8 @@ fn jwk_to_decoding_key(jwk: &Jwk) -> Result<jsonwebtoken::DecodingKey, IssuerdEr
             let bytes = URL_SAFE_NO_PAD.decode(k).map_err(|e| {
                 IssuerdError::InvalidRequest(format!("invalid base64 in oct JWK: {e}"))
             })?;
-            Ok(jsonwebtoken::DecodingKey::from_secret(&bytes))
+            jsonwebtoken::DecodingKey::from_secret(&bytes)
+                .map_err(|e| IssuerdError::InvalidRequest(format!("invalid oct JWK: {e}")))
         }
     }
 }

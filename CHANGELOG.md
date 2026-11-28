@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dependency maintenance.** Update JWT, HTTP, CLI, web-client, example-app, CI-action, and performance-test dependencies, including `jsonwebtoken` 12.0.0 and `tower-http` 0.7.1. Adapt HMAC key construction to the new `jsonwebtoken` API so empty keys return controlled errors instead of being accepted, and add regression coverage for the affected validation paths.
 - **MCP server identity.** The MCP server-info instructions now positively identify the system as Issuerd (issuerd.org), an independent IAM server — agents backed by the MCP tools introduce the server by its own name instead of pattern-matching the realm vocabulary onto better-known products. The agent-visible surface (server info, instructions, all 71 tool descriptions, resource listings) is pinned brand-neutral by a regression test.
 
 ## [0.2.9] - 2026-11-26

@@ -505,18 +505,22 @@ fn map_alg(alg: Algorithm) -> Result<jsonwebtoken::Algorithm, IssuerdError> {
     }
 }
 
-fn build_encoding_key(alg: Algorithm, private_der: &[u8]) -> jsonwebtoken::EncodingKey {
+fn build_encoding_key(
+    alg: Algorithm,
+    private_der: &[u8],
+) -> Result<jsonwebtoken::EncodingKey, IssuerdError> {
     match alg {
         Algorithm::Rs256 | Algorithm::Rs384 | Algorithm::Rs512 => {
-            jsonwebtoken::EncodingKey::from_rsa_der(private_der)
+            Ok(jsonwebtoken::EncodingKey::from_rsa_der(private_der))
         }
         Algorithm::Es256 | Algorithm::Es384 | Algorithm::Es512 => {
-            jsonwebtoken::EncodingKey::from_ec_der(private_der)
+            Ok(jsonwebtoken::EncodingKey::from_ec_der(private_der))
         }
         Algorithm::Hs256 | Algorithm::Hs384 | Algorithm::Hs512 => {
             jsonwebtoken::EncodingKey::from_secret(private_der)
+                .map_err(|e| IssuerdError::ServerError(format!("invalid HMAC signing key: {e}")))
         }
-        Algorithm::EdDsa => jsonwebtoken::EncodingKey::from_ed_der(private_der),
+        Algorithm::EdDsa => Ok(jsonwebtoken::EncodingKey::from_ed_der(private_der)),
     }
 }
 
@@ -562,7 +566,8 @@ fn build_decoding_key(jwk: &Jwk) -> Result<jsonwebtoken::DecodingKey, IssuerdErr
             let bytes = URL_SAFE_NO_PAD.decode(k.as_str()).map_err(|e| {
                 IssuerdError::InvalidRequest(format!("invalid base64 in oct JWK: {e}"))
             })?;
-            Ok(jsonwebtoken::DecodingKey::from_secret(&bytes))
+            jsonwebtoken::DecodingKey::from_secret(&bytes)
+                .map_err(|e| IssuerdError::InvalidRequest(format!("invalid oct JWK: {e}")))
         }
     }
 }
@@ -604,7 +609,7 @@ impl CryptoProvider for RingCryptoProvider {
         }
 
         let jwt_alg = map_alg(alg)?;
-        let encoding_key = build_encoding_key(alg, &signing_key.private_der);
+        let encoding_key = build_encoding_key(alg, &signing_key.private_der)?;
 
         let header = jsonwebtoken::Header {
             alg: jwt_alg,
@@ -1373,6 +1378,12 @@ mod tests {
         assert!(result.is_err());
         let err = result.expect_err("expected error");
         assert!(err.to_string().contains("missing k"));
+    }
+
+    #[test]
+    fn build_encoding_key_empty_hmac_rejected() {
+        let result = build_encoding_key(Algorithm::Hs256, &[]);
+        assert!(result.is_err());
     }
 
     #[test]

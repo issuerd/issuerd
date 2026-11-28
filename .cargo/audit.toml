@@ -39,10 +39,10 @@
 # https://github.com/testcontainers/testcontainers-rs/pull/1006 ships.
 #
 # RUSTSEC-2026-0543 is an informational unmaintained notice, not a
-# vulnerability. No safe chrono upgrade exists. This bugfix keeps the public
-# timestamp types unchanged; rmcp also still requires chrono until
-# https://github.com/modelcontextprotocol/rust-sdk/pull/1474 is released.
-# A future timestamp migration needs its own compatibility review.
+# vulnerability. No chrono release can resolve an all-versions unmaintained
+# notice. rmcp 3.12.0 makes its chrono dependency optional, but Issuerd's
+# public timestamp models and SQLx integration still use chrono. A future
+# timestamp migration needs its own compatibility review.
 ignore = [
     "RUSTSEC-2026-0440",
     "RUSTSEC-2026-0543",

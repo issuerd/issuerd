@@ -82,7 +82,8 @@ pub fn validate_request_object(
         }
         A::HS256 | A::HS384 | A::HS512 => {
             let secret = client_secret.filter(|s| !s.is_empty()).ok_or_else(invalid)?;
-            vec![jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())]
+            vec![jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())
+                .map_err(|e| invalid_caused("HMAC key", e))?]
         }
         other => {
             return Err(IssuerdError::InvalidRequest(format!(
@@ -197,7 +198,7 @@ mod tests {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
         )
         .unwrap()
     }

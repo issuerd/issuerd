@@ -122,7 +122,8 @@ pub fn validate_client_secret_assertion(
             )))
         }
     }
-    let key = jsonwebtoken::DecodingKey::from_secret(client_secret.as_bytes());
+    let key = jsonwebtoken::DecodingKey::from_secret(client_secret.as_bytes())
+        .map_err(|e| invalid_caused("HMAC key", e))?;
     let validation = assertion_validation(header.alg, requirements);
     decode_and_check(assertion, &key, &validation, requirements)
 }
@@ -355,7 +356,7 @@ mod tests {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
         )
         .unwrap()
     }
@@ -564,11 +565,18 @@ mod tests {
             let token = jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(alg),
                 &valid_claims(),
-                &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+                &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()).unwrap(),
             )
             .unwrap();
             assert!(validate_client_secret_assertion(&token, SECRET, &req_with(&aud)).is_ok());
         }
+    }
+
+    #[test]
+    fn client_secret_jwt_empty_secret_rejected_without_panic() {
+        let aud = accepted();
+        let token = sign_hs256(valid_claims(), SECRET);
+        assert!(validate_client_secret_assertion(&token, "", &req_with(&aud)).is_err());
     }
 
     #[test]
